@@ -49,8 +49,9 @@ namespace raftdemo
     void Start();
     void Stop();
     void Wait();
-
+    // 收到别的节点发来的投票请求时的处理逻辑：
     void OnRequestVote(const raft::VoteRequest &request, raft::VoteResponse *response);
+    // 收到 Leader 发来的心跳或日志复制请求时的处理逻辑：
     void OnAppendEntries(const raft::AppendEntriesRequest &request,
                          raft::AppendEntriesResponse *response);
 
@@ -67,17 +68,23 @@ namespace raftdemo
       std::unique_ptr<raft::RaftService::Stub> stub;
       std::mutex mu;
     };
-
+    // 初始化并启动当前节点的 gRPC 服务端。
     void InitServer();
+    // 为所有 peer 节点创建 RPC 客户端，后续用于发投票和日志复制请求。
     void InitClients();
-
+    // 重置选举超时计时器。
     void ResetElectionTimerLocked();
+    // 重置心跳定时器。
     void ResetHeartbeatTimerLocked();
+    // 生成一个随机选举超时时间，避免多个节点同时发起选举。
     std::chrono::milliseconds RandomElectionTimeoutLocked();
-
+    // 选举超时后的处理入口。
     void OnElectionTimeout();
+    // 开始选举
     void StartElection();
+    // 当候选人拿到多数票后调用
     void OnElectionWon(std::uint64_t term);
+    // 发送心跳
     void SendHeartbeats();
 
     void BecomeFollowerLocked(std::uint64_t new_term, int new_leader, const std::string &reason);
@@ -87,8 +94,9 @@ namespace raftdemo
                                       std::uint64_t last_log_term) const;
     std::uint64_t LastLogIndexLocked() const;
     std::uint64_t LastLogTermLocked() const;
-
+    // 向某个 peer 发送投票请求 RPC。
     std::optional<raft::VoteResponse> RequestVoteRpc(int peer_id, const raft::VoteRequest &request);
+    // 向某个 peer 发送追加日志 / 心跳请求 RPC。
     std::optional<raft::AppendEntriesResponse> AppendEntriesRpc(
         int peer_id, const raft::AppendEntriesRequest &request);
 
@@ -133,6 +141,6 @@ namespace raftdemo
     std::unique_ptr<grpc::Server> server_;
     // 当前节点绑定的状态机实例
     std::unique_ptr<IStateMachine> state_machine_;
-    };
+  };
 
 } // namespace raftdemo
