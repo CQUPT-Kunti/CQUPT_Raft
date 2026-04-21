@@ -4,7 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <vector>
+#include <thread>
 
 #include "raft/thread_pool.h"
 

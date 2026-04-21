@@ -137,8 +137,6 @@ class ClusterRunner {
     return false;
   }
 
-  const std::vector<std::shared_ptr<RaftNode>>& nodes() const { return nodes_; }
-
  private:
   std::vector<std::shared_ptr<RaftNode>> nodes_;
   std::vector<std::thread> threads_;

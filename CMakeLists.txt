@@ -1,4 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
+
+if(WIN32)
+  if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "D:/Tools/vcpkg/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file")
+  endif()
+
+  if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows"
+        CACHE STRING "Vcpkg target triplet")
+  endif()
+endif()
+
 project(raft_grpc_cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

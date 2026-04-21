@@ -1,23 +1,29 @@
-# tests 目录说明
+# 跨平台 tests 目录说明
 
-这个目录用于放项目的单元测试与阶段性集成测试。
+这版测试代码的目标是同时兼容 Linux、macOS 和 Windows。
 
-## 当前测试文件
+主要调整：
 
-### 基础模块测试
-- `test_command.cpp`
-- `test_state_machine.cpp`
-- `test_min_heap_timer.cpp`
-- `test_thread_pool.cpp`
+1. `tests/CMakeLists.txt` 统一使用 `FetchContent` 拉取 GoogleTest，避免 Windows 下
+   `find_package(GTest)` 命中预编译库后产生 Debug/Release 运行时不一致。
+2. 在 MSVC 下显式设置 `CMAKE_MSVC_RUNTIME_LIBRARY`，让测试目标和 GoogleTest 使用同一套运行时。
+3. `persistence_test.cpp` 改成 GTest 测试文件，不再使用自定义 `main()`。
+4. `persistence_test.cpp` 使用 `std::filesystem::temp_directory_path()` 和 `std::filesystem::path`
+   生成临时测试目录，避免平台相关路径分隔符问题。
 
-### Raft 流程测试
-- `test_raft_election.cpp`
-- `test_raft_log_replication.cpp`
-- `test_raft_commit_apply.cpp`
+## 需要的根目录 CMake 配合
 
-## 说明
+建议在根 `CMakeLists.txt` 的 `project(...)` 后加上：
 
-- 基础模块测试主要验证单个组件的输入输出行为。
-- Raft 流程测试会实际启动 3 个节点，属于轻量级集成测试。
-- 这几类测试依赖时间窗口、线程调度和本地端口，因此比纯逻辑测试更容易受环境影响。
-- 目前这些 Raft 流程测试主要覆盖正常路径，还没有覆盖 leader 宕机、网络分区、日志冲突恢复等故障场景。
+```cmake
+if (MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+```
+
+并确保根目录启用了：
+
+```cmake
+enable_testing()
+add_subdirectory(tests)
+```

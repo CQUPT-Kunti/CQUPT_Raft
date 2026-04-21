@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "raft/command.h"
 #include "raft/config.h"
 #include "raft/propose.h"
 #include "raft/raft_node.h"

@@ -1,0 +1,10 @@
+在根 CMakeLists.txt 的 project(...) 后面加：
+
+if (MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
+并确保文件末尾有：
+
+enable_testing()
+add_subdirectory(tests)
