@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -568,8 +569,13 @@ namespace raftdemo
         }
 
         if (response->success()) {
-          self->match_index_[peer.node_id] = response->match_index();
-          self->next_index_[peer.node_id] = response->match_index() + 1;
+          const std::uint64_t match_index =
+              std::min<std::uint64_t>(response->match_index(), self->LastLogIndexLocked());
+          auto &peer_match_index = self->match_index_[peer.node_id];
+          if (match_index > peer_match_index) {
+            peer_match_index = match_index;
+          }
+          self->next_index_[peer.node_id] = peer_match_index + 1;
 
           const std::uint64_t old_commit_index = self->commit_index_;
           self->AdvanceCommitIndexUnlocked();
@@ -784,7 +790,7 @@ namespace raftdemo
     std::unique_lock<std::mutex> lk(mu_);
     response->set_term(current_term_);
     response->set_success(false);
-    response->set_match_index(LastLogIndexLocked());
+    response->set_match_index(0);
 
     bool should_apply = false;
 
@@ -826,6 +832,12 @@ namespace raftdemo
     while (req_idx < request.entries_size() && append_at < log_.size())
     {
       const auto &req_entry = request.entries(req_idx);
+      if (req_entry.index() != append_at)
+      {
+        response->set_term(current_term_);
+        response->set_success(false);
+        return;
+      }
       if (log_[append_at].term != req_entry.term())
       {
         log_.resize(append_at);
@@ -839,7 +851,14 @@ namespace raftdemo
     for (; req_idx < request.entries_size(); ++req_idx)
     {
       const auto &req_entry = request.entries(req_idx);
+      if (req_entry.index() != append_at)
+      {
+        response->set_term(current_term_);
+        response->set_success(false);
+        return;
+      }
       log_.push_back(LogRecord{req_entry.index(), req_entry.term(), req_entry.command()});
+      ++append_at;
       log_changed = true;
     }
 
@@ -870,7 +889,8 @@ namespace raftdemo
 
     response->set_term(current_term_);
     response->set_success(true);
-    response->set_match_index(LastLogIndexLocked());
+    response->set_match_index(request.prev_log_index() +
+                              static_cast<std::uint64_t>(request.entries_size()));
 
     lk.unlock();
 
@@ -971,8 +991,8 @@ namespace raftdemo
     const bool replicated = ReplicateLogEntryToMajority(log_index);
     if (!replicated)
     {
-      result.status = ProposeStatus::kReplicationFailed;
-      result.message = "failed to replicate log entry to majority";
+      result.status = ProposeStatus::kTimeout;
+      result.message = "log entry was not committed before timeout";
       return result;
     }
 
@@ -1061,99 +1081,184 @@ namespace raftdemo
 
   bool RaftNode::ReplicateLogEntryToMajority(std::uint64_t log_index)
   {
-    std::vector<PeerConfig> peers;
-    std::uint64_t term = 0;
-    std::uint64_t leader_commit = 0;
-    LogRecord record{};
+    const auto timeout = std::max(config_.rpc_deadline * 8, config_.heartbeat_interval * 4);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (running_.load())
     {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (!running_.load() || role_ != Role::kLeader)
-        return false;
-      if (log_index >= log_.size())
-        return false;
-      peers = config_.peers;
-      term = current_term_;
-      leader_commit = commit_index_;
-      record = log_[log_index];
-    }
-    std::size_t success_count = 1;
-    const std::size_t total_nodes = peers.size() + 1;
-    const std::size_t majority = total_nodes / 2 + 1;
-    for (const auto &peer : peers)
-    {
-      raft::AppendEntriesRequest request;
+      std::vector<PeerConfig> peers;
+      std::uint64_t term = 0;
+      std::uint64_t leader_commit = 0;
+      std::size_t majority = 0;
+
       {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
-          return false;
-
-        const auto next_index_it = next_index_.find(peer.node_id);
-        const std::uint64_t next_index =
-            next_index_it == next_index_.end() ? LastLogIndexLocked() + 1 : next_index_it->second;
-
-        const std::uint64_t prev_log_index = (next_index == 0) ? 0 : (next_index - 1);
-        const std::uint64_t prev_log_term =
-            prev_log_index < log_.size() ? log_[prev_log_index].term : 0;
-
-        request.set_term(term);
-        request.set_leader_id(config_.node_id);
-        request.set_prev_log_index(prev_log_index);
-        request.set_prev_log_term(prev_log_term);
-        request.set_leader_commit(leader_commit);
-
-        // 当前最小版本一次只推送目标日志及其之后的日志
-        for (std::uint64_t i = next_index; i < log_.size(); ++i)
+        if (!running_.load() || role_ != Role::kLeader)
         {
-          auto *entry = request.add_entries();
-          entry->set_index(log_[i].index);
-          entry->set_term(log_[i].term);
-          entry->set_command(log_[i].command);
+          return false;
         }
-      }
-      auto response = AppendEntriesRpc(peer.node_id, request);
-      if (!response.has_value())
-        continue;
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-
-        if (!running_.load())
-          return false;
-
-        // 如果发现更高任期，当前 Leader 必须退回 Follower
-        if (response->term() > current_term_)
+        if (log_index >= log_.size())
         {
-          BecomeFollowerLocked(response->term(), -1,
-                               "peer replied higher term while replicating log entry");
           return false;
         }
 
-        // 角色或任期变化后，不再继续按旧上下文处理
-        if (role_ != Role::kLeader || current_term_ != term)
-          return false;
-
-        if (response->success())
+        const std::size_t total_nodes = config_.peers.size() + 1;
+        majority = total_nodes / 2 + 1;
+        std::size_t replicated_count = 1;
+        for (const auto &peer : config_.peers)
         {
-          match_index_[peer.node_id] = response->match_index();
-          next_index_[peer.node_id] = response->match_index() + 1;
-          ++success_count;
-
-          if (success_count >= majority)
+          const auto it = match_index_.find(peer.node_id);
+          if (it != match_index_.end() && it->second >= log_index)
+          {
+            ++replicated_count;
+          }
+        }
+        if (replicated_count >= majority)
+        {
+          AdvanceCommitIndexUnlocked();
+          if (commit_index_ >= log_index)
           {
             return true;
           }
         }
-        else
+
+        peers = config_.peers;
+        term = current_term_;
+        leader_commit = commit_index_;
+      }
+
+      bool should_apply = false;
+      for (const auto &peer : peers)
+      {
+        raft::AppendEntriesRequest request;
         {
-          // 当前先做简单回退，后续再做冲突优化
-          auto &next_index_ref = next_index_[peer.node_id];
-          if (next_index_ref > 1)
+          std::lock_guard<std::mutex> lk(mu_);
+          if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
           {
-            --next_index_ref;
+            return false;
+          }
+          if (commit_index_ >= log_index)
+          {
+            return true;
+          }
+
+          auto &next_index_ref = next_index_[peer.node_id];
+          if (next_index_ref == 0 || next_index_ref > LastLogIndexLocked() + 1)
+          {
+            next_index_ref = LastLogIndexLocked() + 1;
+          }
+
+          const std::uint64_t next_index = next_index_ref;
+          const std::uint64_t prev_log_index = next_index == 0 ? 0 : next_index - 1;
+          const std::uint64_t prev_log_term = TermAtIndexLocked(prev_log_index);
+
+          request.set_term(term);
+          request.set_leader_id(config_.node_id);
+          request.set_prev_log_index(prev_log_index);
+          request.set_prev_log_term(prev_log_term);
+          request.set_leader_commit(leader_commit);
+
+          for (std::uint64_t i = next_index; i < log_.size(); ++i)
+          {
+            auto *entry = request.add_entries();
+            entry->set_index(log_[i].index);
+            entry->set_term(log_[i].term);
+            entry->set_command(log_[i].command);
+          }
+        }
+
+        auto response = AppendEntriesRpc(peer.node_id, request);
+        if (!response.has_value())
+        {
+          continue;
+        }
+
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+
+          if (!running_.load())
+          {
+            return false;
+          }
+
+          if (response->term() > current_term_)
+          {
+            BecomeFollowerLocked(response->term(), -1,
+                                 "peer replied higher term while replicating log entry");
+            return false;
+          }
+
+          if (role_ != Role::kLeader || current_term_ != term)
+          {
+            return false;
+          }
+
+          if (response->success())
+          {
+            const std::uint64_t match_index =
+                std::min<std::uint64_t>(response->match_index(), LastLogIndexLocked());
+            auto &peer_match_index = match_index_[peer.node_id];
+            if (match_index > peer_match_index)
+            {
+              peer_match_index = match_index;
+            }
+            next_index_[peer.node_id] = peer_match_index + 1;
+
+            const std::uint64_t old_commit_index = commit_index_;
+            AdvanceCommitIndexUnlocked();
+            should_apply = should_apply || commit_index_ > old_commit_index;
+
+            if (commit_index_ >= log_index)
+            {
+              break;
+            }
+          }
+          else
+          {
+            auto &next_index_ref = next_index_[peer.node_id];
+            if (next_index_ref > 1)
+            {
+              --next_index_ref;
+            }
           }
         }
       }
+
+      if (should_apply)
+      {
+        ApplyResult result = ApplyCommittedEntries();
+        if (!result.Ok)
+        {
+          Log(NodeTag(config_.node_id),
+              "apply committed entries failed while replicating, reason=",
+              result.message);
+          return false;
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
+        {
+          return false;
+        }
+        if (commit_index_ >= log_index)
+        {
+          return true;
+        }
+      }
+
+      if (std::chrono::steady_clock::now() >= deadline)
+      {
+        return false;
+      }
+
+      const auto sleep_time = std::min(config_.heartbeat_interval,
+                                       std::chrono::milliseconds(20));
+      std::this_thread::sleep_for(sleep_time);
     }
-    return success_count >= majority;
+
+    return false;
   }
 
   void RaftNode::AdvanceCommitIndexUnlocked()
@@ -1404,7 +1509,17 @@ namespace raftdemo
       const std::filesystem::path temp_path = std::filesystem::path(snapshot_dir) /
                                               ("snapshot_work_node_" + std::to_string(config_.node_id) + ".bin");
 
-      SnapshotResult save_result = state_machine_->SaveSnapshot(temp_path.string());
+      SnapshotResult save_result;
+      {
+        std::lock_guard<std::mutex> apply_lk(apply_mu_);
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          snapshot_index = last_applied_;
+          snapshot_term = TermAtIndexLocked(snapshot_index);
+        }
+        save_result = state_machine_->SaveSnapshot(temp_path.string());
+      }
+
       if (!save_result.Ok())
       {
         Log(NodeTag(config_.node_id), "save state machine snapshot failed: ", save_result.message);

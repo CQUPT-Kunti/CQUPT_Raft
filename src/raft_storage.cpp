@@ -20,6 +20,7 @@ namespace raftdemo
     constexpr std::uint32_t kFileVersion = 1U;
     constexpr const char *kStateFileName = "raft_state.bin";
     constexpr const char *kTempFileName = "raft_state.bin.tmp";
+    constexpr const char *kBackupFileName = "raft_state.bin.bak";
 
     template <typename T>
     bool WritePod(std::ofstream &out, const T &value, std::string *error)
@@ -268,16 +269,44 @@ namespace raftdemo
           }
         }
 
+        const std::filesystem::path backup_path = dir_path / kBackupFileName;
+
         ec.clear();
-        if (std::filesystem::exists(state_path, ec))
+        if (std::filesystem::exists(backup_path, ec))
         {
           ec.clear();
-          std::filesystem::remove(state_path, ec);
+          std::filesystem::remove(backup_path, ec);
           if (ec)
           {
             if (error != nullptr)
             {
-              *error = "remove old state file failed: " + ec.message();
+              *error = "remove stale backup state file failed: " + ec.message();
+            }
+            return false;
+          }
+        }
+
+        bool had_old_state = false;
+        ec.clear();
+        had_old_state = std::filesystem::exists(state_path, ec);
+        if (ec)
+        {
+          if (error != nullptr)
+          {
+            *error = "check old state file failed: " + ec.message();
+          }
+          return false;
+        }
+
+        if (had_old_state)
+        {
+          ec.clear();
+          std::filesystem::rename(state_path, backup_path, ec);
+          if (ec)
+          {
+            if (error != nullptr)
+            {
+              *error = "backup old state file failed: " + ec.message();
             }
             return false;
           }
@@ -287,11 +316,27 @@ namespace raftdemo
         std::filesystem::rename(temp_path, state_path, ec);
         if (ec)
         {
+          const std::string rename_error = ec.message();
+          if (had_old_state)
+          {
+            std::error_code rollback_ec;
+            std::filesystem::rename(backup_path, state_path, rollback_ec);
+          }
           if (error != nullptr)
           {
-            *error = "rename state file failed: " + ec.message();
+            *error = "rename temp state file failed: " + rename_error;
           }
           return false;
+        }
+
+        if (had_old_state)
+        {
+          ec.clear();
+          std::filesystem::remove(backup_path, ec);
+          if (ec && error != nullptr)
+          {
+            *error = "remove backup state file failed: " + ec.message();
+          }
         }
 
         return true;
