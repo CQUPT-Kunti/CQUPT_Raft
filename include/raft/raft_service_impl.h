@@ -4,24 +4,30 @@
 
 #include "raft.grpc.pb.h"
 
-namespace raftdemo {
+namespace raftdemo
+{
 
-class RaftNode;
+  class RaftNode;
 
-class RaftServiceImpl final : public raft::RaftService::CallbackService {
- public:
-  explicit RaftServiceImpl(RaftNode& node);
+  class RaftServiceImpl final : public raft::RaftService::CallbackService
+  {
+  public:
+    explicit RaftServiceImpl(RaftNode &node);
 
-  grpc::ServerUnaryReactor* RequestVote(grpc::CallbackServerContext* context,
-                                        const raft::VoteRequest* request,
-                                        raft::VoteResponse* response) override;
+    grpc::ServerUnaryReactor *RequestVote(grpc::CallbackServerContext *context,
+                                          const raft::VoteRequest *request,
+                                          raft::VoteResponse *response) override;
 
-  grpc::ServerUnaryReactor* AppendEntries(grpc::CallbackServerContext* context,
-                                          const raft::AppendEntriesRequest* request,
-                                          raft::AppendEntriesResponse* response) override;
+    grpc::ServerUnaryReactor *AppendEntries(grpc::CallbackServerContext *context,
+                                            const raft::AppendEntriesRequest *request,
+                                            raft::AppendEntriesResponse *response) override;
 
- private:
-  RaftNode& node_;
-};
+    grpc::ServerUnaryReactor *InstallSnapshot(grpc::CallbackServerContext *context,
+                                              const raft::InstallSnapshotRequest *request,
+                                              raft::InstallSnapshotResponse *response) override;
 
-}  // namespace raftdemo
+  private:
+    RaftNode &node_;
+  };
+
+} // namespace raftdemo

@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -22,6 +25,13 @@ namespace raftdemo
   {
 
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
+    constexpr std::size_t kMaxAppendEntriesPerRpc = 256;
+    constexpr std::size_t kMaxAppendEntriesBytes = 512 * 1024;
+
+    std::uint64_t SafeAddOne(std::uint64_t value)
+    {
+      return value == std::numeric_limits<std::uint64_t>::max() ? value : value + 1;
+    }
 
     std::string NodeTag(int node_id) { return "node-" + std::to_string(node_id); }
 
@@ -494,7 +504,6 @@ namespace raftdemo
   {
     std::vector<PeerConfig> peers;
     std::uint64_t term = 0;
-    std::uint64_t leader_commit = 0;
 
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -504,23 +513,20 @@ namespace raftdemo
       }
       peers = config_.peers;
       term = current_term_;
-      leader_commit = commit_index_;
     }
 
     auto weak = weak_from_this();
     for (const auto &peer : peers)
     {
-      rpc_pool_.Submit([weak, peer, term, leader_commit]
+      rpc_pool_.Submit([weak, peer, term]
                        {
       auto self = weak.lock();
       if (!self || !self->running_.load()) {
         return;
       }
 
+      bool should_install_snapshot = false;
       raft::AppendEntriesRequest request;
-      request.set_term(term);
-      request.set_leader_id(self->config_.node_id);
-      request.set_leader_commit(leader_commit);
 
       {
         std::lock_guard<std::mutex> lk(self->mu_);
@@ -530,21 +536,51 @@ namespace raftdemo
 
         const auto next_index_it = self->next_index_.find(peer.node_id);
         const std::uint64_t next_index =
-            next_index_it == self->next_index_.end() ? self->LastLogIndexLocked() + 1
+            next_index_it == self->next_index_.end() ? SafeAddOne(self->LastLogIndexLocked())
                                                      : next_index_it->second;
-        const std::uint64_t prev_log_index = next_index == 0 ? 0 : next_index - 1;
-        const std::uint64_t prev_log_term =
-            prev_log_index < self->log_.size() ? self->log_[prev_log_index].term : 0;
 
-        request.set_prev_log_index(prev_log_index);
-        request.set_prev_log_term(prev_log_term);
+        if (next_index <= self->FirstLogIndexLocked()) {
+          should_install_snapshot = true;
+        } else {
+          const std::uint64_t prev_log_index = next_index - 1;
+          const std::uint64_t prev_log_term = self->TermAtIndexLocked(prev_log_index);
 
-        for (std::uint64_t i = next_index; i < self->log_.size(); ++i) {
-          auto* entry = request.add_entries();
-          entry->set_index(self->log_[i].index);
-          entry->set_term(self->log_[i].term);
-          entry->set_command(self->log_[i].command);
+          if (prev_log_term == 0 && prev_log_index != 0) {
+            should_install_snapshot = true;
+          } else {
+            request.set_term(term);
+            request.set_leader_id(self->config_.node_id);
+            request.set_prev_log_index(prev_log_index);
+            request.set_prev_log_term(prev_log_term);
+            request.set_leader_commit(self->commit_index_);
+
+            std::size_t entry_count = 0;
+            std::size_t bytes_count = 0;
+            for (std::uint64_t i = next_index;
+                 i <= self->LastLogIndexLocked() && entry_count < kMaxAppendEntriesPerRpc;
+                 ++i) {
+              const LogRecord* record = self->LogAtIndexLocked(i);
+              if (record == nullptr) {
+                break;
+              }
+              const std::size_t next_bytes = bytes_count + record->command.size();
+              if (entry_count > 0 && next_bytes > kMaxAppendEntriesBytes) {
+                break;
+              }
+              auto* entry = request.add_entries();
+              entry->set_index(record->index);
+              entry->set_term(record->term);
+              entry->set_command(record->command);
+              bytes_count = next_bytes;
+              ++entry_count;
+            }
+          }
         }
+      }
+
+      if (should_install_snapshot) {
+        self->SendInstallSnapshotToPeer(peer.node_id, term);
+        return;
       }
 
       auto response = self->AppendEntriesRpc(peer.node_id, request);
@@ -569,21 +605,23 @@ namespace raftdemo
         }
 
         if (response->success()) {
-          const std::uint64_t match_index =
-              std::min<std::uint64_t>(response->match_index(), self->LastLogIndexLocked());
-          auto &peer_match_index = self->match_index_[peer.node_id];
-          if (match_index > peer_match_index) {
-            peer_match_index = match_index;
-          }
-          self->next_index_[peer.node_id] = peer_match_index + 1;
+          auto& match_index = self->match_index_[peer.node_id];
+          auto& next_index = self->next_index_[peer.node_id];
+          match_index = std::max<std::uint64_t>(match_index, response->match_index());
+          next_index = std::max<std::uint64_t>(next_index, SafeAddOne(response->match_index()));
 
           const std::uint64_t old_commit_index = self->commit_index_;
           self->AdvanceCommitIndexUnlocked();
           should_apply = self->commit_index_ > old_commit_index;
         } else {
           auto& next_index = self->next_index_[peer.node_id];
-          if (next_index > 1) {
+          const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
+          if (hinted_next > 0 && hinted_next < next_index) {
+            next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(self->FirstLogIndexLocked()));
+          } else if (next_index > SafeAddOne(self->FirstLogIndexLocked())) {
             --next_index;
+          } else {
+            next_index = self->FirstLogIndexLocked();
           }
         }
       }
@@ -659,10 +697,10 @@ namespace raftdemo
     next_index_.clear();
     match_index_.clear();
     match_index_[config_.node_id] = last_log_index;
-    next_index_[config_.node_id] = last_log_index + 1;
+    next_index_[config_.node_id] = SafeAddOne(last_log_index);
     for (const auto &peer : config_.peers)
     {
-      next_index_[peer.node_id] = last_log_index + 1;
+      next_index_[peer.node_id] = SafeAddOne(last_log_index);
       match_index_[peer.node_id] = 0;
     }
 
@@ -680,9 +718,87 @@ namespace raftdemo
     return last_log_index >= LastLogIndexLocked();
   }
 
-  std::uint64_t RaftNode::LastLogIndexLocked() const { return log_.empty() ? 0 : log_.back().index; }
+  std::uint64_t RaftNode::FirstLogIndexLocked() const
+  {
+    return log_.empty() ? last_snapshot_index_ : log_.front().index;
+  }
 
-  std::uint64_t RaftNode::LastLogTermLocked() const { return log_.empty() ? 0 : log_.back().term; }
+  std::uint64_t RaftNode::LastLogIndexLocked() const
+  {
+    return log_.empty() ? last_snapshot_index_ : log_.back().index;
+  }
+
+  std::uint64_t RaftNode::LastLogTermLocked() const
+  {
+    return log_.empty() ? last_snapshot_term_ : log_.back().term;
+  }
+
+  bool RaftNode::HasLogAtIndexLocked(std::uint64_t index) const
+  {
+    if (log_.empty())
+    {
+      return false;
+    }
+    return index >= log_.front().index && index <= log_.back().index;
+  }
+
+  std::size_t RaftNode::LogOffsetLocked(std::uint64_t index) const
+  {
+    return static_cast<std::size_t>(index - log_.front().index);
+  }
+
+  const LogRecord *RaftNode::LogAtIndexLocked(std::uint64_t index) const
+  {
+    if (!HasLogAtIndexLocked(index))
+    {
+      return nullptr;
+    }
+    return &log_[LogOffsetLocked(index)];
+  }
+
+  std::uint64_t RaftNode::TermAtIndexLocked(std::uint64_t index) const
+  {
+    if (index == last_snapshot_index_)
+    {
+      return last_snapshot_term_;
+    }
+    const LogRecord *record = LogAtIndexLocked(index);
+    return record == nullptr ? 0 : record->term;
+  }
+
+  void RaftNode::CompactLogPrefixLocked(std::uint64_t last_included_index,
+                                        std::uint64_t last_included_term)
+  {
+    if (last_included_index <= last_snapshot_index_ && !log_.empty() &&
+        log_.front().index == last_snapshot_index_)
+    {
+      return;
+    }
+
+    std::vector<LogRecord> compacted;
+    compacted.push_back(LogRecord{last_included_index, last_included_term, "snapshot"});
+
+    for (const auto &record : log_)
+    {
+      if (record.index > last_included_index)
+      {
+        compacted.push_back(record);
+      }
+    }
+
+    log_ = std::move(compacted);
+    last_snapshot_index_ = last_included_index;
+    last_snapshot_term_ = last_included_term;
+
+    if (commit_index_ < last_snapshot_index_)
+    {
+      commit_index_ = last_snapshot_index_;
+    }
+    if (last_applied_ < last_snapshot_index_)
+    {
+      last_applied_ = last_snapshot_index_;
+    }
+  }
 
   std::optional<raft::VoteResponse> RaftNode::RequestVoteRpc(int peer_id,
                                                              const raft::VoteRequest &request)
@@ -734,6 +850,134 @@ namespace raftdemo
       return std::nullopt;
     }
     return response;
+  }
+
+  std::optional<raft::InstallSnapshotResponse> RaftNode::InstallSnapshotRpc(
+      int peer_id, const raft::InstallSnapshotRequest &request)
+  {
+    auto it = clients_.find(peer_id);
+    if (it == clients_.end())
+    {
+      return std::nullopt;
+    }
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + config_.rpc_deadline * 20);
+
+    raft::InstallSnapshotResponse response;
+    grpc::Status status;
+    {
+      std::lock_guard<std::mutex> lk(it->second->mu);
+      status = it->second->stub->InstallSnapshot(&context, request, &response);
+    }
+
+    if (!status.ok())
+    {
+      return std::nullopt;
+    }
+    return response;
+  }
+
+  bool RaftNode::SendInstallSnapshotToPeer(int peer_id, std::uint64_t term)
+  {
+    SnapshotMeta meta;
+    std::string error;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
+      {
+        return false;
+      }
+      meta.last_included_index = last_snapshot_index_;
+      meta.last_included_term = last_snapshot_term_;
+    }
+
+    if (snapshot_storage_ == nullptr || meta.last_included_index == 0)
+    {
+      return false;
+    }
+
+    std::vector<SnapshotMeta> snapshots;
+    if (!snapshot_storage_->ListSnapshots(&snapshots, &error))
+    {
+      Log(NodeTag(config_.node_id), "list snapshots before install failed: ", error);
+      return false;
+    }
+
+    bool found = false;
+    for (const auto &candidate : snapshots)
+    {
+      if (candidate.last_included_index == meta.last_included_index &&
+          candidate.last_included_term == meta.last_included_term)
+      {
+        meta = candidate;
+        found = true;
+        break;
+      }
+    }
+    if (!found && !snapshots.empty())
+    {
+      meta = snapshots.front();
+      found = true;
+    }
+    if (!found)
+    {
+      return false;
+    }
+
+    std::ifstream in(meta.snapshot_path, std::ios::binary);
+    if (!in.is_open())
+    {
+      Log(NodeTag(config_.node_id), "open snapshot for install failed: ", meta.snapshot_path);
+      return false;
+    }
+    std::string snapshot_data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!in.good() && !in.eof())
+    {
+      Log(NodeTag(config_.node_id), "read snapshot for install failed: ", meta.snapshot_path);
+      return false;
+    }
+
+    raft::InstallSnapshotRequest request;
+    request.set_term(term);
+    request.set_leader_id(config_.node_id);
+    request.set_last_included_index(meta.last_included_index);
+    request.set_last_included_term(meta.last_included_term);
+    request.set_snapshot_data(snapshot_data);
+
+    auto response = InstallSnapshotRpc(peer_id, request);
+    if (!response.has_value())
+    {
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    if (response->term() > current_term_)
+    {
+      BecomeFollowerLocked(response->term(), -1,
+                           "peer replied higher term in InstallSnapshot");
+      return false;
+    }
+    if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
+    {
+      return false;
+    }
+    if (!response->success())
+    {
+      auto &next_index = next_index_[peer_id];
+      const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
+      if (hinted_next > 0)
+      {
+        next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(FirstLogIndexLocked()));
+      }
+      return false;
+    }
+
+    auto &match_index = match_index_[peer_id];
+    auto &next_index = next_index_[peer_id];
+    match_index = std::max<std::uint64_t>(match_index, meta.last_included_index);
+    next_index = std::max<std::uint64_t>(next_index, SafeAddOne(meta.last_included_index));
+    return true;
   }
 
   void RaftNode::OnRequestVote(const raft::VoteRequest &request, raft::VoteResponse *response)
@@ -790,7 +1034,8 @@ namespace raftdemo
     std::unique_lock<std::mutex> lk(mu_);
     response->set_term(current_term_);
     response->set_success(false);
-    response->set_match_index(0);
+    response->set_match_index(last_snapshot_index_);
+    response->set_last_log_index(LastLogIndexLocked());
 
     bool should_apply = false;
 
@@ -805,6 +1050,7 @@ namespace raftdemo
       if (!BecomeFollowerLocked(request.term(), request.leader_id(), "received append entries"))
       {
         response->set_term(current_term_);
+        response->set_last_log_index(LastLogIndexLocked());
         return;
       }
     }
@@ -814,52 +1060,64 @@ namespace raftdemo
       ResetElectionTimerLocked();
     }
 
-    if (request.prev_log_index() >= log_.size())
+    if (request.prev_log_index() < last_snapshot_index_)
     {
       response->set_term(current_term_);
+      response->set_last_log_index(LastLogIndexLocked());
       return;
     }
 
-    if (log_[request.prev_log_index()].term != request.prev_log_term())
+    if (!HasLogAtIndexLocked(request.prev_log_index()))
     {
       response->set_term(current_term_);
+      response->set_last_log_index(LastLogIndexLocked());
+      return;
+    }
+
+    if (TermAtIndexLocked(request.prev_log_index()) != request.prev_log_term())
+    {
+      response->set_term(current_term_);
+      response->set_last_log_index(LastLogIndexLocked());
       return;
     }
 
     bool log_changed = false;
-    std::uint64_t append_at = request.prev_log_index() + 1;
-    int req_idx = 0;
-    while (req_idx < request.entries_size() && append_at < log_.size())
-    {
-      const auto &req_entry = request.entries(req_idx);
-      if (req_entry.index() != append_at)
-      {
-        response->set_term(current_term_);
-        response->set_success(false);
-        return;
-      }
-      if (log_[append_at].term != req_entry.term())
-      {
-        log_.resize(append_at);
-        log_changed = true;
-        break;
-      }
-      ++append_at;
-      ++req_idx;
-    }
+    std::uint64_t match_index = request.prev_log_index();
 
-    for (; req_idx < request.entries_size(); ++req_idx)
+    for (int req_idx = 0; req_idx < request.entries_size(); ++req_idx)
     {
       const auto &req_entry = request.entries(req_idx);
-      if (req_entry.index() != append_at)
+      if (req_entry.index() <= last_snapshot_index_)
+      {
+        match_index = std::max<std::uint64_t>(match_index, req_entry.index());
+        continue;
+      }
+
+      if (req_entry.index() > SafeAddOne(LastLogIndexLocked()))
       {
         response->set_term(current_term_);
-        response->set_success(false);
+        response->set_last_log_index(LastLogIndexLocked());
         return;
       }
+
+      if (HasLogAtIndexLocked(req_entry.index()))
+      {
+        const std::size_t offset = LogOffsetLocked(req_entry.index());
+        if (log_[offset].term != req_entry.term())
+        {
+          log_.resize(offset);
+          log_changed = true;
+        }
+        else
+        {
+          match_index = req_entry.index();
+          continue;
+        }
+      }
+
       log_.push_back(LogRecord{req_entry.index(), req_entry.term(), req_entry.command()});
-      ++append_at;
       log_changed = true;
+      match_index = req_entry.index();
     }
 
     if (log_changed)
@@ -870,7 +1128,8 @@ namespace raftdemo
         Log(NodeTag(config_.node_id), "append entries persist failed: ", persist_error);
         response->set_term(current_term_);
         response->set_success(false);
-        response->set_match_index(LastLogIndexLocked());
+        response->set_match_index(match_index);
+        response->set_last_log_index(LastLogIndexLocked());
         return;
       }
     }
@@ -889,8 +1148,8 @@ namespace raftdemo
 
     response->set_term(current_term_);
     response->set_success(true);
-    response->set_match_index(request.prev_log_index() +
-                              static_cast<std::uint64_t>(request.entries_size()));
+    response->set_match_index(match_index);
+    response->set_last_log_index(LastLogIndexLocked());
 
     lk.unlock();
 
@@ -903,6 +1162,143 @@ namespace raftdemo
             "apply committed entries failed after append entries, reason=",
             result.message);
       }
+    }
+  }
+
+  void RaftNode::OnInstallSnapshot(const raft::InstallSnapshotRequest &request,
+                                   raft::InstallSnapshotResponse *response)
+  {
+    response->set_success(false);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      response->set_term(current_term_);
+      response->set_last_log_index(LastLogIndexLocked());
+    }
+
+    if (!snapshot_config_.enabled || snapshot_storage_ == nullptr || state_machine_ == nullptr)
+    {
+      response->set_message("snapshot is disabled");
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      response->set_term(current_term_);
+      response->set_last_log_index(LastLogIndexLocked());
+
+      if (request.term() < current_term_)
+      {
+        response->set_message("stale term");
+        return;
+      }
+
+      if (request.term() > current_term_ || role_ != Role::kFollower ||
+          leader_id_ != request.leader_id())
+      {
+        if (!BecomeFollowerLocked(request.term(), request.leader_id(), "received install snapshot"))
+        {
+          response->set_term(current_term_);
+          response->set_message("persist higher term failed");
+          return;
+        }
+      }
+      else
+      {
+        leader_id_ = request.leader_id();
+        ResetElectionTimerLocked();
+      }
+
+      if (request.last_included_index() <= last_snapshot_index_)
+      {
+        response->set_term(current_term_);
+        response->set_success(true);
+        response->set_last_log_index(LastLogIndexLocked());
+        response->set_message("snapshot already installed");
+        return;
+      }
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(snapshot_config_.snapshot_dir, ec);
+    if (ec)
+    {
+      response->set_message("create snapshot directory failed: " + ec.message());
+      return;
+    }
+
+    const std::filesystem::path temp_path = std::filesystem::path(snapshot_config_.snapshot_dir) /
+                                            ("install_snapshot_node_" + std::to_string(config_.node_id) + ".bin.tmp");
+    {
+      std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+      if (!out.is_open())
+      {
+        response->set_message("open install snapshot temp file failed");
+        return;
+      }
+      const std::string &data = request.snapshot_data();
+      if (!data.empty())
+      {
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+      }
+      out.flush();
+      if (!out)
+      {
+        response->set_message("write install snapshot temp file failed");
+        return;
+      }
+    }
+
+    SnapshotMeta saved_meta;
+    std::string save_error;
+    if (!snapshot_storage_->SaveSnapshotFile(temp_path.string(), request.last_included_index(),
+                                             request.last_included_term(), &saved_meta, &save_error))
+    {
+      response->set_message("persist installed snapshot failed: " + save_error);
+      std::filesystem::remove(temp_path, ec);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> apply_lk(apply_mu_);
+      SnapshotResult load_result = state_machine_->LoadSnapshot(saved_meta.snapshot_path);
+      if (!load_result.Ok())
+      {
+        response->set_message("load installed snapshot failed: " + load_result.message);
+        return;
+      }
+
+      std::lock_guard<std::mutex> lk(mu_);
+      if (request.term() < current_term_)
+      {
+        response->set_term(current_term_);
+        response->set_message("term changed while installing snapshot");
+        return;
+      }
+
+      CompactLogPrefixLocked(request.last_included_index(), request.last_included_term());
+      commit_index_ = std::max<std::uint64_t>(commit_index_, request.last_included_index());
+      last_applied_ = std::max<std::uint64_t>(last_applied_, request.last_included_index());
+
+      std::string persist_error;
+      if (!PersistStateLocked(&persist_error))
+      {
+        response->set_term(current_term_);
+        response->set_last_log_index(LastLogIndexLocked());
+        response->set_message("persist installed snapshot raft state failed: " + persist_error);
+        return;
+      }
+
+      response->set_term(current_term_);
+      response->set_success(true);
+      response->set_last_log_index(LastLogIndexLocked());
+      response->set_message("snapshot installed");
+    }
+
+    std::string prune_error;
+    if (!snapshot_storage_->PruneSnapshots(snapshot_config_.max_snapshot_count, &prune_error) &&
+        !prune_error.empty())
+    {
+      Log(NodeTag(config_.node_id), "prune snapshots after install failed: ", prune_error);
     }
   }
 
@@ -991,8 +1387,8 @@ namespace raftdemo
     const bool replicated = ReplicateLogEntryToMajority(log_index);
     if (!replicated)
     {
-      result.status = ProposeStatus::kTimeout;
-      result.message = "log entry was not committed before timeout";
+      result.status = ProposeStatus::kReplicationFailed;
+      result.message = "failed to replicate log entry to majority";
       return result;
     }
 
@@ -1056,7 +1452,7 @@ namespace raftdemo
 
   std::uint64_t RaftNode::AppendLocalLogUnlocked(const std::string &command_data)
   {
-    const std::uint64_t new_index = static_cast<std::uint64_t>(log_.size());
+    const std::uint64_t new_index = SafeAddOne(LastLogIndexLocked());
     log_.push_back(LogRecord{
         new_index,
         current_term_,
@@ -1064,14 +1460,14 @@ namespace raftdemo
     });
 
     match_index_[config_.node_id] = new_index;
-    next_index_[config_.node_id] = new_index + 1;
+    next_index_[config_.node_id] = SafeAddOne(new_index);
 
     std::string persist_error;
     if (!PersistStateLocked(&persist_error))
     {
       log_.pop_back();
       match_index_[config_.node_id] = LastLogIndexLocked();
-      next_index_[config_.node_id] = LastLogIndexLocked() + 1;
+      next_index_[config_.node_id] = SafeAddOne(LastLogIndexLocked());
       Log(NodeTag(config_.node_id), "append local log persist failed: ", persist_error);
       return 0;
     }
@@ -1081,31 +1477,206 @@ namespace raftdemo
 
   bool RaftNode::ReplicateLogEntryToMajority(std::uint64_t log_index)
   {
-    const auto timeout = std::max(config_.rpc_deadline * 8, config_.heartbeat_interval * 4);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto deadline = std::chrono::steady_clock::now() + config_.rpc_deadline * 20;
 
-    while (running_.load())
+    while (std::chrono::steady_clock::now() < deadline)
     {
       std::vector<PeerConfig> peers;
       std::uint64_t term = 0;
-      std::uint64_t leader_commit = 0;
-      std::size_t majority = 0;
-
       {
         std::lock_guard<std::mutex> lk(mu_);
         if (!running_.load() || role_ != Role::kLeader)
         {
           return false;
         }
-        if (log_index >= log_.size())
+        if (!HasLogAtIndexLocked(log_index))
         {
-          return false;
+          return log_index <= last_snapshot_index_;
+        }
+        peers = config_.peers;
+        term = current_term_;
+      }
+
+      std::size_t replicated_count = 1;
+      const std::size_t total_nodes = peers.size() + 1;
+      const std::size_t majority = total_nodes / 2 + 1;
+      if (majority <= 1)
+      {
+        return true;
+      }
+
+      for (const auto &peer : peers)
+      {
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          const auto it = match_index_.find(peer.node_id);
+          if (it != match_index_.end() && it->second >= log_index)
+          {
+            ++replicated_count;
+            if (replicated_count >= majority)
+            {
+              return true;
+            }
+            continue;
+          }
         }
 
-        const std::size_t total_nodes = config_.peers.size() + 1;
-        majority = total_nodes / 2 + 1;
-        std::size_t replicated_count = 1;
-        for (const auto &peer : config_.peers)
+        bool should_install_snapshot = false;
+        raft::AppendEntriesRequest request;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
+          {
+            return false;
+          }
+
+          auto &next_index = next_index_[peer.node_id];
+          if (next_index == 0)
+          {
+            next_index = SafeAddOne(LastLogIndexLocked());
+          }
+
+          if (next_index <= FirstLogIndexLocked())
+          {
+            should_install_snapshot = true;
+          }
+          else
+          {
+            const std::uint64_t prev_log_index = next_index - 1;
+            const std::uint64_t prev_log_term = TermAtIndexLocked(prev_log_index);
+            if (prev_log_term == 0 && prev_log_index != 0)
+            {
+              should_install_snapshot = true;
+            }
+            else
+            {
+              request.set_term(term);
+              request.set_leader_id(config_.node_id);
+              request.set_prev_log_index(prev_log_index);
+              request.set_prev_log_term(prev_log_term);
+              request.set_leader_commit(commit_index_);
+
+              std::size_t entry_count = 0;
+              std::size_t bytes_count = 0;
+              for (std::uint64_t i = next_index;
+                   i <= LastLogIndexLocked() && entry_count < kMaxAppendEntriesPerRpc;
+                   ++i)
+              {
+                const LogRecord *record = LogAtIndexLocked(i);
+                if (record == nullptr)
+                {
+                  break;
+                }
+                const std::size_t next_bytes = bytes_count + record->command.size();
+                if (entry_count > 0 && next_bytes > kMaxAppendEntriesBytes)
+                {
+                  break;
+                }
+                auto *entry = request.add_entries();
+                entry->set_index(record->index);
+                entry->set_term(record->term);
+                entry->set_command(record->command);
+                bytes_count = next_bytes;
+                ++entry_count;
+              }
+            }
+          }
+        }
+
+        if (should_install_snapshot)
+        {
+          if (SendInstallSnapshotToPeer(peer.node_id, term))
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            const auto it = match_index_.find(peer.node_id);
+            if (it != match_index_.end() && it->second >= log_index)
+            {
+              ++replicated_count;
+            }
+          }
+          continue;
+        }
+
+        auto response = AppendEntriesRpc(peer.node_id, request);
+        if (!response.has_value())
+        {
+          continue;
+        }
+
+        bool should_apply = false;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          if (!running_.load())
+          {
+            return false;
+          }
+          if (response->term() > current_term_)
+          {
+            BecomeFollowerLocked(response->term(), -1,
+                                 "peer replied higher term while replicating log entry");
+            return false;
+          }
+          if (role_ != Role::kLeader || current_term_ != term)
+          {
+            return false;
+          }
+
+          if (response->success())
+          {
+            auto &match_index = match_index_[peer.node_id];
+            auto &next_index = next_index_[peer.node_id];
+            match_index = std::max<std::uint64_t>(match_index, response->match_index());
+            next_index = std::max<std::uint64_t>(next_index, SafeAddOne(response->match_index()));
+
+            const std::uint64_t old_commit_index = commit_index_;
+            AdvanceCommitIndexUnlocked();
+            should_apply = commit_index_ > old_commit_index;
+
+            if (match_index >= log_index)
+            {
+              ++replicated_count;
+            }
+          }
+          else
+          {
+            auto &next_index = next_index_[peer.node_id];
+            const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
+            if (hinted_next > 0 && hinted_next < next_index)
+            {
+              next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(FirstLogIndexLocked()));
+            }
+            else if (next_index > SafeAddOne(FirstLogIndexLocked()))
+            {
+              --next_index;
+            }
+            else
+            {
+              next_index = FirstLogIndexLocked();
+            }
+          }
+        }
+
+        if (should_apply)
+        {
+          ApplyResult result = ApplyCommittedEntries();
+          if (!result.Ok)
+          {
+            Log(NodeTag(config_.node_id),
+                "apply committed entries failed after replication, reason=",
+                result.message);
+          }
+        }
+
+        if (replicated_count >= majority)
+        {
+          return true;
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        replicated_count = 1;
+        for (const auto &peer : peers)
         {
           const auto it = match_index_.find(peer.node_id);
           if (it != match_index_.end() && it->second >= log_index)
@@ -1115,147 +1686,11 @@ namespace raftdemo
         }
         if (replicated_count >= majority)
         {
-          AdvanceCommitIndexUnlocked();
-          if (commit_index_ >= log_index)
-          {
-            return true;
-          }
-        }
-
-        peers = config_.peers;
-        term = current_term_;
-        leader_commit = commit_index_;
-      }
-
-      bool should_apply = false;
-      for (const auto &peer : peers)
-      {
-        raft::AppendEntriesRequest request;
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
-          {
-            return false;
-          }
-          if (commit_index_ >= log_index)
-          {
-            return true;
-          }
-
-          auto &next_index_ref = next_index_[peer.node_id];
-          if (next_index_ref == 0 || next_index_ref > LastLogIndexLocked() + 1)
-          {
-            next_index_ref = LastLogIndexLocked() + 1;
-          }
-
-          const std::uint64_t next_index = next_index_ref;
-          const std::uint64_t prev_log_index = next_index == 0 ? 0 : next_index - 1;
-          const std::uint64_t prev_log_term = TermAtIndexLocked(prev_log_index);
-
-          request.set_term(term);
-          request.set_leader_id(config_.node_id);
-          request.set_prev_log_index(prev_log_index);
-          request.set_prev_log_term(prev_log_term);
-          request.set_leader_commit(leader_commit);
-
-          for (std::uint64_t i = next_index; i < log_.size(); ++i)
-          {
-            auto *entry = request.add_entries();
-            entry->set_index(log_[i].index);
-            entry->set_term(log_[i].term);
-            entry->set_command(log_[i].command);
-          }
-        }
-
-        auto response = AppendEntriesRpc(peer.node_id, request);
-        if (!response.has_value())
-        {
-          continue;
-        }
-
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-
-          if (!running_.load())
-          {
-            return false;
-          }
-
-          if (response->term() > current_term_)
-          {
-            BecomeFollowerLocked(response->term(), -1,
-                                 "peer replied higher term while replicating log entry");
-            return false;
-          }
-
-          if (role_ != Role::kLeader || current_term_ != term)
-          {
-            return false;
-          }
-
-          if (response->success())
-          {
-            const std::uint64_t match_index =
-                std::min<std::uint64_t>(response->match_index(), LastLogIndexLocked());
-            auto &peer_match_index = match_index_[peer.node_id];
-            if (match_index > peer_match_index)
-            {
-              peer_match_index = match_index;
-            }
-            next_index_[peer.node_id] = peer_match_index + 1;
-
-            const std::uint64_t old_commit_index = commit_index_;
-            AdvanceCommitIndexUnlocked();
-            should_apply = should_apply || commit_index_ > old_commit_index;
-
-            if (commit_index_ >= log_index)
-            {
-              break;
-            }
-          }
-          else
-          {
-            auto &next_index_ref = next_index_[peer.node_id];
-            if (next_index_ref > 1)
-            {
-              --next_index_ref;
-            }
-          }
-        }
-      }
-
-      if (should_apply)
-      {
-        ApplyResult result = ApplyCommittedEntries();
-        if (!result.Ok)
-        {
-          Log(NodeTag(config_.node_id),
-              "apply committed entries failed while replicating, reason=",
-              result.message);
-          return false;
-        }
-      }
-
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!running_.load() || role_ != Role::kLeader || current_term_ != term)
-        {
-          return false;
-        }
-        if (commit_index_ >= log_index)
-        {
           return true;
         }
       }
 
-      if (std::chrono::steady_clock::now() >= deadline)
-      {
-        return false;
-      }
-
-      const auto sleep_time = std::min(config_.heartbeat_interval,
-                                       std::chrono::milliseconds(20));
-      std::this_thread::sleep_for(sleep_time);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
     return false;
@@ -1277,23 +1712,19 @@ namespace raftdemo
     const std::size_t majority = total_nodes / 2 + 1;
     const std::uint64_t last_index = LastLogIndexLocked();
 
-    // 从大到小找，找到的第一个满足条件的下标，
-    // 就是当前能够推进到的最大 commit index。
     for (std::uint64_t index = last_index; index > commit_index_; --index)
     {
-      if (index >= log_.size())
+      if (!HasLogAtIndexLocked(index))
       {
         continue;
       }
 
-      // Raft 规则：Leader 只能依据当前任期的日志推进 commit_index。
-      if (log_[index].term != current_term_)
+      if (TermAtIndexLocked(index) != current_term_)
       {
         continue;
       }
 
-      std::size_t replicated_count = 1; // Leader 自己算一个
-
+      std::size_t replicated_count = 1;
       for (const auto &peer : config_.peers)
       {
         const auto it = match_index_.find(peer.node_id);
@@ -1324,7 +1755,11 @@ namespace raftdemo
       {
         std::lock_guard<std::mutex> lk(mu_);
 
-        // 没有新的已提交日志需要 apply
+        if (last_applied_ < last_snapshot_index_)
+        {
+          last_applied_ = last_snapshot_index_;
+        }
+
         if (last_applied_ >= commit_index_)
         {
           return {true, "nothing to apply"};
@@ -1332,12 +1767,18 @@ namespace raftdemo
 
         apply_index = last_applied_ + 1;
 
-        if (apply_index >= log_.size())
+        if (!HasLogAtIndexLocked(apply_index))
         {
           return {false, "apply index out of range"};
         }
 
-        command_data = log_[apply_index].command;
+        const LogRecord *record = LogAtIndexLocked(apply_index);
+        if (record == nullptr)
+        {
+          return {false, "apply log record is missing"};
+        }
+
+        command_data = record->command;
         state_machine = state_machine_.get();
       }
 
@@ -1364,19 +1805,6 @@ namespace raftdemo
         MaybeScheduleSnapshotLocked(false);
       }
     }
-  }
-
-  std::uint64_t RaftNode::TermAtIndexLocked(std::uint64_t index) const
-  {
-    if (index < log_.size())
-    {
-      return log_[index].term;
-    }
-    if (index == last_snapshot_index_)
-    {
-      return last_snapshot_term_;
-    }
-    return 0;
   }
 
   void RaftNode::StartSnapshotWorker()
@@ -1463,17 +1891,22 @@ namespace raftdemo
         continue;
       }
 
-      if (meta.last_included_index > LastLogIndexLocked())
       {
-        Log(NodeTag(config_.node_id), "skip snapshot beyond raft log, snapshot_index=",
-            meta.last_included_index, ", last_log_index=", LastLogIndexLocked());
-        continue;
-      }
+        std::lock_guard<std::mutex> lk(mu_);
+        CompactLogPrefixLocked(meta.last_included_index, meta.last_included_term);
+        commit_index_ = std::max<std::uint64_t>(commit_index_, meta.last_included_index);
+        last_applied_ = std::max<std::uint64_t>(last_applied_, meta.last_included_index);
 
-      last_snapshot_index_ = meta.last_included_index;
-      last_snapshot_term_ = meta.last_included_term;
-      last_applied_ = meta.last_included_index;
-      commit_index_ = meta.last_included_index;
+        std::string persist_error;
+        if (!PersistStateLocked(&persist_error))
+        {
+          if (reason != nullptr)
+          {
+            *reason = persist_error;
+          }
+          return false;
+        }
+      }
 
       Log(NodeTag(config_.node_id), "loaded snapshot from ", meta.snapshot_path,
           ", index=", meta.last_included_index, ", term=", meta.last_included_term);
@@ -1535,8 +1968,12 @@ namespace raftdemo
             std::lock_guard<std::mutex> lk(mu_);
             if (snapshot_index > last_snapshot_index_)
             {
-              last_snapshot_index_ = snapshot_index;
-              last_snapshot_term_ = snapshot_term;
+              CompactLogPrefixLocked(snapshot_index, snapshot_term);
+              std::string persist_error;
+              if (!PersistStateLocked(&persist_error))
+              {
+                Log(NodeTag(config_.node_id), "persist compacted raft state failed: ", persist_error);
+              }
             }
           }
 

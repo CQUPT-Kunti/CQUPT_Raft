@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package raft;
 
-message LogEntry {
-  uint64 index = 1;
-  uint64 term = 2;
-  string command = 3;
+service RaftService {
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 message VoteRequest {
@@ -18,6 +18,12 @@ message VoteRequest {
 message VoteResponse {
   uint64 term = 1;
   bool vote_granted = 2;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  string command = 3;
 }
 
 message AppendEntriesRequest {
@@ -33,9 +39,23 @@ message AppendEntriesResponse {
   uint64 term = 1;
   bool success = 2;
   uint64 match_index = 3;
+
+  // Follower's current last log index. Leader uses this hint to jump next_index
+  // back quickly when the follower is far behind instead of decreasing one by one.
+  uint64 last_log_index = 4;
 }
 
-service RaftService {
-  rpc RequestVote(VoteRequest) returns (VoteResponse);
-  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  int32 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes snapshot_data = 5;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 last_log_index = 3;
+  string message = 4;
 }

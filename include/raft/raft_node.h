@@ -61,6 +61,8 @@ namespace raftdemo
     void OnRequestVote(const raft::VoteRequest &request, raft::VoteResponse *response);
     void OnAppendEntries(const raft::AppendEntriesRequest &request,
                          raft::AppendEntriesResponse *response);
+    void OnInstallSnapshot(const raft::InstallSnapshotRequest &request,
+                           raft::InstallSnapshotResponse *response);
 
     std::string Describe() const;
     ProposeResult Propose(const Command &command);
@@ -95,13 +97,22 @@ namespace raftdemo
 
     bool IsCandidateLogUpToDateLocked(std::uint64_t last_log_index,
                                       std::uint64_t last_log_term) const;
+    std::uint64_t FirstLogIndexLocked() const;
     std::uint64_t LastLogIndexLocked() const;
     std::uint64_t LastLogTermLocked() const;
+    bool HasLogAtIndexLocked(std::uint64_t index) const;
+    std::size_t LogOffsetLocked(std::uint64_t index) const;
+    const LogRecord *LogAtIndexLocked(std::uint64_t index) const;
     std::uint64_t TermAtIndexLocked(std::uint64_t index) const;
+    void CompactLogPrefixLocked(std::uint64_t last_included_index,
+                                std::uint64_t last_included_term);
 
     std::optional<raft::VoteResponse> RequestVoteRpc(int peer_id, const raft::VoteRequest &request);
     std::optional<raft::AppendEntriesResponse> AppendEntriesRpc(
         int peer_id, const raft::AppendEntriesRequest &request);
+    std::optional<raft::InstallSnapshotResponse> InstallSnapshotRpc(
+        int peer_id, const raft::InstallSnapshotRequest &request);
+    bool SendInstallSnapshotToPeer(int peer_id, std::uint64_t term);
 
     static const char *RoleName(Role role);
 

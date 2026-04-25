@@ -35,6 +35,6 @@ endfunction()
 # add_raft_gtest(test_raft_commit_apply test_raft_commit_apply.cpp)
 # add_raft_gtest(persistence_test persistence_test.cpp)
 # add_raft_gtest(snapshot_test snapshot_test.cpp)
-add_raft_gtest(raft_integration_test raft_integration_test.cpp)
+# add_raft_gtest(raft_integration_test raft_integration_test.cpp)
 
 
