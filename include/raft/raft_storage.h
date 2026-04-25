@@ -14,6 +14,8 @@ namespace raftdemo
   {
     std::uint64_t current_term{0};
     int voted_for{-1};
+    std::uint64_t commit_index{0};
+    std::uint64_t last_applied{0};
     std::vector<LogRecord> log;
   };
 

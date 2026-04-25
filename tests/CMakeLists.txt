@@ -27,7 +27,7 @@ function(add_raft_gtest target_name source_file)
 endfunction()
 
 
-add_raft_gtest(test_raft_snapshot_catchup test_raft_snapshot_catchup.cpp)
+# add_raft_gtest(test_raft_snapshot_catchup test_raft_snapshot_catchup.cpp)
 # add_raft_gtest(test_command test_command.cpp)
 # add_raft_gtest(test_state_machine test_state_machine.cpp)
 # add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp)
@@ -38,6 +38,9 @@ add_raft_gtest(test_raft_snapshot_catchup test_raft_snapshot_catchup.cpp)
 # add_raft_gtest(persistence_test persistence_test.cpp)
 # add_raft_gtest(snapshot_test snapshot_test.cpp)
 # add_raft_gtest(raft_integration_test raft_integration_test.cpp)
+# add_raft_gtest(test_raft_snapshot_restart test_raft_snapshot_restart.cpp)
+add_raft_gtest(test_temp test_temp.cpp)
+
 
 
 

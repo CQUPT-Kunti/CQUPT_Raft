@@ -96,15 +96,29 @@ namespace raftdemo
     {
       current_term_ = persistent_state.current_term;
       voted_for_ = persistent_state.voted_for;
+      // Persisted commit/apply boundaries let a restarted node replay committed
+      // tail logs that are newer than the latest snapshot. Older state files may
+      // have one of the two fields as zero, so use the larger one as the best
+      // known committed boundary for local recovery.
+      commit_index_ = std::max<std::uint64_t>(persistent_state.commit_index,
+                                             persistent_state.last_applied);
+      last_applied_ = persistent_state.last_applied;
       log_ = std::move(persistent_state.log);
       if (log_.empty())
       {
         log_.push_back(LogRecord{0, 0, "bootstrap"});
       }
 
+      if (commit_index_ > LastLogIndexLocked())
+      {
+        commit_index_ = LastLogIndexLocked();
+      }
+
       Log(NodeTag(config_.node_id), "loaded persisted state from ", storage_->DataDir(),
           ", term=", current_term_, ", voted_for=", voted_for_,
-          ", last_log_index=", LastLogIndexLocked());
+          ", last_log_index=", LastLogIndexLocked(),
+          ", commit_index=", commit_index_,
+          ", persisted_last_applied=", persistent_state.last_applied);
     }
     else
     {
@@ -118,6 +132,16 @@ namespace raftdemo
       {
         throw std::runtime_error("failed to load snapshot for node " +
                                  std::to_string(config_.node_id) + ": " + snapshot_error);
+      }
+    }
+
+    if (commit_index_ > last_applied_)
+    {
+      ApplyResult replay_result = ApplyCommittedEntries();
+      if (!replay_result.Ok)
+      {
+        throw std::runtime_error("failed to replay committed log entries for node " +
+                                 std::to_string(config_.node_id) + ": " + replay_result.message);
       }
     }
   }
@@ -182,6 +206,15 @@ namespace raftdemo
     }
     scheduler_.Stop();
     rpc_pool_.Stop();
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      std::string persist_error;
+      if (!PersistStateLocked(&persist_error))
+      {
+        Log(NodeTag(config_.node_id), "persist state on stop failed: ", persist_error);
+      }
+    }
 
     Log(NodeTag(config_.node_id), "stopped");
   }
@@ -617,11 +650,11 @@ namespace raftdemo
           auto& next_index = self->next_index_[peer.node_id];
           const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
           if (hinted_next > 0 && hinted_next < next_index) {
-            next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(self->FirstLogIndexLocked()));
-          } else if (next_index > SafeAddOne(self->FirstLogIndexLocked())) {
+            next_index = hinted_next;
+          } else if (next_index > 1) {
             --next_index;
           } else {
-            next_index = self->FirstLogIndexLocked();
+            next_index = 1;
           }
         }
       }
@@ -968,7 +1001,7 @@ namespace raftdemo
       const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
       if (hinted_next > 0)
       {
-        next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(FirstLogIndexLocked()));
+        next_index = hinted_next;
       }
       return false;
     }
@@ -1142,6 +1175,16 @@ namespace raftdemo
       if (new_commit > commit_index_)
       {
         commit_index_ = new_commit;
+        std::string persist_error;
+        if (!PersistStateLocked(&persist_error))
+        {
+          Log(NodeTag(config_.node_id), "persist commit index after append entries failed: ", persist_error);
+          response->set_term(current_term_);
+          response->set_success(false);
+          response->set_match_index(match_index);
+          response->set_last_log_index(LastLogIndexLocked());
+          return;
+        }
         should_apply = true;
       }
     }
@@ -1643,15 +1686,15 @@ namespace raftdemo
             const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
             if (hinted_next > 0 && hinted_next < next_index)
             {
-              next_index = std::max<std::uint64_t>(hinted_next, SafeAddOne(FirstLogIndexLocked()));
+              next_index = hinted_next;
             }
-            else if (next_index > SafeAddOne(FirstLogIndexLocked()))
+            else if (next_index > 1)
             {
               --next_index;
             }
             else
             {
-              next_index = FirstLogIndexLocked();
+              next_index = 1;
             }
           }
         }
@@ -1737,6 +1780,11 @@ namespace raftdemo
       if (replicated_count >= majority)
       {
         commit_index_ = index;
+        std::string persist_error;
+        if (!PersistStateLocked(&persist_error))
+        {
+          Log(NodeTag(config_.node_id), "persist advanced commit index failed: ", persist_error);
+        }
         return;
       }
     }
@@ -1801,6 +1849,12 @@ namespace raftdemo
         if (last_applied_ < apply_index)
         {
           last_applied_ = apply_index;
+          std::string persist_error;
+          if (!PersistStateLocked(&persist_error))
+          {
+            Log(NodeTag(config_.node_id), "persist last applied after apply failed: ", persist_error);
+            return {false, persist_error};
+          }
         }
         MaybeScheduleSnapshotLocked(false);
       }
@@ -1895,7 +1949,7 @@ namespace raftdemo
         std::lock_guard<std::mutex> lk(mu_);
         CompactLogPrefixLocked(meta.last_included_index, meta.last_included_term);
         commit_index_ = std::max<std::uint64_t>(commit_index_, meta.last_included_index);
-        last_applied_ = std::max<std::uint64_t>(last_applied_, meta.last_included_index);
+        last_applied_ = meta.last_included_index;
 
         std::string persist_error;
         if (!PersistStateLocked(&persist_error))
@@ -2019,6 +2073,8 @@ namespace raftdemo
     PersistentRaftState state;
     state.current_term = current_term_;
     state.voted_for = voted_for_;
+    state.commit_index = commit_index_;
+    state.last_applied = last_applied_;
     state.log = log_;
     return storage_->Save(state, reason);
   }

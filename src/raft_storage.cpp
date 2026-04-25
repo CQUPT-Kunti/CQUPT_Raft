@@ -17,10 +17,9 @@ namespace raftdemo
   {
 
     constexpr std::uint32_t kFileMagic = 0x52465431U; // "RFT1"
-    constexpr std::uint32_t kFileVersion = 1U;
+    constexpr std::uint32_t kFileVersion = 2U;
     constexpr const char *kStateFileName = "raft_state.bin";
     constexpr const char *kTempFileName = "raft_state.bin.tmp";
-    constexpr const char *kBackupFileName = "raft_state.bin.bak";
 
     template <typename T>
     bool WritePod(std::ofstream &out, const T &value, std::string *error)
@@ -138,6 +137,8 @@ namespace raftdemo
         *has_state = false;
         state->current_term = 0;
         state->voted_for = -1;
+        state->commit_index = 0;
+        state->last_applied = 0;
         state->log.clear();
 
         const std::filesystem::path state_path = std::filesystem::path(data_dir_) / kStateFileName;
@@ -164,8 +165,7 @@ namespace raftdemo
         if (!ReadPod(in, &magic, error) ||
             !ReadPod(in, &version, error) ||
             !ReadPod(in, &state->current_term, error) ||
-            !ReadPod(in, &voted_for, error) ||
-            !ReadPod(in, &log_count, error))
+            !ReadPod(in, &voted_for, error))
         {
           return false;
         }
@@ -178,7 +178,7 @@ namespace raftdemo
           }
           return false;
         }
-        if (version != kFileVersion)
+        if (version != 1U && version != kFileVersion)
         {
           if (error != nullptr)
           {
@@ -188,6 +188,22 @@ namespace raftdemo
         }
 
         state->voted_for = static_cast<int>(voted_for);
+        if (version == 1U)
+        {
+          if (!ReadPod(in, &log_count, error))
+          {
+            return false;
+          }
+        }
+        else if (version >= 2U)
+        {
+          if (!ReadPod(in, &state->commit_index, error) ||
+              !ReadPod(in, &state->last_applied, error) ||
+              !ReadPod(in, &log_count, error))
+          {
+            return false;
+          }
+        }
         state->log.reserve(static_cast<std::size_t>(log_count));
 
         for (std::uint64_t i = 0; i < log_count; ++i)
@@ -243,6 +259,8 @@ namespace raftdemo
               !WritePod(out, version, error) ||
               !WritePod(out, state.current_term, error) ||
               !WritePod(out, voted_for, error) ||
+              !WritePod(out, state.commit_index, error) ||
+              !WritePod(out, state.last_applied, error) ||
               !WritePod(out, log_count, error))
           {
             return false;
@@ -269,44 +287,16 @@ namespace raftdemo
           }
         }
 
-        const std::filesystem::path backup_path = dir_path / kBackupFileName;
-
         ec.clear();
-        if (std::filesystem::exists(backup_path, ec))
+        if (std::filesystem::exists(state_path, ec))
         {
           ec.clear();
-          std::filesystem::remove(backup_path, ec);
+          std::filesystem::remove(state_path, ec);
           if (ec)
           {
             if (error != nullptr)
             {
-              *error = "remove stale backup state file failed: " + ec.message();
-            }
-            return false;
-          }
-        }
-
-        bool had_old_state = false;
-        ec.clear();
-        had_old_state = std::filesystem::exists(state_path, ec);
-        if (ec)
-        {
-          if (error != nullptr)
-          {
-            *error = "check old state file failed: " + ec.message();
-          }
-          return false;
-        }
-
-        if (had_old_state)
-        {
-          ec.clear();
-          std::filesystem::rename(state_path, backup_path, ec);
-          if (ec)
-          {
-            if (error != nullptr)
-            {
-              *error = "backup old state file failed: " + ec.message();
+              *error = "remove old state file failed: " + ec.message();
             }
             return false;
           }
@@ -316,27 +306,11 @@ namespace raftdemo
         std::filesystem::rename(temp_path, state_path, ec);
         if (ec)
         {
-          const std::string rename_error = ec.message();
-          if (had_old_state)
-          {
-            std::error_code rollback_ec;
-            std::filesystem::rename(backup_path, state_path, rollback_ec);
-          }
           if (error != nullptr)
           {
-            *error = "rename temp state file failed: " + rename_error;
+            *error = "rename state file failed: " + ec.message();
           }
           return false;
-        }
-
-        if (had_old_state)
-        {
-          ec.clear();
-          std::filesystem::remove(backup_path, ec);
-          if (ec && error != nullptr)
-          {
-            *error = "remove backup state file failed: " + ec.message();
-          }
         }
 
         return true;
