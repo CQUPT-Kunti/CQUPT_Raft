@@ -29,6 +29,18 @@ namespace raftdemo
     virtual const std::string &DataDir() const = 0;
   };
 
+  // Cross-platform file storage.
+  // Layout:
+  //   data_dir/
+  //     meta.bin
+  //     log/
+  //       segment_00000000000000000001.log
+  //       segment_00000000000000000513.log
+  //
+  // Logs are split into segment files. Obsolete segment files are removed
+  // automatically whenever RaftNode compacts log_ after snapshot. The storage
+  // layer never deletes log records that still exist in PersistentRaftState::log,
+  // because doing so would break Raft recovery and follower catch-up.
   std::unique_ptr<IRaftStorage> CreateFileRaftStorage(std::string data_dir);
 
 } // namespace raftdemo
