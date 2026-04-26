@@ -39,8 +39,8 @@ endfunction()
 # add_raft_gtest(snapshot_test snapshot_test.cpp)
 # add_raft_gtest(raft_integration_test raft_integration_test.cpp)
 # add_raft_gtest(test_raft_snapshot_restart test_raft_snapshot_restart.cpp)
-# add_raft_gtest(test_temp test_temp.cpp)
-add_raft_gtest(test_raft_segment_storage test_raft_segment_storage.cpp)
+add_raft_gtest(test_temp test_temp.cpp)
+# add_raft_gtest(test_raft_segment_storage test_raft_segment_storage.cpp)
 
 
 
