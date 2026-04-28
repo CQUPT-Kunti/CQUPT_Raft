@@ -1,1182 +1,1338 @@
-# Raft 项目 README（面向当前代码实现的流程说明）
+# CQUPT_Raft
 
-> 这份 README 不是照着论文复述 Raft，而是**按当前这份代码的实现方式**来解释：
-> - 每个模块负责什么
-> - 选举、投票、日志复制、提交、状态机应用分别是怎么走的
-> - 关键变量在每一步分别代表什么
-> - `main.cpp` 里的测试到底测到了什么
->
-> 阅读建议：先看“整体流程图”和“关键变量对照”，再回头对照 `raft_node.cpp` 看具体函数，会更容易理解。
+一个基于 **C++20 + gRPC + Protobuf + GoogleTest** 实现的 Raft KV 存储内核。当前版本重点完成了 Raft 内核能力：选举、日志复制、提交应用、持久化、快照、落后节点追赶、InstallSnapshot、segment log、目录式 snapshot、独立 Replicator 复制状态机，以及较完整的 GTest 覆盖。
+
+当前项目定位是：**先完成单 RaftGroup 的内核稳定性，再往 KV Service / File Storage / Meta 管理方向扩展**。
 
 ---
 
-## 1. 项目整体结构
+## 1. 当前能力概览
 
-当前代码大致可以分成下面几个部分：
+当前已经实现：
 
-### 1.1 Raft 核心节点
-- 文件：`raft_node.h` / `raft_node.cpp`
-- 作用：
-  - 保存一个节点的核心状态
-  - 处理选举超时
-  - 发起投票
-  - 处理投票请求
-  - 发送心跳 / 日志复制请求
-  - 处理 `AppendEntries`
-  - 管理提交位置 `commit_index_`
-  - 把已提交日志应用到状态机
+- Raft leader election。
+- RequestVote / AppendEntries / InstallSnapshot RPC。
+- 多数派提交。
+- 客户端命令通过 `Propose()` 进入 Raft 日志。
+- follower 检查 `prev_log_index / prev_log_term`。
+- leader 根据 `last_log_index` 快速回退 `next_index`。
+- AppendEntries 批量追赶。
+- follower 严重落后时通过 InstallSnapshot 追赶。
+- snapshot 安装完成后继续复制 snapshot 之后的日志。
+- `Replicator` 独立维护每个 follower 的复制状态。
+- 单 follower in-flight 限制。
+- RPC 失败指数退避。
+- segment 日志持久化。
+- snapshot 后自动清理旧 segment。
+- 目录式 snapshot 保存。
+- snapshot checksum 校验。
+- 损坏 snapshot 回退加载旧 snapshot。
+- snapshot 后 tail logs 重启恢复。
+- 纯 log 重启恢复时 replay 已提交日志。
+- leader election timer generation 校验，避免旧 timer 回调导致重复选举。
+- GoogleTest 覆盖基础 KV、选举、复制、提交、持久化、快照、追赶、Replicator、segment storage、snapshot storage。
 
-这个类是整个项目的核心。
+暂时还没有实现：
 
----
-
-### 1.2 RPC 服务层
-- 文件：`raft_service_impl.h` / `raft_service_impl.cpp`
-- 作用：
-  - 暴露 gRPC 接口
-  - 把 `RequestVote` 和 `AppendEntries` 请求转发给 `RaftNode`
-
-这里本身逻辑很薄，主要是把网络入口接进来。
-
----
-
-### 1.3 命令抽象层
-- 文件：`command.h` / `command.cpp`
-- 作用：
-  - 定义业务命令 `Command`
-  - 目前支持：
-    - `SET key value`
-    - `DEL key`
-  - 提供：
-    - `IsValid()`：校验命令是否合法
-    - `Serialize()`：序列化为字符串，写入日志
-    - `Deserialize()`：从日志中的字符串反序列化回命令
-
-也就是说，Raft 日志里真正存的是序列化后的字符串，而不是直接存 `Command` 对象。
+- 对外 KV gRPC Service。
+- 线性一致读 ReadIndex。
+- 文件对象存储 StorageNode。
+- Meta / Manager 多集群管理。
+- 动态成员变更。
+- learner。
+- snapshot chunk 流式传输。
+- 工业级异步 WAL。
+- client request 去重。
 
 ---
 
-### 1.4 状态机层
-- 文件：`state_machine.h` / `state_machine.cpp`
-- 作用：
-  - `IStateMachine` 是抽象接口
-  - `KvStateMachine` 是当前实现的 KV 状态机
-  - 负责把**已经提交的日志**真正执行到内存 KV 上
-
-当前状态机规则很简单：
-- `SET`：写入或覆盖
-- `DEL`：删除 key
-
-注意：**状态机只能执行已经 commit 的日志**。
-
----
-
-### 1.5 配置层
-- 文件：`config.h`
-- 作用：
-  - 定义 `PeerConfig`
-  - 定义 `NodeConfig`
-  - 保存节点地址、peer 列表、选举超时、心跳间隔、RPC 超时等参数
-
----
-
-### 1.6 定时器和线程池
-- 文件：
-  - `min_heap_timer.h` / `min_heap_timer.cpp`
-  - `thread_pool.h` / `thread_pool.cpp`
-- 作用：
-  - `TimerScheduler`：负责调度选举超时和心跳定时任务
-  - `ThreadPool`：负责并发发送 RPC（投票请求 / 日志复制请求）
-
----
-
-### 1.7 测试入口
-- 文件：`main.cpp`
-- 作用：
-  - 启动 3 个节点
-  - 等待 leader 选出
-  - 向 leader 提交一系列命令
-  - 打印集群快照，观察日志、提交、应用和 KV 状态
-
----
-
-## 2. 一个节点内部有哪些核心状态
-
-下面这些变量是理解整个流程的关键。
-
----
-
-### 2.1 角色相关
-
-#### `role_`
-表示当前节点角色：
-- `Role::kFollower`
-- `Role::kCandidate`
-- `Role::kLeader`
-
-这是判断一个节点当前职责的核心变量。
-
-#### `leader_id_`
-表示当前已知 leader 的节点 ID。
-- follower 收到 leader 心跳后会更新它
-- candidate 开始选举时会先把它设为 `-1`
-- leader 成功上位后会把它设成自己的 `config_.node_id`
-
----
-
-### 2.2 任期和投票相关
-
-#### `current_term_`
-表示当前节点看到的任期。
-- 发起新一轮选举时自增
-- 收到更高任期请求时更新为对方的 term
-
-它是 Raft 里最核心的“时代编号”。
-
-#### `voted_for_`
-表示当前任期投票投给了谁。
-- 初始是 `-1`
-- candidate 发起选举时会先投给自己
-- follower 在当前 term 内只会投给一个 candidate
-
----
-
-### 2.3 日志相关
-
-#### `log_`
-类型是 `std::vector<LogRecord>`。
-
-每条日志包括：
-- `index`
-- `term`
-- `command`
-
-你当前代码里在构造函数里先塞了一条：
-- `LogRecord{0, 0, "bootstrap"}`
-
-所以你的有效业务日志通常从下标 `1` 开始。
-
-#### `LastLogIndexLocked()`
-返回当前日志最后一条的索引。
-
-#### `LastLogTermLocked()`
-返回当前日志最后一条的任期。
-
-这两个函数会在选举投票时用来比较“谁的日志更新”。
-
----
-
-### 2.4 提交和应用相关
-
-#### `commit_index_`
-表示“已经提交”的最大日志下标。
-
-含义是：
-- 这个下标及之前的日志，已经可以认为达成提交条件
-- 但**提交了不等于已经执行到状态机**
-
-#### `last_applied_`
-表示“已经应用到状态机”的最大日志下标。
-
-因此，任意时刻应该满足：
-- `last_applied_ <= commit_index_`
-
-当 `last_applied_ < commit_index_` 时，说明还有日志已经提交，但还没被状态机执行。
-
----
-
-### 2.5 Leader 复制进度相关
-
-#### `next_index_`
-`unordered_map<int, std::uint64_t>`，以 peer 节点 ID 为 key。
-
-含义：
-- leader 下一次准备发给某个 follower 的日志起点
-
-如果某个 follower 一直跟得上 leader，`next_index_[peer]` 会越来越大。
-如果某次复制失败，leader 会把它往回减，用来回退重试。
-
-#### `match_index_`
-`unordered_map<int, std::uint64_t>`，以 peer 节点 ID 为 key。
-
-含义：
-- leader 认为某个 follower 已经成功复制到的最大日志下标
-
-这个变量后续非常重要，因为**标准 Raft 的 commit 推进**就是基于它来判断“是否已经复制到多数派”。
-
----
-
-### 2.6 并发控制相关
-
-#### `mu_`
-Raft 核心状态锁。
-
-保护的对象主要包括：
-- `role_`
-- `current_term_`
-- `voted_for_`
-- `leader_id_`
-- `log_`
-- `commit_index_`
-- `last_applied_`
-- `next_index_`
-- `match_index_`
-
-#### `apply_mu_`
-状态机应用锁。
-
-它的作用是避免多个线程同时进入 `ApplyCommittedEntries()`，从而重复 apply。
-
----
-
-## 3. 一次完整运行的总流程
-
-把整个系统从启动到写入，粗略分成下面几步：
-
-1. `main.cpp` 构造 3 个 `RaftNode`
-2. 每个节点 `Start()`
-3. 节点启动 gRPC 服务，启动定时器，重置选举超时
-4. 某个 follower 先超时，触发 `OnElectionTimeout()`
-5. 它进入 `StartElection()`，变成 candidate，term 加 1，给自己投票
-6. 它向其他节点发 `RequestVote`
-7. 多数派同意后，candidate 进入 `OnElectionWon()`，成为 leader
-8. leader 进入心跳循环，周期性发送 `AppendEntries`
-9. `main.cpp` 找到 leader，向 leader 调用 `Propose()`
-10. leader 本地追加日志
-11. leader 向 follower 复制日志
-12. 日志达到提交条件后推进 `commit_index_`
-13. 调用 `ApplyCommittedEntries()`
-14. 状态机执行日志，更新 KV
-15. follower 收到包含 `leader_commit` 的 `AppendEntries` 后，也会推进本地 `commit_index_` 并 apply
-16. 最终所有节点的 `kv` 内容一致
-
----
-
-## 4. 节点启动流程
-
-### 4.1 `RaftNode::Start()`
-这个函数做了几件事：
-
-1. `InitClients()`
-   - 为每个 peer 创建 gRPC channel 和 stub
-
-2. `scheduler_.Start()`
-   - 启动最小堆定时器线程
-
-3. `InitServer()`
-   - 启动本节点的 gRPC server
-   - 注册 `RaftServiceImpl`
-
-4. 加锁后 `ResetElectionTimerLocked()`
-   - 安排一个随机选举超时任务
-
-所以节点一启动，本质上就已经进入：
-- 等请求
-- 等超时
-- 等选举
-
-的状态了。
-
----
-
-## 5. 选举流程
-
-### 5.1 选举超时怎么触发
-
-#### `ResetElectionTimerLocked()`
-- 先取消旧的选举定时器
-- 调 `RandomElectionTimeoutLocked()` 生成一个随机时间
-- 定时到期后执行 `OnElectionTimeout()`
-
-#### `RandomElectionTimeoutLocked()`
-- 从 `election_timeout_min ~ election_timeout_max` 之间随机选一个时间
-
-这样做的目的是减少多个节点同时发起选举的概率。
-
----
-
-### 5.2 `OnElectionTimeout()`
-逻辑很简单：
-- 如果节点已经停止，返回
-- 如果当前已经是 leader，返回
-- 否则调用 `StartElection()`
-
-也就是说，**只有 follower / candidate 才会因为超时继续发起选举**。
-
----
-
-### 5.3 `StartElection()`
-这是 candidate 发起选举的入口。
-
-进入后主要做这些事：
-
-1. 加锁检查当前节点是否还能发起选举
-2. `role_ = Role::kCandidate`
-3. `++current_term_`
-4. `voted_for_ = config_.node_id`（先给自己投票）
-5. `leader_id_ = -1`
-6. 记录：
-   - `term`
-   - `last_log_index`
-   - `last_log_term`
-7. 重新设置选举定时器
-8. 并发向所有 peer 发送 `RequestVote`
-
-这里有两个很关键的局部量：
-
-#### `votes`
-初始为 1，因为 candidate 先投给自己。
-
-#### `quorum`
-表示多数派门槛。
-3 节点情况下就是 2。
-
----
-
-### 5.4 candidate 发出的 `VoteRequest` 里有什么
-
-`raft.proto` 中定义：
-- `term`
-- `candidate_id`
-- `last_log_index`
-- `last_log_term`
-
-含义是：
-- 我现在在哪个 term
-- 我是谁
-- 我当前日志最新到哪里
-
-这样 follower 才能决定要不要投票给它。
-
----
-
-### 5.5 follower 如何处理投票请求
-
-入口函数：`RaftNode::OnRequestVote()`
-
-处理逻辑分为几步：
-
-#### 第一步：默认拒绝
-```cpp
-response->set_vote_granted(false);
+## 2. 项目目录结构
+
+典型目录结构如下：
+
+```text
+CQUPT_Raft/
+  CMakeLists.txt
+  config.txt
+  proto/
+    raft.proto
+
+  include/raft/
+    command.h
+    config.h
+    logging.h
+    min_heap_timer.h
+    propose.h
+    raft_node.h
+    raft_service_impl.h
+    raft_storage.h
+    replicator.h
+    snapshot_storage.h
+    state_machine.h
+    thread_pool.h
+
+  src/
+    command.cpp
+    main.cpp
+    min_heap_timer.cpp
+    raft_node.cpp
+    raft_service_impl.cpp
+    raft_storage.cpp
+    replicator.cpp
+    snapshot_storage.cpp
+    state_machine.cpp
+    thread_pool.cpp
+
+  tests/
+    CMakeLists.txt
+    test_command.cpp
+    test_state_machine.cpp
+    test_min_heap_timer.cpp
+    test_thread_pool.cpp
+    test_raft_election.cpp
+    test_raft_log_replication.cpp
+    test_raft_commit_apply.cpp
+    persistence_test.cpp
+    snapshot_test.cpp
+    raft_integration_test.cpp
+    test_raft_snapshot_catchup.cpp
+    test_raft_snapshot_restart.cpp
+    test_raft_snapshot_diagnosis.cpp
+    test_raft_segment_storage.cpp
+    test_snapshot_storage_reliability.cpp
+    test_raft_replicator_behavior.cpp
 ```
 
-#### 第二步：term 太旧，直接拒绝
-如果：
-```cpp
-request.term() < current_term_
-```
-就直接返回。
+运行后会产生：
 
-#### 第三步：如果对方 term 更高，自己先退成 follower
-如果：
-```cpp
-request.term() > current_term_
-```
-就调用：
-```cpp
-BecomeFollowerLocked(request.term(), -1, "received higher term vote request")
-```
+```text
+raft_data/
+  node_1/
+    meta.bin
+    log/
+      segment_*.log
 
-#### 第四步：比较 candidate 的日志是否足够新
-调用：
-```cpp
-IsCandidateLogUpToDateLocked(request.last_log_index(), request.last_log_term())
+raft_snapshots/
+  node_1/
+    snapshot_<index>/
+      data.bin
+      __raft_snapshot_meta
 ```
 
-比较规则是：
-1. 先比最后一条日志的 term
-2. term 相同再比最后一条日志的 index
+测试数据默认保存在：
 
-这一步是 Raft 保证安全性的关键之一。
-
-#### 第五步：检查当前 term 是否还能投票
-```cpp
-const bool can_vote = (voted_for_ == -1 || voted_for_ == request.candidate_id());
+```text
+build/tests/raft_test_data/
 ```
-
-也就是：
-- 还没投过票，可以投
-- 已经投给同一个 candidate，也可以认为继续投它
-
-#### 第六步：满足条件则投票
-如果同时满足：
-- `can_vote`
-- `up_to_date`
-
-那么：
-- `voted_for_ = request.candidate_id()`
-- `response->set_vote_granted(true)`
-- `ResetElectionTimerLocked()`
-
-为什么投票后要重置选举超时？
-因为这表示当前节点已经认可这轮选举，不应该马上自己再发起一轮新的选举。
 
 ---
 
-### 5.6 candidate 如何变成 leader
+## 3. 每个核心 `.cpp` 文件的作用
 
-在 `StartElection()` 发出的每个 RPC 回包里，如果：
-- `response->vote_granted() == true`
+### 3.1 `src/main.cpp`
 
-就把 `votes` 加 1。
+程序入口。负责从 `config.txt` 读取节点配置，构造 `NodeConfig` 和 `snapshotConfig`，启动一个 `RaftNode`。
 
-当：
-```cpp
-total >= quorum
+主要职责：
+
+- 解析 `key=value` 格式配置。
+- 读取 `node.<id>=host:port` 成员信息。
+- 根据命令行参数决定当前启动哪个节点。
+- 构造当前节点的 peer 列表。
+- 配置 data_dir / snapshot_dir。
+- 打印当前节点的 `cluster_size` 和 `quorum`。
+- 启动 `RaftNode::Start()`。
+- 定期打印 `RaftNode::Describe()`。
+- 接收 `SIGINT / SIGTERM` 后停止节点。
+
+典型启动方式：
+
+```bash
+./build/raft_demo ./config.txt 1
+./build/raft_demo ./config.txt 2
+./build/raft_demo ./config.txt 3
 ```
-时，调用：
+
+如果 `config.txt` 只配置 `node.1`，则是单节点 Raft 集群；如果配置 `node.1/node.2/node.3`，则是三节点 Raft 集群。
+
+---
+
+### 3.2 `src/command.cpp`
+
+KV 命令序列化与反序列化。
+
+当前命令格式仍然保持简单字符串格式：
+
+```text
+SET|key|value
+DEL|key
+```
+
+主要职责：
+
+- 将 `Command` 序列化成日志中保存的字符串。
+- 从日志字符串反序列化为 `Command`。
+- 校验命令是否合法。
+- 保持 `SET / DEL` 命令格式稳定。
+
+这个文件不负责 Raft 复制，只负责命令编码。
+
+---
+
+### 3.3 `src/state_machine.cpp`
+
+KV 状态机实现。
+
+主要职责：
+
+- 接收已经 committed 的命令。
+- 执行 `SET` / `DEL`。
+- 维护内存 KV map。
+- 支持 `Get()` 查询。
+- 支持 snapshot 保存。
+- 支持 snapshot 加载。
+- 支持 `DebugString()` 打印当前 KV 状态。
+
+Raft 日志提交后，最终会通过：
+
 ```cpp
+RaftNode::ApplyCommittedEntries()
+  -> state_machine_->Apply(...)
+```
+
+把命令应用到这里。
+
+---
+
+### 3.4 `src/raft_node.cpp`
+
+Raft 核心控制器，是当前项目最重要的文件。
+
+主要职责：
+
+- 节点启动和停止。
+- gRPC server 初始化。
+- peer client 初始化。
+- leader election。
+- heartbeat 定时器。
+- election timer 定时器。
+- snapshot 定时器。
+- RequestVote 处理。
+- AppendEntries 处理。
+- InstallSnapshot 处理。
+- 本地日志追加。
+- 客户端 `Propose()`。
+- 多数派复制。
+- commit index 推进。
+- apply committed logs。
+- snapshot 创建与加载。
+- 持久化 raft state。
+- 重启恢复。
+- 维护 `next_index_ / match_index_`。
+- 管理每个 follower 的 `Replicator`。
+
+这个文件保留 Raft 节点级逻辑；单个 follower 的复制细节已经拆到 `replicator.cpp`。
+
+---
+
+### 3.5 `src/replicator.cpp`
+
+单个 follower 的复制状态机。
+
+每个 follower 对应一个 `Replicator`。leader 不再直接把所有复制细节堆在 `RaftNode` 中，而是通过 `Replicator` 管理：
+
+- AppendEntries 构造。
+- 批量日志复制。
+- heartbeat / probe。
+- `next_index` 快速回退。
+- `match_index` 更新。
+- 落后到 snapshot 边界前时触发 InstallSnapshot。
+- InstallSnapshot 期间暂停普通 AppendEntries。
+- 单 follower in-flight 限制。
+- RPC 失败指数退避。
+- 复制成功后重置退避。
+
+核心入口：
+
+```cpp
+Replicator::ReplicateOnce(...)
+```
+
+由 `RaftNode::SendHeartbeats()` 和 `RaftNode::ReplicateLogEntryToMajority()` 调用。
+
+---
+
+### 3.6 `src/raft_service_impl.cpp`
+
+Raft gRPC 服务实现层。
+
+主要职责：
+
+- 接收远端 `RequestVote`。
+- 接收远端 `AppendEntries`。
+- 接收远端 `InstallSnapshot`。
+- 将 RPC 请求转发给 `RaftNode` 的对应处理函数。
+
+典型调用：
+
+```cpp
+RaftServiceImpl::RequestVote(...)
+  -> RaftNode::OnRequestVote(...)
+
+RaftServiceImpl::AppendEntries(...)
+  -> RaftNode::OnAppendEntries(...)
+
+RaftServiceImpl::InstallSnapshot(...)
+  -> RaftNode::OnInstallSnapshot(...)
+```
+
+这个文件只做 RPC service glue，不直接修改 Raft 状态。
+
+---
+
+### 3.7 `src/raft_storage.cpp`
+
+Raft 持久化存储实现。
+
+当前已经从单个 `raft_state.bin` 升级为：
+
+```text
+data_dir/
+  meta.bin
+  log/
+    segment_00000000000000000001.log
+    segment_00000000000000000513.log
+```
+
+主要职责：
+
+- 保存 `current_term`。
+- 保存 `voted_for`。
+- 保存 `commit_index`。
+- 保存 `last_applied`。
+- 分段保存 Raft log records。
+- 每条日志保存 header、index、term、size、checksum、data。
+- 启动时扫描 segment 文件恢复日志。
+- 校验日志 checksum。
+- snapshot compaction 后删除不再需要的旧 segment。
+- 保证未被 snapshot 覆盖的日志不会被错误删除。
+
+注意：`raft_storage.cpp` 只保存 Raft 日志和元信息，不保存状态机 KV 数据。状态机数据靠 snapshot 或 committed log replay 恢复。
+
+---
+
+### 3.8 `src/snapshot_storage.cpp`
+
+snapshot 文件存储实现。
+
+当前 snapshot 保存为目录式结构：
+
+```text
+raft_snapshots/node_1/
+  snapshot_00000000000000000120/
+    data.bin
+    __raft_snapshot_meta
+```
+
+主要职责：
+
+- 保存状态机 snapshot 文件。
+- 写入 `__raft_snapshot_meta`。
+- 记录 `last_included_index`。
+- 记录 `last_included_term`。
+- 记录 snapshot 数据 checksum。
+- 列出所有合法 snapshot。
+- 忽略损坏 snapshot。
+- 最新 snapshot 损坏时回退到旧 snapshot。
+- 自动清理超过保留数量的旧 snapshot。
+
+当前版本按调试要求：不使用 `temp_*` 目录，而是直接写入最终 `snapshot_<index>/` 目录。加载时通过 meta 和 checksum 避免加载损坏快照。
+
+---
+
+### 3.9 `src/min_heap_timer.cpp`
+
+最小堆定时器。
+
+主要职责：
+
+- 支持延迟任务调度。
+- 支持取消任务。
+- 被 Raft 用于 election timeout、heartbeat timeout、snapshot timeout。
+- 内部通过最小堆维护最近到期任务。
+
+Raft 中主要使用位置：
+
+```cpp
+ResetElectionTimerLocked()
+ResetHeartbeatTimerLocked()
+ResetSnapshotTimerLocked()
+```
+
+---
+
+### 3.10 `src/thread_pool.cpp`
+
+线程池实现。
+
+主要职责：
+
+- 执行异步任务。
+- 用于 RPC 并发发送。
+- 支持 Stop。
+- Stop 后拒绝新任务。
+- 已提交任务在退出前尽量执行完成。
+
+Raft 中用于：
+
+```cpp
+RequestVoteRpc
+AppendEntriesRpc
+InstallSnapshotRpc
+Replicator
+```
+
+---
+
+## 4. 测试 `.cpp` 文件作用
+
+### 4.1 `tests/test_command.cpp`
+
+测试命令序列化和反序列化。
+
+覆盖：
+
+- `SET` 命令序列化。
+- `DEL` 命令序列化。
+- 空 key 非法。
+- 未知命令非法。
+- 错误输入反序列化失败。
+
+---
+
+### 4.2 `tests/test_state_machine.cpp`
+
+测试 KV 状态机。
+
+覆盖：
+
+- `SET` 后可以读回。
+- `SET` 覆盖旧值。
+- `DEL` 删除已有 key。
+- 删除不存在 key 仍然返回成功。
+- 非法命令 apply 失败。
+- debug string 按 key 排序输出。
+
+---
+
+### 4.3 `tests/test_min_heap_timer.cpp`
+
+测试定时器。
+
+覆盖：
+
+- 定时任务能执行。
+- 取消任务不会执行。
+- Stop 会清理 pending tasks。
+
+---
+
+### 4.4 `tests/test_thread_pool.cpp`
+
+测试线程池。
+
+覆盖：
+
+- 提交任务会执行。
+- Stop 后不再接收新任务。
+- Stop 前队列中的任务能完成。
+
+---
+
+### 4.5 `tests/test_raft_election.cpp`
+
+测试基础选举。
+
+覆盖：
+
+- 三节点集群能选出唯一 leader。
+- follower 在 leader 存在时拒绝客户端直接 propose。
+
+---
+
+### 4.6 `tests/test_raft_log_replication.cpp`
+
+测试日志复制。
+
+覆盖：
+
+- leader propose 后日志复制到所有节点。
+- 多条顺序日志在集群内保持一致。
+
+---
+
+### 4.7 `tests/test_raft_commit_apply.cpp`
+
+测试 commit 和 apply。
+
+覆盖：
+
+- propose 成功后 commit_index / last_applied 推进。
+- delete 命令能复制并应用到所有节点。
+
+---
+
+### 4.8 `tests/persistence_test.cpp`
+
+测试纯日志持久化恢复。
+
+覆盖：
+
+- 整个集群停止后重启，依靠 segment log replay 恢复 KV。
+- follower 停止后重启，能追上停机期间提交的日志。
+
+注意：这个测试禁用 snapshot，专门验证纯 log 恢复路径。
+
+---
+
+### 4.9 `tests/snapshot_test.cpp`
+
+测试基础 snapshot 保存和加载。
+
+覆盖：
+
+- snapshot 文件生成。
+- 重启后从 snapshot 恢复状态机。
+
+---
+
+### 4.10 `tests/raft_integration_test.cpp`
+
+集成测试。
+
+覆盖：
+
+- 三节点选主。
+- set/delete 命令复制。
+- leader 停止后重新选主。
+- 日志达到阈值后生成 snapshot。
+
+---
+
+### 4.11 `tests/test_raft_snapshot_catchup.cpp`
+
+测试 snapshot 追赶。
+
+覆盖：
+
+- follower 落后很多时通过批量 AppendEntries 追赶。
+- leader compact 后 follower 通过 InstallSnapshot 追赶。
+- follower 安装 snapshot 后继续复制后续日志。
+
+---
+
+### 4.12 `tests/test_raft_snapshot_restart.cpp`
+
+测试 snapshot 与重启恢复组合。
+
+覆盖：
+
+- follower 安装 snapshot 后重启仍能保留状态。
+- leader compact 后重启仍能恢复 snapshot 状态。
+- 全集群 snapshot 后重启还能继续写。
+- snapshot + snapshot 后 tail logs 能完整恢复。
+
+---
+
+### 4.13 `tests/test_raft_snapshot_diagnosis.cpp`
+
+诊断测试。
+
+覆盖：
+
+- 单节点重启时加载 snapshot 后 replay tail logs。
+- compacted cluster 重启 leader 后仍能继续复制新日志。
+- 失败时打印每个节点 `Describe()`，用于定位恢复路径还是追赶路径问题。
+
+---
+
+### 4.14 `tests/test_raft_segment_storage.cpp`
+
+测试 segment log storage。
+
+覆盖：
+
+- 多个 segment 文件写入。
+- segment log 重新加载。
+- snapshot compaction 后自动删除旧 segment。
+- 真实 Raft 集群生成 segment log 和 snapshot 文件。
+
+---
+
+### 4.15 `tests/test_snapshot_storage_reliability.cpp`
+
+测试 snapshot storage 可靠性。
+
+覆盖：
+
+- snapshot 保存成目录结构。
+- 不使用 temp snapshot 目录。
+- 最新 snapshot 损坏时回退加载旧 snapshot。
+- 超过最大保留数量时自动清理旧 snapshot。
+
+---
+
+### 4.16 `tests/test_raft_replicator_behavior.cpp`
+
+测试 Replicator 行为。
+
+覆盖：
+
+- 慢 follower 不阻塞多数派提交。
+- follower 落后后能追上。
+- follower 追赶期间 leader 仍能继续接受和提交新日志。
+
+---
+
+## 5. 核心数据结构
+
+### 5.1 `NodeConfig`
+
+定义单个 Raft 节点配置：
+
+```cpp
+node_id
+address
+peers
+election_timeout_min
+election_timeout_max
+heartbeat_interval
+rpc_deadline
+data_dir
+```
+
+### 5.2 `snapshotConfig`
+
+定义 snapshot 行为：
+
+```cpp
+enabled
+snapshot_dir
+log_threshold
+snapshot_interval
+max_snapshot_count
+load_on_startup
+file_prefix
+```
+
+### 5.3 `LogRecord`
+
+内存中的 Raft 日志项：
+
+```cpp
+index
+term
+command
+```
+
+### 5.4 `PersistentRaftState`
+
+磁盘持久化状态：
+
+```cpp
+current_term
+voted_for
+commit_index
+last_applied
+log
+```
+
+### 5.5 `SnapshotMeta`
+
+snapshot 元信息：
+
+```cpp
+snapshot_path
+meta_path
+snapshot_dir
+last_included_index
+last_included_term
+created_unix_ms
+data_checksum
+```
+
+---
+
+## 6. 关键流程说明
+
+### 6.1 节点启动流程
+
+核心函数链：
+
+```text
+main.cpp
+  -> LoadKeyValueConfig()
+  -> BuildNodeConfig()
+  -> BuildSnapshotConfig()
+  -> std::make_shared<RaftNode>(...)
+  -> RaftNode::RaftNode(...)
+       -> CreateFileRaftStorage()
+       -> CreateFileSnapshotStorage()
+       -> storage_->Load()
+       -> LoadLatestSnapshotOnStartup()
+       -> ApplyCommittedEntries()
+  -> RaftNode::Start()
+       -> InitClients()
+       -> InitServer()
+       -> ResetElectionTimerLocked()
+       -> ResetSnapshotTimerLocked()
+       -> StartSnapshotWorker()
+```
+
+说明：
+
+1. `main.cpp` 从配置文件读取当前节点 ID 和所有成员地址。
+2. `RaftNode` 构造时先加载本地持久化 Raft state。
+3. 如果开启 snapshot，则尝试加载最新合法 snapshot。
+4. 加载 snapshot 后，从 `last_applied_ + 1` 到 `commit_index_` replay 已提交日志。
+5. `Start()` 初始化 peer client 和 gRPC server。
+6. follower / candidate 启动 election timer。
+7. leader 不会注册 election timer。
+
+---
+
+### 6.2 选举流程
+
+核心函数链：
+
+```text
+ResetElectionTimerLocked()
+  -> scheduler_.ScheduleAfter(...)
+  -> OnElectionTimeout(timer_generation)
+  -> StartElection()
+       -> current_term_ += 1
+       -> voted_for_ = self
+       -> RequestVoteRpc(peer)
+       -> OnElectionWon(term)
+       -> BecomeLeaderLocked()
+       -> ProposeNoOpEntry()
+```
+
+关键点：
+
+- 每一轮新选举都会增加 term。
+- 三节点配置只启动一个节点时，只能拿到 1 票，不够 quorum=2，因此会一直 Candidate。
+- 单节点配置 `cluster_size=1, quorum=1` 时，可以自己选自己为 leader。
+- election timer 使用 `election_timer_generation_` 防止旧 timer 回调在 leader 状态下重新触发选举。
+- leader 状态下不会注册 election timer。
+
+---
+
+### 6.3 RequestVote 处理流程
+
+核心函数链：
+
+```text
+RaftServiceImpl::RequestVote()
+  -> RaftNode::OnRequestVote()
+       -> request.term < current_term_ ? reject
+       -> request.term > current_term_ ? BecomeFollowerLocked()
+       -> IsCandidateLogUpToDateLocked()
+       -> voted_for_ 检查
+       -> grant / reject
+       -> PersistStateLocked()
+       -> ResetElectionTimerLocked()
+```
+
+投票条件：
+
+- candidate term 不能小于本地 term。
+- candidate 日志至少和本地一样新。
+- 当前 term 没投过其他 candidate，或者已经投给同一个 candidate。
+- grant vote 后重置 election timer。
+
+---
+
+### 6.4 leader 当选流程
+
+核心函数链：
+
+```text
 OnElectionWon(term)
+  -> BecomeLeaderLocked()
+       -> role_ = Leader
+       -> leader_id_ = self
+       -> CancelElectionTimerLocked()
+       -> 初始化 next_index_
+       -> 初始化 match_index_
+       -> 创建 Replicator
+       -> ResetHeartbeatTimerLocked()
+  -> ProposeNoOpEntry()
 ```
-
----
-
-### 5.7 `OnElectionWon()`
-这个函数会再次检查：
-- 自己是不是还在运行
-- 自己是不是 candidate
-- 当前 term 是否还是刚刚赢下来的那个 term
-
-检查通过后调用：
-```cpp
-BecomeLeaderLocked()
-```
-然后立即发送一次心跳：
-```cpp
-SendHeartbeats()
-```
-
-这样集群其他节点就能尽快知道 leader 出现了。
-
----
-
-## 6. Leader 初始化流程
-
-### 6.1 `BecomeLeaderLocked()`
-leader 上位时主要做几件事：
-
-1. `role_ = Role::kLeader`
-2. `leader_id_ = config_.node_id`
-3. 取消选举定时器
-4. 初始化复制进度：
-   - `next_index_[peer] = last_log_index + 1`
-   - `match_index_[peer] = 0`
-5. 启动心跳定时器：`ResetHeartbeatTimerLocked()`
-
----
-
-### 6.2 为什么 `next_index_` 初始是 `last_log_index + 1`
-因为对 leader 来说：
-- follower 理论上“下一条应该接收的日志”
-- 默认先假设 follower 和自己一样新
-
-如果后面发现 follower 不匹配，再慢慢回退。
-
----
-
-## 7. 心跳与日志复制流程
-
-在你的实现里，**心跳和日志复制走的是同一个 RPC：`AppendEntries`**。
-
-区别只是：
-- 如果 `entries` 为空，就是纯心跳
-- 如果 `entries` 不为空，就是带日志的复制请求
-
----
-
-### 7.1 Leader 如何发送心跳
-
-入口函数：`RaftNode::SendHeartbeats()`
-
-整体步骤：
-
-1. 加锁确认自己还是 leader
-2. 取出：
-   - `peers`
-   - `term`
-   - `leader_commit`
-3. 对每个 peer 提交一个线程池任务
-4. 每个任务构造一个 `AppendEntriesRequest`
-
-在构造请求时，会用到这个 follower 的：
-- `next_index_[peer.node_id]`
-
-然后计算：
-- `prev_log_index = next_index - 1`
-- `prev_log_term = log_[prev_log_index].term`
-
-接着把 `[next_index, log_.size())` 这段日志全部带上。
-
-所以你当前代码不是“只发空心跳”，而是：
-- 如果 follower 落后，顺便带上缺失日志
-- 如果 follower 不落后，entries 可能为空，就退化成普通心跳
-
----
-
-### 7.2 follower 如何处理 `AppendEntries`
-
-入口函数：`RaftNode::OnAppendEntries()`
-
-处理顺序非常关键。
-
-#### 第一步：先默认失败
-```cpp
-response->set_success(false);
-```
-
-#### 第二步：term 太旧，直接拒绝
-如果：
-```cpp
-request.term() < current_term_
-```
-则直接返回。
-
-#### 第三步：如果对方 term 更高，或者自己不是合格 follower，则转成 follower
-调用：
-```cpp
-BecomeFollowerLocked(request.term(), request.leader_id(), "received append entries")
-```
-
-如果 term 没问题而且自己本来就是 follower，则：
-- `leader_id_ = request.leader_id()`
-- `ResetElectionTimerLocked()`
-
-这一步非常重要，因为：
-- 收到 leader 的心跳，说明 leader 还活着
-- follower 就不应该自己发起选举
-
----
-
-### 7.3 一致性检查：`prev_log_index` / `prev_log_term`
-
-这是日志复制的关键。
-
-#### 情况 1：`request.prev_log_index() >= log_.size()`
-说明 follower 本地日志太短，连前置日志都没有。
-直接失败返回。
-
-#### 情况 2：
-```cpp
-log_[request.prev_log_index()].term != request.prev_log_term()
-```
-说明 follower 本地在这个位置的 term 对不上。
-也失败返回。
-
-含义是：
-- 只有当前缀日志完全匹配时，后续日志才能接上
-
----
-
-### 7.4 follower 如何处理冲突日志
-
-如果前缀一致，就从：
-```cpp
-append_at = request.prev_log_index() + 1
-```
-开始处理新日志。
-
-代码逻辑是：
-1. 一边看请求里的 `entries`
-2. 一边看本地 `log_`
-3. 如果同一位置 term 不同，说明这里开始冲突
-4. 直接：
-```cpp
-log_.resize(append_at)
-```
-把冲突位置及后面的本地日志全部删掉
-5. 再把 leader 发来的剩余日志 append 到本地
-
-这个过程就是 Raft 里的：
-- 冲突日志删除
-- 正确日志覆盖
-
----
-
-### 7.5 follower 如何更新提交位置
-
-如果：
-```cpp
-request.leader_commit() > commit_index_
-```
-说明 leader 已经提交得更远了。
-
-那 follower 会把自己的提交位置推进到：
-```cpp
-min(request.leader_commit(), LastLogIndexLocked())
-```
-
-为什么要取 `min`？
-因为 follower 不能提交超过自己本地实际已有日志的位置。
-
-如果 commit 前进了，就把：
-```cpp
-should_apply = true;
-```
-
-函数解锁后再调用：
-```cpp
-ApplyCommittedEntries()
-```
-
-也就是说：
-- **收到日志** 不等于立即 apply
-- **收到 leader_commit 并推进 commit_index_** 后，才会 apply
-
----
-
-## 8. 客户端提案流程
-
-入口函数：`RaftNode::Propose(const Command &command)`
-
-这是客户端写请求进入 Raft 的主要入口。
-
----
-
-### 8.1 第一步：先检查当前节点能不能接请求
-
-#### 检查 1：节点是否还在运行
-如果节点正在停止：
-- 返回 `kNodeStopping`
-
-#### 检查 2：当前节点是否是 leader
-如果不是 leader：
-- 返回 `kNotLeader`
-- 同时带上 `leader_id_`
-
-所以你的 follower 是不会直接接收客户端写请求的。
-
----
-
-### 8.2 第二步：校验业务命令
-调用：
-```cpp
-ValidateCommandUnlocked(command, &reason)
-```
-
-这里主要检查：
-- `command.IsValid()`
-- `Serialize()` 后是不是空
-- 命令大小有没有超过上限（当前上限是 1MB）
-
-通过后，再把命令序列化成日志字符串：
-```cpp
-command_data = command.Serialize();
-```
-
----
-
-### 8.3 第三步：leader 本地先追加日志
-调用：
-```cpp
-log_index = AppendLocalLogUnlocked(command_data);
-```
-
-这个函数做了两件事：
-
-1. 往 `log_` 里 push 一条新日志
-   - `index = log_.size()`
-   - `term = current_term_`
-   - `command = command_data`
-
-2. 更新 leader 自己的复制状态
-```cpp
-match_index_[config_.node_id] = new_index;
-next_index_[config_.node_id] = new_index + 1;
-```
-
-这里的含义是：
-- leader 自己当然已经拥有这条日志
-- 所以自己的 `match_index_` 可以直接推进
-
----
-
-### 8.4 第四步：复制到多数派
-
-调用：
-```cpp
-ReplicateLogEntryToMajority(log_index)
-```
-
-这个函数当前实现是**同步串行**地向 peers 发 `AppendEntries`。
-
-它的逻辑大致是：
-1. 先记录当前：
-   - `term`
-   - `leader_commit`
-   - `peers`
-2. 对每个 peer 构造 `AppendEntriesRequest`
-3. 从 `next_index_[peer]` 开始把还没复制的日志带上
-4. 发 RPC
-5. 收到响应后：
-   - 如果对方 term 更高，leader 退化成 follower
-   - 如果成功：
-     - 更新 `match_index_[peer]`
-     - 更新 `next_index_[peer]`
-     - `success_count++`
-   - 如果失败：
-     - `next_index_[peer]--`
-6. 一旦 `success_count >= majority`，就返回 true
-
-注意，这里当前是“最小可运行版本”，所以：
-- 失败时只做简单回退 `next_index_--`
-- 没有做更完整的冲突优化信息返回
-
----
-
-### 8.5 第五步：推进 `commit_index_`
-
-复制到多数派之后，`Propose()` 会调用：
-```cpp
-AdvanceCommitIndexUnlocked()
-```
-
-**按当前上传代码，这个函数还是简化实现：**
-```cpp
-if (last_index > commit_index_) {
-    commit_index_ = last_index;
-}
-```
-
-也就是说，当前仓库版本里：
-- 它还没有完整使用 `match_index_` 按标准 Raft 规则推进提交
-- 它更像一个“当前阶段先跑通”的实现
-
-所以如果后面你按更标准的方式改这里，README 对应也要一起更新。
-
----
-
-### 8.6 第六步：应用到状态机
-
-提交推进后，`Propose()` 会调用：
-```cpp
-ApplyCommittedEntries()
-```
-
-它会把：
-- 从 `last_applied_ + 1`
-- 到 `commit_index_`
-
-之间的所有日志，按顺序应用到状态机。
-
-最后如果：
-```cpp
-last_applied_ < log_index
-```
-就认为这次提案虽然提交了，但还没有真正 apply 完，返回失败。
-
-否则返回：
-- `status = kOk`
-- `message = "command committed and applied"`
-
-所以在你当前代码里，一次 `Propose()` 成功的定义不是“日志写进 leader 本地”，而是：
-- 复制成功
-- commit 推进成功
-- apply 成功
-
----
-
-## 9. 状态机应用流程
-
-### 9.1 `ApplyCommittedEntries()`
-这个函数是日志和业务状态之间的桥梁。
-
-它的执行步骤是：
-
-1. 先拿 `apply_mu_`
-   - 保证一次只有一个线程在做 apply
-
-2. 循环检查：
-   - 如果 `last_applied_ >= commit_index_`
-   - 说明没有新提交日志需要 apply
-   - 直接返回
-
-3. 取下一条待应用日志：
-```cpp
-apply_index = last_applied_ + 1;
-command_data = log_[apply_index].command;
-```
-
-4. 解读状态机对象：
-```cpp
-state_machine = state_machine_.get();
-```
-
-5. 调用状态机：
-```cpp
-state_machine->Apply(apply_index, command_data)
-```
-
-6. 如果成功，把：
-```cpp
-last_applied_ = apply_index;
-```
-
-7. 然后继续下一条，直到追平 `commit_index_`
-
-这保证了一个很重要的性质：
-- **状态机只会按日志顺序执行**
-- 不会跳着执行，也不会并发执行同一段日志
-
----
-
-### 9.2 `KvStateMachine::Apply()`
-当前状态机很直观：
-
-1. `Command::Deserialize(command_data, &cmd)`
-   - 把日志字符串恢复为业务命令
-
-2. `cmd.IsValid()`
-   - 再做一次校验
-
-3. 加锁保护 `kv_`
-
-4. 根据 `cmd.type` 执行：
-   - `kSet`：
-     ```cpp
-     kv_[cmd.key] = cmd.value;
-     ```
-   - `kDelete`：
-     ```cpp
-     kv_.erase(cmd.key);
-     ```
-
-所以日志真正“落到业务状态”是在这里发生的。
-
----
-
-## 10. `Describe()` 输出该怎么读
-
-`RaftNode::Describe()` 会输出：
-- `node`
-- `role`
-- `term`
-- `voted_for`
-- `leader`
-- `last_log_index`
-- `commit_index`
-- `last_applied`
-- `kv`
-
-这是你当前调试最有价值的观察窗口。
-
-可以这样理解：
-
-### `last_log_index`
-说明日志已经写到哪里了。
-
-### `commit_index`
-说明哪些日志已经“提交”。
-
-### `last_applied`
-说明哪些日志已经真正执行到状态机了。
-
-### `kv`
-说明业务结果是什么。
-
-如果某个时刻：
-- `last_log_index = 10`
-- `commit_index = 8`
-- `last_applied = 8`
 
 说明：
-- 节点本地已经存了 10 条日志
-- 只有前 8 条确认提交
-- 状态机也只执行到第 8 条
-- 第 9 和第 10 条还不能对外当作已生效
+
+- 成为 leader 后取消 election timer。
+- 初始化每个 peer 的复制进度。
+- leader 追加一条 no-op 日志，用于确认当前 term 的领导权。
+- no-op 也会走正常日志复制和 commit 流程。
 
 ---
 
-## 11. `main.cpp` 的测试流程怎么理解
+### 6.5 客户端写入流程
 
-`main.cpp` 当前更像一个“集成联调 demo”，不是完整的故障测试框架。
+核心函数链：
 
-它主要做了这些事：
-
-### 11.1 启动 3 节点集群
-调用 `BuildThreeNodeConfigs()` 生成：
-- node-1: `127.0.0.1:50051`
-- node-2: `127.0.0.1:50052`
-- node-3: `127.0.0.1:50053`
-
-每个节点都有：
-- 选举超时：300~600ms
-- 心跳间隔：100ms
-- RPC 超时：500ms
-
----
-
-### 11.2 等待 leader 出现
-`WaitForLeader()` 会周期性检查 `Describe()` 字符串里是否包含 `role=Leader`。
-
-一旦找到 leader，就开始后面的写入测试。
-
----
-
-### 11.3 正常路径命令测试
-`main.cpp` 会依次测试：
-- `SET x 1`
-- `SET y 2`
-- `SET x 100`
-- `DEL y`
-- `DEL not_exist`
-- `SET z 999`
-- `DEL x`
-- `SET x final`
-
-每次都通过：
-```cpp
-ProposeAndWait(...)
+```text
+RaftNode::Propose(command)
+  -> ValidateCommandUnlocked()
+  -> AppendLocalLogUnlocked(command_data)
+  -> PersistStateLocked()
+  -> ReplicateLogEntryToMajority(log_index)
+  -> AdvanceCommitIndexUnlocked()
+  -> ApplyCommittedEntries()
 ```
-去：
-1. 调用 `leader->Propose(cmd)`
-2. 打印 `ProposeResult`
-3. sleep 一小段时间
-4. 打印所有节点快照
-
-所以你能直接在日志里看到：
-- 哪个节点是 leader
-- 写完后各节点 `last_log_index` 是否一致
-- `commit_index` / `last_applied` 是否一致
-- `kv` 是否一致
-
----
-
-### 11.4 非法请求测试
-#### 空 key 命令
-`SET <empty> bad`
-
-预期：
-- leader 返回 `InvalidCommand`
-
-#### 向 follower 直接提案
-预期：
-- follower 返回 `NotLeader`
-
-这两个测试都能验证：
-- 命令校验是否有效
-- 非 leader 是否正确拒绝写请求
-
----
-
-### 11.5 连续写入测试
-最后会连续写入 `k0 ~ k9`。
-
-这个测试主要验证：
-- 在短时间连续提案时
-- 日志复制、提交和应用链路是否还能保持一致
-
----
-
-## 12. 变量在几个关键阶段的对照
-
-这一节可以当成速查表。
-
----
-
-### 12.1 follower 正常空闲时
-- `role_ = kFollower`
-- `leader_id_` 指向当前 leader
-- `current_term_` 跟随集群最新 term
-- `voted_for_` 可能是 `-1`，也可能是本 term 内投过票的 candidate
-- `commit_index_` / `last_applied_` 随 leader 推进
-
----
-
-### 12.2 发起选举时
-- `role_`：Follower -> Candidate
-- `current_term_++`
-- `voted_for_ = 自己`
-- `leader_id_ = -1`
-- `votes = 1`
-
-这一步最重要的变化就是：
-- 进入新 term
-- 先给自己投一票
-
----
-
-### 12.3 当选 leader 时
-- `role_ = kLeader`
-- `leader_id_ = 自己`
-- `next_index_[peer] = last_log_index + 1`
-- `match_index_[peer] = 0`
-
-这表示：
-- 我现在负责对外提供写入服务
-- 我准备开始维护每个 follower 的复制进度
-
----
-
-### 12.4 leader 接收客户端写请求后
-- `log_` 多一条新日志
-- `match_index_[self] = new_index`
-- `next_index_[self] = new_index + 1`
 
 说明：
-- leader 本地已经先写入这条日志
+
+1. 只有 leader 接收 propose。
+2. 命令序列化后追加到本地 log。
+3. 本地 log 持久化到 segment storage。
+4. leader 尝试复制到多数派。
+5. 多数派成功后推进 commit_index。
+6. committed entry apply 到状态机。
+7. apply 后再次持久化 commit/apply 边界。
 
 ---
 
-### 12.5 follower 复制落后时
-如果某个 follower 回复 `AppendEntries` 失败：
-- `next_index_[peer]--`
+### 6.6 AppendEntries 发送流程
 
-含义是：
-- leader 认为这个 follower 的日志可能更旧
-- 下次从更前面的位置开始尝试对齐
+核心函数链：
 
----
+```text
+RaftNode::SendHeartbeats()
+  -> Replicator::ReplicateOnce(term, target_index=0)
 
-### 12.6 follower 收到 leader 已提交进度后
-如果：
-- `request.leader_commit() > commit_index_`
+RaftNode::ReplicateLogEntryToMajority(log_index)
+  -> Replicator::ReplicateOnce(term, target_index=log_index)
+       -> BuildAppendEntriesRequest()
+       -> RaftNode::AppendEntriesRpc()
+       -> HandleAppendEntriesResponse()
+```
 
-那么 follower 会：
-- 推进自己的 `commit_index_`
-- 再调用 `ApplyCommittedEntries()`
-- 最后把 `last_applied_` 追上来
+Replicator 负责：
 
----
-
-## 13. 当前实现的几个简化点
-
-这一节非常重要，因为它决定了“这份代码现在到了哪个阶段”。
-
-### 13.1 `AdvanceCommitIndexUnlocked()` 还是简化版本
-当前上传代码里，它还没有完全按标准 Raft 的 `match_index_ + 当前 term` 规则推进提交。
-
-所以目前它更像：
-- 先跑通流程的版本
-
-如果你后面把这里改成更标准的版本，README 也要同步更新这一节。
+- 根据 `next_index` 构造 `prev_log_index / prev_log_term`。
+- 最多发送一批日志。
+- 空日志时作为 heartbeat/probe。
+- 控制单 peer in-flight。
+- RPC 失败后退避。
+- 成功后推进 `match_index` 和 `next_index`。
+- 失败后根据 follower `last_log_index` 快速回退 `next_index`。
 
 ---
 
-### 13.2 `ReplicateLogEntryToMajority()` 是同步串行复制
-这让逻辑比较直观，但工程上还比较粗。
+### 6.7 AppendEntries 接收流程
 
-优点：
-- 好理解
-- 好调试
+核心函数链：
 
-缺点：
-- 性能一般
-- 对复杂故障场景处理还不够细
+```text
+RaftServiceImpl::AppendEntries()
+  -> RaftNode::OnAppendEntries()
+       -> term 检查
+       -> BecomeFollowerLocked() if higher term
+       -> prev_log_index / prev_log_term 检查
+       -> 冲突日志截断
+       -> 追加 leader entries
+       -> 更新 commit_index
+       -> PersistStateLocked()
+       -> ApplyCommittedEntries()
+       -> response.success / last_log_index
+```
 
----
+follower 处理规则：
 
-### 13.3 失败回退是简单 `next_index_--`
-当前没有做更完整的冲突优化。
-
-这意味着：
-- 能工作
-- 但在冲突日志很多时效率不高
-
----
-
-### 13.4 还没有持久化
-当前这些状态都还在内存里：
-- `current_term_`
-- `voted_for_`
-- `log_`
-
-所以节点一重启，状态就丢了。
-
-这说明当前代码还处于：
-- **可运行的内存版 Raft**
-而不是完整可恢复版本。
+- leader term 小于本地 term，拒绝。
+- leader term 大于本地 term，转 follower。
+- `prev_log_index / prev_log_term` 不匹配，拒绝并返回本地 `last_log_index`。
+- 发现冲突日志时，截断本地冲突部分。
+- 追加 leader 发送的新日志。
+- 根据 leader commit 更新本地 commit_index。
+- apply committed entries。
 
 ---
 
-### 13.5 `main.cpp` 是 happy path 集成测试，不是完整故障测试
-目前主要测到了：
-- 能选主
-- 能提案
-- 能复制
-- 能提交
-- 能应用
-- 三节点最终 KV 一致
+### 6.8 commit index 推进流程
 
-还没系统测到：
-- leader 宕机切换
-- follower 掉队后追日志
-- 网络分区
-- 节点重启恢复
-- 不同 term 下的复杂冲突
+核心函数链：
 
----
+```text
+Replicator::HandleAppendEntriesResponse()
+  -> 更新 match_index_[peer]
+  -> RaftNode::AdvanceCommitIndexUnlocked()
+       -> 统计每个 candidate index 的 match 数量
+       -> 达到 quorum
+       -> 只提交当前 term 的日志
+       -> commit_index_ 前进
+```
 
-## 14. 建议你如何结合这份 README 看代码
+关键点：
 
-推荐顺序：
-
-### 第一遍：先抓主线
-先看这些函数：
-1. `Start()`
-2. `OnElectionTimeout()`
-3. `StartElection()`
-4. `OnElectionWon()`
-5. `BecomeLeaderLocked()`
-6. `SendHeartbeats()`
-7. `OnAppendEntries()`
-8. `Propose()`
-9. `ApplyCommittedEntries()`
-10. `KvStateMachine::Apply()`
-
-只理解“请求是怎么流动的”，先别纠结细节。
+- commit 必须达到多数派。
+- leader 只通过当前 term 的日志推进 commit，避免旧 term 日志错误提交。
+- commit 后通过 `ApplyCommittedEntries()` 应用到状态机。
 
 ---
 
-### 第二遍：再盯变量变化
-重点盯：
-- `role_`
-- `current_term_`
-- `voted_for_`
-- `leader_id_`
-- `log_`
-- `commit_index_`
-- `last_applied_`
-- `next_index_`
-- `match_index_`
+### 6.9 apply committed logs 流程
 
-每看一个函数，就问自己：
-- 它改了哪些变量？
-- 为什么必须改这些变量？
-- 改完后节点语义发生了什么变化？
+核心函数链：
 
----
+```text
+ApplyCommittedEntries()
+  -> while last_applied_ < commit_index_
+       -> 找到 LogRecord
+       -> 反序列化 Command
+       -> state_machine_->Apply()
+       -> last_applied_++
+       -> PersistStateLocked()
+```
 
-### 第三遍：结合 `main.cpp` 日志看
-当你跑 `main.cpp` 时，重点盯输出中的：
-- `role`
-- `term`
-- `leader`
-- `last_log_index`
-- `commit_index`
-- `last_applied`
-- `kv`
+说明：
 
-你会非常容易把代码和实际运行结果对应起来。
+- no-op 日志不会改变 KV。
+- 普通 `SET / DEL` 命令应用到 `KvStateMachine`。
+- apply 后更新 `last_applied_`。
+- `last_applied_` 会持久化，用于恢复提交边界。
+- 重启时状态机不是直接从 `last_applied_` 恢复，而是从 snapshot 或 0 开始 replay 已提交日志。
 
 ---
 
-## 15. 一句话总结
+### 6.10 snapshot 保存流程
 
-这份项目当前已经实现了一个**最小可运行的 Raft 原型**：
-- 能启动多节点
-- 能选举 leader
-- 能通过 `AppendEntries` 复制日志
-- 能推进提交位置
-- 能把已提交日志应用到 KV 状态机
-- 能在 `main.cpp` 中观察三节点最终状态一致
+核心函数链：
 
-但它仍然保留了一些“当前阶段的简化实现”，例如：
-- commit 推进还可以更标准
-- 复制失败回退还比较粗
-- 没有持久化
-- 测试还偏 happy path
+```text
+ResetSnapshotTimerLocked()
+  -> OnSnapshotTimer()
+  -> MaybeScheduleSnapshotLocked(force_by_timer=true)
+  -> SnapshotWorkerLoop()
+       -> state_machine_->SaveSnapshot(temp_file)
+       -> snapshot_storage_->SaveSnapshotFile(...)
+       -> CompactLogPrefixLocked(last_included_index, term)
+       -> PersistStateLocked()
+       -> snapshot_storage_->PruneSnapshots(max_snapshot_count)
+```
 
-所以最适合把它理解成：
+说明：
 
-> **一个已经跑通主流程、并且适合继续往工业化版本演进的 Raft 基础实现。**
+- snapshot 覆盖 `last_applied_` 之前的状态。
+- snapshot 保存成目录：
+  `snapshot_<index>/data.bin + __raft_snapshot_meta`
+- 保存后裁剪内存日志前缀。
+- 持久化时 segment storage 自动删除不再需要的旧 segment。
+- snapshot storage 自动清理超过保留数量的旧 snapshot。
+
+---
+
+### 6.11 snapshot 启动加载流程
+
+核心函数链：
+
+```text
+RaftNode::RaftNode(...)
+  -> storage_->Load()
+  -> LoadLatestSnapshotOnStartup()
+       -> snapshot_storage_->LoadLatestValidSnapshot()
+       -> state_machine_->LoadSnapshot()
+       -> last_snapshot_index_ = meta.last_included_index
+       -> last_snapshot_term_ = meta.last_included_term
+       -> last_applied_ = last_snapshot_index_
+       -> commit_index_ = max(commit_index_, last_snapshot_index_)
+       -> CompactLogPrefixLocked(...)
+  -> ApplyCommittedEntries()
+```
+
+说明：
+
+- 启动时先加载 Raft log/meta。
+- 再加载最新合法 snapshot。
+- 如果最新 snapshot 损坏，则回退旧 snapshot。
+- 加载 snapshot 后 replay snapshot 之后的 committed tail logs。
+- 这保证 `snapshot + tail logs` 能完整恢复状态机。
+
+---
+
+### 6.12 纯 log 重启恢复流程
+
+如果没有 snapshot，状态机从空开始：
+
+```text
+RaftNode::RaftNode(...)
+  -> storage_->Load()
+       -> current_term_
+       -> voted_for_
+       -> commit_index_
+       -> persisted_last_applied
+       -> log_
+  -> last_applied_ = 0
+  -> ApplyCommittedEntries()
+       -> replay 1..commit_index_
+```
+
+重要点：
+
+- 不能把运行时 `last_applied_` 直接设置为 `persisted_last_applied`。
+- 因为状态机 KV 没有单独持久化，必须 replay log。
+- `persisted_last_applied` 只用于确定已提交边界，不用于跳过状态机 replay。
+
+---
+
+### 6.13 落后 follower 追赶流程
+
+正常批量追赶：
+
+```text
+leader Replicator::ReplicateOnce()
+  -> AppendEntries(prev_log_index, prev_log_term, entries)
+  -> follower OnAppendEntries()
+  -> success
+  -> leader 更新 match_index / next_index
+  -> 继续下一批
+```
+
+日志不匹配：
+
+```text
+follower 返回 success=false + last_log_index
+leader 根据 follower last_log_index + 1 调整 next_index
+继续 probe / append
+```
+
+日志已经被 snapshot 裁剪：
+
+```text
+Replicator::BuildAppendEntriesRequest()
+  -> 发现 next_index <= last_snapshot_index 或 prev_log term 不存在
+  -> should_install_snapshot=true
+  -> RaftNode::SendInstallSnapshotToPeer()
+```
+
+---
+
+### 6.14 InstallSnapshot 流程
+
+leader 侧：
+
+```text
+Replicator::ReplicateOnce()
+  -> should_install_snapshot
+  -> RaftNode::SendInstallSnapshotToPeer(peer_id, term)
+       -> 读取最新 snapshot
+       -> 构造 InstallSnapshotRequest
+       -> InstallSnapshotRpc()
+       -> 成功后更新 next_index / match_index
+```
+
+follower 侧：
+
+```text
+RaftServiceImpl::InstallSnapshot()
+  -> RaftNode::OnInstallSnapshot()
+       -> term 检查
+       -> BecomeFollowerLocked()
+       -> 保存 snapshot data
+       -> state_machine_->LoadSnapshot()
+       -> last_snapshot_index_ / last_snapshot_term_
+       -> commit_index_ / last_applied_
+       -> CompactLogPrefixLocked()
+       -> PersistStateLocked()
+```
+
+安装完成后：
+
+```text
+leader 继续 AppendEntries 复制 snapshot 之后的日志
+```
+
+---
+
+### 6.15 脑裂 / 网络分区下的行为
+
+Raft 处理脑裂依赖三个机制：
+
+```text
+多数派提交
+term 比较
+日志冲突回滚
+```
+
+三节点配置只启动一个节点：
+
+```text
+cluster_size=3
+quorum=2
+只有 1 票
+不能成为 leader
+会一直 Candidate
+每一轮新选举 term + 1
+```
+
+单节点配置只包含 `node.1`：
+
+```text
+cluster_size=1
+quorum=1
+可以自己选自己为 leader
+当选后 term 不应持续增长
+```
+
+如果旧 leader 被隔离在少数派：
+
+```text
+旧 leader 可能短时间认为自己是 leader
+但拿不到多数派，不能 commit
+多数派分区会选出新 leader
+网络恢复后旧 leader 收到更高 term，退回 follower
+未提交冲突日志被新 leader 覆盖
+```
+
+注意：未来实现 `Get` 时不能直接从旧 leader 本地读，否则有 stale read 风险。需要 ReadIndex 或 no-op read。
+
+---
+
+## 7. 构建与运行
+
+### 7.1 低并发构建
+
+如果机器 CPU / 内存容易被 Ninja 打满，建议使用：
+
+```bash
+cmake -S . -B build \
+  -DRAFT_BUILD_JOBS=1 \
+  -DRAFT_LINK_JOBS=1 \
+  -DRAFT_PROTO_JOBS=1
+
+cmake --build build --parallel 1
+```
+
+### 7.2 运行三节点集群
+
+`config.txt` 示例：
+
+```text
+node_id=1
+
+node.1=127.0.0.1:50051
+node.2=127.0.0.1:50052
+node.3=127.0.0.1:50053
+
+data_root=./raft_data
+snapshot_root=./raft_snapshots
+
+election_timeout_min_ms=800
+election_timeout_max_ms=1600
+heartbeat_interval_ms=150
+rpc_deadline_ms=500
+
+snapshot_enabled=true
+snapshot_log_threshold=30
+snapshot_interval_ms=600000
+snapshot_max_count=5
+snapshot_load_on_startup=true
+snapshot_file_prefix=snapshot
+
+describe_interval_ms=5000
+```
+
+启动：
+
+```bash
+./build/raft_demo ./config.txt 1
+./build/raft_demo ./config.txt 2
+./build/raft_demo ./config.txt 3
+```
+
+### 7.3 运行单节点集群
+
+如果只想测试单节点模式，配置中只保留：
+
+```text
+node_id=1
+node.1=127.0.0.1:50051
+```
+
+此时应看到：
+
+```text
+cluster_size=1, quorum=1
+start election, term=1
+won election, become leader, term=1
+```
+
+后续 term 不应继续增长。
+
+---
+
+## 8. 测试
+
+查看全部测试：
+
+```bash
+ctest --test-dir build -N
+```
+
+跑全部测试：
+
+```bash
+ctest --test-dir build --output-on-failure -j1
+```
+
+按类别运行：
+
+```bash
+ctest --test-dir build -R CommandTest --output-on-failure -j1
+ctest --test-dir build -R KvStateMachineTest --output-on-failure -j1
+ctest --test-dir build -R RaftElectionTest --output-on-failure -j1
+ctest --test-dir build -R RaftLogReplicationTest --output-on-failure -j1
+ctest --test-dir build -R RaftCommitApplyTest --output-on-failure -j1
+ctest --test-dir build -R PersistenceTest --output-on-failure -j1
+ctest --test-dir build -R RaftSnapshot --output-on-failure -j1
+ctest --test-dir build -R RaftSegmentStorageTest --output-on-failure -j1
+ctest --test-dir build -R SnapshotStorageReliabilityTest --output-on-failure -j1
+ctest --test-dir build -R RaftReplicatorBehaviorTest --output-on-failure -j1
+```
+
+保留测试数据：
+
+```bash
+RAFT_TEST_KEEP_DATA=1 ctest --test-dir build -R RaftSnapshot --output-on-failure -j1
+```
+
+测试数据位置：
+
+```text
+build/tests/raft_test_data/
+```
+
+---
+
+## 9. 持久化文件说明
+
+### 9.1 Raft data
+
+```text
+raft_data/node_1/
+  meta.bin
+  log/
+    segment_00000000000000000001.log
+    segment_00000000000000000513.log
+```
+
+`meta.bin` 保存：
+
+```text
+current_term
+voted_for
+commit_index
+last_applied
+first_log_index
+last_log_index
+log_count
+```
+
+`segment_*.log` 保存：
+
+```text
+record header
+record data
+checksum
+```
+
+### 9.2 Snapshot
+
+```text
+raft_snapshots/node_1/
+  snapshot_00000000000000000120/
+    data.bin
+    __raft_snapshot_meta
+```
+
+`data.bin` 是状态机 snapshot 数据。
+
+`__raft_snapshot_meta` 保存：
+
+```text
+last_included_index
+last_included_term
+created_unix_ms
+data_file_name
+data_checksum
+```
+
+---
+
+## 10. 后续开发建议
+
+当前 Raft 内核已经基本完成实验级能力。后续更适合转向应用层：
+
+### 10.1 对外 KV Service
+
+新增：
+
+```text
+KvService.Put
+KvService.Get
+KvService.Delete
+```
+
+第一版：
+
+- Put/Delete 只允许 leader 处理。
+- follower 返回 leader_id。
+- Get 第一版可以只允许 leader 读。
+- 后续补 ReadIndex 保证线性一致读。
+
+### 10.2 File Storage
+
+不要把大文件内容写入 Raft log。推荐：
+
+```text
+Raft 保存 file metadata
+StorageNode 保存 chunk data
+```
+
+新增：
+
+```text
+FileStorage
+StorageService.StoreChunk
+StorageService.ReadChunk
+StorageService.DeleteChunk
+FileService.PutFile
+FileService.GetFile
+```
+
+### 10.3 Meta / Manager
+
+多 RaftGroup 后再引入 Meta：
+
+```text
+object/key -> slot -> group
+group -> leader/node list
+```
+
+Meta 只管路由和状态，不传输用户数据。
+
+---
+
+## 11. 当前关键约束
+
+- 不要把大文件内容直接放入 Raft log。
+- Raft log 只适合复制小命令或元数据。
+- 写请求必须多数派 commit 后才能返回成功。
+- 读请求未来需要 ReadIndex / no-op read，避免旧 leader stale read。
+- membership 不能根据“当前连得上的节点数”动态变化。
+- 三节点配置只启动一个节点时，不应该成为 leader。
+- 单节点配置可以自己成为 leader。
+- snapshot 删除只删除已经被覆盖的旧日志或旧 snapshot，不要删除仍可能用于恢复/追赶的日志。
