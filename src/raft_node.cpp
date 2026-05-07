@@ -5,8 +5,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <optional>
 #include <limits>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "raft/logging.h"
+#include "raft/kv_service_impl.h"
 #include "raft/raft_service_impl.h"
 #include "raft/replicator.h"
 #include "raft/state_machine.h"
@@ -27,6 +29,7 @@ namespace raftdemo
 
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
     constexpr const char *kSnapshotMarkerCommand = "snapshot";
+    constexpr const char *kIdentityFileName = "node_identity.txt";
 
     std::uint64_t SafeAddOne(std::uint64_t value)
     {
@@ -43,6 +46,44 @@ namespace raftdemo
     std::string DefaultSnapshotDir(int node_id)
     {
       return "./raft_snapshots/node_" + std::to_string(node_id);
+    }
+
+    std::string Trim(std::string text)
+    {
+      const auto first = text.find_first_not_of(" \t\r\n");
+      if (first == std::string::npos)
+      {
+        return "";
+      }
+      const auto last = text.find_last_not_of(" \t\r\n");
+      return text.substr(first, last - first + 1);
+    }
+
+    std::map<std::string, std::string> ReadIdentityFile(const std::filesystem::path &path)
+    {
+      std::ifstream in(path);
+      if (!in.is_open())
+      {
+        throw std::runtime_error("failed to open identity file: " + path.string());
+      }
+
+      std::map<std::string, std::string> values;
+      std::string line;
+      while (std::getline(in, line))
+      {
+        line = Trim(line);
+        if (line.empty())
+        {
+          continue;
+        }
+        const auto pos = line.find('=');
+        if (pos == std::string::npos)
+        {
+          throw std::runtime_error("invalid identity line: " + line);
+        }
+        values.emplace(Trim(line.substr(0, pos)), Trim(line.substr(pos + 1)));
+      }
+      return values;
     }
 
   } // namespace
@@ -67,7 +108,8 @@ namespace raftdemo
       : config_(std::move(config)),
         snapshot_config_(std::move(snapshot_config)),
         rng_(std::random_device{}()),
-        state_machine_(std::move(state_machine))
+        state_machine_(std::move(state_machine)),
+        rpc_metrics_(BuildRpcMetricStateTemplate())
   {
     if (config_.data_dir.empty())
     {
@@ -78,6 +120,8 @@ namespace raftdemo
     {
       snapshot_config_.snapshot_dir = DefaultSnapshotDir(config_.node_id);
     }
+
+    ValidateNodeIdentity();
 
     storage_ = CreateFileRaftStorage(config_.data_dir);
     snapshot_storage_ = CreateFileSnapshotStorage(snapshot_config_.snapshot_dir,
@@ -234,13 +278,62 @@ namespace raftdemo
     }
   }
 
+  void RaftNode::ValidateNodeIdentity()
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(config_.data_dir, ec);
+    if (ec)
+    {
+      throw std::runtime_error("failed to create data directory " + config_.data_dir +
+                               ": " + ec.message());
+    }
+
+    const std::filesystem::path identity_path =
+        std::filesystem::path(config_.data_dir) / kIdentityFileName;
+
+    if (std::filesystem::exists(identity_path, ec))
+    {
+      const auto values = ReadIdentityFile(identity_path);
+      const auto node_id_it = values.find("node_id");
+      if (node_id_it == values.end())
+      {
+        throw std::runtime_error("identity file missing node_id: " + identity_path.string());
+      }
+
+      const int stored_node_id = std::stoi(node_id_it->second);
+      if (stored_node_id != config_.node_id)
+      {
+        throw std::runtime_error("data directory identity mismatch: data_dir=" + config_.data_dir +
+                                 ", expected node_id=" + std::to_string(config_.node_id) +
+                                 ", found node_id=" + std::to_string(stored_node_id));
+      }
+      return;
+    }
+
+    std::ofstream out(identity_path, std::ios::trunc);
+    if (!out.is_open())
+    {
+      throw std::runtime_error("failed to create identity file: " + identity_path.string());
+    }
+
+    out << "node_id=" << config_.node_id << '\n';
+    out << "address=" << config_.address << '\n';
+    out.flush();
+    if (!out)
+    {
+      throw std::runtime_error("failed to write identity file: " + identity_path.string());
+    }
+  }
+
   void RaftNode::InitServer()
   {
     service_ = std::make_unique<RaftServiceImpl>(*this);
+    kv_service_ = std::make_unique<KvServiceImpl>(*this);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(config_.address, grpc::InsecureServerCredentials());
     builder.RegisterService(service_.get());
+    builder.RegisterService(kv_service_.get());
     server_ = builder.BuildAndStart();
     if (!server_)
     {
@@ -278,19 +371,118 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
   return raw;
 }
 
-  std::string RaftNode::Describe() const
+  bool RaftNode::IsRunning() const
+  {
+    return running_.load();
+  }
+
+  bool RaftNode::ValidateKey(const std::string &key, std::string *reason) const
   {
     std::lock_guard<std::mutex> lk(mu_);
+    return ValidateKeyUnlocked(key, reason);
+  }
+
+  bool RaftNode::ValidateValue(const std::string &value, std::string *reason) const
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    return ValidateValueUnlocked(value, reason);
+  }
+
+  NodeStatusSnapshot RaftNode::GetStatusSnapshot() const
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+
+    NodeStatusSnapshot snapshot;
+    snapshot.node_id = config_.node_id;
+    snapshot.address = config_.address;
+    snapshot.role = RoleName(role_);
+    snapshot.term = current_term_;
+    snapshot.leader_id = leader_id_;
+    snapshot.leader_address = AddressForNodeLocked(leader_id_);
+    snapshot.commit_index = commit_index_;
+    snapshot.last_applied = last_applied_;
+    snapshot.last_log_index = LastLogIndexLocked();
+    snapshot.snapshot_index = last_snapshot_index_;
+
+    snapshot.peers.reserve(config_.peers.size());
+    for (const auto &peer : config_.peers)
+    {
+      PeerReplicationStatus peer_status;
+      peer_status.peer_id = peer.node_id;
+      peer_status.address = peer.address;
+      if (const auto match_it = match_index_.find(peer.node_id); match_it != match_index_.end())
+      {
+        peer_status.match_index = match_it->second;
+      }
+      if (const auto next_it = next_index_.find(peer.node_id); next_it != next_index_.end())
+      {
+        peer_status.next_index = next_it->second;
+      }
+      snapshot.peers.push_back(std::move(peer_status));
+    }
+
+    return snapshot;
+  }
+
+  NodeMetricsSnapshot RaftNode::GetMetricsSnapshot() const
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+
+    NodeMetricsSnapshot snapshot;
+    snapshot.propose_success_count = propose_success_count_;
+    snapshot.propose_failure_count = propose_failure_count_;
+    snapshot.election_count = election_count_;
+    snapshot.leader_change_count = leader_change_count_;
+    snapshot.snapshot_success_count = snapshot_success_count_;
+    snapshot.snapshot_failure_count = snapshot_failure_count_;
+    snapshot.storage_persist_failure_count = storage_persist_failure_count_;
+    snapshot.rpc_metrics.reserve(rpc_metrics_.size());
+    for (const auto &metric : rpc_metrics_)
+    {
+      snapshot.rpc_metrics.push_back(RpcMetricsSnapshot{
+          metric.name,
+          metric.success_count,
+          metric.failure_count,
+          metric.total_latency_us,
+          metric.max_latency_us,
+      });
+    }
+    return snapshot;
+  }
+
+  std::string RaftNode::Describe() const
+  {
+    const NodeStatusSnapshot status = GetStatusSnapshot();
     std::ostringstream oss;
-    oss << "node=" << config_.node_id
-        << ", role=" << RoleName(role_)
-        << ", term=" << current_term_
-        << ", voted_for=" << voted_for_
-        << ", leader=" << leader_id_
-        << ", last_log_index=" << LastLogIndexLocked()
-        << ", commit_index=" << commit_index_
-        << ", last_applied=" << last_applied_
-        << ", last_snapshot_index=" << last_snapshot_index_;
+    oss << "node=" << status.node_id
+        << ", role=" << status.role
+        << ", term=" << status.term;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      oss << ", voted_for=" << voted_for_;
+    }
+    oss << ", leader=" << status.leader_id
+        << ", leader_address=" << status.leader_address
+        << ", last_log_index=" << status.last_log_index
+        << ", commit_index=" << status.commit_index
+        << ", last_applied=" << status.last_applied
+        << ", last_snapshot_index=" << status.snapshot_index;
+
+    if (!status.peers.empty())
+    {
+      oss << ", peers=[";
+      for (std::size_t i = 0; i < status.peers.size(); ++i)
+      {
+        if (i > 0)
+        {
+          oss << "; ";
+        }
+        oss << status.peers[i].peer_id
+            << "(match=" << status.peers[i].match_index
+            << ",next=" << status.peers[i].next_index << ")";
+      }
+      oss << "]";
+    }
 
     const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
     if (kv_sm != nullptr)
@@ -452,6 +644,8 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
   void RaftNode::StartElection()
   {
+    RecordElectionStarted();
+
     std::uint64_t term = 0;
     std::uint64_t last_log_index = 0;
     std::uint64_t last_log_term = 0;
@@ -643,6 +837,7 @@ void RaftNode::SendHeartbeats()
   {
     const auto old_role = role_;
     const auto old_term = current_term_;
+    const auto old_leader_id = leader_id_;
     bool hard_state_changed = false;
 
     if (new_term > current_term_)
@@ -654,6 +849,7 @@ void RaftNode::SendHeartbeats()
 
     role_ = Role::kFollower;
     leader_id_ = new_leader;
+    MaybeRecordLeaderChangeLocked(old_leader_id, leader_id_);
 
     if (heartbeat_timer_id_)
     {
@@ -685,8 +881,10 @@ void RaftNode::SendHeartbeats()
 
   void RaftNode::BecomeLeaderLocked()
   {
+    const auto old_leader_id = leader_id_;
     role_ = Role::kLeader;
     leader_id_ = config_.node_id;
+    MaybeRecordLeaderChangeLocked(old_leader_id, leader_id_);
 
     CancelElectionTimerLocked();
 
@@ -870,6 +1068,7 @@ void RaftNode::SendHeartbeats()
       return std::nullopt;
     }
 
+    const auto start = std::chrono::steady_clock::now();
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + config_.rpc_deadline);
 
@@ -882,8 +1081,14 @@ void RaftNode::SendHeartbeats()
 
     if (!status.ok())
     {
+      RecordRpcLatency(RpcKind::kRequestVote, false,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start));
       return std::nullopt;
     }
+    RecordRpcLatency(RpcKind::kRequestVote, true,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start));
     return response;
   }
 
@@ -896,6 +1101,7 @@ void RaftNode::SendHeartbeats()
       return std::nullopt;
     }
 
+    const auto start = std::chrono::steady_clock::now();
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + config_.rpc_deadline);
 
@@ -908,8 +1114,14 @@ void RaftNode::SendHeartbeats()
 
     if (!status.ok())
     {
+      RecordRpcLatency(RpcKind::kAppendEntries, false,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start));
       return std::nullopt;
     }
+    RecordRpcLatency(RpcKind::kAppendEntries, true,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start));
     return response;
   }
 
@@ -922,6 +1134,7 @@ void RaftNode::SendHeartbeats()
       return std::nullopt;
     }
 
+    const auto start = std::chrono::steady_clock::now();
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + config_.rpc_deadline * 20);
 
@@ -934,8 +1147,14 @@ void RaftNode::SendHeartbeats()
 
     if (!status.ok())
     {
+      RecordRpcLatency(RpcKind::kInstallSnapshot, false,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start));
       return std::nullopt;
     }
+    RecordRpcLatency(RpcKind::kInstallSnapshot, true,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start));
     return response;
   }
 
@@ -1404,6 +1623,139 @@ void RaftNode::SendHeartbeats()
     return "Unknown";
   }
 
+  const char *RaftNode::RpcKindName(RpcKind kind)
+  {
+    switch (kind)
+    {
+    case RpcKind::kRequestVote:
+      return "request_vote";
+    case RpcKind::kAppendEntries:
+      return "append_entries";
+    case RpcKind::kInstallSnapshot:
+      return "install_snapshot";
+    case RpcKind::kKvPut:
+      return "kv_put";
+    case RpcKind::kKvDelete:
+      return "kv_delete";
+    case RpcKind::kKvGet:
+      return "kv_get";
+    case RpcKind::kKvStatus:
+      return "kv_status";
+    case RpcKind::kKvHealth:
+      return "kv_health";
+    case RpcKind::kKvMetrics:
+      return "kv_metrics";
+    }
+    return "unknown";
+  }
+
+  std::vector<RaftNode::RpcMetricState> RaftNode::BuildRpcMetricStateTemplate()
+  {
+    std::vector<RpcMetricState> metrics;
+    metrics.reserve(9);
+    for (const RpcKind kind : {
+             RpcKind::kRequestVote,
+             RpcKind::kAppendEntries,
+             RpcKind::kInstallSnapshot,
+             RpcKind::kKvPut,
+             RpcKind::kKvDelete,
+             RpcKind::kKvGet,
+             RpcKind::kKvStatus,
+             RpcKind::kKvHealth,
+             RpcKind::kKvMetrics,
+         })
+    {
+      metrics.push_back(RpcMetricState{RpcKindName(kind), 0, 0, 0, 0});
+    }
+    return metrics;
+  }
+
+  RaftNode::RpcMetricState &RaftNode::RpcMetricLocked(RpcKind kind)
+  {
+    return rpc_metrics_.at(static_cast<std::size_t>(kind));
+  }
+
+  std::string RaftNode::AddressForNodeLocked(int node_id) const
+  {
+    if (node_id == config_.node_id)
+    {
+      return config_.address;
+    }
+    for (const auto &peer : config_.peers)
+    {
+      if (peer.node_id == node_id)
+      {
+        return peer.address;
+      }
+    }
+    return "";
+  }
+
+  void RaftNode::MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id)
+  {
+    if (old_leader_id == new_leader_id || new_leader_id < 0)
+    {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    ++leader_change_count_;
+  }
+
+  void RaftNode::RecordProposeResult(bool success)
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    if (success)
+    {
+      ++propose_success_count_;
+    }
+    else
+    {
+      ++propose_failure_count_;
+    }
+  }
+
+  void RaftNode::RecordElectionStarted()
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    ++election_count_;
+  }
+
+  void RaftNode::RecordRpcLatency(RpcKind kind, bool success, std::chrono::microseconds latency)
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    auto &metric = RpcMetricLocked(kind);
+    if (success)
+    {
+      ++metric.success_count;
+    }
+    else
+    {
+      ++metric.failure_count;
+    }
+    const auto latency_us = static_cast<std::uint64_t>(std::max<std::int64_t>(0, latency.count()));
+    metric.total_latency_us += latency_us;
+    metric.max_latency_us = std::max(metric.max_latency_us, latency_us);
+  }
+
+  void RaftNode::RecordSnapshotOutcome(bool success)
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    if (success)
+    {
+      ++snapshot_success_count_;
+    }
+    else
+    {
+      ++snapshot_failure_count_;
+    }
+  }
+
+  void RaftNode::RecordStoragePersistFailure()
+  {
+    std::lock_guard<std::mutex> lk(metrics_mu_);
+    ++storage_persist_failure_count_;
+  }
+
   ProposeResult RaftNode::Propose(const Command &command)
   {
     ProposeResult result;
@@ -1421,6 +1773,7 @@ void RaftNode::SendHeartbeats()
         result.leader_id = leader_id_;
         result.term = current_term_;
         result.message = "node is stopping";
+        RecordProposeResult(false);
         return result;
       }
 
@@ -1430,6 +1783,7 @@ void RaftNode::SendHeartbeats()
         result.leader_id = leader_id_;
         result.term = current_term_;
         result.message = "node is not the leader";
+        RecordProposeResult(false);
         return result;
       }
 
@@ -1439,6 +1793,7 @@ void RaftNode::SendHeartbeats()
         result.leader_id = config_.node_id;
         result.term = current_term_;
         result.message = reason;
+        RecordProposeResult(false);
         return result;
       }
 
@@ -1450,6 +1805,7 @@ void RaftNode::SendHeartbeats()
         result.leader_id = config_.node_id;
         result.term = current_term_;
         result.message = "failed to serialize command";
+        RecordProposeResult(false);
         return result;
       }
 
@@ -1462,6 +1818,7 @@ void RaftNode::SendHeartbeats()
         result.leader_id = config_.node_id;
         result.term = current_term_;
         result.message = "failed to append and persist local log entry";
+        RecordProposeResult(false);
         return result;
       }
 
@@ -1493,6 +1850,7 @@ void RaftNode::SendHeartbeats()
         result.status = ProposeStatus::kReplicationFailed;
         result.message = "failed to replicate log entry to majority";
       }
+      RecordProposeResult(false);
       return result;
     }
 
@@ -1507,6 +1865,7 @@ void RaftNode::SendHeartbeats()
     {
       result.status = ProposeStatus::kApplyFailed;
       result.message = apply_result.message;
+      RecordProposeResult(false);
       return result;
     }
 
@@ -1516,12 +1875,14 @@ void RaftNode::SendHeartbeats()
       {
         result.status = ProposeStatus::kApplyFailed;
         result.message = "log committed but not applied";
+        RecordProposeResult(false);
         return result;
       }
     }
 
     result.status = ProposeStatus::kOk;
     result.message = "command committed and applied";
+    RecordProposeResult(true);
     return result;
   }
 
@@ -1529,11 +1890,23 @@ void RaftNode::SendHeartbeats()
   {
     if (!command.IsValid())
     {
-      *reason = "Invalid command";
+      if (reason != nullptr)
+      {
+        *reason = "invalid command";
+      }
       return false;
     }
-    // 2. 限制命令大小，避免异常大 payload 进入日志
-    constexpr std::size_t kMaxCommandBytes = 1024 * 1024;
+
+    if (!ValidateKeyUnlocked(command.key, reason))
+    {
+      return false;
+    }
+
+    if (command.type == CommandType::kSet && !ValidateValueUnlocked(command.value, reason))
+    {
+      return false;
+    }
+
     const std::string serialized = command.Serialize();
     if (serialized.empty())
     {
@@ -1543,11 +1916,61 @@ void RaftNode::SendHeartbeats()
       }
       return false;
     }
-    if (serialized.size() > kMaxCommandBytes)
+    if (serialized.size() > config_.kv_limits.max_command_bytes)
     {
       if (reason != nullptr)
       {
         *reason = "command size exceeds limit";
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool RaftNode::ValidateKeyUnlocked(const std::string &key, std::string *reason) const
+  {
+    if (key.empty())
+    {
+      if (reason != nullptr)
+      {
+        *reason = "key must not be empty";
+      }
+      return false;
+    }
+    if (key.find('|') != std::string::npos)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "key must not contain '|'";
+      }
+      return false;
+    }
+    if (key.size() > config_.kv_limits.max_key_bytes)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "key size exceeds limit";
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool RaftNode::ValidateValueUnlocked(const std::string &value, std::string *reason) const
+  {
+    if (value.find('|') != std::string::npos)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "value must not contain '|'";
+      }
+      return false;
+    }
+    if (value.size() > config_.kv_limits.max_value_bytes)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "value size exceeds limit";
       }
       return false;
     }
@@ -1967,6 +2390,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
 
       if (!save_result.Ok())
       {
+        RecordSnapshotOutcome(false);
         Log(NodeTag(config_.node_id), "save state machine snapshot failed: ", save_result.message);
       }
       else
@@ -1998,9 +2422,11 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
 
           Log(NodeTag(config_.node_id), "snapshot saved: ", meta.snapshot_path,
               ", index=", snapshot_index, ", term=", snapshot_term);
+          RecordSnapshotOutcome(true);
         }
         else
         {
+          RecordSnapshotOutcome(false);
           Log(NodeTag(config_.node_id), "persist snapshot file failed: ", error);
         }
       }
@@ -2034,7 +2460,12 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
     state.commit_index = commit_index_;
     state.last_applied = last_applied_;
     state.log = log_;
-    return storage_->Save(state, reason);
+    const bool ok = storage_->Save(state, reason);
+    if (!ok)
+    {
+      RecordStoragePersistFailure();
+    }
+    return ok;
   }
 
   bool RaftNode::ProposeNoOpEntry()

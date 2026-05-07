@@ -1,10 +1,19 @@
 # CQUPT_Raft 项目说明
 
+禁止读.gitignore文件下面的文件夹里面的任何文件
+禁止读 {
+  vcpkg-configuration.json
+  CQUPT_Raft_AI_Context.md
+  README.md
+  /deploy
+}
+
+
 这是一个基于 C++20、gRPC、Protobuf、GoogleTest 的 Raft KV 存储内核项目。
 
 当前重点是 Raft 内核：选举、日志复制、提交应用、持久化、快照、落后节点追赶和重启恢复。暂时还不是完整的对外 KV 服务或分布式存储系统。
 
-禁止读.gitignore文件下面的文件夹里面的任何文件
+
 
 ## 主要目录
 

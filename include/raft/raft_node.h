@@ -11,6 +11,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +30,7 @@ namespace raftdemo
 {
 
   class RaftServiceImpl;
+  class KvServiceImpl;
   class Replicator;
 
   enum class Role
@@ -43,6 +45,50 @@ namespace raftdemo
     std::uint64_t index;
     std::uint64_t term;
     std::string command;
+  };
+
+  struct PeerReplicationStatus
+  {
+    int peer_id{0};
+    std::string address;
+    std::uint64_t match_index{0};
+    std::uint64_t next_index{0};
+  };
+
+  struct RpcMetricsSnapshot
+  {
+    std::string name;
+    std::uint64_t success_count{0};
+    std::uint64_t failure_count{0};
+    std::uint64_t total_latency_us{0};
+    std::uint64_t max_latency_us{0};
+  };
+
+  struct NodeMetricsSnapshot
+  {
+    std::uint64_t propose_success_count{0};
+    std::uint64_t propose_failure_count{0};
+    std::uint64_t election_count{0};
+    std::uint64_t leader_change_count{0};
+    std::uint64_t snapshot_success_count{0};
+    std::uint64_t snapshot_failure_count{0};
+    std::uint64_t storage_persist_failure_count{0};
+    std::vector<RpcMetricsSnapshot> rpc_metrics;
+  };
+
+  struct NodeStatusSnapshot
+  {
+    int node_id{0};
+    std::string address;
+    std::string role;
+    std::uint64_t term{0};
+    int leader_id{-1};
+    std::string leader_address;
+    std::uint64_t commit_index{0};
+    std::uint64_t last_applied{0};
+    std::uint64_t last_log_index{0};
+    std::uint64_t snapshot_index{0};
+    std::vector<PeerReplicationStatus> peers;
   };
 
   class RaftNode : public std::enable_shared_from_this<RaftNode>
@@ -68,6 +114,11 @@ namespace raftdemo
     std::string Describe() const;
     ProposeResult Propose(const Command &command);
     bool DebugGetValue(const std::string &key, std::string *value) const;
+    bool ValidateKey(const std::string &key, std::string *reason) const;
+    bool ValidateValue(const std::string &value, std::string *reason) const;
+    NodeStatusSnapshot GetStatusSnapshot() const;
+    NodeMetricsSnapshot GetMetricsSnapshot() const;
+    bool IsRunning() const;
 
   private:
     enum class ReplicationOutcome
@@ -87,7 +138,31 @@ namespace raftdemo
       std::mutex mu;
     };
 
+    enum class RpcKind : std::uint8_t
+    {
+      kRequestVote,
+      kAppendEntries,
+      kInstallSnapshot,
+      kKvPut,
+      kKvDelete,
+      kKvGet,
+      kKvStatus,
+      kKvHealth,
+      kKvMetrics,
+    };
+
+    struct RpcMetricState
+    {
+      std::string name;
+      std::uint64_t success_count{0};
+      std::uint64_t failure_count{0};
+      std::uint64_t total_latency_us{0};
+      std::uint64_t max_latency_us{0};
+    };
+
     friend class Replicator;
+    friend class RaftServiceImpl;
+    friend class KvServiceImpl;
 
     void InitServer();
     void InitClients();
@@ -136,12 +211,25 @@ namespace raftdemo
     static const char *RoleName(Role role);
 
     bool ValidateCommandUnlocked(const Command &command, std::string *reason) const;
+    bool ValidateKeyUnlocked(const std::string &key, std::string *reason) const;
+    bool ValidateValueUnlocked(const std::string &value, std::string *reason) const;
     std::uint64_t AppendLocalLogUnlocked(const std::string &command_data);
     ReplicationOutcome ReplicateLogEntryToMajority(std::uint64_t log_index);
     void AdvanceCommitIndexUnlocked();
     ApplyResult ApplyCommittedEntries();
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
+    std::string AddressForNodeLocked(int node_id) const;
+    void MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id);
+    void RecordProposeResult(bool success);
+    void RecordElectionStarted();
+    void RecordRpcLatency(RpcKind kind, bool success, std::chrono::microseconds latency);
+    void RecordSnapshotOutcome(bool success);
+    void RecordStoragePersistFailure();
+    static const char *RpcKindName(RpcKind kind);
+    static std::vector<RpcMetricState> BuildRpcMetricStateTemplate();
+    RpcMetricState &RpcMetricLocked(RpcKind kind);
+    void ValidateNodeIdentity();
 
     void StartSnapshotWorker();
     void StopSnapshotWorker();
@@ -182,6 +270,7 @@ namespace raftdemo
     std::atomic<bool> running_{false};
 
     std::unique_ptr<RaftServiceImpl> service_;
+    std::unique_ptr<KvServiceImpl> kv_service_;
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
@@ -197,6 +286,16 @@ namespace raftdemo
     bool snapshot_in_progress_{false};
     std::uint64_t pending_snapshot_index_{0};
     std::uint64_t pending_snapshot_term_{0};
+
+    mutable std::mutex metrics_mu_;
+    std::uint64_t propose_success_count_{0};
+    std::uint64_t propose_failure_count_{0};
+    std::uint64_t election_count_{0};
+    std::uint64_t leader_change_count_{0};
+    std::uint64_t snapshot_success_count_{0};
+    std::uint64_t snapshot_failure_count_{0};
+    std::uint64_t storage_persist_failure_count_{0};
+    std::vector<RpcMetricState> rpc_metrics_;
   };
 
 } // namespace raftdemo

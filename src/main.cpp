@@ -195,6 +195,13 @@ namespace raftdemo
             config.rpc_deadline =
                 std::chrono::milliseconds(GetInt(kv, "rpc_deadline_ms", 500));
 
+            config.kv_limits.max_key_bytes =
+                static_cast<std::size_t>(GetInt(kv, "kv_max_key_bytes", 256));
+            config.kv_limits.max_value_bytes =
+                static_cast<std::size_t>(GetInt(kv, "kv_max_value_bytes", 64 * 1024));
+            config.kv_limits.max_command_bytes =
+                static_cast<std::size_t>(GetInt(kv, "kv_max_command_bytes", 1024 * 1024));
+
             const std::filesystem::path config_dir =
                 config_path.has_parent_path() ? config_path.parent_path() : std::filesystem::current_path();
 
@@ -254,6 +261,9 @@ namespace raftdemo
             }
 
             Log("raft-node-main", "data_dir=", node_config.data_dir);
+            Log("raft-node-main", "kv_max_key_bytes=", node_config.kv_limits.max_key_bytes,
+                ", kv_max_value_bytes=", node_config.kv_limits.max_value_bytes,
+                ", kv_max_command_bytes=", node_config.kv_limits.max_command_bytes);
             Log("raft-node-main", "snapshot_enabled=", snapshot_config.enabled ? "true" : "false");
             Log("raft-node-main", "snapshot_dir=", snapshot_config.snapshot_dir);
         }
@@ -284,6 +294,13 @@ int main(int argc, char **argv)
         }
 
         const auto kv = LoadKeyValueConfig(config_path);
+        const std::string log_level_text = GetString(kv, "log_level", "info");
+        LogLevel log_level = LogLevel::kInfo;
+        if (!TryParseLogLevel(log_level_text, &log_level))
+        {
+            throw std::runtime_error("invalid log_level: " + log_level_text);
+        }
+        SetGlobalLogLevel(log_level);
         NodeConfig node_config = BuildNodeConfig(kv, node_id_override, config_path);
         snapshotConfig snapshot_config =
             BuildSnapshotConfig(kv, node_config.node_id, config_path);

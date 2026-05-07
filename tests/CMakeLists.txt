@@ -50,6 +50,7 @@ add_raft_gtest(test_command test_command.cpp)
 add_raft_gtest(test_state_machine test_state_machine.cpp)
 add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp)
 add_raft_gtest(test_thread_pool test_thread_pool.cpp)
+add_raft_gtest(test_kv_service test_kv_service.cpp)
 
 # =========================
 # Basic Raft behavior tests

@@ -118,6 +118,7 @@ add_library(raft_core
   src/command.cpp
   src/raft_node.cpp
   src/raft_service_impl.cpp
+  src/kv_service_impl.cpp
   src/state_machine.cpp
   src/raft_storage.cpp
   src/snapshot_storage.cpp
@@ -143,6 +144,15 @@ add_executable(raft_demo
 target_link_libraries(raft_demo
   PRIVATE
     raft_core
+)
+
+add_executable(raft_kv_client
+  src/raft_kv_client.cpp
+)
+
+target_link_libraries(raft_kv_client
+  PRIVATE
+    raft_proto
 )
 
 enable_testing()

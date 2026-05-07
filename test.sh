@@ -15,6 +15,7 @@ set -Eeuo pipefail
 # Groups:
 #   unit
 #   snapshot-storage
+#   kv-service
 #   segment-basic
 #   election
 #   replication
@@ -141,6 +142,9 @@ run_group_by_name() {
     snapshot-storage)
       run_ctest_group "snapshot-storage" "^SnapshotStorageReliabilityTest\."
       ;;
+    kv-service)
+      run_ctest_group "kv-service" "^RaftKvServiceTest\."
+      ;;
     segment-basic)
       run_ctest_group "segment-basic" "^RaftSegmentStorageTest\.(WritesMultipleSegmentFilesUnderBuildDirectory|AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave)$"
       ;;
@@ -177,6 +181,7 @@ run_group_by_name() {
     all)
       run_group_by_name unit
       run_group_by_name snapshot-storage
+      run_group_by_name kv-service
       run_group_by_name segment-basic
       run_group_by_name election
       run_group_by_name replication
