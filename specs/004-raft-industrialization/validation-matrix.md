@@ -232,9 +232,9 @@ cross-platform gaps are scheduled for follow-up work.
 | 项目 | 当前状态 | 说明 |
 |------|----------|------|
 | Windows conservative baseline | PASS | `windows-release-tests`，当前 `18/18` 通过 |
-| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态见 `T041` |
+| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态为 `32` 项失败 |
 | 失败详情 | 单独维护 | 详见 [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md) |
-| 当前主要后续任务 | 已分流 | `T038` election/replication/commit-apply、`T039` snapshot/restart/catch-up、`T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
+| 当前主要后续任务 | 已分流 | `T039` snapshot/restart/catch-up、`T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
 
 ### T036 Windows Full Managed Entrypoint Check
 
@@ -287,6 +287,40 @@ T036 当前结论：
 - `confirmed no entry blocker / no-op`
 - 剩余红灯继续转交 `T037-T041`
 
+### T038 Windows Election / Replication / Commit-Apply Closure
+
+本次 `T038` 只处理 Windows full managed 中的 `4` 个 election / replication /
+commit-apply 红灯，不进入 snapshot / persistence / durability deferred 范围。
+
+本次最小测试层修正：
+
+- `tests/test_raft_election.cpp`
+  - 改为每次测试使用独立 data/snapshot 根目录，避免固定 `./raft_data` /
+    `./raft_snapshots` 造成的复跑残留污染。
+  - 在断言 follower redirect 之前，等待 leader 可见性真正传播到 follower，
+    收紧“leader 已可见”与“follower 已能返回 leader_id”之间的时序空洞。
+- `tests/test_t017_leader_switch_ordering.cpp`
+  - Windows 下切换到更短的临时测试根路径，避免长路径在建目录阶段直接失败。
+- `tests/test_raft_replicator_behavior.cpp`
+  - Windows 下切换到更短的临时测试根路径，避免长路径在 identity file 创建前就失败。
+
+本次 focused / full managed 结果摘要：
+
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftSplitBrainTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\.'`
+  - PASS
+  - 当前 `17/17` 通过
+- `ctest --preset windows-release-managed-tests --output-on-failure`
+  - FAIL
+  - 当前 full managed 剩余失败数量已从 `36` 收敛到 `32`
+
+当前 T038 结论：
+
+- 原始接收的 `4` 个失败已全部转绿，并已从 failure matrix 移除。
+- 当前没有证据表明 `modules/raft/node`、`modules/raft/replication`、
+  `modules/raft/runtime`、`modules/raft/service` 存在需要在 T038 范围内修复的
+  真实跨平台生产缺陷。
+- 剩余 full managed 红灯全部转交 `T039` / `T040` / `T042`。
+
 ### T041 Windows Durability Adapt-Or-Defer
 
 本次 `T041` 聚焦 Windows durability 语义，不修改 Raft election /
@@ -317,13 +351,12 @@ replication / snapshot 业务逻辑，只处理 storage 层的 Windows flush / s
   - 当前剩余 `8` 个 focused storage / durability 失败
 - `ctest --preset windows-release-managed-tests --output-on-failure`
   - FAIL
-  - 当前 full managed 剩余失败数量已从 `85` 收敛到 `36`
+  - 当前 full managed 剩余失败数量已从 `85` 收敛到 `32`
 
 当前 T041 结论：
 
 - `FlushFileBuffers ... GetLastError=5` 已从当前 focused / full managed 主失败信号中消失。
-- Windows full managed 当前剩余 `36` 项失败，后续分流为：
-  - `T038`：`4` 项 election / replication / commit-apply 红灯
+- Windows full managed 当前剩余 `32` 项失败，后续分流为：
   - `T039`：`17` 项 snapshot / restart / catch-up 红灯
   - `T040`：`6` 项 platform-neutral persistence / segment / storage 红灯
   - `T042`：`9` 项 exact Linux-specific failure-injection seam，按 deferred /

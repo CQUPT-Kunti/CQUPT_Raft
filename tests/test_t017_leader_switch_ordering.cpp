@@ -49,9 +49,15 @@ std::string SafeTestName(const ::testing::TestInfo* info) {
 
 std::filesystem::path MakeTestRoot(const ::testing::TestInfo* info) {
   std::random_device rd;
+#ifdef _WIN32
+  const std::string name = "rq_ls_" + std::to_string(NowForPath()) + "_" +
+                           std::to_string(rd());
+  return std::filesystem::temp_directory_path() / "rq_ls" / name;
+#else
   return TestBinaryDir() / "raft_test_data" / "t017_leader_switch_ordering" /
          (SafeTestName(info) + "_" + std::to_string(NowForPath()) + "_" +
           std::to_string(rd()));
+#endif
 }
 
 bool Contains(const std::string& text, const std::string& needle) {

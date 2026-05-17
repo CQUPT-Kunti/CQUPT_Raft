@@ -594,7 +594,7 @@
   Execution Note:
   - focused rerun 证明 `RaftIntegrationTest.*` 和 `RaftKvServiceTest.*` 当前主信号都已收敛为 `FlushFileBuffers ... GetLastError=5`，因此原先暂放在 `T037` 的 7 个失败已统一转交 `T041`；当前没有独立剩余的 runtime/harness blocker。
 
-- [ ] T038 Fix Windows election / replication / commit-apply red lights exposed by the full managed sweep
+- [x] T038 Fix Windows election / replication / commit-apply red lights exposed by the full managed sweep
   Goal: 收口 Windows full managed CTest 中属于平台无关 Raft 逻辑的 election / replication / commit-apply 红灯，不把它们继续留在“只有 Linux 绿”的状态。
   Input: T035 失败矩阵，T037 输出，`tests/test_raft_election.cpp`, `tests/test_raft_log_replication.cpp`, `tests/test_raft_commit_apply.cpp`, `tests/test_t017_leader_switch_ordering.cpp`, `tests/test_raft_replicator_behavior.cpp`，相关模块源码。
   Scope: 如需修改生产代码，只允许最小改动 `modules/raft/node/*.cpp`, `modules/raft/replication/*.cpp`, `modules/raft/runtime/*.cpp`, `modules/raft/service/*.cpp`；允许同步补充相关测试与文档；禁止修改协议语义、公共 API、类名、函数名或持久化格式。
@@ -606,6 +606,14 @@
   Windows/macOS Fallback: Yes, 目标是补齐平台无关 Raft 逻辑验证，不宣称 Linux-specific 等价。
   Basis: `spec.md` FR-004/FR-011；`plan.md` W4/W8；`platform-support.md` Windows cluster-style 未验证范围。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `4` 个 T038 失败已在 Windows focused rerun 与 full managed rerun 中全部转绿；当前没有独立剩余的 T038 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_election.cpp`、`tests/test_t017_leader_switch_ordering.cpp`、`tests/test_raft_replicator_behavior.cpp`，没有修改生产代码。
+  - `tests/test_raft_election.cpp` 收紧了 leader 可见性与 follower redirect 就绪之间的等待条件，并改为每次测试使用独立 data/snapshot 根目录，避免固定 `./raft_data` / `./raft_snapshots` 造成复跑残留污染。
+  - `tests/test_t017_leader_switch_ordering.cpp` 与 `tests/test_raft_replicator_behavior.cpp` 在 Windows 下改用更短的临时测试根路径，修复了 data directory / identity file 创建前即命中的长路径失败。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftSplitBrainTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\\.'` 当前 `PASS (17/17)`。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，但剩余失败数量已从 `36` 收敛到 `32`；剩余项全部转交 `T039` / `T040` / `T042`。
 
 - [ ] T039 Fix Windows snapshot / restart / catch-up red lights exposed by the full managed sweep
   Goal: 收口 Windows 下 snapshot、restart、catch-up、diagnosis 链路里的真实红灯，明确哪些是平台无关恢复/追赶问题，哪些才属于 durability follow-up。
