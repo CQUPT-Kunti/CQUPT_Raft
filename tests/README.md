@@ -13,6 +13,8 @@ fallback，以及 failure-injection / durability-boundary 测试应如何解释�
 
 macOS 当前不在本 feature 验证范围内。
 
+编码注意事项速查见：[../specs/004-raft-industrialization/cross-platform-coding-notes.md](../specs/004-raft-industrialization/cross-platform-coding-notes.md)
+
 ## 1. 受管 GTest / CTest 回归
 
 以下测试目标由 `tests/CMakeLists.txt` 通过 `add_raft_gtest(...)` 受管注册，
@@ -159,11 +161,11 @@ macOS 当前不在本 feature 验证范围内。
 
 - 这组入口和上面的 conservative baseline 分开存在。
 - 它们运行完整受管 GTest / CTest 目标集合。
-- 它们只是后续 Windows full managed sweep 的入口，不代表已经通过。
+- 当前 Windows Release full managed 最新正式 rerun 已 `104/104 PASS`。
 - 它们不等价于 Linux 当前 `104/104` managed 结果。
 - 它们也不把 Linux-specific durability / failure-injection 改写成 Windows
   已等价验证。
-- 当前完整失败明细只保留在
+- 当前完整状态只保留在
   [../specs/004-raft-industrialization/windows-full-managed-failure-matrix.md](../specs/004-raft-industrialization/windows-full-managed-failure-matrix.md)。
 
 ## 4. 哪些受管测试不进入 Windows fallback

@@ -92,11 +92,10 @@
   - `windows-release-managed-tests` / `windows-debug-managed-tests` 运行完整受管
     CTest 目标集合，不使用 `CommandTest` / `KvStateMachineTest` /
     `TimerSchedulerTest` / `ThreadPoolTest` 的保守子集过滤。
-  - 它们只代表“Windows full managed sweep 入口已存在”，不代表已经通过，
-    也不代表与 Linux 当前 `104/104` 结果等价。
-  - 当前 `T036` 已确认没有独立的 full managed 入口层阻塞；剩余红灯继续按
-    `T037-T041` 的 runtime / logic / storage / durability 分类处理。
-  - 当前完整失败明细、失败分类和受管目标状态统一见
+  - 当前 Windows Release full managed 最新正式 rerun 已 `104/104 PASS`。
+  - 该结果不等价于 Linux-specific durability / failure-injection /
+    crash-style 语义主解释。
+  - 当前完整状态与受管目标矩阵统一见
     [../windows-full-managed-failure-matrix.md](../windows-full-managed-failure-matrix.md)。
   - 即使 full managed 入口存在，也不得把 Linux-specific durability /
     failure-injection / crash-style 语义写成 Windows 已等价验证。

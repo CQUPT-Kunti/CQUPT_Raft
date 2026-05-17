@@ -11,6 +11,8 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 本文件只记录当前证据和解释边界，不改变 CQUPT_Raft 的协议语义、持久化格式、
 公共 API 或测试行为。
 
+编码注意事项速查见：[cross-platform-coding-notes.md](./cross-platform-coding-notes.md)
+
 ## 范围说明
 
 - Linux：当前主验证平台
@@ -28,7 +30,7 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 
 - 指 Windows 下完整受管 CTest 目标集合的单独 sweep 入口
 - 它不同于 conservative baseline
-- 它的存在只表示“入口已提供”，不自动表示“已经通过”
+- 当前最新正式 rerun 已 `104/104 PASS`
 
 ### cluster/runtime-heavy
 

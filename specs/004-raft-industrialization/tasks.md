@@ -690,7 +690,7 @@ T042 前置结果：
 - `ctest --preset windows-release-managed-tests --output-on-failure` 当前 `PASS (104/104)`。
 - 这 `9` 个 exact seam 项已从 `windows-full-managed-failure-matrix.md` 删除；当前 Windows full managed 无剩余失败项。
 
-- [ ] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
+- [x] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
   Goal: 用最终 Windows full managed CTest 结果回填平台文档、验证矩阵、入口说明和测试角色说明，形成“Windows full managed 已验证到哪里、哪些仍是 Linux-specific / deferred”的最终收口结论。
   Input: T033-T041 全部输出，`specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/quickstart.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `tests/README.md`, `CMakePresets.json`, `test.ps1`.
   Scope: 允许修改文档、preset 与 wrapper 说明，并执行最终 Windows full managed rerun；若 rerun 暴露新生产问题，应新开后续任务，不在本任务内临时扩大修复范围。
@@ -702,8 +702,14 @@ T042 前置结果：
   Windows/macOS Fallback: Yes, 需同时保留 conservative baseline 与 full managed 入口说明。
   Basis: `spec.md` SC-003/SC-004/SC-005；`plan.md` W8；当前 Phase 7 总目标。
   Tests To Run: `cmake --preset windows`; `cmake --build --preset windows-release`; `ctest --preset windows-release-tests`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - Phase 7 文档已按最终状态收口；当前 Linux full managed CTest `104/104 PASS`、Windows baseline `PASS`、Windows full managed CTest `104/104 PASS`、剩余失败 `0`。
+  Execution Note:
+  - 本轮按用户要求只做文档更新，没有重新运行测试。
+  - 已新增 `specs/004-raft-industrialization/cross-platform-coding-notes.md`，并在 `platform-support.md`、`validation-matrix.md`、`quickstart.md`、`tests/README.md` 增加单行链接。
+  - `quickstart.md`、`contracts/validation-entrypoints.md` 与 `tests/README.md` 中旧的 “Windows full managed 入口已存在但不代表通过” 表述已改为最终 `104/104 PASS` 状态。
 
-**Checkpoint**: Phase 7 完成后，Windows 将不再只停留在 `18/18` conservative baseline；维护者应能看清 full managed CTest 的真实覆盖、失败矩阵、已修复类别、durability 非等价边界和剩余 deferred 项。
+**Checkpoint**: Phase 7 已最终收口；维护者现在可以直接看到 Linux full managed `104/104 PASS`、Windows conservative baseline `PASS`、Windows full managed `104/104 PASS` 与跨平台解释边界。
 
 ---
 
