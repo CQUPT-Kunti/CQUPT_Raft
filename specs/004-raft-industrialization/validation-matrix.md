@@ -232,9 +232,9 @@ cross-platform gaps are scheduled for follow-up work.
 | 项目 | 当前状态 | 说明 |
 |------|----------|------|
 | Windows conservative baseline | PASS | `windows-release-tests`，当前 `18/18` 通过 |
-| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态为 `15` 项失败 |
+| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败；按 T040 focused 收口后，当前 failure matrix 只剩 `9` 项 `T042` exact seam，等待最终 closure sweep |
 | 失败详情 | 单独维护 | 详见 [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md) |
-| 当前主要后续任务 | 已分流 | `T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
+| 当前主要后续任务 | 已分流 | `T042` exact seam deferred / non-equivalent 最终收口 |
 
 ### T036 Windows Full Managed Entrypoint Check
 
@@ -397,6 +397,17 @@ replication / snapshot 业务逻辑，只处理 storage 层的 Windows flush / s
 - Windows durability 当前不能写成“已等价 Linux-specific failure-injection”；
   只能写成“required directory flush contract 已做 Windows 适配，exact seam
   仍显式 deferred / non-equivalent”。
+
+### T040 Windows Persistence / Segment / Storage Closure
+
+本次 `T040` 只处理 Windows full managed 中 `6` 个 platform-neutral persistence /
+segment / storage 红灯，不进入 `T042` exact failure-injection seam 范围。
+
+当前 T040 结论：
+
+- `tests/test_raft_segment_storage.cpp` 在 Windows 下改用更短的临时测试根路径；没有修改生产代码。
+- 原始接收的 `6` 个 `RaftSegmentStorageTest` 平台无关红灯已在 focused rerun 全部转绿，并已从 failure matrix 删除。
+- 本轮按执行规则未重跑 full managed；当前剩余项已全部收敛到 `T042` 的 `9` 个 exact seam deferred / non-equivalent 用例。
 
 ## CTest Label Matrix
 

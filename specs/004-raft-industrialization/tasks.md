@@ -647,6 +647,12 @@
   Windows/macOS Fallback: Yes, 但不得把 Linux-specific failure-injection 结果改写成 Windows 已等价验证。
   Basis: `spec.md` FR-003/FR-006/FR-010/FR-011；`plan.md` W2/W3/W8；根 `AGENTS.md` durability contract。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `6` 个 T040 platform-neutral persistence / segment / storage 失败已全部收口；当前 Windows failure matrix 已无独立 T040 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_segment_storage.cpp`，没有修改生产代码。
+  - `tests/test_raft_segment_storage.cpp` 在 Windows 下改用更短的临时测试根路径，收口了 `RaftSegmentStorageTest` 中 `Save()` / identity file 创建阶段的长路径噪声。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'` 命令整体仍为 `FAIL`，但剩余 `9` 个失败经复核全部属于 `T042` exact seam；本轮按执行规则未再运行 `windows-release-managed-tests`。
 
 - [x] T041 Handle Windows durability semantics as explicit adapt-or-defer follow-up
   Goal: 单独处理 Windows durability 语义，不把 Linux `fsync` / directory sync / crash-style failure injection 直接硬写成 Windows 等价；能实现的 required durability contract 做最小适配，不能等价的部分明确 deferred 边界和错误语义。

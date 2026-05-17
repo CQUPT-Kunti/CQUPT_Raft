@@ -51,7 +51,7 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 | 平台 | 当前角色 | 主验证入口 | 当前状态 | 已验证范围 | 未验证范围 / 不声明事项 |
 |------|----------|------------|----------|------------|-------------------------|
 | Linux | 主验证平台 | `./test.sh` / `ctest --preset debug-tests` | low-parallel configure/build 已记录 PASS；Linux 受管 CTest 当前 `104/104` PASS | Linux Bash 主入口、受管 CTest、`platform-neutral` 100 个测试、`durability-boundary` 4 个测试、Linux-specific durability / failure-injection / crash-style 解释边界 | 不把 Linux 结果外推为 Windows 等价覆盖；Windows Raft 全功能仍是 follow-up |
-| Windows | 保守 fallback 平台，并新增 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；full managed 当前 `FAIL (15/104)` | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；`T038`、`T039` 与 `T041` 后已转绿的 Windows focused cluster/runtime 子集；以及单独的 full managed sweep 入口 | 不声明 Windows Raft 全功能测试通过；不声明 Windows 已等价验证 Linux-specific durability / failure-injection；不声明 exact seam failure injection 已完成等价验证 |
+| Windows | 保守 fallback 平台，并新增 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；最近一次 full managed 正式 sweep 为 `FAIL (15/104)`；按 T040 focused 收口后，当前 failure matrix 只剩 `9` 个 `T042` exact seam | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；`T038`、`T039`、`T040` 与 `T041` 后已转绿的 Windows focused cluster/runtime 与 platform-neutral storage 子集；以及单独的 full managed sweep 入口 | 不声明 Windows Raft 全功能测试通过；不声明 Windows 已等价验证 Linux-specific durability / failure-injection；不声明 exact seam failure injection 已完成等价验证 |
 | macOS | 不在本 feature 验证范围内 | N/A | 当前不在本 feature 验证范围内 | 无 | 不写已验证，不声明任何等价运行时证据 |
 
 ## 各平台验证入口
@@ -97,9 +97,11 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 - `cmake --build --preset windows-release`：PASS
 - `ctest --preset windows-release-tests`：PASS
 - `ctest --preset windows-release-managed-tests`：FAIL
-  - `104` 个受管测试里 `89` 个通过、`15` 个失败
+  - 最近一次正式 full managed sweep 记录为 `104` 个受管测试里 `89` 个通过、`15` 个失败
 - `.\test.ps1 -Managed`：FAIL
   - 失败数量与 `windows-release-managed-tests` 一致，当前也是 `15`
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`：FAIL
+  - 当前 `49` 个 focused 用例里，原始 `6` 个 T040 项已全部转绿；命令剩余 `9` 个失败均为 `T042` exact seam
 
 解释规则：
 
@@ -137,7 +139,10 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 - full managed sweep：
   - `windows-release-managed-tests`
   - `FAIL`
-  - 当前仍失败 `15/104`
+  - 最近一次正式 rerun 仍失败 `15/104`
+- T040 focused 收口后：
+  - 当前 failure matrix 只剩 `9` 个 exact seam deferred / non-equivalent 项
+  - 本轮按执行规则没有重新运行 full managed，最终 closure sweep 留给 `T042`
 
 当前平台摘要只保留到这里；完整失败测试名、失败分类矩阵和 19 个受管目标的
 PASS / FAIL / BLOCKED 状态，统一收敛到：
@@ -152,7 +157,7 @@ PASS / FAIL / BLOCKED 状态，统一收敛到：
   当前独立 runtime/harness 项为 `0`，原先 7 项已转交 `T041`
 - `T038`：已收口；原始 4 项 election / replication / commit-apply 红灯已转绿
 - `T039`：已收口；当前无独立剩余 snapshot / restart / catch-up 红灯
-- `T040`：收口 Windows persistence / segment / storage 红灯
+- `T040`：已收口；原始 `6` 项 platform-neutral persistence / segment / storage 红灯已转绿
 - `T041`：已修掉 Windows 目录 flush 句柄权限问题
 - `T042`：对剩余 exact seam deferred / non-equivalent 结论做最终文档化收口
 
@@ -207,8 +212,9 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
   `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`
 - 已新增 Windows full managed CTest 入口：
   `windows-release-managed-tests`、`windows-debug-managed-tests`、`.\test.ps1 -Managed`
-- 已记录 Windows full managed 当前结果：
-- 当前 `89` 个测试通过、`15` 个测试失败
+- 已记录 Windows full managed 当前状态：
+- 最近一次正式 full managed rerun 为 `89` 个测试通过、`15` 个测试失败
+- 按 T040 focused 收口后，当前 failure matrix 只剩 `9` 个 `T042` exact seam
 - `T038` / `T041` rerun 已确认：
   `RaftElectionTest.FollowerRejectsClientProposeAfterLeaderIsElected`
   、`RaftLeaderSwitchOrderingTest.CommittedStateSurvivesLeaderSwitchAndNewLeaderContinuesReplication`
@@ -261,7 +267,7 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
 - 路径、临时目录、rename/replace、flush/sync 与 crash-style 语义目前不宣称
   已具备 Linux 等价证据
 - 当前只把 Windows 记为 platform-neutral fallback，不记为 durability
-  主验收平台；当前剩余问题已收敛到 `T040` / `T042`
+  主验收平台；当前剩余问题已收敛到 `T042`
 
 ## 后续 Follow-Up
 
