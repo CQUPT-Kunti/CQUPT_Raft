@@ -13,6 +13,8 @@ fallback，以及 failure-injection / durability-boundary 测试应如何解释�
 
 macOS 当前不在本 feature 验证范围内。
 
+编码注意事项速查见：[../specs/004-raft-industrialization/cross-platform-coding-notes.md](../specs/004-raft-industrialization/cross-platform-coding-notes.md)
+
 ## 1. 受管 GTest / CTest 回归
 
 以下测试目标由 `tests/CMakeLists.txt` 通过 `add_raft_gtest(...)` 受管注册，
@@ -147,6 +149,25 @@ macOS 当前不在本 feature 验证范围内。
 
 这只是保守 platform-neutral baseline，不代表 Windows Raft 全功能测试通过。
 
+## 3.1 Windows full managed CTest 入口
+
+当前另外提供单独的 Windows full managed CTest 入口：
+
+- `ctest --preset windows-release-managed-tests`
+- `ctest --preset windows-debug-managed-tests`
+- `.\test.ps1 -Managed`
+
+解释规则：
+
+- 这组入口和上面的 conservative baseline 分开存在。
+- 它们运行完整受管 GTest / CTest 目标集合。
+- 当前 Windows Release full managed 最新正式 rerun 已 `104/104 PASS`。
+- 它们不等价于 Linux 当前 `104/104` managed 结果。
+- 它们也不把 Linux-specific durability / failure-injection 改写成 Windows
+  已等价验证。
+- 当前完整状态只保留在
+  [../specs/004-raft-industrialization/windows-full-managed-failure-matrix.md](../specs/004-raft-industrialization/windows-full-managed-failure-matrix.md)。
+
 ## 4. 哪些受管测试不进入 Windows fallback
 
 以下受管回归当前都不属于 Windows platform-neutral fallback：
@@ -222,9 +243,10 @@ CTEST_PARALLEL_LEVEL=1 ./test.sh --group all
 当前 Linux 已知状态：
 
 - `./test.sh --group persistence` 已通过
-- `ctest --preset debug-tests --output-on-failure` 当前仍有
-  cluster/runtime-heavy 现存红灯
-- 这些现存红灯不在本 README 修复范围内
+- `ctest --preset debug-tests --output-on-failure` 当前 `104/104` PASS
+- Linux full managed CTest 当前已全绿：
+  - `platform-neutral` 100 tests PASS
+  - `durability-boundary` 4 tests PASS
 
 失败后建议顺序：
 

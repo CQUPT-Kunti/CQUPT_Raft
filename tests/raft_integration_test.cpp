@@ -155,10 +155,18 @@ namespace raftdemo
         }
       }
 
+#ifdef _WIN32
+      // Keep Windows integration roots short so publish/staging artifacts stay
+      // below common path-length limits during cluster-style test runs.
+      const std::string name = "ri_" + std::to_string(NowForPath()) + "_" +
+                               std::to_string(rd());
+      return std::filesystem::temp_directory_path() / "rq_ri" / name;
+#else
       const std::string name = "raft_kv_gtest_" + safe_name + "_" +
                                std::to_string(NowForPath()) + "_" +
                                std::to_string(rd());
       return TestBinaryDir() / "raft_test_data" / "integration" / name;
+#endif
     }
 
     std::vector<NodeConfig> BuildThreeNodeConfigs(const std::filesystem::path &data_root,

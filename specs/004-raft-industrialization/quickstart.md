@@ -6,6 +6,7 @@
 - 执行顺序与验收标准：[plan.md](./plan.md)
 - 风险冻结与验证矩阵：[validation-matrix.md](./validation-matrix.md)
 - 平台支持矩阵：[platform-support.md](./platform-support.md)
+- 编码注意事项速查：[cross-platform-coding-notes.md](./cross-platform-coding-notes.md)
 
 `validation-matrix.md` 是本 feature 的单一验证基线。后续执行、rerun、平台解释和
 Linux-specific 边界，都以它为准。
@@ -18,7 +19,9 @@ Linux-specific 边界，都以它为准。
 3. 若某个高风险区域失败，按矩阵中的 focused rerun 命令进入对应分组。
 4. 若当前环境是 Windows，优先使用 `.\test.ps1 -All` 完成 PowerShell
    platform-neutral fallback。
-5. 若不在 Linux 上且不适用 Windows preset，或只需要跑平台无关基线，使用
+5. 若需要单独观察 Windows 的完整受管 CTest sweep，显式运行
+   `ctest --preset windows-release-managed-tests` 或 `.\test.ps1 -Managed`。
+6. 若不在 Linux 上且不适用 Windows preset，或只需要跑平台无关基线，使用
    `ctest --preset debug-tests` 作为 fallback。
 
 ## 3. Linux 主入口怎么跑
@@ -89,7 +92,7 @@ CTEST_PARALLEL_LEVEL=1 ./test.sh --group <group> --keep-data
   中的 group 解释、rerun 命令和 Linux-specific 边界
 - [platform-support.md](./platform-support.md)
   中的平台支持范围与 Windows fallback 边界
-- [tests/README.md](/home/yangjilei/Code/C++/CQUPT_Raft/tests/README.md)
+- [tests/README.md](../../tests/README.md)
   中的测试角色说明：哪些是受管回归、哪些是 manual-only /
   diagnostic-only、哪些不进入 Windows fallback
 
@@ -183,6 +186,9 @@ ctest --preset debug-tests --output-on-failure
   当前只运行保守 test-name 子集：
   `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`。
 - 如需额外验证 Debug 路径，使用 `windows-debug` 与 `windows-debug-tests`。
+- `windows-release-managed-tests` 是单独的 Windows Release full managed CTest
+  sweep 入口，不会替换掉 `windows-release-tests`。
+- 如需 Debug full managed sweep，可使用 `windows-debug-managed-tests`。
 - `platform-neutral-fallback` 比完整的 `platform-neutral` 语义桶更保守。
 - 若某个 executable 没有 `platform-neutral-fallback`，即使它仍带有
   `platform-neutral` 语义，也不代表它已经被纳入 Windows 默认 fallback 验证。
@@ -199,6 +205,30 @@ ctest --preset windows-release-tests
 - 不声明 Windows Raft 全功能通过。
 - 不声明 Windows 已等价验证 Linux-specific durability /
   failure-injection。
+
+如果需要显式触发 Windows full managed CTest sweep，使用：
+
+```bash
+ctest --preset windows-release-managed-tests
+```
+
+或：
+
+```bash
+.\test.ps1 -Managed
+```
+
+解释规则：
+
+- 这条入口运行完整受管 CTest 目标集合。
+- 当前最新正式 rerun 已 `104/104 PASS`。
+- 它不等价于 Linux 当前 `104/104` managed 结果。
+- `T041` 已修掉 Windows 目录句柄权限导致的
+  `FlushFileBuffers ... GetLastError=5` 主信号；如果旧日志里仍看到这个错误，
+  应按“修复前的 Windows durability 语义问题”理解，而不是继续当作长路径
+  harness 问题。
+- 当前已无剩余 Windows full managed 失败项；完整状态统一见
+  [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md)。
 
 ## 9. 哪些测试属于 Windows fallback，哪些不属于
 
@@ -227,7 +257,7 @@ Windows fallback 当前只跑保守 baseline：
 - `RaftReplicatorBehaviorTest`
 - `RaftIntegrationTest`
 
-更完整的测试角色边界见 [tests/README.md](/home/yangjilei/Code/C++/CQUPT_Raft/tests/README.md)。
+更完整的测试角色边界见 [tests/README.md](../../tests/README.md)。
 
 ## 10. Linux-specific 测试组说明
 
@@ -272,7 +302,7 @@ ctest --preset debug-tests --output-on-failure
 - 它适合人工查看 marker、manifest 和 retained artifacts
 - 它不属于 Linux 主回归入口，也不属于 Windows platform-neutral fallback
 
-更完整的测试角色说明见 [tests/README.md](/home/yangjilei/Code/C++/CQUPT_Raft/tests/README.md)。
+更完整的测试角色说明见 [tests/README.md](../../tests/README.md)。
 
 ## 13. 当前实现顺序
 

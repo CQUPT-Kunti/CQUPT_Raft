@@ -109,7 +109,7 @@ std::uint64_t NowForPath() {
 }
 
 int PickBasePort(const std::string& test_name) {
-  const int name_offset = static_cast<int>(std::hash<std::string>{}(test_name) % 2000);
+  const int name_offset = static_cast<int>(std::hash<std::string>{}(test_name) % 1800);
 
   if (const char* env = std::getenv("RAFT_TEST_BASE_PORT")) {
     try {
@@ -119,9 +119,9 @@ int PickBasePort(const std::string& test_name) {
     }
   }
 
-  std::random_device rd;
-  const int jitter = static_cast<int>(rd() % 10000);
-  return 40000 + name_offset + jitter;
+  // Keep each test in its own small port window so adjacent cases do not
+  // randomly collide with sockets that are still draining on Windows.
+  return 36000 + name_offset * 12;
 }
 
 std::filesystem::path MakeTestRoot(const std::string& test_name) {
@@ -133,10 +133,16 @@ std::filesystem::path MakeTestRoot(const std::string& test_name) {
     }
   }
 
+#ifdef _WIN32
+  const std::string name = "sr_" + std::to_string(NowForPath()) + "_" +
+                           std::to_string(rd());
+  return std::filesystem::temp_directory_path() / "rq_sr" / name;
+#else
   const std::string name = "raft_snapshot_restart_" + safe_name + "_" +
                            std::to_string(NowForPath()) + "_" +
                            std::to_string(rd());
   return std::filesystem::temp_directory_path() / name;
+#endif
 }
 
 void WriteTextFile(const std::filesystem::path& path, const std::string& content) {
@@ -197,6 +203,14 @@ std::string PendingT010Message(const std::string& operation,
       << ", trusted_state_expectation=" << trusted_state_expectation
       << ", diagnostic_expectation=" << diagnostic_expectation;
   return oss.str();
+}
+
+const char* ExpectedLinuxSpecificMarker() {
+#if defined(__linux__)
+  return "linux_specific=true";
+#else
+  return "linux_specific=false";
+#endif
 }
 
 void SetEnvVar(const char* name, const std::string& value) {
@@ -1504,7 +1518,7 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
       << error;
   EXPECT_NE(error.find("path=" + injected_final_dir.string()), std::string::npos) << error;
   EXPECT_NE(error.find("failure_class=directory sync"), std::string::npos) << error;
-  EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+  EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
   EXPECT_NE(
       error.find("trusted_state_expectation=if restart sees a newer snapshot publish point without the required trusted publish completion, it must reject that snapshot and continue from the previous trusted snapshot plus replayable log tail"),
       std::string::npos)

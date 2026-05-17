@@ -97,6 +97,18 @@
             }
         },
         {
+            "name": "windows-debug-managed-tests",
+            "displayName": "Run Windows Debug full managed tests",
+            "configurePreset": "windows",
+            "configuration": "Debug",
+            "execution": {
+                "jobs": 1
+            },
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
             "name": "windows-release-tests",
             "displayName": "Run Windows Release platform-neutral tests",
             "configurePreset": "windows",
@@ -108,6 +120,18 @@
             },
             "execution": {
                 "jobs": 4
+            },
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "windows-release-managed-tests",
+            "displayName": "Run Windows Release full managed tests",
+            "configurePreset": "windows",
+            "configuration": "Release",
+            "execution": {
+                "jobs": 1
             },
             "output": {
                 "outputOnFailure": true

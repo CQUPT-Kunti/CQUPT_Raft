@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -30,12 +31,26 @@ std::string Sanitize(const std::string& name) {
 }
 
 std::filesystem::path TestRoot(const std::string& test_name) {
+#ifdef _WIN32
+  std::random_device rd;
+  const std::string name = "ssr_" + std::to_string(rd());
+  return std::filesystem::temp_directory_path() / "rq_ssr" / name;
+#else
   return std::filesystem::current_path() / "raft_test_data" / "snapshot_storage" / Sanitize(test_name);
+#endif
 }
 
 bool KeepData() {
   const char* value = std::getenv("RAFT_TEST_KEEP_DATA");
   return value != nullptr && std::string(value) != "0";
+}
+
+const char* ExpectedLinuxSpecificMarker() {
+#if defined(__linux__)
+  return "linux_specific=true";
+#else
+  return "linux_specific=false";
+#endif
 }
 
 void WriteTextFile(const std::filesystem::path& path, const std::string& content) {
@@ -364,7 +379,7 @@ TEST_F(SnapshotStorageReliabilityTest, StagedSnapshotPublishFailureNeedsExactFai
       << error;
   EXPECT_NE(error.find("path=" + snapshot_publish_root.string()), std::string::npos) << error;
   EXPECT_NE(error.find("failure_class=replace/rename"), std::string::npos) << error;
-  EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+  EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
   EXPECT_NE(
       error.find("trusted_state_expectation=if staged snapshot publish fails before the final trusted publish point, restart must keep using the previously trusted snapshot and ignore the incomplete newer snapshot"),
       std::string::npos)
@@ -411,7 +426,7 @@ TEST_F(SnapshotStorageReliabilityTest, SnapshotDirectorySyncFailureNeedsExactFai
       << error;
   EXPECT_NE(error.find("path=" + snapshot_dir_.string()), std::string::npos) << error;
   EXPECT_NE(error.find("failure_class=directory sync"), std::string::npos) << error;
-  EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+  EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
   EXPECT_NE(
       error.find("trusted_state_expectation=if the new snapshot directory becomes visible but the parent directory sync does not complete, restart must stay on the last fully durable trusted snapshot boundary"),
       std::string::npos)
@@ -459,7 +474,7 @@ TEST_F(SnapshotStorageReliabilityTest, SnapshotPruneRemoveFailureNeedsExactFailu
   EXPECT_NE(error.find("operation=snapshot prune remove old directory"), std::string::npos) << error;
   EXPECT_NE(error.find("path=" + old_snapshot_dir.string()), std::string::npos) << error;
   EXPECT_NE(error.find("failure_class=prune/remove"), std::string::npos) << error;
-  EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+  EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
   EXPECT_NE(
       error.find("trusted_state_expectation=if pruning old snapshots fails during remove/publish cleanup, the newest trusted snapshot must remain loadable and restart must not mis-classify prune leftovers as the chosen trusted snapshot"),
       std::string::npos)

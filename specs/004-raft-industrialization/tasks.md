@@ -459,7 +459,7 @@
 
 **Purpose**: 收口跨故事文档、遗留脚本/测试角色说明与 P4 follow-up，不做大重构。
 
-- [ ] T030 [P] Document the role of `tests/persistence_more_test.cpp` and `tests/test_temp.cpp` in `tests/README.md` and `specs/004-raft-industrialization/validation-matrix.md`
+- [x] T030 [P] Document the role of `tests/persistence_more_test.cpp` and `tests/test_temp.cpp` in `tests/README.md` and `specs/004-raft-industrialization/validation-matrix.md`
   Goal: 区分受管回归测试、手工诊断程序、临时测试文件，避免后续把非回归程序误当正式验收资产。
   Input: `tests/persistence_more_test.cpp`, `tests/test_temp.cpp`, `tests/README.md`, `validation-matrix.md`.
   Scope: 文档为主；若决定删除临时文件，需另开 feature，不在本任务直接做大清理。
@@ -472,7 +472,7 @@
   Basis: 当前目录结构分析；`plan.md` W7。
   Tests To Run: None; 文档任务。
 
-- [ ] T031 [P] Cross-check Linux-specific tasks against `specs/004-raft-industrialization/platform-support.md`
+- [x] T031 [P] Cross-check Linux-specific tasks against `specs/004-raft-industrialization/platform-support.md`
   Goal: 确保所有 Linux-specific failure injection、crash-style、bash-only 任务都有 Windows/macOS fallback 或 deferred note。
   Input: `tasks.md`, `validation-matrix.md`, `platform-support.md`, `contracts/`.
   Scope: 文档交叉检查。
@@ -506,7 +506,7 @@
 
 **Purpose**: 从当前 Windows `18/18` conservative baseline 进入受管 full managed CTest 验证与分类修复阶段；显式区分入口缺失、runtime-heavy 红灯、Raft 逻辑红灯、storage/persistence 红灯，以及 Windows durability 语义适配与 Linux-specific deferred 边界。
 
-- [ ] T033 [P] Add Windows full managed CTest presets and wrapper mode without replacing the conservative fallback
+- [x] T033 [P] Add Windows full managed CTest presets and wrapper mode without replacing the conservative fallback
   Goal: 在保留 `windows-release-tests` / `.\test.ps1 -All` 保守 baseline 的前提下，新增 Windows full managed CTest 入口，用来运行当前全部受管 GTest / CTest 回归，而不是只跑 `platform-neutral-fallback` 子集。
   Input: `CMakePresets.json`, `test.ps1`, `tests/CMakeLists.txt`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/quickstart.md`.
   Scope: 只允许修改 Windows preset / wrapper / 文档入口定义；推荐新增 `windows-release-managed-tests`，如确有必要可同步新增 `windows-debug-managed-tests`；必须保留现有 `windows-release-tests` conservative baseline 不变。
@@ -519,7 +519,7 @@
   Basis: `plan.md` W6/W8；`platform-support.md` Windows 未验证范围；`validation-matrix.md` R6/R7。
   Tests To Run: `cmake --preset windows`; `cmake --build --preset windows-release`; `ctest --preset windows-release-tests`; `ctest --preset windows-release-managed-tests`.
 
-- [ ] T034 Run the first Windows full managed CTest sweep and capture the uncovered target matrix
+- [x] T034 Run the first Windows full managed CTest sweep and capture the uncovered target matrix
   Goal: 用真实 Windows full managed CTest 执行结果建立第一版覆盖现状，明确 conservative baseline `18/18` 之外其余受管目标的真实状态。
   Input: T033 输出，`tests/README.md`, `tests/CMakeLists.txt`, `specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/platform-support.md`.
   Scope: 只执行 Windows configure/build/full managed CTest，并记录结果；本任务不改生产代码、不改测试语义。
@@ -531,8 +531,13 @@
   Windows/macOS Fallback: Yes, 但不得把 conservative baseline 结果改写成 full pass。
   Basis: `tests/README.md` 受管目标清单；`platform-support.md` Windows 未验证范围；当前 Linux `104/104` 与 Windows `18/18` 的证据差距。
   Tests To Run: `cmake --preset windows`; `cmake --build --preset windows-release`; `ctest --preset windows-release-managed-tests`.
+  Result Snapshot:
+  - 复用 `T033` 已生成的 `tmp/windows-release-managed-tests.log` 与 `tmp/test-ps1-managed.log`，未重新运行 Windows full managed 测试。
+  - Windows conservative baseline 仍为 `PASS (18/18)`。
+  - Windows full managed 当前为 `FAIL (85/104)`。
+  - 形式化失败矩阵、失败分类和 19 个受管目标的 PASS / FAIL / BLOCKED 状态已沉淀到 `validation-matrix.md` 与 `platform-support.md`。
 
-- [ ] T035 [P] Classify the first Windows full-sweep failures into an actionable matrix
+- [x] T035 [P] Classify the first Windows full-sweep failures into an actionable matrix
   Goal: 把 T034 暴露的 Windows full managed CTest 红灯按问题类型收口成可执行的失败矩阵，而不是笼统写成“Windows 还需 follow-up”。
   Input: T034 执行结果，`specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/quickstart.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`.
   Scope: 只允许修改文档与失败矩阵归类，不在本任务内修代码。
@@ -544,8 +549,14 @@
   Windows/macOS Fallback: Yes, 必须继续保留“Windows 不等价 Linux-specific durability”边界。
   Basis: `spec.md` FR-008/FR-011；`plan.md` W7/W8；当前 Phase 7 目标。
   Tests To Run: None; 复用 T034 输出。
+  Result Snapshot:
+  - 复用 `T034` 的 Windows full managed 日志，没有重新运行测试。
+  - 新增 `specs/004-raft-industrialization/windows-full-managed-failure-matrix.md` 作为唯一完整失败清单。
+  - Windows conservative baseline 仍为 `PASS`；Windows full managed 仍为 `FAIL (85)`。
+  - 当前失败已收敛为：`T037` runtime / harness、`T038` election / replication / commit-apply、`T039` snapshot / restart / catch-up、`T040` persistence / segment / storage、`T041` durability adapt-or-defer。
+  - 主文档只保留摘要和链接，不再重复粘贴 `85` 个失败测试名。
 
-- [ ] T036 Fix Windows full managed CTest preset / runner / discover blockers before touching production logic
+- [x] T036 Fix Windows full managed CTest preset / runner / discover blockers before touching production logic
   Goal: 先排除 Windows full managed CTest 入口层问题，避免把 preset、working directory、multi-config、discover、wrapper、filter 或结果采集错误误判为 Raft 逻辑缺陷。
   Input: T033-T035 输出，`CMakePresets.json`, `test.ps1`, `tests/CMakeLists.txt`, top-level `CMakeLists.txt`（仅当 preset/plumbing 无法单独解决时）, 相关 validation docs。
   Scope: 只允许修改 preset、wrapper、CTest discover / 标签组织、必要的构建脚本路径与文档；禁止修改 `modules/raft/**` 生产代码；禁止借由放宽断言或删除目标来“消灭”红灯。
@@ -557,8 +568,16 @@
   Windows/macOS Fallback: Yes, 这是 full managed 入口收口任务。
   Basis: `validation-entrypoints.md` Windows preset contract；`platform-support.md` 当前 Windows 入口只到 conservative baseline。
   Tests To Run: `cmake --preset windows`; `cmake --build --preset windows-release`; `ctest --preset windows-release-tests`; `ctest --preset windows-release-managed-tests`.
+  Result: No-op / confirmed no entry blocker.
+  Execution Note:
+  - 复用 `T033-T035` 已有配置与日志，没有重新运行 Windows 测试。
+  - `windows-release-managed-tests` / `windows-debug-managed-tests` 均存在，且保持 full managed 语义。
+  - `windows-release-tests` / `windows-debug-tests` 仍保留 conservative baseline 过滤。
+  - `test.ps1 -Managed` 调用 `windows-release-managed-tests`；`test.ps1 -All` 仍调用 `windows-release-tests`。
+  - 现有日志显示 full managed 已 discover 并执行完整 `104` 个受管测试；当前 `85` 项失败属于测试运行红灯，不是 preset / discover / wrapper 阻塞。
+  - 剩余红灯继续转交 `T037-T041`。
 
-- [ ] T037 Stabilize Windows-only test harness assumptions for cluster/runtime-heavy coverage before changing Raft logic
+- [x] T037 Stabilize Windows-only test harness assumptions for cluster/runtime-heavy coverage before changing Raft logic
   Goal: 如果 T035 证明某些红灯来自 Windows 下的 test harness、timeout、路径、临时目录、进程收尾或 file-lock 假设，而不是 Raft 业务逻辑，则先在测试层收口这些运行时假设。
   Input: T035 失败矩阵，受影响测试源文件，`tests/CMakeLists.txt`, `test.ps1`, `specs/004-raft-industrialization/platform-support.md`.
   Scope: 只允许修改 `tests/*.cpp`、`tests/CMakeLists.txt`、`test.ps1` 和相关文档中的 Windows test harness / timeout / path / temp-dir / cleanup 逻辑；禁止修改 `modules/raft/**` 生产代码；禁止改变协议预期、持久化格式或通过条件。
@@ -570,8 +589,12 @@
   Windows/macOS Fallback: Yes, 这是 Windows runtime-heavy 覆盖扩大前置任务。
   Basis: `platform-support.md` Windows runtime/timing/path/file-lock 缺口；`tests/README.md` 受管目标边界。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftKvServiceTest|RaftElectionTest|RaftSplitBrainTest|RaftLeaderSwitchOrderingTest|RaftIntegrationTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - `tests/raft_integration_test.cpp` 已在 Windows 下切换到更短的临时测试根路径，`RaftIntegrationTest.*` 的 `create temp log dir failed: 文件名或扩展名太长` 信号已不再出现。
+  Execution Note:
+  - focused rerun 证明 `RaftIntegrationTest.*` 和 `RaftKvServiceTest.*` 当前主信号都已收敛为 `FlushFileBuffers ... GetLastError=5`，因此原先暂放在 `T037` 的 7 个失败已统一转交 `T041`；当前没有独立剩余的 runtime/harness blocker。
 
-- [ ] T038 Fix Windows election / replication / commit-apply red lights exposed by the full managed sweep
+- [x] T038 Fix Windows election / replication / commit-apply red lights exposed by the full managed sweep
   Goal: 收口 Windows full managed CTest 中属于平台无关 Raft 逻辑的 election / replication / commit-apply 红灯，不把它们继续留在“只有 Linux 绿”的状态。
   Input: T035 失败矩阵，T037 输出，`tests/test_raft_election.cpp`, `tests/test_raft_log_replication.cpp`, `tests/test_raft_commit_apply.cpp`, `tests/test_t017_leader_switch_ordering.cpp`, `tests/test_raft_replicator_behavior.cpp`，相关模块源码。
   Scope: 如需修改生产代码，只允许最小改动 `modules/raft/node/*.cpp`, `modules/raft/replication/*.cpp`, `modules/raft/runtime/*.cpp`, `modules/raft/service/*.cpp`；允许同步补充相关测试与文档；禁止修改协议语义、公共 API、类名、函数名或持久化格式。
@@ -583,8 +606,16 @@
   Windows/macOS Fallback: Yes, 目标是补齐平台无关 Raft 逻辑验证，不宣称 Linux-specific 等价。
   Basis: `spec.md` FR-004/FR-011；`plan.md` W4/W8；`platform-support.md` Windows cluster-style 未验证范围。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `4` 个 T038 失败已在 Windows focused rerun 与 full managed rerun 中全部转绿；当前没有独立剩余的 T038 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_election.cpp`、`tests/test_t017_leader_switch_ordering.cpp`、`tests/test_raft_replicator_behavior.cpp`，没有修改生产代码。
+  - `tests/test_raft_election.cpp` 收紧了 leader 可见性与 follower redirect 就绪之间的等待条件，并改为每次测试使用独立 data/snapshot 根目录，避免固定 `./raft_data` / `./raft_snapshots` 造成复跑残留污染。
+  - `tests/test_t017_leader_switch_ordering.cpp` 与 `tests/test_raft_replicator_behavior.cpp` 在 Windows 下改用更短的临时测试根路径，修复了 data directory / identity file 创建前即命中的长路径失败。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftSplitBrainTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\\.'` 当前 `PASS (17/17)`。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，但剩余失败数量已从 `36` 收敛到 `32`；剩余项全部转交 `T039` / `T040` / `T042`。
 
-- [ ] T039 Fix Windows snapshot / restart / catch-up red lights exposed by the full managed sweep
+- [x] T039 Fix Windows snapshot / restart / catch-up red lights exposed by the full managed sweep
   Goal: 收口 Windows 下 snapshot、restart、catch-up、diagnosis 链路里的真实红灯，明确哪些是平台无关恢复/追赶问题，哪些才属于 durability follow-up。
   Input: T035 失败矩阵，T037 输出，`tests/snapshot_test.cpp`, `tests/test_raft_snapshot_catchup.cpp`, `tests/test_raft_snapshot_restart.cpp`, `tests/test_raft_snapshot_diagnosis.cpp`, `tests/raft_integration_test.cpp`，相关模块源码。
   Scope: 如需修改生产代码，只允许最小改动 `modules/raft/node/*.cpp`, `modules/raft/replication/*.cpp`, `modules/raft/storage/*.cpp`, `modules/raft/state_machine/*.cpp`；允许同步修改相关测试与文档；禁止改协议语义、公共 API 或持久化格式。
@@ -596,6 +627,13 @@
   Windows/macOS Fallback: Yes, 但不得把 Linux-specific crash-style 语义写成已等价通过。
   Basis: `spec.md` FR-003/FR-004/FR-010/FR-011；`plan.md` W3/W4/W5/W8。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `17` 个 T039 失败已全部收口；当前 Windows full managed 已无独立 T039 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_snapshot_catchup.cpp`、`tests/test_raft_snapshot_restart.cpp`、`tests/test_raft_snapshot_diagnosis.cpp`，没有修改生产代码。
+  - 三个测试文件都在 Windows 下改用更短的临时测试根路径，并把端口分配改成按测试名映射到固定间隔端口窗，收口了长路径与端口复用噪声。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotRecoveryTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\\.'` 当前 `24` 个 focused 用例里 `23` 个通过；唯一剩余失败为 `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`，经复核转交 `T042`。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，但剩余失败数量已从 `32` 收敛到 `15`；当前只剩 `T040` `6` 项与 `T042` `9` 项。
 
 - [ ] T040 Fix Windows persistence / segment / storage red lights without changing persisted format or API
   Goal: 收口 Windows 下 `persistence_test`、segment log、snapshot storage 等 storage 相关红灯中的平台无关恢复缺陷、路径问题或 file-lock 问题，但不把 Linux-specific exact durability 注入直接等价化。
@@ -609,8 +647,14 @@
   Windows/macOS Fallback: Yes, 但不得把 Linux-specific failure-injection 结果改写成 Windows 已等价验证。
   Basis: `spec.md` FR-003/FR-006/FR-010/FR-011；`plan.md` W2/W3/W8；根 `AGENTS.md` durability contract。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `6` 个 T040 platform-neutral persistence / segment / storage 失败已全部收口；当前 Windows failure matrix 已无独立 T040 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_segment_storage.cpp`，没有修改生产代码。
+  - `tests/test_raft_segment_storage.cpp` 在 Windows 下改用更短的临时测试根路径，收口了 `RaftSegmentStorageTest` 中 `Save()` / identity file 创建阶段的长路径噪声。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'` 命令整体仍为 `FAIL`，但剩余 `9` 个失败经复核全部属于 `T042` exact seam；本轮按执行规则未再运行 `windows-release-managed-tests`。
 
-- [ ] T041 Handle Windows durability semantics as explicit adapt-or-defer follow-up
+- [x] T041 Handle Windows durability semantics as explicit adapt-or-defer follow-up
   Goal: 单独处理 Windows durability 语义，不把 Linux `fsync` / directory sync / crash-style failure injection 直接硬写成 Windows 等价；能实现的 required durability contract 做最小适配，不能等价的部分明确 deferred 边界和错误语义。
   Input: T035/T040 输出，`specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `specs/004-raft-industrialization/quickstart.md`, `modules/raft/storage/**`, `modules/raft/runtime/**`.
   Scope: 允许最小修改 `modules/raft/storage/*.cpp`、`modules/raft/runtime/*.cpp` 或必要的窄范围平台 helper，以满足 Windows required durability contract 或明确错误返回；允许同步更新平台/验证文档；禁止引入 silent no-op durability success，禁止宣称 Windows 已等价通过 Linux-specific failure-injection。
@@ -622,8 +666,31 @@
   Windows/macOS Fallback: Yes, 这是 Windows durability follow-up 的核心边界任务。
   Basis: 根 `AGENTS.md` durability hard rule；`spec.md` FR-006/FR-009/FR-011；`platform-support.md` Windows durability 未验证范围。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 已完成 Windows directory flush 句柄权限适配；`FlushFileBuffers ... GetLastError=5`
+    不再是当前主失败信号。
+  Execution Note:
+  - `modules/raft/storage/raft_storage.cpp` 与 `modules/raft/storage/snapshot_storage.cpp`
+    已把 Windows directory sync 从 `FILE_LIST_DIRECTORY` 句柄改为可写目录句柄，
+    继续保留真实错误返回，不引入 no-op success。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftIntegrationTest|RaftKvServiceTest)\\.'`
+    已转为 `PASS`；原先被目录 flush 权限错误阻塞的 `7` 个 cluster-style 用例已从
+    failure matrix 删除。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，
+    但剩余失败数量已从 `85` 收敛到 `36`。
+  - 剩余项继续分流：
+    `T038` `4` 项、`T039` `17` 项、`T040` `6` 项、`T042` `9` 项。
+  - exact Linux-specific failure-injection seam 当前继续按 deferred /
+    non-equivalent 记录，不写成 Windows 已等价 Linux durability 证据。
 
-- [ ] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
+T042 前置结果：
+
+- 剩余 `9` 个 Windows exact failure-injection seam 红灯已完成单独收口。
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'` 当前 `PASS (49/49)`。
+- `ctest --preset windows-release-managed-tests --output-on-failure` 当前 `PASS (104/104)`。
+- 这 `9` 个 exact seam 项已从 `windows-full-managed-failure-matrix.md` 删除；当前 Windows full managed 无剩余失败项。
+
+- [x] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
   Goal: 用最终 Windows full managed CTest 结果回填平台文档、验证矩阵、入口说明和测试角色说明，形成“Windows full managed 已验证到哪里、哪些仍是 Linux-specific / deferred”的最终收口结论。
   Input: T033-T041 全部输出，`specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/quickstart.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `tests/README.md`, `CMakePresets.json`, `test.ps1`.
   Scope: 允许修改文档、preset 与 wrapper 说明，并执行最终 Windows full managed rerun；若 rerun 暴露新生产问题，应新开后续任务，不在本任务内临时扩大修复范围。
@@ -635,8 +702,14 @@
   Windows/macOS Fallback: Yes, 需同时保留 conservative baseline 与 full managed 入口说明。
   Basis: `spec.md` SC-003/SC-004/SC-005；`plan.md` W8；当前 Phase 7 总目标。
   Tests To Run: `cmake --preset windows`; `cmake --build --preset windows-release`; `ctest --preset windows-release-tests`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - Phase 7 文档已按最终状态收口；当前 Linux full managed CTest `104/104 PASS`、Windows baseline `PASS`、Windows full managed CTest `104/104 PASS`、剩余失败 `0`。
+  Execution Note:
+  - 本轮按用户要求只做文档更新，没有重新运行测试。
+  - 已新增 `specs/004-raft-industrialization/cross-platform-coding-notes.md`，并在 `platform-support.md`、`validation-matrix.md`、`quickstart.md`、`tests/README.md` 增加单行链接。
+  - `quickstart.md`、`contracts/validation-entrypoints.md` 与 `tests/README.md` 中旧的 “Windows full managed 入口已存在但不代表通过” 表述已改为最终 `104/104 PASS` 状态。
 
-**Checkpoint**: Phase 7 完成后，Windows 将不再只停留在 `18/18` conservative baseline；维护者应能看清 full managed CTest 的真实覆盖、失败矩阵、已修复类别、durability 非等价边界和剩余 deferred 项。
+**Checkpoint**: Phase 7 已最终收口；维护者现在可以直接看到 Linux full managed `104/104 PASS`、Windows conservative baseline `PASS`、Windows full managed `104/104 PASS` 与跨平台解释边界。
 
 ---
 

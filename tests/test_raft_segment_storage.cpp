@@ -61,10 +61,16 @@ namespace raftdemo
     std::filesystem::path MakeInspectableTestRoot(const ::testing::TestInfo *info)
     {
       std::random_device rd;
+#ifdef _WIN32
+      const std::string dir_name = "ss_" + std::to_string(NowForPath()) + "_" +
+                                   std::to_string(rd());
+      return std::filesystem::temp_directory_path() / "rq_ss" / dir_name;
+#else
       const std::string dir_name = SafeTestName(info) + "_" +
                                    std::to_string(NowForPath()) + "_" +
                                    std::to_string(rd());
       return TestBinaryDir() / "raft_test_data" / "segment_storage" / dir_name;
+#endif
     }
 
     bool KeepTestData()
@@ -77,6 +83,15 @@ namespace raftdemo
         return true;
       }
       return std::string(value) != "0";
+    }
+
+    const char *ExpectedLinuxSpecificMarker()
+    {
+#if defined(__linux__)
+      return "linux_specific=true";
+#else
+      return "linux_specific=false";
+#endif
     }
 
     std::size_t CountFilesWithExtension(const std::filesystem::path &dir,
@@ -342,7 +357,7 @@ namespace raftdemo
       EXPECT_NE(error.find("operation=" + operation), std::string::npos) << error;
       EXPECT_NE(error.find("path=" + path.string()), std::string::npos) << error;
       EXPECT_NE(error.find("failure_class=" + failure_class), std::string::npos) << error;
-      EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+      EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
       EXPECT_NE(error.find("trusted_state_expectation=" + trusted_state_expectation), std::string::npos)
           << error;
       EXPECT_NE(error.find("recovery_expectation=" + trusted_state_expectation), std::string::npos)

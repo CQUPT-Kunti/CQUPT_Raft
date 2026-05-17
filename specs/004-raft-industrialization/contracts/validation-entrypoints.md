@@ -80,7 +80,27 @@
   - 它不调用 Bash，不执行 Linux-specific 分组，也不声称提供与
     `./test.sh --keep-data` 等价的 retained-artifact 诊断能力。
 
-### 5. Windows/macOS wrapper follow-up
+### 5. Windows full managed CTest sweep
+
+- **当前状态**：
+  - Windows full managed CTest 入口已单独提供：
+    - `ctest --preset windows-release-managed-tests`
+    - `ctest --preset windows-debug-managed-tests`
+    - `.\test.ps1 -Managed`
+- **约定**：
+  - 这些入口与 conservative baseline 分开存在。
+  - `windows-release-managed-tests` / `windows-debug-managed-tests` 运行完整受管
+    CTest 目标集合，不使用 `CommandTest` / `KvStateMachineTest` /
+    `TimerSchedulerTest` / `ThreadPoolTest` 的保守子集过滤。
+  - 当前 Windows Release full managed 最新正式 rerun 已 `104/104 PASS`。
+  - 该结果不等价于 Linux-specific durability / failure-injection /
+    crash-style 语义主解释。
+  - 当前完整状态与受管目标矩阵统一见
+    [../windows-full-managed-failure-matrix.md](../windows-full-managed-failure-matrix.md)。
+  - 即使 full managed 入口存在，也不得把 Linux-specific durability /
+    failure-injection / crash-style 语义写成 Windows 已等价验证。
+
+### 6. Windows/macOS wrapper follow-up
 
 - **当前状态**：
   - `test.ps1` 已作为 Windows fallback 落地
@@ -102,7 +122,9 @@
 5. 如果当前环境是 Windows，优先使用 `.\test.ps1 -All` 作为 PowerShell
    fallback；其底层固定调用 `windows`、`windows-release`、
    `windows-release-tests` preset。
-6. 如果当前环境不走 Bash 主入口且不适用 Windows preset，则使用
+6. 如果需要单独观察 Windows 的完整受管 CTest sweep，显式使用
+   `ctest --preset windows-release-managed-tests`，或 `.\test.ps1 -Managed`。
+7. 如果当前环境不走 Bash 主入口且不适用 Windows preset，则使用
    `ctest --preset debug-tests --output-on-failure` 作为平台无关 fallback。
 
 ## 真实分组与 rerun 约定
@@ -156,6 +178,9 @@
   行为仍可工作，但这不改变 Linux-primary / Linux-specific 的验收边界。
 - `ctest --preset windows-release-tests` 与 `ctest --preset windows-debug-tests`
   只代表 Windows platform-neutral fallback。
+- `ctest --preset windows-release-managed-tests` 与
+  `ctest --preset windows-debug-managed-tests` 代表 Windows full managed CTest
+  sweep 入口，但不自带“已通过”含义。
 - Windows test preset 当前运行的是保守 test-name 子集：
   `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`。
 - 当命中的测试带有 `linux-specific-failure-injection` 或
@@ -271,10 +296,16 @@
   - `ctest --preset windows-release-tests`
   - `cmake --build --preset windows-debug`
   - `ctest --preset windows-debug-tests`
+- Windows 当前也额外具备 full managed CTest sweep 入口：
+  - `ctest --preset windows-release-managed-tests`
+  - `ctest --preset windows-debug-managed-tests`
+  - `.\test.ps1 -Managed`
 - 其中 Windows test preset 默认只覆盖 `platform-neutral-fallback`
   baseline 子集，不运行 Linux-specific failure-injection / diagnosis /
   durability-boundary executable，也不默认包含更大范围的 cluster-style
   `platform-neutral` executable。
+- Windows full managed 入口运行的是完整受管 CTest 目标集合，但文档不得把该入口
+  的存在写成 Windows 已达到 Linux 当前 `104/104` managed 结果。
 - 若需要更细粒度重跑，可使用与 `test.sh` 对应的直接 `ctest --test-dir build/linux -R`
   命令，但解释范围仍属于 platform-neutral logic fallback。
 - `test.ps1` 只是 Windows wrapper，不得把它描述成与 Linux Bash 主入口
