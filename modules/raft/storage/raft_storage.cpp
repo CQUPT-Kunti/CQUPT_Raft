@@ -574,8 +574,11 @@ namespace raftdemo
     bool SyncDirectory(const std::filesystem::path &path, std::string *error)
     {
 #if defined(_WIN32)
+      // Windows directory flush requires a writable directory handle. Opening
+      // with FILE_LIST_DIRECTORY alone causes FlushFileBuffers to fail with
+      // ERROR_ACCESS_DENIED on normal directories.
       const HANDLE handle = ::CreateFileW(path.c_str(),
-                                          FILE_LIST_DIRECTORY,
+                                          GENERIC_WRITE,
                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                           nullptr,
                                           OPEN_EXISTING,

@@ -10,7 +10,10 @@
 - 复用 `T033` / `T034` 已有日志：
   - `tmp/windows-release-managed-tests.log`
   - `tmp/test-ps1-managed.log`
-- 本次 `T035` 没有重新运行测试。
+- `T041` focused / full managed rerun 日志：
+  - `tmp/test-logs/t041-focused-runtime.log`
+  - `tmp/test-logs/t041-focused-storage.log`
+  - `tmp/test-logs/t041-windows-release-managed.log`
 
 ## 当前摘要
 
@@ -23,7 +26,7 @@
 - Windows full managed：`FAIL`
   - `ctest --preset windows-release-managed-tests`
   - `.\test.ps1 -Managed`
-  - 当前仍失败数量：`85`
+  - 当前仍失败数量：`36`
 
 ## 失败分类矩阵
 
@@ -31,11 +34,11 @@
 |------|----------|----------|----------|--------------|
 | Windows full managed CTest entry / harness 问题 | 已确认无独立阻塞 | 0 | `104` 个受管测试都已 discover 并执行；preset / wrapper 不是“没跑起来” | T036 |
 | Windows runtime / timing / harness 问题 | 已收紧当前路径假设；无独立剩余项 | 0 | `raft_integration_test.cpp` 已改用更短的 Windows 临时根路径；`create temp log dir failed` 不再是当前独立 blocker | T037 |
-| Windows election / replication / commit-apply 红灯 | FAIL | 17 | election / replication / commit-apply 断言失败，且当前不能写成 Windows 已收口 | T038 |
-| Windows snapshot / restart / catch-up 红灯 | FAIL | 18 | snapshot restore、restart replay、catch-up sequencing、diagnosis 断言失败 | T039 |
-| Windows persistence / segment / storage 红灯 | FAIL | 34 | trusted-state、meta/log publish、segment recovery、snapshot catalog/staging 断言失败 | T040 |
-| Windows durability semantics adapt-or-defer | FAIL | 16 | exact seam：`FlushFileBuffers`、directory sync、replace / rename、partial write、prune / remove；当前还会阻塞部分 cluster-style 选主前持久化 | T041 |
-| 其他 / 待进一步分类 | 当前无独立项 | 0 | 当前 `85` 项都能先落到上面几类 | T036 / T037 |
+| Windows election / replication / commit-apply 红灯 | FAIL | 4 | 剩余 cluster-style 逻辑红灯已不再被 `FlushFileBuffers ... GetLastError=5` 阻塞 | T038 |
+| Windows snapshot / restart / catch-up 红灯 | FAIL | 17 | snapshot restore、restart replay、catch-up sequencing、diagnosis 断言失败；不再与目录 flush 权限错误混写 | T039 |
+| Windows persistence / segment / storage 红灯 | FAIL | 6 | segment publish / recovery / clustered storage 仍有平台无关红灯 | T040 |
+| Windows durability semantics adapt-or-defer | 已完成根因定位；剩余 exact seam 保持 deferred / non-equivalent | 9 | `FlushFileBuffers` 目录句柄权限问题已修复；剩余 exact failure-injection seam 不写成 Windows 已等价 Linux | T042 |
+| 其他 / 待进一步分类 | 当前无独立项 | 0 | 当前 `36` 项都能先落到上面几类 | T038 / T039 / T040 / T042 |
 
 ## 受管目标状态矩阵
 
@@ -45,21 +48,21 @@
 | `test_state_machine` | PASS | 0 | N/A | N/A |
 | `test_min_heap_timer` | PASS | 0 | N/A | N/A |
 | `test_thread_pool` | PASS | 0 | N/A | N/A |
-| `test_kv_service` | FAIL | 2 | Windows durability semantics adapt-or-defer | T041 |
-| `test_raft_election` | FAIL | 2 | Windows election / replication / commit-apply 红灯 | T038 |
-| `test_raft_log_replication` | FAIL | 2 | Windows election / replication / commit-apply 红灯 | T038 |
-| `test_raft_commit_apply` | FAIL | 2 | Windows election / replication / commit-apply 红灯 | T038 |
-| `test_raft_split_brain` | FAIL | 7 | Windows election / replication / commit-apply 红灯 | T038 |
+| `test_kv_service` | PASS | 0 | N/A | N/A |
+| `test_raft_election` | FAIL | 1 | Windows election / replication / commit-apply 红灯 | T038 |
+| `test_raft_log_replication` | PASS | 0 | N/A | N/A |
+| `test_raft_commit_apply` | PASS | 0 | N/A | N/A |
+| `test_raft_split_brain` | PASS | 0 | N/A | N/A |
 | `test_t017_leader_switch_ordering` | FAIL | 2 | Windows election / replication / commit-apply 红灯 | T038 |
-| `persistence_test` | FAIL | 12 | Windows persistence / segment / storage 红灯 | T040 |
-| `snapshot_test` | FAIL | 7 | Windows snapshot / restart / catch-up 红灯 | T039 |
-| `raft_integration_test` | FAIL | 5 | Windows durability semantics adapt-or-defer | T041 |
+| `persistence_test` | FAIL | 2 | Windows durability semantics adapt-or-defer | T042 |
+| `snapshot_test` | FAIL | 6 | Windows snapshot / restart / catch-up 红灯 | T039 / T042 |
+| `raft_integration_test` | PASS | 0 | N/A | N/A |
 | `test_raft_snapshot_catchup` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
 | `test_raft_snapshot_restart` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
 | `test_raft_snapshot_diagnosis` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
-| `test_raft_segment_storage` | FAIL | 19 | Windows persistence / segment / storage 红灯 | T040 |
-| `test_snapshot_storage_reliability` | FAIL | 11 | Windows persistence / segment / storage 红灯 | T040 |
-| `test_raft_replicator_behavior` | FAIL | 2 | Windows election / replication / commit-apply 红灯 | T038 |
+| `test_raft_segment_storage` | FAIL | 9 | Windows persistence / segment / storage 红灯 | T040 / T042 |
+| `test_snapshot_storage_reliability` | FAIL | 3 | Windows durability semantics adapt-or-defer | T042 |
+| `test_raft_replicator_behavior` | FAIL | 1 | Windows election / replication / commit-apply 红灯 | T038 |
 
 ## 当前失败详情
 
@@ -71,7 +74,8 @@
 当前没有独立失败项落入这一类。现有证据更支持“入口可用，但跑出真实红灯”：
 
 - `ctest --preset windows-release-managed-tests` 能执行完整 `104` 个受管测试
-- `.\test.ps1 -Managed` 复现同一组 `85` 个失败
+- `.\test.ps1 -Managed` 与 full managed preset 保持同一条受管测试路径
+- `T041` 最新 rerun 已把 full managed 失败数从 `85` 收敛到 `36`
 
 T036 结论：
 
@@ -86,35 +90,27 @@ T036 结论：
 
 - `tests/raft_integration_test.cpp` 已在 Windows 下改用更短的临时测试根路径，
   原先的 `create temp log dir failed: 文件名或扩展名太长` 信号不再出现。
-- 重新跑 `RaftIntegrationTest.*` 后，5 个测试仍然失败，但主信号已经统一变成
-  `FlushFileBuffers ... GetLastError=5`，不再属于纯路径/临时目录 blocker。
-- `RaftKvServiceTest.*` 重新跑后也呈现相同的 `FlushFileBuffers ... GetLastError=5`
-  主信号。
+- `T041` 修复 Windows 目录 sync 句柄权限后，
+  `RaftKvServiceTest.SingleNodeSupportsPutGetDeleteAndStatusHealth`、
+  `RaftKvServiceTest.ThreeNodeFollowerRedirectsWritesAndReadsToLeader`、
+  `RaftIntegrationTest.ElectsSingleLeaderInThreeNodeCluster`、
+  `RaftIntegrationTest.ReplicatesSetAndDeleteCommandsToAllNodes`、
+  `RaftIntegrationTest.ElectsNewLeaderAfterCurrentLeaderStops`、
+  `RaftIntegrationTest.GeneratesSnapshotMetaFileAfterEnoughAppliedLogs`、
+  `RaftIntegrationTest.LaggingFollowerInstallsSnapshotAndReplaysTailDeleteAcrossCompactionBoundary`
+  已从失败矩阵移除。
 
-因此，原先暂放在 `T037` 的 7 个失败已转交 `T041`，作为 Windows durability
-semantics adapt-or-defer 问题继续处理，而不是继续停留在 runtime/harness 桶里。
+因此，原先暂放在 `T037` 的 7 个失败已完成收口；当前没有独立的
+Windows runtime / timing / harness blocker。
 
 ### 3. Windows election / replication / commit-apply 红灯
 
 这些失败优先进入 `T038`，处理平台无关 Raft election / replication /
-commit-apply 逻辑在 Windows full managed sweep 下的红灯：
+commit-apply 逻辑在 Windows full managed sweep 下的剩余红灯：
 
-- `RaftElectionTest.ThreeNodeClusterElectsExactlyOneLeader`
 - `RaftElectionTest.FollowerRejectsClientProposeAfterLeaderIsElected`
-- `RaftLogReplicationTest.LeaderProposeReplicatesLogToAllNodes`
-- `RaftLogReplicationTest.MultipleSequentialEntriesStayConsistentAcrossCluster`
-- `RaftCommitApplyTest.CommitAndApplyIndexesAdvanceAfterSuccessfulPropose`
-- `RaftCommitApplyTest.DeleteCommandIsAppliedToAllNodes`
-- `RaftSplitBrainTest.MinorityLeaderTimesOutAndDoesNotApplyUncommittedCommand`
-- `RaftSplitBrainTest.LeaderStepsDownWhenHigherTermAppendEntriesArrives`
-- `RaftSplitBrainTest.StaleAppendEntriesIsRejectedAfterNodeObservesHigherTerm`
-- `RaftSplitBrainTest.SameTermSecondCandidateVoteIsRejected`
-- `RaftSplitBrainTest.StaleCandidateVoteRequestIsRejectedEvenWithHigherTerm`
-- `RaftSplitBrainTest.AppendEntriesRejectionIncludesFastBacktrackHint`
-- `RaftSplitBrainTest.InstallSnapshotDiscardsSuffixWhenBoundaryTermDiffers`
 - `RaftLeaderSwitchOrderingTest.CommittedStateSurvivesLeaderSwitchAndNewLeaderContinuesReplication`
 - `RaftLeaderSwitchOrderingTest.LaggingFollowerCatchesUpDuringLeaderSwitchWithoutCommitApplyReordering`
-- `RaftReplicatorBehaviorTest.SlowFollowerDoesNotBlockMajorityCommit`
 - `RaftReplicatorBehaviorTest.SlowFollowerCatchesUpWhileLeaderKeepsAcceptingNewLogs`
 
 ### 4. Windows snapshot / restart / catch-up 红灯
@@ -122,10 +118,10 @@ commit-apply 逻辑在 Windows full managed sweep 下的红灯：
 这些失败优先进入 `T039`，处理 snapshot、restart、catch-up、diagnosis 相关
 红灯：
 
-- `RaftSnapshotRecoveryTest.SavesSnapshotAndRestoresAfterRestart`
 - `RaftSnapshotRecoveryTest.FullRestartReplaysSnapshotTailWithoutLosingDeletesOrOverwrites`
 - `RaftSnapshotRecoveryTest.RestartedFollowerAppliesCommittedTailExactlyOnceAfterSnapshotLoad`
 - `RaftSnapshotRecoveryTest.StandaloneRestartFallsBackToOlderTrustedSnapshotWhenNewestSnapshotIsCorrupted`
+- `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`
 - `RaftSnapshotRecoveryTest.StandaloneRestartRejectsMetadataMismatchedVisibleSnapshotAndKeepsTrustedBoundary`
 - `RaftSnapshotRecoveryTest.AllPublishedSnapshotsInvalidYieldNoTrustedSnapshot`
 - `RaftSnapshotCatchupTest.RestartedFollowerCatchesUpLargeGapWithBatchedAppendEntries`
@@ -146,46 +142,20 @@ commit-apply 逻辑在 Windows full managed sweep 下的红灯：
 这些失败优先进入 `T040`，处理 platform-neutral 的 persistence / segment /
 storage 恢复与路径问题：
 
-- `PersistenceTest.FullClusterRestartRecovery`
-- `PersistenceTest.RestartedFollowerCatchesUp`
-- `PersistenceTest.ColdRestartPreservesPersistedHardStateBeforeStart`
-- `PersistenceTest.ColdRestartClampsCommitAndApplyBoundariesToLastLogIndex`
-- `PersistenceTest.ColdRestartUsesPreviouslyTrustedMetaBoundaryWhenNewLogPublishesBeforeMeta`
-- `PersistenceTest.ColdRestartClampsCommitIndexToLastLogAndReplaysCommittedPrefix`
-- `PersistenceTest.ColdRestartClampsLastAppliedToCommitIndexWhenAppliedExceedsCommit`
-- `PersistenceTest.ColdRestartClampsLastAppliedToTrustedLogPrefixWhenAppliedPointsPastAvailableLog`
-- `PersistenceTest.ColdRestartUsesOlderMetaTermAndVoteWhenNewerLogTreeIsVisible`
-- `PersistenceTest.NewMetaWithOldLogBoundaryRejectsUntrustedCurrentTermAndVote`
-- `RaftSegmentStorageTest.WritesMultipleSegmentFilesUnderBuildDirectory`
-- `RaftSegmentStorageTest.AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave`
-- `RaftSegmentStorageTest.TruncatesCorruptedSegmentTailDuringRecovery`
-- `RaftSegmentStorageTest.TruncatesPartialSegmentHeaderDuringRecovery`
-- `RaftSegmentStorageTest.SaveDoesNotLeaveTemporaryOrBackupLogDirectories`
-- `RaftSegmentStorageTest.SavePublishesMetaFileWithoutLeavingMetaTempFile`
-- `RaftSegmentStorageTest.RecoveryIgnoresTemporaryPublishArtifacts`
-- `RaftSegmentStorageTest.MetaAndLogPublishWindowUsesOnlyTrustedBoundary`
 - `RaftSegmentStorageTest.MissingFirstSegmentFailsBeforeTrustingPublishedBoundary`
 - `RaftSegmentStorageTest.FinalSegmentTailTruncateKeepsTrustedLogPrefixAndClampsCommitApply`
-- `RaftSegmentStorageTest.MissingMetaFileCausesLoadToReportNoPersistedState`
-- `RaftSegmentStorageTest.CorruptedMetaFileFailsLoad`
 - `RaftSegmentStorageTest.UnsupportedMetaVersionFailsLoadWithPathAndVersion`
 - `RaftSegmentStorageTest.InconsistentMetaLogBoundaryFailsBeforeTrustingSegments`
 - `RaftSegmentStorageTest.CorruptedEarlierSegmentTailCleansLaterSegmentsAndReportsDiagnostics`
 - `RaftSegmentStorageTest.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory`
-- `SnapshotStorageReliabilityTest.SavesSnapshotAsDirectoryWithDataAndMeta`
-- `SnapshotStorageReliabilityTest.PublishesSnapshotWithCompatibleFinalLayout`
-- `SnapshotStorageReliabilityTest.IgnoresStagingAndIncompleteSnapshotDirectories`
-- `SnapshotStorageReliabilityTest.ReportsValidationIssuesForSkippedSnapshotEntries`
-- `SnapshotStorageReliabilityTest.FallsBackToOlderSnapshotWhenNewestIsCorrupted`
-- `SnapshotStorageReliabilityTest.AllInvalidSnapshotsReturnNoTrustedSnapshotWithDiagnostics`
-- `SnapshotStorageReliabilityTest.SameIndexSameTermSaveIsIdempotent`
-- `SnapshotStorageReliabilityTest.PrunesOldSnapshotDirectoriesByIndex`
 
 ### 6. Windows durability semantics adapt-or-defer
 
-这些 exact seam 用例，以及当前被 `FlushFileBuffers ... GetLastError=5` 阻塞的
-cluster-style 运行时失败，优先进入 `T041`。它们不能被写成“Windows 已等价验证
-Linux-specific durability / failure-injection”：
+`T041` 已确认 `FlushFileBuffers ... GetLastError=5` 的根因是 Windows 目录句柄
+只用 `FILE_LIST_DIRECTORY` 打开，导致 `FlushFileBuffers` 在普通目录上触发
+`ERROR_ACCESS_DENIED`。当前 storage / snapshot storage 都已改为用可写目录句柄
+执行 directory sync，因此下列 7 个此前被该问题阻塞的 cluster-style 用例已经转绿，
+并从失败矩阵中删除：
 
 - `RaftKvServiceTest.SingleNodeSupportsPutGetDeleteAndStatusHealth`
 - `RaftKvServiceTest.ThreeNodeFollowerRedirectsWritesAndReadsToLeader`
@@ -194,6 +164,12 @@ Linux-specific durability / failure-injection”：
 - `RaftIntegrationTest.ElectsNewLeaderAfterCurrentLeaderStops`
 - `RaftIntegrationTest.GeneratesSnapshotMetaFileAfterEnoughAppliedLogs`
 - `RaftIntegrationTest.LaggingFollowerInstallsSnapshotAndReplaysTailDeleteAcrossCompactionBoundary`
+
+剩余 exact seam 用例不再以 `FlushFileBuffers GetLastError=5` 这种目录 flush 权限错误
+失败，但它们依然不能被写成“Windows 已等价验证 Linux-specific durability /
+failure-injection”。这些项在本轮按 `deferred / non-equivalent` 收口，留给 `T042`
+做最终文档化关闭：
+
 - `PersistenceTest.MetaFileSyncFailureNeedsExactFailureInjectionSeam`
 - `PersistenceTest.MetaDirectorySyncFailureNeedsExactFailureInjectionSeam`
 - `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`

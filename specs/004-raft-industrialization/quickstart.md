@@ -222,9 +222,12 @@ ctest --preset windows-release-managed-tests
 - 这条入口运行完整受管 CTest 目标集合。
 - 它只是新增的验证入口，不代表已经通过。
 - 它不等价于 Linux 当前 `104/104` managed 结果。
-- 当前若在 Windows full managed rerun 中看到
-  `FlushFileBuffers ... GetLastError=5`，应按 Windows durability 语义问题解释，
-  而不是继续当作长路径 harness 问题。
+- `T041` 已修掉 Windows 目录句柄权限导致的
+  `FlushFileBuffers ... GetLastError=5` 主信号；如果旧日志里仍看到这个错误，
+  应按“修复前的 Windows durability 语义问题”理解，而不是继续当作长路径
+  harness 问题。
+- 当前剩余的 exact Linux-specific failure-injection seam 仍是
+  deferred / non-equivalent，不应写成 Windows 已等价 Linux durability 证据。
 - 当前失败明细、失败分类和受管目标状态统一见
   [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md)。
 

@@ -577,7 +577,7 @@
   - 现有日志显示 full managed 已 discover 并执行完整 `104` 个受管测试；当前 `85` 项失败属于测试运行红灯，不是 preset / discover / wrapper 阻塞。
   - 剩余红灯继续转交 `T037-T041`。
 
-- [ ] T037 Stabilize Windows-only test harness assumptions for cluster/runtime-heavy coverage before changing Raft logic
+- [x] T037 Stabilize Windows-only test harness assumptions for cluster/runtime-heavy coverage before changing Raft logic
   Goal: 如果 T035 证明某些红灯来自 Windows 下的 test harness、timeout、路径、临时目录、进程收尾或 file-lock 假设，而不是 Raft 业务逻辑，则先在测试层收口这些运行时假设。
   Input: T035 失败矩阵，受影响测试源文件，`tests/CMakeLists.txt`, `test.ps1`, `specs/004-raft-industrialization/platform-support.md`.
   Scope: 只允许修改 `tests/*.cpp`、`tests/CMakeLists.txt`、`test.ps1` 和相关文档中的 Windows test harness / timeout / path / temp-dir / cleanup 逻辑；禁止修改 `modules/raft/**` 生产代码；禁止改变协议预期、持久化格式或通过条件。
@@ -645,6 +645,22 @@
   Windows/macOS Fallback: Yes, 这是 Windows durability follow-up 的核心边界任务。
   Basis: 根 `AGENTS.md` durability hard rule；`spec.md` FR-006/FR-009/FR-011；`platform-support.md` Windows durability 未验证范围。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 已完成 Windows directory flush 句柄权限适配；`FlushFileBuffers ... GetLastError=5`
+    不再是当前主失败信号。
+  Execution Note:
+  - `modules/raft/storage/raft_storage.cpp` 与 `modules/raft/storage/snapshot_storage.cpp`
+    已把 Windows directory sync 从 `FILE_LIST_DIRECTORY` 句柄改为可写目录句柄，
+    继续保留真实错误返回，不引入 no-op success。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftIntegrationTest|RaftKvServiceTest)\\.'`
+    已转为 `PASS`；原先被目录 flush 权限错误阻塞的 `7` 个 cluster-style 用例已从
+    failure matrix 删除。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，
+    但剩余失败数量已从 `85` 收敛到 `36`。
+  - 剩余项继续分流：
+    `T038` `4` 项、`T039` `17` 项、`T040` `6` 项、`T042` `9` 项。
+  - exact Linux-specific failure-injection seam 当前继续按 deferred /
+    non-equivalent 记录，不写成 Windows 已等价 Linux durability 证据。
 
 - [ ] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
   Goal: 用最终 Windows full managed CTest 结果回填平台文档、验证矩阵、入口说明和测试角色说明，形成“Windows full managed 已验证到哪里、哪些仍是 Linux-specific / deferred”的最终收口结论。

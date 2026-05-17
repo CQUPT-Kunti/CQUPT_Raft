@@ -209,7 +209,7 @@ cross-platform gaps are scheduled for follow-up work.
 - full managed sweep：
   - `ctest --preset windows-release-managed-tests`
   - `.\test.ps1 -Managed`
-  - 两条入口都收敛到同一组结果：`104` 个受管测试里 `19` 个通过、`85` 个失败
+  - `T034` 首次 sweep 结果：`104` 个受管测试里 `19` 个通过、`85` 个失败
 
 ### T035 Windows Full Managed Actionable Matrix
 
@@ -232,9 +232,9 @@ cross-platform gaps are scheduled for follow-up work.
 | 项目 | 当前状态 | 说明 |
 |------|----------|------|
 | Windows conservative baseline | PASS | `windows-release-tests`，当前 `18/18` 通过 |
-| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`，当前仍失败 `85` 项 |
+| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态见 `T041` |
 | 失败详情 | 单独维护 | 详见 [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md) |
-| 当前主要后续任务 | 已分流 | `T036` 入口检查、`T037` runtime/harness、`T038` election/replication/commit-apply、`T039` snapshot/restart/catch-up、`T040` persistence/segment/storage、`T041` durability adapt-or-defer |
+| 当前主要后续任务 | 已分流 | `T038` election/replication/commit-apply、`T039` snapshot/restart/catch-up、`T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
 
 ### T036 Windows Full Managed Entrypoint Check
 
@@ -286,6 +286,51 @@ T036 当前结论：
 
 - `confirmed no entry blocker / no-op`
 - 剩余红灯继续转交 `T037-T041`
+
+### T041 Windows Durability Adapt-Or-Defer
+
+本次 `T041` 聚焦 Windows durability 语义，不修改 Raft election /
+replication / snapshot 业务逻辑，只处理 storage 层的 Windows flush / sync
+契约与对应证据。
+
+本次最小生产代码修复：
+
+- `modules/raft/storage/raft_storage.cpp`
+- `modules/raft/storage/snapshot_storage.cpp`
+
+当前确认的根因：
+
+- Windows 目录 sync 之前使用 `FILE_LIST_DIRECTORY` 打开目录句柄，随后直接对该
+  目录句柄调用 `FlushFileBuffers`。
+- 在当前 Windows 环境下，这会稳定触发
+  `FlushFileBuffers ... GetLastError=5 (ERROR_ACCESS_DENIED)`。
+- `T041` 已把 directory sync 改为使用可写目录句柄执行 flush，因此当前 focused
+  rerun 已不再暴露这个主信号。
+
+本次 focused / full managed 结果摘要：
+
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftIntegrationTest|RaftKvServiceTest)\.'`
+  - PASS
+  - 原先被 `FlushFileBuffers GetLastError=5` 阻塞的 `7` 个 cluster-style 用例已转绿
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`
+  - FAIL
+  - 当前剩余 `8` 个 focused storage / durability 失败
+- `ctest --preset windows-release-managed-tests --output-on-failure`
+  - FAIL
+  - 当前 full managed 剩余失败数量已从 `85` 收敛到 `36`
+
+当前 T041 结论：
+
+- `FlushFileBuffers ... GetLastError=5` 已从当前 focused / full managed 主失败信号中消失。
+- Windows full managed 当前剩余 `36` 项失败，后续分流为：
+  - `T038`：`4` 项 election / replication / commit-apply 红灯
+  - `T039`：`17` 项 snapshot / restart / catch-up 红灯
+  - `T040`：`6` 项 platform-neutral persistence / segment / storage 红灯
+  - `T042`：`9` 项 exact Linux-specific failure-injection seam，按 deferred /
+    non-equivalent 最终收口
+- Windows durability 当前不能写成“已等价 Linux-specific failure-injection”；
+  只能写成“required directory flush contract 已做 Windows 适配，exact seam
+  仍显式 deferred / non-equivalent”。
 
 ## CTest Label Matrix
 

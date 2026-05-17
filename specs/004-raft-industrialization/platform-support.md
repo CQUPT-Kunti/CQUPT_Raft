@@ -51,7 +51,7 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 | 平台 | 当前角色 | 主验证入口 | 当前状态 | 已验证范围 | 未验证范围 / 不声明事项 |
 |------|----------|------------|----------|------------|-------------------------|
 | Linux | 主验证平台 | `./test.sh` / `ctest --preset debug-tests` | low-parallel configure/build 已记录 PASS；Linux 受管 CTest 当前 `104/104` PASS | Linux Bash 主入口、受管 CTest、`platform-neutral` 100 个测试、`durability-boundary` 4 个测试、Linux-specific durability / failure-injection / crash-style 解释边界 | 不把 Linux 结果外推为 Windows 等价覆盖；Windows Raft 全功能仍是 follow-up |
-| Windows | 保守 fallback 平台，并新增 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；full managed 首次 sweep 当前 `FAIL (85/104)` | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；以及单独的 full managed sweep 入口 | 不声明 Windows Raft 全功能测试通过；不声明 Windows 已等价验证 Linux-specific durability / failure-injection；不声明 cluster-style 测试已完成稳定性验证 |
+| Windows | 保守 fallback 平台，并新增 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；full managed 当前 `FAIL (36/104)` | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；`T041` 后已转绿的 Windows focused cluster/runtime 子集；以及单独的 full managed sweep 入口 | 不声明 Windows Raft 全功能测试通过；不声明 Windows 已等价验证 Linux-specific durability / failure-injection；不声明 exact seam failure injection 已完成等价验证 |
 | macOS | 不在本 feature 验证范围内 | N/A | 当前不在本 feature 验证范围内 | 无 | 不写已验证，不声明任何等价运行时证据 |
 
 ## 各平台验证入口
@@ -97,9 +97,9 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 - `cmake --build --preset windows-release`：PASS
 - `ctest --preset windows-release-tests`：PASS
 - `ctest --preset windows-release-managed-tests`：FAIL
-  - `104` 个受管测试里 `19` 个通过、`85` 个失败
+  - `104` 个受管测试里 `68` 个通过、`36` 个失败
 - `.\test.ps1 -Managed`：FAIL
-  - 失败数量与 `windows-release-managed-tests` 一致，当前也是 `85`
+  - 失败数量与 `windows-release-managed-tests` 一致，当前也是 `36`
 
 解释规则：
 
@@ -116,6 +116,9 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
   进入默认验收范围。
 - `windows-release-managed-tests` 运行完整受管 CTest 目标集合，但其结果不能写成
   Windows 已等价达到 Linux 当前 `104/104`。
+- `T041` 已修掉 Windows 目录句柄权限导致的
+  `FlushFileBuffers ... GetLastError=5` 主信号；剩余 exact Linux-specific
+  failure-injection seam 继续按 deferred / non-equivalent 解释。
 
 ### Windows full managed 首次 sweep 结果快照
 
@@ -134,7 +137,7 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 - full managed sweep：
   - `windows-release-managed-tests`
   - `FAIL`
-  - 当前仍失败 `85/104`
+  - 当前仍失败 `36/104`
 
 当前平台摘要只保留到这里；完整失败测试名、失败分类矩阵和 19 个受管目标的
 PASS / FAIL / BLOCKED 状态，统一收敛到：
@@ -150,7 +153,8 @@ PASS / FAIL / BLOCKED 状态，统一收敛到：
 - `T038`：收口 Windows election / replication / commit-apply 红灯
 - `T039`：收口 Windows snapshot / restart / catch-up 红灯
 - `T040`：收口 Windows persistence / segment / storage 红灯
-- `T041`：单独处理 Windows durability semantics adapt-or-defer
+- `T041`：已修掉 Windows 目录 flush 句柄权限问题
+- `T042`：对剩余 exact seam deferred / non-equivalent 结论做最终文档化收口
 
 ## 验证范围分层
 
@@ -203,8 +207,11 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
   `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`
 - 已新增 Windows full managed CTest 入口：
   `windows-release-managed-tests`、`windows-debug-managed-tests`、`.\test.ps1 -Managed`
-- 已记录第一次 Windows full managed sweep 结果：
-  当前 `19` 个测试通过、`85` 个测试失败
+- 已记录 Windows full managed 当前结果：
+  当前 `68` 个测试通过、`36` 个测试失败
+- `T041` focused rerun 已确认：
+  `RaftKvServiceTest.*` 与 `RaftIntegrationTest.*` 中先前被
+  `FlushFileBuffers ... GetLastError=5` 阻塞的 7 个用例已转绿
 
 ## 未验证范围
 
