@@ -65,7 +65,7 @@ cross-platform gaps are scheduled for follow-up work.
 | `cmake --preset windows` | Windows configure fallback | Windows platform-neutral baseline setup | No | No | Existing Visual Studio 17 2022 configure preset remains unchanged |
 | `cmake --build --preset windows-release` | Windows Release build fallback | Windows platform-neutral baseline build | No | No | Uses `configurePreset: windows`, `configuration: Release` |
 | `ctest --preset windows-release-tests` | Windows Release test fallback | Windows platform-neutral baseline execution | No | No | Uses `configuration: Release`; current subset is `CommandTest|KvStateMachineTest|TimerSchedulerTest|ThreadPoolTest` |
-| `ctest --preset windows-release-managed-tests` | Windows Release full managed sweep | Windows full managed CTest target sweep | No | No | Uses `configuration: Release`; runs the complete managed CTest target set; entry exists but does not imply PASS |
+| `ctest --preset windows-release-managed-tests` | Windows Release full managed sweep | Windows full managed CTest target sweep | No | No | Uses `configuration: Release`; runs the complete managed CTest target set; latest Windows rerun is `104/104 PASS` |
 | `cmake --build --preset windows-debug` | Windows Debug build fallback | Optional Windows platform-neutral debug build | No | No | Uses `configurePreset: windows`, `configuration: Debug` |
 | `ctest --preset windows-debug-tests` | Windows Debug test fallback | Optional Windows platform-neutral debug execution | No | No | Uses `configuration: Debug`; current subset is `CommandTest|KvStateMachineTest|TimerSchedulerTest|ThreadPoolTest` |
 | `ctest --preset windows-debug-managed-tests` | Windows Debug full managed sweep | Optional Windows full managed CTest target sweep | No | No | Uses `configuration: Debug`; runs the complete managed CTest target set; entry exists but does not imply PASS |
@@ -232,9 +232,9 @@ cross-platform gaps are scheduled for follow-up work.
 | 项目 | 当前状态 | 说明 |
 |------|----------|------|
 | Windows conservative baseline | PASS | `windows-release-tests`，当前 `18/18` 通过 |
-| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败；按 T040 focused 收口后，当前 failure matrix 只剩 `9` 项 `T042` exact seam，等待最终 closure sweep |
+| Windows full managed | PASS | `windows-release-managed-tests` 最近一次正式 rerun 已 `104/104` 通过；Windows full managed 当前无剩余红灯 |
 | 失败详情 | 单独维护 | 详见 [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md) |
-| 当前主要后续任务 | 已分流 | `T042` exact seam deferred / non-equivalent 最终收口 |
+| 当前主要后续任务 | 文档收口 | 进入 `T042` 做跨平台文档回填与最终任务关闭；不再有待修失败项 |
 
 ### T036 Windows Full Managed Entrypoint Check
 
@@ -408,6 +408,27 @@ segment / storage 红灯，不进入 `T042` exact failure-injection seam 范围�
 - `tests/test_raft_segment_storage.cpp` 在 Windows 下改用更短的临时测试根路径；没有修改生产代码。
 - 原始接收的 `6` 个 `RaftSegmentStorageTest` 平台无关红灯已在 focused rerun 全部转绿，并已从 failure matrix 删除。
 - 本轮按执行规则未重跑 full managed；当前剩余项已全部收敛到 `T042` 的 `9` 个 exact seam deferred / non-equivalent 用例。
+
+### T042 前置 Windows Exact Seam 收口结果
+
+本次 exact seam 收口继续只处理剩余 `9` 个 Windows red lights，不扩大到
+`T038` / `T039` / `T040` 已清零范围。
+
+当前结果：
+
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`
+  - PASS
+  - `49/49` 通过
+- `ctest --preset windows-release-managed-tests --output-on-failure`
+  - PASS
+  - `104/104` 通过
+
+本轮收口结论：
+
+- 剩余 `9` 个 exact failure-injection seam 已在 Windows 下稳定触发并转绿。
+- `windows-full-managed-failure-matrix.md` 已删除这 `9` 个 exact seam 项；
+  当前 Windows full managed 无剩余失败项。
+- `T042` 后续只负责跨平台文档回填与最终任务收口，不再承担新的失败修复。
 
 ## CTest Label Matrix
 

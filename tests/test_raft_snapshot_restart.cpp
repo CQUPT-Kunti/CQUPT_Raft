@@ -205,6 +205,14 @@ std::string PendingT010Message(const std::string& operation,
   return oss.str();
 }
 
+const char* ExpectedLinuxSpecificMarker() {
+#if defined(__linux__)
+  return "linux_specific=true";
+#else
+  return "linux_specific=false";
+#endif
+}
+
 void SetEnvVar(const char* name, const std::string& value) {
 #if defined(_WIN32)
   ASSERT_EQ(_putenv_s(name, value.c_str()), 0) << name;
@@ -1510,7 +1518,7 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
       << error;
   EXPECT_NE(error.find("path=" + injected_final_dir.string()), std::string::npos) << error;
   EXPECT_NE(error.find("failure_class=directory sync"), std::string::npos) << error;
-  EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+  EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
   EXPECT_NE(
       error.find("trusted_state_expectation=if restart sees a newer snapshot publish point without the required trusted publish completion, it must reject that snapshot and continue from the previous trusted snapshot plus replayable log tail"),
       std::string::npos)

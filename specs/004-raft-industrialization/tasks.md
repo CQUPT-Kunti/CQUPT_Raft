@@ -683,6 +683,13 @@
   - exact Linux-specific failure-injection seam 当前继续按 deferred /
     non-equivalent 记录，不写成 Windows 已等价 Linux durability 证据。
 
+T042 前置结果：
+
+- 剩余 `9` 个 Windows exact failure-injection seam 红灯已完成单独收口。
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'` 当前 `PASS (49/49)`。
+- `ctest --preset windows-release-managed-tests --output-on-failure` 当前 `PASS (104/104)`。
+- 这 `9` 个 exact seam 项已从 `windows-full-managed-failure-matrix.md` 删除；当前 Windows full managed 无剩余失败项。
+
 - [ ] T042 Backfill cross-platform docs and run the final Windows full managed closure sweep
   Goal: 用最终 Windows full managed CTest 结果回填平台文档、验证矩阵、入口说明和测试角色说明，形成“Windows full managed 已验证到哪里、哪些仍是 Linux-specific / deferred”的最终收口结论。
   Input: T033-T041 全部输出，`specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/quickstart.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `tests/README.md`, `CMakePresets.json`, `test.ps1`.

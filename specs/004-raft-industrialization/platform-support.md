@@ -51,7 +51,7 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 | 平台 | 当前角色 | 主验证入口 | 当前状态 | 已验证范围 | 未验证范围 / 不声明事项 |
 |------|----------|------------|----------|------------|-------------------------|
 | Linux | 主验证平台 | `./test.sh` / `ctest --preset debug-tests` | low-parallel configure/build 已记录 PASS；Linux 受管 CTest 当前 `104/104` PASS | Linux Bash 主入口、受管 CTest、`platform-neutral` 100 个测试、`durability-boundary` 4 个测试、Linux-specific durability / failure-injection / crash-style 解释边界 | 不把 Linux 结果外推为 Windows 等价覆盖；Windows Raft 全功能仍是 follow-up |
-| Windows | 保守 fallback 平台，并新增 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；最近一次 full managed 正式 sweep 为 `FAIL (15/104)`；按 T040 focused 收口后，当前 failure matrix 只剩 `9` 个 `T042` exact seam | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；`T038`、`T039`、`T040` 与 `T041` 后已转绿的 Windows focused cluster/runtime 与 platform-neutral storage 子集；以及单独的 full managed sweep 入口 | 不声明 Windows Raft 全功能测试通过；不声明 Windows 已等价验证 Linux-specific durability / failure-injection；不声明 exact seam failure injection 已完成等价验证 |
+| Windows | 保守 fallback 平台，并提供 full managed CTest 入口 | `.\test.ps1 -All` / `ctest --preset windows-release-managed-tests` | conservative baseline 已记录 PASS；最近一次 full managed 正式 rerun 已 `104/104 PASS` | Visual Studio 2022 MSVC x64 下的保守 platform-neutral baseline 子集：`CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`；以及 Windows full managed CTest 全量 `104` 个受管测试最新 rerun 全绿 | 不把 Windows 结果写成“等价 Linux-specific durability 语义”；macOS 仍不在当前验证范围内 |
 | macOS | 不在本 feature 验证范围内 | N/A | 当前不在本 feature 验证范围内 | 无 | 不写已验证，不声明任何等价运行时证据 |
 
 ## 各平台验证入口
@@ -96,12 +96,10 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
 - `cmake --preset windows`：PASS
 - `cmake --build --preset windows-release`：PASS
 - `ctest --preset windows-release-tests`：PASS
-- `ctest --preset windows-release-managed-tests`：FAIL
-  - 最近一次正式 full managed sweep 记录为 `104` 个受管测试里 `89` 个通过、`15` 个失败
-- `.\test.ps1 -Managed`：FAIL
-  - 失败数量与 `windows-release-managed-tests` 一致，当前也是 `15`
-- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`：FAIL
-  - 当前 `49` 个 focused 用例里，原始 `6` 个 T040 项已全部转绿；命令剩余 `9` 个失败均为 `T042` exact seam
+- `ctest --preset windows-release-managed-tests`：PASS
+  - 最近一次正式 full managed rerun 记录为 `104` 个受管测试全部通过
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`：PASS
+  - focused exact seam rerun 当前 `49/49` 通过
 
 解释规则：
 
@@ -116,33 +114,39 @@ cluster/runtime-heavy、durability-boundary、linux-specific-failure-injection
   `ThreadPoolTest`。
 - 这不代表所有带有部分 `platform-neutral` 逻辑的受管测试都已在 Windows
   进入默认验收范围。
-- `windows-release-managed-tests` 运行完整受管 CTest 目标集合，但其结果不能写成
-  Windows 已等价达到 Linux 当前 `104/104`。
+- `windows-release-managed-tests` 当前已在 Windows 下完成一次 `104/104 PASS`
+  的正式 rerun，但这不改变 Linux 仍是 Linux-specific durability /
+  failure-injection 语义的主解释平台这一边界。
 - `T041` 已修掉 Windows 目录句柄权限导致的
-  `FlushFileBuffers ... GetLastError=5` 主信号；剩余 exact Linux-specific
-  failure-injection seam 继续按 deferred / non-equivalent 解释。
+  `FlushFileBuffers ... GetLastError=5` 主信号；后续 exact seam 也已在 Windows
+  rerun 中转绿。
 
-### Windows full managed 首次 sweep 结果快照
+### Windows full managed 结果快照
 
 本次 `T034` 直接复用 `T033` 的两份日志：
 
 - `tmp/windows-release-managed-tests.log`
 - `tmp/test-ps1-managed.log`
 
-本次没有重新运行 Windows full managed 测试。当前正式记录为：
+首次 sweep 的历史结果仍保留用于问题分流；当前最新正式记录为：
 
 - conservative baseline：
   - `windows-release-tests`
   - `PASS`
   - 当前仍然只覆盖 `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、
     `ThreadPoolTest`
-- full managed sweep：
+- full managed 首次 sweep：
   - `windows-release-managed-tests`
   - `FAIL`
-  - 最近一次正式 rerun 仍失败 `15/104`
-- T040 focused 收口后：
-  - 当前 failure matrix 只剩 `9` 个 exact seam deferred / non-equivalent 项
-  - 本轮按执行规则没有重新运行 full managed，最终 closure sweep 留给 `T042`
+  - 历史首轮曾暴露 `85` 个失败项
+- full managed 最新 rerun：
+  - `windows-release-managed-tests`
+  - `PASS`
+  - 当前 `104/104` 通过
+- focused exact seam 最新 rerun：
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'`
+  - `PASS`
+  - 当前 `49/49` 通过
 
 当前平台摘要只保留到这里；完整失败测试名、失败分类矩阵和 19 个受管目标的
 PASS / FAIL / BLOCKED 状态，统一收敛到：
@@ -158,15 +162,15 @@ PASS / FAIL / BLOCKED 状态，统一收敛到：
 - `T038`：已收口；原始 4 项 election / replication / commit-apply 红灯已转绿
 - `T039`：已收口；当前无独立剩余 snapshot / restart / catch-up 红灯
 - `T040`：已收口；原始 `6` 项 platform-neutral persistence / segment / storage 红灯已转绿
-- `T041`：已修掉 Windows 目录 flush 句柄权限问题
-- `T042`：对剩余 exact seam deferred / non-equivalent 结论做最终文档化收口
+- `T041`：已修掉 Windows 目录 flush 句柄权限问题，并完成 exact seam Windows rerun 收口
+- `T042`：后续只剩跨平台文档回填与最终任务收口，不再承担剩余失败修复
 
 ## 验证范围分层
 
 | 分类 | Linux 当前记录 | Windows 当前记录 | macOS 当前记录 |
 |------|----------------|------------------|----------------|
 | platform-neutral baseline | Linux 受管 CTest 当前 `104/104` PASS，其中 `platform-neutral` 100 个测试通过 | 只记录保守 baseline 子集已通过 | 当前不在本 feature 验证范围内 |
-| Windows full managed CTest sweep | Linux 侧已有完整受管 CTest 作为对齐参照 | 已新增单独入口，但不默认声明为通过，也不等价 Linux `104/104` | 当前不在本 feature 验证范围内 |
+| Windows full managed CTest sweep | Linux 侧已有完整受管 CTest 作为对齐参照 | 已有单独入口，且最近一次正式 rerun 已 `104/104 PASS`；但不把该结果写成 Linux-specific 语义等价证明 | 当前不在本 feature 验证范围内 |
 | cluster/runtime-heavy | 当前 Linux 受管 CTest 未再记录红灯；更长时间 soak / stress 仍可作为后续观察 | 不声明已覆盖，也不声明已通过 | 当前不在本 feature 验证范围内 |
 | durability-boundary | 已记录 Linux 主环境解释与相关恢复边界 | 不声明等价运行时验证 | 当前不在本 feature 验证范围内 |
 | linux-specific-failure-injection | 当前只记录 Linux 证据 | 明确不等价、不继承 | 当前不在本 feature 验证范围内 |
@@ -212,9 +216,9 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
   `CommandTest`、`KvStateMachineTest`、`TimerSchedulerTest`、`ThreadPoolTest`
 - 已新增 Windows full managed CTest 入口：
   `windows-release-managed-tests`、`windows-debug-managed-tests`、`.\test.ps1 -Managed`
-- 已记录 Windows full managed 当前状态：
-- 最近一次正式 full managed rerun 为 `89` 个测试通过、`15` 个测试失败
-- 按 T040 focused 收口后，当前 failure matrix 只剩 `9` 个 `T042` exact seam
+- Windows full managed 当前状态：
+  - `ctest --preset windows-release-managed-tests` 最近一次正式 rerun 已 `104/104 PASS`
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\.'` 最近一次 focused exact seam rerun 已 `49/49 PASS`
 - `T038` / `T041` rerun 已确认：
   `RaftElectionTest.FollowerRejectsClientProposeAfterLeaderIsElected`
   、`RaftLeaderSwitchOrderingTest.CommittedStateSurvivesLeaderSwitchAndNewLeaderContinuesReplication`
@@ -245,11 +249,8 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
 ### Windows 未验证范围
 
 - Windows cluster-style 测试扩大范围
-- Windows 下的 snapshot / persistence / durability exact seam
-  稳定性验证
-- Windows full managed CTest sweep 的最终文档收口
-- Windows 等价 durability-boundary 运行时验证
-- Windows 等价 linux-specific-failure-injection 语义验证
+- Windows full managed `104/104 PASS` 之后的长期 soak / CI 持续验证
+- Windows 与 Linux 在更深层 crash-style / retained-artifact 运维流程上的完全等价性证明
 - Windows 下 Bash-first retained-artifact / `--keep-data` 等价流程
 
 ## 路径、临时目录与进程模型说明
@@ -264,10 +265,9 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
 ### Windows
 
 - 当前文档化入口基于 Visual Studio preset 与 PowerShell wrapper
-- 路径、临时目录、rename/replace、flush/sync 与 crash-style 语义目前不宣称
-  已具备 Linux 等价证据
-- 当前只把 Windows 记为 platform-neutral fallback，不记为 durability
-  主验收平台；当前剩余问题已收敛到 `T042`
+- Windows full managed 当前已完成一次 `104/104 PASS` 的正式 rerun
+- 路径、临时目录、rename/replace、flush/sync 与 crash-style 语义仍不写成
+  “与 Linux 主验收完全等价”的证据
 
 ## 后续 Follow-Up
 
@@ -283,9 +283,10 @@ injection、crash-style、Bash-first 与 durability-boundary 的内容，同当�
 ## 结论
 
 - Linux 仍是当前主验证平台。
-- Windows 仍是当前保守 fallback 平台。
-- Windows fallback 不等价于 Linux-specific durability / failure-injection /
-  crash-style 验收。
-- 当前 `US3` 的入口文档和状态说明已经收口；剩余 cluster-style、
-  durability 语义扩大验证和 CI 扩展继续保留为 follow-up。
+- Windows conservative baseline 与 Windows full managed 入口都已可用，且最近一次
+  `windows-release-managed-tests` 已 `104/104 PASS`。
+- Windows 结果不等价于 Linux-specific durability / failure-injection /
+  crash-style 语义主解释。
+- 当前 `US3` 的入口文档和状态说明已进入最终收口阶段；后续主要剩长期验证和 CI
+  扩展 follow-up。
 - 当前不记录 macOS 已验证；macOS 仍不在本 feature 验证范围内。

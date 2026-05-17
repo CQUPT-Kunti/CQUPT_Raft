@@ -85,6 +85,15 @@ namespace raftdemo
       return std::string(value) != "0";
     }
 
+    const char *ExpectedLinuxSpecificMarker()
+    {
+#if defined(__linux__)
+      return "linux_specific=true";
+#else
+      return "linux_specific=false";
+#endif
+    }
+
     std::size_t CountFilesWithExtension(const std::filesystem::path &dir,
                                         const std::string &extension)
     {
@@ -348,7 +357,7 @@ namespace raftdemo
       EXPECT_NE(error.find("operation=" + operation), std::string::npos) << error;
       EXPECT_NE(error.find("path=" + path.string()), std::string::npos) << error;
       EXPECT_NE(error.find("failure_class=" + failure_class), std::string::npos) << error;
-      EXPECT_NE(error.find("linux_specific=true"), std::string::npos) << error;
+      EXPECT_NE(error.find(ExpectedLinuxSpecificMarker()), std::string::npos) << error;
       EXPECT_NE(error.find("trusted_state_expectation=" + trusted_state_expectation), std::string::npos)
           << error;
       EXPECT_NE(error.find("recovery_expectation=" + trusted_state_expectation), std::string::npos)
