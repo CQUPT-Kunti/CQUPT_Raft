@@ -72,7 +72,7 @@ std::uint64_t NowForPath() {
 }
 
 int PickBasePort(const std::string& test_name) {
-  const int name_offset = static_cast<int>(std::hash<std::string>{}(test_name) % 2000);
+  const int name_offset = static_cast<int>(std::hash<std::string>{}(test_name) % 1800);
 
   if (const char* env = std::getenv("RAFT_TEST_BASE_PORT")) {
     try {
@@ -82,9 +82,9 @@ int PickBasePort(const std::string& test_name) {
     }
   }
 
-  std::random_device rd;
-  const int jitter = static_cast<int>(rd() % 10000);
-  return 42000 + name_offset + jitter;
+  // Keep each test in its own small port window so adjacent cases do not
+  // randomly collide with sockets that are still draining on Windows.
+  return 36000 + name_offset * 12;
 }
 
 std::filesystem::path MakeTestRoot(const std::string& test_name) {
@@ -96,6 +96,11 @@ std::filesystem::path MakeTestRoot(const std::string& test_name) {
     }
   }
 
+#ifdef _WIN32
+  const std::string name = "sd_" + std::to_string(NowForPath()) + "_" +
+                           std::to_string(rd());
+  return std::filesystem::temp_directory_path() / "rq_sd" / name;
+#else
   const std::string name = "raft_snapshot_diagnosis_" + safe_name + "_" +
                            std::to_string(NowForPath()) + "_" +
                            std::to_string(rd());
@@ -109,6 +114,7 @@ std::filesystem::path MakeTestRoot(const std::string& test_name) {
   }
 
   return base_dir / name;
+#endif
 }
 
 void WriteTextFile(const std::filesystem::path& path, const std::string& content) {

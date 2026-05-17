@@ -26,7 +26,7 @@
 - Windows full managed：`FAIL`
   - `ctest --preset windows-release-managed-tests`
   - `.\test.ps1 -Managed`
-  - 当前仍失败数量：`32`
+  - 当前仍失败数量：`15`
 
 ## 失败分类矩阵
 
@@ -35,10 +35,10 @@
 | Windows full managed CTest entry / harness 问题 | 已确认无独立阻塞 | 0 | `104` 个受管测试都已 discover 并执行；preset / wrapper 不是“没跑起来” | T036 |
 | Windows runtime / timing / harness 问题 | 已收紧当前路径假设；无独立剩余项 | 0 | `raft_integration_test.cpp` 已改用更短的 Windows 临时根路径；`create temp log dir failed` 不再是当前独立 blocker | T037 |
 | Windows election / replication / commit-apply 红灯 | 已收口 | 0 | Windows focused rerun 与 full managed rerun 已确认 `4` 个 T038 项全部转绿 | T038 |
-| Windows snapshot / restart / catch-up 红灯 | FAIL | 17 | snapshot restore、restart replay、catch-up sequencing、diagnosis 断言失败；不再与目录 flush 权限错误混写 | T039 |
+| Windows snapshot / restart / catch-up 红灯 | 已收口 | 0 | Windows focused rerun 已确认 snapshot / restart / catch-up 本体转绿；仅剩 exact seam 项转交 T042 | T039 |
 | Windows persistence / segment / storage 红灯 | FAIL | 6 | segment publish / recovery / clustered storage 仍有平台无关红灯 | T040 |
 | Windows durability semantics adapt-or-defer | 已完成根因定位；剩余 exact seam 保持 deferred / non-equivalent | 9 | `FlushFileBuffers` 目录句柄权限问题已修复；剩余 exact failure-injection seam 不写成 Windows 已等价 Linux | T042 |
-| 其他 / 待进一步分类 | 当前无独立项 | 0 | 当前 `32` 项都能先落到上面几类 | T039 / T040 / T042 |
+| 其他 / 待进一步分类 | 当前无独立项 | 0 | 当前 `15` 项都能先落到上面几类 | T040 / T042 |
 
 ## 受管目标状态矩阵
 
@@ -55,11 +55,11 @@
 | `test_raft_split_brain` | PASS | 0 | N/A | N/A |
 | `test_t017_leader_switch_ordering` | PASS | 0 | N/A | N/A |
 | `persistence_test` | FAIL | 2 | Windows durability semantics adapt-or-defer | T042 |
-| `snapshot_test` | FAIL | 6 | Windows snapshot / restart / catch-up 红灯 | T039 / T042 |
+| `snapshot_test` | FAIL | 1 | Windows durability semantics adapt-or-defer | T042 |
 | `raft_integration_test` | PASS | 0 | N/A | N/A |
-| `test_raft_snapshot_catchup` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
-| `test_raft_snapshot_restart` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
-| `test_raft_snapshot_diagnosis` | FAIL | 4 | Windows snapshot / restart / catch-up 红灯 | T039 |
+| `test_raft_snapshot_catchup` | PASS | 0 | N/A | N/A |
+| `test_raft_snapshot_restart` | PASS | 0 | N/A | N/A |
+| `test_raft_snapshot_diagnosis` | PASS | 0 | N/A | N/A |
 | `test_raft_segment_storage` | FAIL | 9 | Windows persistence / segment / storage 红灯 | T040 / T042 |
 | `test_snapshot_storage_reliability` | FAIL | 3 | Windows durability semantics adapt-or-defer | T042 |
 | `test_raft_replicator_behavior` | PASS | 0 | N/A | N/A |
@@ -131,26 +131,17 @@ Windows runtime / timing / harness blocker。
 
 ### 4. Windows snapshot / restart / catch-up 红灯
 
-这些失败优先进入 `T039`，处理 snapshot、restart、catch-up、diagnosis 相关
-红灯：
+`T039` 当前没有独立剩余失败项。
 
-- `RaftSnapshotRecoveryTest.FullRestartReplaysSnapshotTailWithoutLosingDeletesOrOverwrites`
-- `RaftSnapshotRecoveryTest.RestartedFollowerAppliesCommittedTailExactlyOnceAfterSnapshotLoad`
-- `RaftSnapshotRecoveryTest.StandaloneRestartFallsBackToOlderTrustedSnapshotWhenNewestSnapshotIsCorrupted`
-- `RaftSnapshotRecoveryTest.StandaloneRestartRejectsMetadataMismatchedVisibleSnapshotAndKeepsTrustedBoundary`
-- `RaftSnapshotRecoveryTest.AllPublishedSnapshotsInvalidYieldNoTrustedSnapshot`
-- `RaftSnapshotCatchupTest.RestartedFollowerCatchesUpLargeGapWithBatchedAppendEntries`
-- `RaftSnapshotCatchupTest.LaggingFollowerReplaysLiveLogWithoutBreakingCommittedDeleteOrdering`
-- `RaftSnapshotCatchupTest.RestartedFollowerInstallsSnapshotWhenLeaderCompactedLogs`
-- `RaftSnapshotCatchupTest.FollowerContinuesReplicatingLogsAfterInstallingSnapshot`
-- `RaftSnapshotRestartTest.FollowerKeepsStateAfterInstallSnapshotAndRestart`
-- `RaftSnapshotRestartTest.LeaderKeepsCompactedSnapshotStateAfterRestart`
-- `RaftSnapshotRestartTest.FullClusterRestartsAfterSnapshotAndContinuesWriting`
-- `RaftSnapshotRestartTest.SnapshotAndPostSnapshotLogsRecoverAfterFullRestart`
-- `RaftSnapshotDiagnosisTest.RestartedSingleNodeLoadsSnapshotAndTailLogsWithoutPeers`
-- `RaftSnapshotDiagnosisTest.CompactedClusterReplicatesNewLogAfterRestartedLeaderStepsDown`
-- `RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot`
-- `RaftSnapshotDiagnosisTest.RestartedSingleNodeSkipsMetadataMismatchedVisibleSnapshotAndReplaysCommittedTail`
+本轮 Windows focused rerun 已确认：
+
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotRecoveryTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\.'`
+  当前只剩 `1` 个 exact seam 失败。
+- `RaftSnapshotCatchupTest.*`、`RaftSnapshotRestartTest.*`、
+  `RaftSnapshotDiagnosisTest.*` 与 platform-neutral 的
+  `RaftSnapshotRecoveryTest.*` restart/catch-up 本体断言都已转绿，并已从失败矩阵删除。
+- `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`
+  经复核属于 exact failure-injection seam，不再保留在 T039，已转交 `T042`。
 
 ### 5. Windows persistence / segment / storage 红灯
 

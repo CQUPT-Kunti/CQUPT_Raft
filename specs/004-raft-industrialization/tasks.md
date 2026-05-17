@@ -615,7 +615,7 @@
   - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(RaftElectionTest|RaftLogReplicationTest|RaftCommitApplyTest|RaftSplitBrainTest|RaftLeaderSwitchOrderingTest|RaftReplicatorBehaviorTest)\\.'` 当前 `PASS (17/17)`。
   - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，但剩余失败数量已从 `36` 收敛到 `32`；剩余项全部转交 `T039` / `T040` / `T042`。
 
-- [ ] T039 Fix Windows snapshot / restart / catch-up red lights exposed by the full managed sweep
+- [x] T039 Fix Windows snapshot / restart / catch-up red lights exposed by the full managed sweep
   Goal: 收口 Windows 下 snapshot、restart、catch-up、diagnosis 链路里的真实红灯，明确哪些是平台无关恢复/追赶问题，哪些才属于 durability follow-up。
   Input: T035 失败矩阵，T037 输出，`tests/snapshot_test.cpp`, `tests/test_raft_snapshot_catchup.cpp`, `tests/test_raft_snapshot_restart.cpp`, `tests/test_raft_snapshot_diagnosis.cpp`, `tests/raft_integration_test.cpp`，相关模块源码。
   Scope: 如需修改生产代码，只允许最小改动 `modules/raft/node/*.cpp`, `modules/raft/replication/*.cpp`, `modules/raft/storage/*.cpp`, `modules/raft/state_machine/*.cpp`；允许同步修改相关测试与文档；禁止改协议语义、公共 API 或持久化格式。
@@ -627,6 +627,13 @@
   Windows/macOS Fallback: Yes, 但不得把 Linux-specific crash-style 语义写成已等价通过。
   Basis: `spec.md` FR-003/FR-004/FR-010/FR-011；`plan.md` W3/W4/W5/W8。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\\.'`; `ctest --preset windows-release-managed-tests`.
+  Result:
+  - 原始接收的 `17` 个 T039 失败已全部收口；当前 Windows full managed 已无独立 T039 红灯。
+  Execution Note:
+  - 本轮只修改 `tests/test_raft_snapshot_catchup.cpp`、`tests/test_raft_snapshot_restart.cpp`、`tests/test_raft_snapshot_diagnosis.cpp`，没有修改生产代码。
+  - 三个测试文件都在 Windows 下改用更短的临时测试根路径，并把端口分配改成按测试名映射到固定间隔端口窗，收口了长路径与端口复用噪声。
+  - `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotRecoveryTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\\.'` 当前 `24` 个 focused 用例里 `23` 个通过；唯一剩余失败为 `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`，经复核转交 `T042`。
+  - `ctest --preset windows-release-managed-tests --output-on-failure` 当前仍为 `FAIL`，但剩余失败数量已从 `32` 收敛到 `15`；当前只剩 `T040` `6` 项与 `T042` `9` 项。
 
 - [ ] T040 Fix Windows persistence / segment / storage red lights without changing persisted format or API
   Goal: 收口 Windows 下 `persistence_test`、segment log、snapshot storage 等 storage 相关红灯中的平台无关恢复缺陷、路径问题或 file-lock 问题，但不把 Linux-specific exact durability 注入直接等价化。
@@ -641,7 +648,7 @@
   Basis: `spec.md` FR-003/FR-006/FR-010/FR-011；`plan.md` W2/W3/W8；根 `AGENTS.md` durability contract。
   Tests To Run: `ctest --test-dir build/windows -C Release --output-on-failure -R '^(PersistenceTest|RaftSegmentStorageTest|SnapshotStorageReliabilityTest|RaftSnapshotRecoveryTest)\\.'`; `ctest --preset windows-release-managed-tests`.
 
-- [ ] T041 Handle Windows durability semantics as explicit adapt-or-defer follow-up
+- [x] T041 Handle Windows durability semantics as explicit adapt-or-defer follow-up
   Goal: 单独处理 Windows durability 语义，不把 Linux `fsync` / directory sync / crash-style failure injection 直接硬写成 Windows 等价；能实现的 required durability contract 做最小适配，不能等价的部分明确 deferred 边界和错误语义。
   Input: T035/T040 输出，`specs/004-raft-industrialization/platform-support.md`, `specs/004-raft-industrialization/validation-matrix.md`, `specs/004-raft-industrialization/contracts/validation-entrypoints.md`, `specs/004-raft-industrialization/quickstart.md`, `modules/raft/storage/**`, `modules/raft/runtime/**`.
   Scope: 允许最小修改 `modules/raft/storage/*.cpp`、`modules/raft/runtime/*.cpp` 或必要的窄范围平台 helper，以满足 Windows required durability contract 或明确错误返回；允许同步更新平台/验证文档；禁止引入 silent no-op durability success，禁止宣称 Windows 已等价通过 Linux-specific failure-injection。

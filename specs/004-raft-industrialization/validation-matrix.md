@@ -232,9 +232,9 @@ cross-platform gaps are scheduled for follow-up work.
 | 项目 | 当前状态 | 说明 |
 |------|----------|------|
 | Windows conservative baseline | PASS | `windows-release-tests`，当前 `18/18` 通过 |
-| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态为 `32` 项失败 |
+| Windows full managed | FAIL | `windows-release-managed-tests` / `.\test.ps1 -Managed`；首次 sweep 为 `85` 项失败，当前最新状态为 `15` 项失败 |
 | 失败详情 | 单独维护 | 详见 [windows-full-managed-failure-matrix.md](./windows-full-managed-failure-matrix.md) |
-| 当前主要后续任务 | 已分流 | `T039` snapshot/restart/catch-up、`T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
+| 当前主要后续任务 | 已分流 | `T040` persistence/segment/storage、`T042` exact seam deferred 收口 |
 
 ### T036 Windows Full Managed Entrypoint Check
 
@@ -321,6 +321,40 @@ commit-apply 红灯，不进入 snapshot / persistence / durability deferred 范
   真实跨平台生产缺陷。
 - 剩余 full managed 红灯全部转交 `T039` / `T040` / `T042`。
 
+### T039 Windows Snapshot / Restart / Catch-Up Closure
+
+本次 `T039` 只处理 Windows full managed 中的 `17` 个 snapshot / restart /
+catch-up 红灯，不进入 persistence / segment / exact seam deferred 范围。
+
+本次最小测试层修正：
+
+- `tests/test_raft_snapshot_catchup.cpp`
+  - Windows 下改用更短的临时测试根路径。
+  - 端口分配改为按测试名映射到固定间隔端口窗，避免相邻 case 在 Windows 上随机撞到刚释放的端口范围。
+- `tests/test_raft_snapshot_restart.cpp`
+  - Windows 下改用更短的临时测试根路径。
+  - 端口分配改为按测试名映射到固定间隔端口窗，避免 snapshot/restart case 间的端口复用噪声。
+- `tests/test_raft_snapshot_diagnosis.cpp`
+  - Windows 下改用更短的临时测试根路径。
+  - 端口分配改为按测试名映射到固定间隔端口窗，减少 diagnosis 集群 case 的随机端口冲突。
+
+本次 focused / full managed 结果摘要：
+
+- `ctest --test-dir build/windows -C Release --output-on-failure -R '^(SnapshotTest|RaftSnapshotCatchupTest|RaftSnapshotRestartTest|RaftSnapshotRecoveryTest|RaftSnapshotDiagnosisTest|RaftIntegrationTest)\.'`
+  - FAIL
+  - 当前 `24` 个 focused 用例里 `23` 个通过；唯一剩余失败为
+    `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`
+- `ctest --preset windows-release-managed-tests --output-on-failure`
+  - FAIL
+  - 当前 full managed 剩余失败数量已从 `32` 收敛到 `15`
+
+当前 T039 结论：
+
+- 原始接收的 snapshot / restart / catch-up 本体红灯已全部转绿，并已从 failure matrix 删除。
+- `RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam`
+  经复核属于 exact failure-injection seam，不再保留在 T039，已转交 `T042`。
+- 当前 Windows full managed 已无独立 T039 失败；剩余红灯只转交 `T040` / `T042`。
+
 ### T041 Windows Durability Adapt-Or-Defer
 
 本次 `T041` 聚焦 Windows durability 语义，不修改 Raft election /
@@ -351,13 +385,12 @@ replication / snapshot 业务逻辑，只处理 storage 层的 Windows flush / s
   - 当前剩余 `8` 个 focused storage / durability 失败
 - `ctest --preset windows-release-managed-tests --output-on-failure`
   - FAIL
-  - 当前 full managed 剩余失败数量已从 `85` 收敛到 `32`
+  - 在 `T039` 完成后，当前 full managed 剩余失败数量进一步收敛到 `15`
 
 当前 T041 结论：
 
 - `FlushFileBuffers ... GetLastError=5` 已从当前 focused / full managed 主失败信号中消失。
-- Windows full managed 当前剩余 `32` 项失败，后续分流为：
-  - `T039`：`17` 项 snapshot / restart / catch-up 红灯
+- Windows full managed 当前剩余 `15` 项失败，后续分流为：
   - `T040`：`6` 项 platform-neutral persistence / segment / storage 红灯
   - `T042`：`9` 项 exact Linux-specific failure-injection seam，按 deferred /
     non-equivalent 最终收口
