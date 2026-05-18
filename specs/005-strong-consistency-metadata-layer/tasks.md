@@ -89,7 +89,7 @@
 **Goal**: 支持 create -> pending invisible -> commit -> committed visible 的最小强一致元数据闭环。  
 **Independent Test**: 用状态机或 Metadata Client 创建模拟对象，确认 create 后 Head/List 不可见，commit 后 Head/List 可见，并验证重复 create/commit 的 request_id 幂等。
 
-- [ ] T009 [P] [US1] Add state machine API declarations in modules/raft/state_machine/metadata_state_machine.h
+- [x] T009 [P] [US1] Add state machine API declarations in modules/raft/state_machine/metadata_state_machine.h
   - 目标: 定义 `StrongConsistencyMetadataStateMachine` 的公共接口。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/AGENTS.md`, `modules/raft/state_machine/state_machine.h`, `modules/raft/common/metadata_command.h`, `modules/raft/common/metadata_result.h`, `specs/005-strong-consistency-metadata-layer/plan.md`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.h`
