@@ -124,7 +124,7 @@
   - 实现要求: 只做最小 test target 追加；不得跳过或删除已有测试。
   - 验收标准: 新测试 target 可被 CTest 发现；若读取 `tests/CMakeLists.txt` 被禁止则暂停。
 
-- [ ] T014 [P] [US1] Add MetadataService contract in proto/raft.proto
+- [x] T014 [P] [US1] Add MetadataService contract in proto/raft.proto
   - 目标: 规划并实现 Metadata API 的 protobuf 契约扩展。
   - 允许读取文件: `NOTREAD.md`, `proto/AGENTS.md`, `proto/raft.proto`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `proto/raft.proto`

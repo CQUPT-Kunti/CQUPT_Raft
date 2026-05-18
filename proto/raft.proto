@@ -17,6 +17,14 @@ service KvService {
   rpc Metrics(MetricsRequest) returns (MetricsResponse);
 }
 
+service MetadataService {
+  rpc CreateMetadataRecord(CreateMetadataRecordRequest) returns (CreateMetadataRecordResponse);
+  rpc CommitMetadataRecord(CommitMetadataRecordRequest) returns (CommitMetadataRecordResponse);
+  rpc DeleteMetadataRecord(DeleteMetadataRecordRequest) returns (DeleteMetadataRecordResponse);
+  rpc HeadMetadataRecord(HeadMetadataRecordRequest) returns (HeadMetadataRecordResponse);
+  rpc ListMetadataRecords(ListMetadataRecordsRequest) returns (ListMetadataRecordsResponse);
+}
+
 message VoteRequest {
   uint64 term = 1;
   int32 candidate_id = 2;
@@ -192,4 +200,124 @@ message MetricsResponse {
   int32 leader_id = 4;
   string leader_address = 5;
   MetricsSnapshot metrics = 6;
+}
+
+enum MetadataStatusCode {
+  METADATA_STATUS_CODE_UNSPECIFIED = 0;
+  METADATA_STATUS_CODE_OK = 1;
+  METADATA_STATUS_CODE_NOT_LEADER = 2;
+  METADATA_STATUS_CODE_INVALID_ARGUMENT = 3;
+  METADATA_STATUS_CODE_NOT_FOUND = 4;
+  METADATA_STATUS_CODE_IDEMPOTENT_REPLAY = 5;
+  METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT = 6;
+  METADATA_STATUS_CODE_STATE_CONFLICT = 7;
+  METADATA_STATUS_CODE_INTERNAL_ERROR = 8;
+  METADATA_STATUS_CODE_TIMEOUT = 9;
+}
+
+enum MetadataRecordState {
+  METADATA_RECORD_STATE_UNSPECIFIED = 0;
+  METADATA_RECORD_STATE_PENDING = 1;
+  METADATA_RECORD_STATE_COMMITTED = 2;
+  METADATA_RECORD_STATE_DELETED = 3;
+}
+
+message MetadataLeaderHint {
+  int32 leader_id = 1;
+  string leader_address = 2;
+}
+
+message MetadataManifest {
+  uint64 object_size = 1;
+  uint64 chunk_size = 2;
+  uint64 chunk_count = 3;
+  string checksum = 4;
+  repeated string mock_locations = 5;
+}
+
+message MetadataRecord {
+  string object_key = 1;
+  MetadataRecordState state = 2;
+  MetadataManifest manifest = 3;
+  string payload = 4;
+  string create_request_id = 5;
+  string commit_request_id = 6;
+  string delete_request_id = 7;
+  uint64 created_at_log_index = 8;
+  uint64 committed_at_log_index = 9;
+  uint64 deleted_at_log_index = 10;
+  string commit_info = 11;
+  string delete_info = 12;
+}
+
+message MetadataResponseSummary {
+  MetadataStatusCode code = 1;
+  string message = 2;
+  string request_id = 3;
+  string object_key = 4;
+  MetadataRecordState state = 5;
+  uint64 term = 6;
+  uint64 log_index = 7;
+  MetadataLeaderHint leader_hint = 8;
+}
+
+message CreateMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  MetadataManifest manifest = 3;
+  string payload = 4;
+  uint64 client_timestamp = 5;
+}
+
+message CreateMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  MetadataRecord record = 2;
+}
+
+message CommitMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  string expected_create_request_id = 3;
+  string commit_info = 4;
+  uint64 client_timestamp = 5;
+}
+
+message CommitMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  MetadataRecord record = 2;
+}
+
+message DeleteMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  string delete_info = 3;
+  uint64 client_timestamp = 4;
+}
+
+message DeleteMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+}
+
+message HeadMetadataRecordRequest {
+  string object_key = 1;
+  uint64 client_timestamp = 2;
+}
+
+message HeadMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  bool found = 2;
+  MetadataRecord record = 3;
+}
+
+message ListMetadataRecordsRequest {
+  string prefix = 1;
+  uint32 limit = 2;
+  string page_token = 3;
+  uint64 client_timestamp = 4;
+}
+
+message ListMetadataRecordsResponse {
+  MetadataResponseSummary summary = 1;
+  repeated MetadataRecord records = 2;
+  string next_page_token = 3;
 }
