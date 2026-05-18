@@ -18,8 +18,8 @@
 
 **Purpose**: 固定本 feature 的实现边界，避免从 KV demo 演进时误触 Raft 内核或禁止路径。
 
-- [ ] T001 Establish implementation boundary notes in specs/005-strong-consistency-metadata-layer/tasks.md
-  - 目标: 在开始实现前确认本 feature 只触碰上层 metadata demo/API/client/state_machine 规划边界。
+- [x] T001 Establish implementation boundary notes in specs/005-strong-consistency-metadata-layer/tasks.md
+  - 目标: 在开x始实现前确认本 feature 只触碰上层 metadata demo/API/client/state_machine 规划边界。
   - 允许读取文件: `NOTREAD.md`, `AGENTS.md`, `specs/005-strong-consistency-metadata-layer/plan.md`, `specs/005-strong-consistency-metadata-layer/spec.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/tasks.md`
   - 实现要求: 记录不得读取 004、不得读取禁止路径、不得修改 Raft 内核、不得实现数据面。
