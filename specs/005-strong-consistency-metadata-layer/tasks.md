@@ -110,7 +110,7 @@
   - 实现要求: 同一 request_id 同 fingerprint 返回等价结果；同一 request_id 不同 fingerprint 返回 `IDEMPOTENCY_CONFLICT`；重复 commit 不产生重复可见记录。
   - 验收标准: VM-003、VM-004、VM-005 通过；幂等表结果包含 request_id、operation、object_key、fingerprint、result_state、log_index。
 
-- [ ] T012 [P] [US1] Add metadata state machine unit tests in tests/metadata_state_machine_test.cpp
+- [x] T012 [P] [US1] Add metadata state machine unit tests in tests/metadata_state_machine_test.cpp
   - 目标: 覆盖 US1 的状态机级别 MVP 测试。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: `tests/metadata_state_machine_test.cpp`
