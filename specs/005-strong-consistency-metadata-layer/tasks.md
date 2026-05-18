@@ -138,7 +138,7 @@
   - 实现要求: service 层只做适配、校验和响应填充；不持有 metadata 生命周期状态；not leader 返回 leader hint；写成功返回 term/log_index。
   - 验收标准: Create/Commit/Head/List 的响应码符合 `api.md`；不改 Raft 内核逻辑。
 
-- [ ] T016 [P] [US1] Add metadata service declaration in modules/raft/service/metadata_service_impl.h
+- [x] T016 [P] [US1] Add metadata service declaration in modules/raft/service/metadata_service_impl.h
   - 目标: 声明 MetadataService gRPC 适配类。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/service/AGENTS.md`, `modules/raft/service/kv_service_impl.h`, `proto/raft.proto`
   - 允许修改文件: `modules/raft/service/metadata_service_impl.h`

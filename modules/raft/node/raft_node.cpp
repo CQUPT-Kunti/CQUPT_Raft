@@ -17,9 +17,9 @@
 
 #include "raft/runtime/logging.h"
 #include "raft/service/kv_service_impl.h"
+#include "raft/service/metadata_service_impl.h"
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
-#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/state_machine/state_machine.h"
 #include "raft/storage/snapshot_storage.h"
 
@@ -89,13 +89,55 @@ namespace raftdemo
 
   } // namespace
 
+  ApplyResult CompositeKvMetadataStateMachine::Apply(std::uint64_t index,
+                                                     const std::string &command_data)
+  {
+    Command command;
+    if (Command::Deserialize(command_data, &command) &&
+        command.type == CommandType::kMetadata)
+    {
+      return metadata_.Apply(index, command_data);
+    }
+    return kv_.Apply(index, command_data);
+  }
+
+  SnapshotResult CompositeKvMetadataStateMachine::SaveSnapshot(const std::string &file_path) const
+  {
+    return kv_.SaveSnapshot(file_path);
+  }
+
+  SnapshotResult CompositeKvMetadataStateMachine::LoadSnapshot(const std::string &file_path)
+  {
+    return kv_.LoadSnapshot(file_path);
+  }
+
+  bool CompositeKvMetadataStateMachine::GetValue(const std::string &key, std::string *value) const
+  {
+    return kv_.Get(key, value);
+  }
+
+  std::string CompositeKvMetadataStateMachine::DebugString() const
+  {
+    return kv_.DebugString();
+  }
+
+  StrongConsistencyMetadataStateMachine *CompositeKvMetadataStateMachine::MetadataStateMachine()
+  {
+    return &metadata_;
+  }
+
+  const StrongConsistencyMetadataStateMachine *CompositeKvMetadataStateMachine::MetadataStateMachine() const
+  {
+    return &metadata_;
+  }
+
   RaftNode::RaftNode(NodeConfig config)
-      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<KvStateMachine>())
+      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<CompositeKvMetadataStateMachine>())
   {
   }
 
   RaftNode::RaftNode(NodeConfig config, snapshotConfig snapshot_config)
-      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<KvStateMachine>())
+      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<CompositeKvMetadataStateMachine>())
   {
   }
 
@@ -348,11 +390,13 @@ namespace raftdemo
   {
     service_ = std::make_unique<RaftServiceImpl>(*this);
     kv_service_ = std::make_unique<KvServiceImpl>(*this);
+    metadata_service_ = std::make_unique<MetadataServiceImpl>(*this);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(config_.address, grpc::InsecureServerCredentials());
     builder.RegisterService(service_.get());
     builder.RegisterService(kv_service_.get());
+    builder.RegisterService(metadata_service_.get());
     server_ = builder.BuildAndStart();
     if (!server_)
     {
@@ -503,10 +547,16 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       oss << "]";
     }
 
-    const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-    if (kv_sm != nullptr)
+    if (const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
+        kv_sm != nullptr)
     {
       oss << ", kv=" << kv_sm->DebugString();
+    }
+    else if (const auto *composite_sm =
+                 dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
+             composite_sm != nullptr)
+    {
+      oss << ", kv=" << composite_sm->DebugString();
     }
 
     return oss.str();
@@ -514,12 +564,19 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
   bool RaftNode::DebugGetValue(const std::string &key, std::string *value) const
   {
-    const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-    if (kv_sm == nullptr)
+    if (const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
+        kv_sm != nullptr)
+    {
+      return kv_sm->Get(key, value);
+    }
+
+    const auto *composite_sm =
+        dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
+    if (composite_sm == nullptr)
     {
       return false;
     }
-    return kv_sm->Get(key, value);
+    return composite_sm->GetValue(key, value);
   }
 
   void RaftNode::CancelElectionTimerLocked()
@@ -2037,12 +2094,38 @@ void RaftNode::SendHeartbeats()
 
   StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine()
   {
-    return dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+    if (auto *metadata_sm =
+            dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+        metadata_sm != nullptr)
+    {
+      return metadata_sm;
+    }
+
+    auto *composite_sm =
+        dynamic_cast<CompositeKvMetadataStateMachine *>(state_machine_.get());
+    if (composite_sm == nullptr)
+    {
+      return nullptr;
+    }
+    return composite_sm->MetadataStateMachine();
   }
 
   const StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine() const
   {
-    return dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+    if (const auto *metadata_sm =
+            dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+        metadata_sm != nullptr)
+    {
+      return metadata_sm;
+    }
+
+    const auto *composite_sm =
+        dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
+    if (composite_sm == nullptr)
+    {
+      return nullptr;
+    }
+    return composite_sm->MetadataStateMachine();
   }
 
   bool RaftNode::ValidateCommandUnlocked(const Command &command, std::string *reason) const
