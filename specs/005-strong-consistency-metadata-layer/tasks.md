@@ -32,7 +32,7 @@
   - 实现要求: 只总结允许文件中的模块职责，不读取源码、不读取 tests、不读取 004。
   - 验收标准: 明确 `common` 负责 command codec、`state_machine` 负责业务状态、`service` 负责适配、`apps` 负责 CLI、`proto` 负责契约、Raft 内核不主动修改。
 
-- [ ] T003 [P] Confirm future touched file list in specs/005-strong-consistency-metadata-layer/tasks.md
+- [X] T003 [P] Confirm future touched file list in specs/005-strong-consistency-metadata-layer/tasks.md
   - 目标: 为后续任务固定最小文件范围，避免全量扫描。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/plan.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/tasks.md`
