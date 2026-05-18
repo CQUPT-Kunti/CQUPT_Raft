@@ -59,7 +59,7 @@
   - 实现要求: 不复用 `SET|key|value` / `DEL|key|` 作为 metadata 格式；必须拒绝大 payload、缺失 request_id、空 object_key、非法 chunk_size/chunk_count。
   - 验收标准: codec 可区分 create/commit/delete；同一 request_id 不同 fingerprint 可被上层识别为 idempotency conflict；不破坏 `command.cpp`。
 
-- [ ] T006 [P] Add metadata status mapping contract in modules/raft/common/metadata_result.h
+- [x] T006 [P] Add metadata status mapping contract in modules/raft/common/metadata_result.h
   - 目标: 定义 metadata API 的结果码和响应摘要类型。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/api.md`, `modules/raft/common/AGENTS.md`
   - 允许修改文件: `modules/raft/common/metadata_result.h`
