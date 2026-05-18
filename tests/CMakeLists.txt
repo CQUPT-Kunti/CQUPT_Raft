@@ -75,6 +75,33 @@ endfunction()
 # =========================
 add_raft_gtest(test_command test_command.cpp
   "platform-neutral;platform-neutral-fallback")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_command_test.cpp")
+  add_executable(test_metadata_command
+    metadata_command_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/common/metadata_command.cpp
+  )
+
+  target_link_libraries(test_metadata_command
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_metadata_command
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  gtest_discover_tests(test_metadata_command
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES
+      LABELS "platform-neutral;platform-neutral-fallback"
+  )
+else()
+  message(STATUS "Skip test_metadata_command: metadata_command_test.cpp not found")
+endif()
+
 add_raft_gtest(test_state_machine test_state_machine.cpp
   "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp

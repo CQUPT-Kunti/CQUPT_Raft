@@ -73,7 +73,7 @@
   - 实现要求: 若执行时 `NOTREAD.md` 仍禁止读取 `tests/**`，不得读取既有测试；只能新增该测试文件并等待后续明确 wiring 任务处理。
   - 验收标准: 覆盖合法 create/commit/delete、缺失 request_id、payload 超限、fingerprint conflict、mock_locations 解析；测试文件不依赖真实 StorageNode 或真实文件。
 
-- [ ] T008 Prepare build wiring for metadata common tests in tests/CMakeLists.txt
+- [x] T008 Prepare build wiring for metadata common tests in tests/CMakeLists.txt
   - 目标: 将 metadata command 单测接入构建。
   - 允许读取文件: `NOTREAD.md`, `tests/CMakeLists.txt`, `CMakeLists.txt`
   - 允许修改文件: `tests/CMakeLists.txt`
