@@ -15,6 +15,7 @@ namespace raftdemo
         kUnknown = 0,
         kSet = 1,
         kDelete = 2,
+        kMetadata = 3,
     };
 
     // 业务层提交给 Raft 的原始命令
@@ -23,6 +24,7 @@ namespace raftdemo
         CommandType type;
         std::string key;
         std::string value;
+        std::string metadata_payload;
 
         // 判断当前命令对象是否合法。
         bool IsValid() const;

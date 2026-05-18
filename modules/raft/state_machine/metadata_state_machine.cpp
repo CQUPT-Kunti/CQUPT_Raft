@@ -5,14 +5,10 @@
 #include <utility>
 #include <vector>
 
+#include "raft/common/command.h"
+
 namespace raftdemo
 {
-    // T005 当前尚未在头文件公开 codec 声明，这里只引入最小原型以复用既有实现。
-    std::string SerializeMetadataCommand(const MetadataCommand &command);
-    bool ParseMetadataCommand(const std::string &input, MetadataCommand *out);
-    bool ValidateMetadataCommand(const MetadataCommand &command, std::string *error);
-    std::string ComputeMetadataCommandFingerprint(const MetadataCommand &command);
-
     namespace
     {
         ApplyResult MakeApplyFailure(const std::string &message)
@@ -58,9 +54,21 @@ namespace raftdemo
                                                              const std::string &command_data)
     {
         MetadataCommand command;
-        if (!ParseMetadataCommand(command_data, &command))
+        std::string metadata_payload = command_data;
+        if (!ParseMetadataCommand(metadata_payload, &command))
         {
-            return MakeApplyFailure("failed to parse metadata command");
+            Command wrapped_command;
+            if (!Command::Deserialize(command_data, &wrapped_command) ||
+                wrapped_command.type != CommandType::kMetadata)
+            {
+                return MakeApplyFailure("failed to parse metadata command");
+            }
+
+            metadata_payload = wrapped_command.metadata_payload;
+            if (!ParseMetadataCommand(metadata_payload, &command))
+            {
+                return MakeApplyFailure("failed to parse metadata command");
+            }
         }
 
         std::string validation_error;

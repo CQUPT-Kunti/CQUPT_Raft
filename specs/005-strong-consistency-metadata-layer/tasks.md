@@ -131,7 +131,7 @@
   - 实现要求: 新增 `MetadataService` 和相关 message/enum；不得修改 `RaftService` 语义；不得复用 KV 状态码造成语义歧义。
   - 验收标准: 契约包含 Create/Commit/Delete/Head/List、leader hint、term、log_index、request_id、state 和细分错误码。
 
-- [ ] T015 [US1] Implement metadata service create/commit/head/list adapter in modules/raft/service/metadata_service_impl.cpp
+- [x] T015 [US1] Implement metadata service create/commit/head/list adapter in modules/raft/service/metadata_service_impl.cpp
   - 目标: 将 MetadataService create/commit 写请求转换为 Raft metadata proposal，将 Head/List 读请求映射到 committed-only 查询。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/service/AGENTS.md`, `modules/raft/service/kv_service_impl.cpp`, `modules/raft/node/raft_node.h`, `modules/raft/common/metadata_command.h`, `proto/raft.proto`
   - 允许修改文件: `modules/raft/service/metadata_service_impl.cpp`

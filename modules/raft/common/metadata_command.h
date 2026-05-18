@@ -137,4 +137,9 @@ namespace raftdemo
         return command;
     }
 
+    std::string SerializeMetadataCommand(const MetadataCommand &command);
+    bool ParseMetadataCommand(const std::string &input, MetadataCommand *out);
+    bool ValidateMetadataCommand(const MetadataCommand &command, std::string *error);
+    std::string ComputeMetadataCommandFingerprint(const MetadataCommand &command);
+
 } // namespace raftdemo

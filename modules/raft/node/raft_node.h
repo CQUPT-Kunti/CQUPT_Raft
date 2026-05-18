@@ -31,6 +31,7 @@ namespace raftdemo
 
   class RaftServiceImpl;
   class KvServiceImpl;
+  class StrongConsistencyMetadataStateMachine;
   class Replicator;
 
   enum class Role
@@ -113,7 +114,10 @@ namespace raftdemo
 
     std::string Describe() const;
     ProposeResult Propose(const Command &command);
+    ProposeResult ProposeMetadata(const std::string &metadata_command_data);
     bool DebugGetValue(const std::string &key, std::string *value) const;
+    StrongConsistencyMetadataStateMachine *GetMetadataStateMachine();
+    const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
     bool ValidateKey(const std::string &key, std::string *reason) const;
     bool ValidateValue(const std::string &value, std::string *reason) const;
     NodeStatusSnapshot GetStatusSnapshot() const;

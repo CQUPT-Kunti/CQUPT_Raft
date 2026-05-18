@@ -19,6 +19,7 @@
 #include "raft/service/kv_service_impl.h"
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/state_machine/state_machine.h"
 #include "raft/storage/snapshot_storage.h"
 
@@ -1904,6 +1905,146 @@ void RaftNode::SendHeartbeats()
     return result;
   }
 
+  ProposeResult RaftNode::ProposeMetadata(const std::string &metadata_command_data)
+  {
+    Command command;
+    command.type = CommandType::kMetadata;
+    command.metadata_payload = metadata_command_data;
+
+    ProposeResult result;
+    std::string reason;
+    std::string command_data;
+    std::uint64_t log_index = 0;
+    std::uint64_t term = 0;
+
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+
+      if (!running_.load())
+      {
+        result.status = ProposeStatus::kNodeStopping;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is stopping";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      if (role_ != Role::kLeader)
+      {
+        result.status = ProposeStatus::kNotLeader;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is not the leader";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      if (!ValidateCommandUnlocked(command, &reason))
+      {
+        result.status = ProposeStatus::kInvalidCommand;
+        result.leader_id = config_.node_id;
+        result.term = current_term_;
+        result.message = reason;
+        RecordProposeResult(false);
+        return result;
+      }
+
+      command_data = command.Serialize();
+      if (command_data.empty())
+      {
+        result.status = ProposeStatus::kInvalidCommand;
+        result.leader_id = config_.node_id;
+        result.term = current_term_;
+        result.message = "failed to serialize command";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      term = current_term_;
+      log_index = AppendLocalLogUnlocked(command_data);
+      if (log_index == 0)
+      {
+        result.status = ProposeStatus::kReplicationFailed;
+        result.leader_id = config_.node_id;
+        result.term = current_term_;
+        result.message = "failed to append and persist local log entry";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      result.leader_id = config_.node_id;
+      result.term = term;
+      result.log_index = log_index;
+      result.message = "log appended locally";
+    }
+
+    const ReplicationOutcome replicated = ReplicateLogEntryToMajority(log_index);
+    if (replicated != ReplicationOutcome::kReplicated)
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      if (replicated == ReplicationOutcome::kTimeout)
+      {
+        result.status = ProposeStatus::kTimeout;
+        result.message = "timed out waiting for majority replication";
+      }
+      else if (replicated == ReplicationOutcome::kLostLeadership)
+      {
+        result.status = ProposeStatus::kNotLeader;
+        result.message = "lost leadership before the log entry reached a majority";
+      }
+      else
+      {
+        result.status = ProposeStatus::kReplicationFailed;
+        result.message = "failed to replicate log entry to majority";
+      }
+      RecordProposeResult(false);
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      AdvanceCommitIndexUnlocked();
+    }
+
+    ApplyResult apply_result = ApplyCommittedEntries();
+    if (!apply_result.Ok)
+    {
+      result.status = ProposeStatus::kApplyFailed;
+      result.message = apply_result.message;
+      RecordProposeResult(false);
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (last_applied_ < log_index)
+      {
+        result.status = ProposeStatus::kApplyFailed;
+        result.message = "log committed but not applied";
+        RecordProposeResult(false);
+        return result;
+      }
+    }
+
+    result.status = ProposeStatus::kOk;
+    result.message = apply_result.message;
+    RecordProposeResult(true);
+    return result;
+  }
+
+  StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine()
+  {
+    return dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+  }
+
+  const StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine() const
+  {
+    return dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+  }
+
   bool RaftNode::ValidateCommandUnlocked(const Command &command, std::string *reason) const
   {
     if (!command.IsValid())
@@ -1915,7 +2056,8 @@ void RaftNode::SendHeartbeats()
       return false;
     }
 
-    if (!ValidateKeyUnlocked(command.key, reason))
+    if ((command.type == CommandType::kSet || command.type == CommandType::kDelete) &&
+        !ValidateKeyUnlocked(command.key, reason))
     {
       return false;
     }

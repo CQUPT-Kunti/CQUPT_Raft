@@ -143,10 +143,13 @@ add_library(raft_core
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
   modules/raft/common/command.cpp
+  modules/raft/common/metadata_command.cpp
   modules/raft/node/raft_node.cpp
   modules/raft/service/raft_service_impl.cpp
   modules/raft/service/kv_service_impl.cpp
+  modules/raft/service/metadata_service_impl.cpp
   modules/raft/state_machine/state_machine.cpp
+  modules/raft/state_machine/metadata_state_machine.cpp
   modules/raft/storage/raft_storage.cpp
   modules/raft/storage/snapshot_storage.cpp
   modules/raft/replication/replicator.cpp

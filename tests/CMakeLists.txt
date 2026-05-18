@@ -78,7 +78,6 @@ add_raft_gtest(test_command test_command.cpp
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_command_test.cpp")
   add_executable(test_metadata_command
     metadata_command_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/common/metadata_command.cpp
   )
 
   target_link_libraries(test_metadata_command
@@ -104,8 +103,6 @@ endif()
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_state_machine_test.cpp")
   add_executable(test_metadata_state_machine
     metadata_state_machine_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/state_machine/metadata_state_machine.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/common/metadata_command.cpp
   )
 
   target_link_libraries(test_metadata_state_machine
