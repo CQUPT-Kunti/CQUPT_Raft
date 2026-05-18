@@ -145,7 +145,7 @@
   - 实现要求: `.h` 只放类声明和方法签名；不写业务状态转换。
   - 验收标准: `.cpp` 可引用该声明；不改变 `KvServiceImpl` 的公开行为。
 
-- [ ] T017 [US1] Wire MetadataService into server startup in apps/main.cpp
+- [x] T017 [US1] Wire MetadataService into server startup in apps/main.cpp
   - 目标: 在 demo 服务端注册 MetadataService。
   - 允许读取文件: `NOTREAD.md`, `apps/AGENTS.md`, `apps/main.cpp`, `modules/raft/service/metadata_service_impl.h`
   - 允许修改文件: `apps/main.cpp`
