@@ -25,7 +25,7 @@
   - 实现要求: 记录不得读取 004、不得读取禁止路径、不得修改 Raft 内核、不得实现数据面。
   - 验收标准: `tasks.md` 中存在明确 guardrails；未修改源码、测试或协议文件。
 
-- [ ] T002 [P] Map current KV demo boundaries in specs/005-strong-consistency-metadata-layer/tasks.md
+- [X] T002 [P] Map current KV demo boundaries in specs/005-strong-consistency-metadata-layer/tasks.md
   - 目标: 明确 KV demo/client/state_machine 与 Raft 内核的边界，作为后续实现任务输入。
   - 允许读取文件: `NOTREAD.md`, `AGENTS.md`, `apps/AGENTS.md`, `modules/raft/common/AGENTS.md`, `modules/raft/state_machine/AGENTS.md`, `modules/raft/service/AGENTS.md`, `proto/AGENTS.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/tasks.md`
