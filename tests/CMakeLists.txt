@@ -101,6 +101,33 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_command_test.cpp")
 else()
   message(STATUS "Skip test_metadata_command: metadata_command_test.cpp not found")
 endif()
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_state_machine_test.cpp")
+  add_executable(test_metadata_state_machine
+    metadata_state_machine_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/state_machine/metadata_state_machine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../modules/raft/common/metadata_command.cpp
+  )
+
+  target_link_libraries(test_metadata_state_machine
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_metadata_state_machine
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  gtest_discover_tests(test_metadata_state_machine
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES
+      LABELS "platform-neutral;platform-neutral-fallback"
+  )
+else()
+  message(STATUS "Skip test_metadata_state_machine: metadata_state_machine_test.cpp not found")
+endif()
 
 add_raft_gtest(test_state_machine test_state_machine.cpp
   "platform-neutral;platform-neutral-fallback")

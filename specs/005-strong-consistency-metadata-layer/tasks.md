@@ -117,7 +117,7 @@
   - 实现要求: 若 `NOTREAD.md` 仍禁止读取 `tests/**`，不得读取既有测试；新增独立测试文件即可。
   - 验收标准: 测试覆盖 create pending invisible、commit visible、duplicate create、idempotency conflict、missing pending commit。
 
-- [ ] T013 [US1] Add metadata state machine test wiring in tests/CMakeLists.txt
+- [x] T013 [US1] Add metadata state machine test wiring in tests/CMakeLists.txt
   - 目标: 将 `metadata_state_machine_test.cpp` 接入构建。
   - 允许读取文件: `NOTREAD.md`, `tests/CMakeLists.txt`
   - 允许修改文件: `tests/CMakeLists.txt`
