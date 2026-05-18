@@ -96,7 +96,7 @@
   - 实现要求: 只声明 `Apply`, `SaveSnapshot`, `LoadSnapshot`, `HeadMetadataRecord`, `ListMetadataRecords` 和必要查询类型；复杂逻辑放 `.cpp`。
   - 验收标准: 接口继承或兼容 `IStateMachine` 边界；不修改 `KvStateMachine` 行为；头文件不包含复杂业务逻辑。
 
-- [ ] T010 [US1] Implement create and commit state transitions in modules/raft/state_machine/metadata_state_machine.cpp
+- [x] T010 [US1] Implement create and commit state transitions in modules/raft/state_machine/metadata_state_machine.cpp
   - 目标: 实现 `NeverCreated -> Pending -> Committed` 状态转换和 committed-only visibility。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `modules/raft/state_machine/state_machine.cpp`, `modules/raft/common/metadata_command.h`, `modules/raft/common/metadata_result.h`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.cpp`
