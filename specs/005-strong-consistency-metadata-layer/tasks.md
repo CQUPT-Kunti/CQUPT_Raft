@@ -66,7 +66,7 @@
   - 实现要求: 覆盖 `OK`, `NOT_LEADER`, `INVALID_ARGUMENT`, `NOT_FOUND`, `IDEMPOTENT_REPLAY`, `IDEMPOTENCY_CONFLICT`, `STATE_CONFLICT`, `INTERNAL_ERROR`, `TIMEOUT`。
   - 验收标准: 后续状态机、service 和 client 可共享结果语义；不引入 gRPC/protobuf 依赖到 `common`。
 
-- [ ] T007 [P] Add metadata model unit tests in tests/metadata_command_test.cpp
+- [x] T007 [P] Add metadata model unit tests in tests/metadata_command_test.cpp
   - 目标: 验证 metadata 数据模型和 command codec 的基础行为。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/common/metadata_command.h`, `modules/raft/common/metadata_result.h`, `specs/005-strong-consistency-metadata-layer/data-model.md`
   - 允许修改文件: `tests/metadata_command_test.cpp`
