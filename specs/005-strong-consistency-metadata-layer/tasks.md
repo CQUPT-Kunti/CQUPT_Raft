@@ -45,14 +45,14 @@
 
 **Purpose**: 建立数据模型、命令契约和公共错误语义；未完成前不得进入用户故事实现。
 
-- [ ] T004 Define metadata domain header in modules/raft/common/metadata_command.h
+- [x] T004 Define metadata domain header in modules/raft/common/metadata_command.h
   - 目标: 建立 `MetadataRecord`、`MetadataRecordState`、`MetadataCommand`、`IdempotencyEntry`、`Tombstone` 的接口与轻量类型。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/common/AGENTS.md`, `modules/raft/common/command.h`, `specs/005-strong-consistency-metadata-layer/data-model.md`
   - 允许修改文件: `modules/raft/common/metadata_command.h`
   - 实现要求: `.h` 只放类型、枚举、常量、函数声明和轻量 inline；不放复杂解析、文件 IO、Raft 状态转换或业务流程。
   - 验收标准: 类型覆盖 Pending/Committed/Deleted、request_id、object manifest、tombstone 和幂等结果；不修改现有 `Command` 结构和 KV command 语义。
 
-- [ ] T005 Implement metadata command codec in modules/raft/common/metadata_command.cpp
+- [x] T005 Implement metadata command codec in modules/raft/common/metadata_command.cpp
   - 目标: 实现 metadata command 的序列化、反序列化、fingerprint 和字段校验。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/common/metadata_command.h`, `modules/raft/common/command.cpp`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `modules/raft/common/metadata_command.cpp`
