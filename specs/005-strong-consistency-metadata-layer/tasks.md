@@ -103,7 +103,7 @@
   - 实现要求: `CreateMetadataRecord` 只产生 Pending；`CommitMetadataRecord` 才让 Head/List 可见；Pending 不得被 Head/List 返回。
   - 验收标准: VM-001、VM-002、VM-006 对应状态机行为可通过单测验证；不访问真实文件、不触碰 Raft node/replication/storage。
 
-- [ ] T011 [US1] Implement request_id replay table for create and commit in modules/raft/state_machine/metadata_state_machine.cpp
+- [x] T011 [US1] Implement request_id replay table for create and commit in modules/raft/state_machine/metadata_state_machine.cpp
   - 目标: 实现 create/commit 的幂等重试和 idempotency conflict。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.cpp`

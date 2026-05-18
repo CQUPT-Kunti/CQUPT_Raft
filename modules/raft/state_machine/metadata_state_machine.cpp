@@ -11,38 +11,46 @@ namespace raftdemo
     std::string SerializeMetadataCommand(const MetadataCommand &command);
     bool ParseMetadataCommand(const std::string &input, MetadataCommand *out);
     bool ValidateMetadataCommand(const MetadataCommand &command, std::string *error);
+    std::string ComputeMetadataCommandFingerprint(const MetadataCommand &command);
 
     namespace
     {
-        ApplyResult ToApplyResult(const MetadataResult &result)
-        {
-            return {result.Ok() || result.code == MetadataStatusCode::kStateConflict ||
-                            result.code == MetadataStatusCode::kNotFound ||
-                            result.code == MetadataStatusCode::kInvalidArgument
-                        ? result.Ok()
-                        : false,
-                    result.summary.message};
-        }
-
         ApplyResult MakeApplyFailure(const std::string &message)
         {
             return {false, message};
-        }
-
-        MetadataResponseSummary MakeSummary(const MetadataCommand &command,
-                                            const std::string &message)
-        {
-            MetadataResponseSummary summary;
-            summary.request_id = command.request_id;
-            summary.object_key = command.object_key;
-            summary.message = message;
-            return summary;
         }
 
         bool StartsWith(const std::string &value, const std::string &prefix)
         {
             return value.size() >= prefix.size() &&
                    value.compare(0, prefix.size(), prefix) == 0;
+        }
+
+        ApplyResult MakeReplayConflictFailure()
+        {
+            return {false, "idempotency conflict: request_id maps to different command"};
+        }
+
+        ApplyResult MakeReplaySuccess()
+        {
+            return {true, "idempotent replay"};
+        }
+
+        IdempotencyEntry MakeReplayEntry(const MetadataCommand &command,
+                                         const std::string &fingerprint,
+                                         const MetadataRecord &record,
+                                         const std::uint64_t log_index)
+        {
+            IdempotencyEntry entry;
+            entry.request_id = command.request_id;
+            entry.operation = command.operation;
+            entry.object_key = command.object_key;
+            entry.command_fingerprint = fingerprint;
+            entry.result_code = "OK";
+            entry.result_state = record.state;
+            entry.log_index = log_index;
+            entry.response_record = record;
+            return entry;
         }
     } // namespace
 
@@ -61,7 +69,22 @@ namespace raftdemo
             return MakeApplyFailure("invalid metadata command: " + validation_error);
         }
 
+        const std::string fingerprint = ComputeMetadataCommandFingerprint(command);
+
         std::lock_guard<std::mutex> lk(mu_);
+
+        auto replay = replay_table_.find(command.request_id);
+        if (replay != replay_table_.end())
+        {
+            const IdempotencyEntry &entry = replay->second;
+            if (entry.operation != command.operation ||
+                entry.object_key != command.object_key ||
+                entry.command_fingerprint != fingerprint)
+            {
+                return MakeReplayConflictFailure();
+            }
+            return MakeReplaySuccess();
+        }
 
         if (command.IsCreate())
         {
@@ -83,7 +106,9 @@ namespace raftdemo
             record.delete_request_id.reset();
             record.committed_at_log_index.reset();
             record.deleted_at_log_index.reset();
-            records_[record.object_key] = std::move(record);
+            records_[record.object_key] = record;
+            replay_table_[command.request_id] =
+                MakeReplayEntry(command, fingerprint, record, index);
             return {true, "ok"};
         }
 
@@ -105,6 +130,8 @@ namespace raftdemo
             record.commit_request_id = command.request_id;
             record.committed_at_log_index = index;
             record.commit_info = command.commit_info;
+            replay_table_[command.request_id] =
+                MakeReplayEntry(command, fingerprint, record, index);
             return {true, "ok"};
         }
 
