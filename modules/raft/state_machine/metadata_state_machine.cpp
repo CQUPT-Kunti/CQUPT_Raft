@@ -48,6 +48,24 @@ namespace raftdemo
             entry.response_record = record;
             return entry;
         }
+
+        Tombstone MakeTombstone(const MetadataRecord &record,
+                                const ClientRequestId &delete_request_id,
+                                const std::string &delete_info,
+                                const std::uint64_t log_index)
+        {
+            Tombstone tombstone;
+            tombstone.object_key = record.object_key;
+            tombstone.delete_request_id = delete_request_id;
+            tombstone.deleted_at_log_index = log_index;
+            tombstone.previous_commit_request_id = record.commit_request_id;
+            if (!record.checksum.empty())
+            {
+                tombstone.checksum = record.checksum;
+            }
+            tombstone.delete_info = delete_info;
+            return tombstone;
+        }
     } // namespace
 
     ApplyResult StrongConsistencyMetadataStateMachine::Apply(std::uint64_t index,
@@ -96,6 +114,11 @@ namespace raftdemo
 
         if (command.IsCreate())
         {
+            if (tombstones_.find(command.object_key) != tombstones_.end())
+            {
+                return MakeApplyFailure("state conflict: object is tombstoned");
+            }
+
             auto existing = records_.find(command.object_key);
             if (existing != records_.end())
             {
@@ -125,12 +148,20 @@ namespace raftdemo
             auto existing = records_.find(command.object_key);
             if (existing == records_.end())
             {
+                if (tombstones_.find(command.object_key) != tombstones_.end())
+                {
+                    return MakeApplyFailure("state conflict: record is deleted");
+                }
                 return MakeApplyFailure("not found: pending record does not exist");
             }
 
             MetadataRecord &record = existing->second;
             if (!record.IsPending())
             {
+                if (record.IsDeleted())
+                {
+                    return MakeApplyFailure("state conflict: record is deleted");
+                }
                 return MakeApplyFailure("state conflict: record is not pending");
             }
 
@@ -140,6 +171,41 @@ namespace raftdemo
             record.commit_info = command.commit_info;
             replay_table_[command.request_id] =
                 MakeReplayEntry(command, fingerprint, record, index);
+            return {true, "ok"};
+        }
+
+        if (command.IsDelete())
+        {
+            auto existing = records_.find(command.object_key);
+            if (existing == records_.end())
+            {
+                if (tombstones_.find(command.object_key) != tombstones_.end())
+                {
+                    return MakeApplyFailure("state conflict: record is not committed");
+                }
+                return MakeApplyFailure("not found: record does not exist");
+            }
+
+            MetadataRecord &record = existing->second;
+            if (record.IsPending())
+            {
+                return MakeApplyFailure("state conflict: pending record cannot be deleted");
+            }
+            if (record.IsDeleted())
+            {
+                return MakeApplyFailure("state conflict: record is not committed");
+            }
+            if (!record.IsCommitted())
+            {
+                return MakeApplyFailure("state conflict: record is not committed");
+            }
+
+            record.state = MetadataRecordState::kDeleted;
+            record.delete_request_id = command.request_id;
+            record.deleted_at_log_index = index;
+            record.delete_info = command.delete_info;
+            tombstones_[record.object_key] =
+                MakeTombstone(record, command.request_id, command.delete_info, index);
             return {true, "ok"};
         }
 

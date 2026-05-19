@@ -161,7 +161,7 @@
 **Goal**: 支持 Committed -> Deleted tombstone，删除后 Head/List 不可见，并在 snapshot/restart 后恢复 committed metadata 与 tombstone。  
 **Independent Test**: create + commit + delete 后 Head/List 不可见；snapshot/restart 后仍不可见；相同 delete request_id 重试幂等。
 
-- [ ] T018 [US2] Implement delete tombstone transition in modules/raft/state_machine/metadata_state_machine.cpp
+- [x] T018 [US2] Implement delete tombstone transition in modules/raft/state_machine/metadata_state_machine.cpp
   - 目标: 实现 `Committed -> Deleted` tombstone 语义。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/data-model.md`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.cpp`
