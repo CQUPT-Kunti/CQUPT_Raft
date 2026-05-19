@@ -219,7 +219,7 @@
   - 实现要求: 默认只允许 leader serving Head/List 或使用已有明确线性一致读路径；not leader 返回 leader hint。
   - 验收标准: failover 期间 follower Head/List 不错误返回 committed 或 Pending 状态；响应码可诊断。
 
-- [ ] T025 [US3] Add failover retry scenario to Metadata Client in apps/raft_metadata_client.cpp
+- [x] T025 [US3] Add failover retry scenario to Metadata Client in apps/raft_metadata_client.cpp
   - 目标: 支持用户用同一 request_id 在 failover 后重试 commit/delete。
   - 允许读取文件: `NOTREAD.md`, `apps/AGENTS.md`, `apps/raft_metadata_client.cpp`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `apps/raft_metadata_client.cpp`
