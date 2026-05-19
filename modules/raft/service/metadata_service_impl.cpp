@@ -229,6 +229,7 @@ namespace raftdemo
     }
 
     bool EnsureLeaderForRead(const NodeStatusSnapshot &status,
+                             const std::string &object_key,
                              raft::MetadataResponseSummary *summary)
     {
       if (status.role == "Leader")
@@ -240,6 +241,7 @@ namespace raftdemo
       {
         summary->set_code(raft::METADATA_STATUS_CODE_NOT_LEADER);
         summary->set_message("node is not the leader");
+        summary->set_object_key(object_key);
         summary->set_term(status.term);
         FillLeaderHint(status, summary->mutable_leader_hint());
       }
@@ -371,7 +373,7 @@ namespace raftdemo
   {
     auto *reactor = context->DefaultReactor();
     const auto status = node_.GetStatusSnapshot();
-    if (!EnsureLeaderForRead(status, response->mutable_summary()))
+    if (!EnsureLeaderForRead(status, request->object_key(), response->mutable_summary()))
     {
       reactor->Finish(grpc::Status::OK);
       return reactor;
@@ -409,7 +411,7 @@ namespace raftdemo
   {
     auto *reactor = context->DefaultReactor();
     const auto status = node_.GetStatusSnapshot();
-    if (!EnsureLeaderForRead(status, response->mutable_summary()))
+    if (!EnsureLeaderForRead(status, "", response->mutable_summary()))
     {
       reactor->Finish(grpc::Status::OK);
       return reactor;

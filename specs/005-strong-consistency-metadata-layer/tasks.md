@@ -212,7 +212,7 @@
   - 实现要求: 若执行时需要复用既有集群测试工具但 `NOTREAD.md` 禁止读取 `tests/**`，必须暂停请求许可；不得复制大段旧测试。
   - 验收标准: 覆盖 VM-014、VM-015；失败时记录失败测试名、关键断言、最后 50 行日志和完整日志路径。
 
-- [ ] T024 [US3] Ensure metadata reads are leader-safe in modules/raft/service/metadata_service_impl.cpp
+- [x] T024 [US3] Ensure metadata reads are leader-safe in modules/raft/service/metadata_service_impl.cpp
   - 目标: 保证 Head/List 读路径不从不安全 follower 暴露 stale metadata。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/service/metadata_service_impl.cpp`, `modules/raft/service/kv_service_impl.cpp`, `modules/raft/node/raft_node.h`
   - 允许修改文件: `modules/raft/service/metadata_service_impl.cpp`
