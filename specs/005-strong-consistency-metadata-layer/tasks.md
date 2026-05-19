@@ -168,7 +168,7 @@
   - 实现要求: Delete 只允许作用于 Committed；Deleted 从 Head/List 隐藏；Pending delete 返回 `STATE_CONFLICT`；never-created delete 返回 `NOT_FOUND`。
   - 验收标准: VM-007、VM-009 通过；删除不会物理丢失 tombstone 事实。
 
-- [ ] T019 [US2] Extend idempotency replay for delete in modules/raft/state_machine/metadata_state_machine.cpp
+- [x] T019 [US2] Extend idempotency replay for delete in modules/raft/state_machine/metadata_state_machine.cpp
   - 目标: 支持 delete request_id 重试和旧请求复活防护。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.cpp`

@@ -206,6 +206,8 @@ namespace raftdemo
             record.delete_info = command.delete_info;
             tombstones_[record.object_key] =
                 MakeTombstone(record, command.request_id, command.delete_info, index);
+            replay_table_[command.request_id] =
+                MakeReplayEntry(command, fingerprint, record, index);
             return {true, "ok"};
         }
 
