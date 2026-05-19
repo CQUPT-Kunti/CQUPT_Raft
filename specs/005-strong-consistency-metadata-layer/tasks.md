@@ -182,7 +182,7 @@
   - 实现要求: 新 metadata snapshot 格式必须有 magic/version；不得修改 KV snapshot 格式；required durability operation 不允许 no-op 成功。
   - 验收标准: Save/Load 后 Committed 可见、Deleted 不可见、Pending 不外部可见；损坏/版本不匹配返回明确错误。
 
-- [ ] T021 [P] [US2] Add tombstone and restart unit tests in tests/metadata_snapshot_test.cpp
+- [x] T021 [P] [US2] Add tombstone and restart unit tests in tests/metadata_snapshot_test.cpp
   - 目标: 覆盖 tombstone、snapshot/restart 和 Pending 恢复不可见。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/metadata_state_machine.h`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: `tests/metadata_snapshot_test.cpp`
