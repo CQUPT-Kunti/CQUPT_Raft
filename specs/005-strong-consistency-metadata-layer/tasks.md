@@ -256,7 +256,7 @@
   - 实现要求: 不读取既有 tests；测试 mock_locations 指向不存在节点也应接受，payload 超限应拒绝。
   - 验收标准: 覆盖合法 manifest、非法 chunk_size、chunk_count 不匹配、checksum 缺失、payload 超限、mock StorageNode 不存在。
 
-- [ ] T029 [US4] Add Metadata Client create generator in apps/raft_metadata_client.cpp
+- [x] T029 [US4] Add Metadata Client create generator in apps/raft_metadata_client.cpp
   - 目标: 实现客户端模拟 object_key、object_size、chunk_size、chunk_count、checksum、mock_locations、payload 的生成和解析。
   - 允许读取文件: `NOTREAD.md`, `apps/AGENTS.md`, `apps/raft_kv_client.cpp`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `apps/raft_metadata_client.cpp`

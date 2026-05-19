@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +25,12 @@ namespace
     std::string command;
     std::string request_id;
     std::string object_key;
+    std::uint64_t object_size = 0;
+    std::uint64_t chunk_size = 0;
+    std::optional<std::uint64_t> chunk_count;
+    std::string checksum;
+    std::vector<std::string> mock_locations;
+    std::string payload;
     std::string expected_create_request_id;
     std::string commit_info;
     std::string delete_info;
@@ -104,6 +111,13 @@ namespace
   {
     std::cerr
         << "Usage:\n"
+        << "  raft_metadata_client <addr> create"
+        << " --request-id <id> --object-key <key>"
+        << " --object-size <bytes> --chunk-size <bytes>"
+        << " [--chunk-count <n>] [--checksum <mock-checksum>]"
+        << " [--mock-location <value>]..."
+        << " [--payload <metadata-only-payload>]"
+        << " [--timeout-ms <ms>]\n"
         << "  raft_metadata_client <addr> commit-retry"
         << " --request-id <id> --object-key <key>"
         << " [--expected-create-request-id <id>] [--commit-info <text>]"
@@ -150,6 +164,30 @@ namespace
       {
         args.expected_create_request_id = require_value("--expected-create-request-id");
       }
+      else if (flag == "--object-size")
+      {
+        args.object_size = ParsePositiveInt(require_value("--object-size"), "--object-size");
+      }
+      else if (flag == "--chunk-size")
+      {
+        args.chunk_size = ParsePositiveInt(require_value("--chunk-size"), "--chunk-size");
+      }
+      else if (flag == "--chunk-count")
+      {
+        args.chunk_count = ParsePositiveInt(require_value("--chunk-count"), "--chunk-count");
+      }
+      else if (flag == "--checksum")
+      {
+        args.checksum = require_value("--checksum");
+      }
+      else if (flag == "--mock-location")
+      {
+        args.mock_locations.push_back(require_value("--mock-location"));
+      }
+      else if (flag == "--payload")
+      {
+        args.payload = require_value("--payload");
+      }
       else if (flag == "--commit-info")
       {
         args.commit_info = require_value("--commit-info");
@@ -176,7 +214,9 @@ namespace
       }
     }
 
-    if (args.command != "commit-retry" && args.command != "delete-retry")
+    if (args.command != "create" &&
+        args.command != "commit-retry" &&
+        args.command != "delete-retry")
     {
       std::cerr << "unsupported command: " << args.command << '\n';
       PrintUsage();
@@ -187,6 +227,19 @@ namespace
     {
       std::cerr << "--request-id and --object-key are required\n";
       std::exit(2);
+    }
+    if (args.command == "create")
+    {
+      if (args.object_size == 0 || args.chunk_size == 0)
+      {
+        std::cerr << "--object-size and --chunk-size must be > 0 for create\n";
+        std::exit(2);
+      }
+      if (args.chunk_count.has_value() && *args.chunk_count == 0)
+      {
+        std::cerr << "--chunk-count must be > 0 when specified\n";
+        std::exit(2);
+      }
     }
 
     if (args.max_retries < 0)
@@ -210,6 +263,53 @@ namespace
     return raft::MetadataService::NewStub(channel);
   }
 
+  std::uint64_t ComputeChunkCount(std::uint64_t object_size, std::uint64_t chunk_size)
+  {
+    return 1 + ((object_size - 1) / chunk_size);
+  }
+
+  std::string MakeMockChecksum(const ParsedArgs &args, std::uint64_t chunk_count)
+  {
+    std::ostringstream oss;
+    oss << "sha256:mock:"
+        << args.object_key << ':'
+        << args.object_size << ':'
+        << args.chunk_size << ':'
+        << chunk_count;
+    return oss.str();
+  }
+
+  std::vector<std::string> MakeMockLocations(const ParsedArgs &args, std::uint64_t chunk_count)
+  {
+    if (!args.mock_locations.empty())
+    {
+      return args.mock_locations;
+    }
+
+    std::vector<std::string> locations;
+    locations.reserve(static_cast<std::size_t>(chunk_count));
+    for (std::uint64_t i = 0; i < chunk_count; ++i)
+    {
+      locations.push_back("mock-node-" + std::to_string((i % 3) + 1) +
+                          "/chunk-" + std::to_string(i));
+    }
+    return locations;
+  }
+
+  std::string JoinItems(const std::vector<std::string> &items)
+  {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < items.size(); ++i)
+    {
+      if (i != 0)
+      {
+        oss << ',';
+      }
+      oss << items[i];
+    }
+    return oss.str();
+  }
+
   void PrintSummary(const char *stage,
                     int attempt,
                     const std::string &target_address,
@@ -219,6 +319,7 @@ namespace
               << " attempt=" << attempt
               << " target_address=" << target_address
               << " code=" << MetadataStatusCodeToString(summary.code())
+              << " status=" << MetadataStatusCodeToString(summary.code())
               << " message=\"" << summary.message() << "\""
               << " request_id=" << summary.request_id()
               << " object_key=" << summary.object_key()
@@ -263,6 +364,34 @@ namespace
                           std::chrono::milliseconds(timeout_ms));
   }
 
+  raft::CreateMetadataRecordResponse DoCreate(const ParsedArgs &args,
+                                              std::uint64_t chunk_count,
+                                              const std::string &checksum,
+                                              const std::vector<std::string> &mock_locations,
+                                              grpc::Status *rpc_status)
+  {
+    auto stub = MakeStub(args.server_address);
+    raft::CreateMetadataRecordRequest request;
+    request.set_request_id(args.request_id);
+    request.set_object_key(args.object_key);
+    request.mutable_manifest()->set_object_size(args.object_size);
+    request.mutable_manifest()->set_chunk_size(args.chunk_size);
+    request.mutable_manifest()->set_chunk_count(chunk_count);
+    request.mutable_manifest()->set_checksum(checksum);
+    for (const auto &location : mock_locations)
+    {
+      request.mutable_manifest()->add_mock_locations(location);
+    }
+    request.set_payload(args.payload);
+
+    grpc::ClientContext context;
+    ConfigureContext(&context, args.timeout_ms);
+
+    raft::CreateMetadataRecordResponse response;
+    *rpc_status = stub->CreateMetadataRecord(&context, request, &response);
+    return response;
+  }
+
   raft::CommitMetadataRecordResponse DoCommitAttempt(const ParsedArgs &args,
                                                      const std::string &address,
                                                      grpc::Status *rpc_status)
@@ -298,6 +427,56 @@ namespace
     raft::DeleteMetadataRecordResponse response;
     *rpc_status = stub->DeleteMetadataRecord(&context, request, &response);
     return response;
+  }
+
+  int RunCreate(const ParsedArgs &args)
+  {
+    const std::uint64_t chunk_count =
+        args.chunk_count.value_or(ComputeChunkCount(args.object_size, args.chunk_size));
+    const std::string checksum =
+        args.checksum.empty() ? MakeMockChecksum(args, chunk_count) : args.checksum;
+    const std::vector<std::string> mock_locations = MakeMockLocations(args, chunk_count);
+
+    grpc::Status rpc_status;
+    const raft::CreateMetadataRecordResponse response =
+        DoCreate(args, chunk_count, checksum, mock_locations, &rpc_status);
+    if (!rpc_status.ok())
+    {
+      std::cerr << "stage=create"
+                << " target_address=" << args.server_address
+                << " grpc_code=" << rpc_status.error_code()
+                << " grpc_message=\"" << rpc_status.error_message() << "\""
+                << " request_id=" << args.request_id
+                << " object_key=" << args.object_key
+                << '\n';
+      return 1;
+    }
+
+    const raft::MetadataResponseSummary &summary = response.summary();
+    std::cout << "stage=create"
+              << " target_address=" << args.server_address
+              << " code=" << MetadataStatusCodeToString(summary.code())
+              << " status=" << MetadataStatusCodeToString(summary.code())
+              << " message=\"" << summary.message() << "\""
+              << " request_id=" << summary.request_id()
+              << " object_key=" << summary.object_key()
+              << " state=" << MetadataRecordStateToString(summary.state())
+              << " object_size=" << args.object_size
+              << " chunk_size=" << args.chunk_size
+              << " chunk_count=" << chunk_count
+              << " checksum=" << checksum
+              << " mock_locations=" << JoinItems(mock_locations)
+              << " payload_kind=metadata-only"
+              << " payload_bytes=" << args.payload.size()
+              << " leader_id=" << summary.leader_hint().leader_id()
+              << " leader_address=" << summary.leader_hint().leader_address()
+              << " term=" << summary.term()
+              << " log_index=" << summary.log_index()
+              << '\n';
+    return summary.code() == raft::METADATA_STATUS_CODE_OK ||
+                   summary.code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY
+               ? 0
+               : 1;
   }
 
   int RunCommitRetry(const ParsedArgs &args)
@@ -385,6 +564,10 @@ namespace
 int main(int argc, char **argv)
 {
   const ParsedArgs args = ParseArgs(argc, argv);
+  if (args.command == "create")
+  {
+    return RunCreate(args);
+  }
   if (args.command == "commit-retry")
   {
     return RunCommitRetry(args);
