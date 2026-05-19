@@ -249,7 +249,7 @@
   - 实现要求: 校验 object_size/chunk_size/chunk_count/checksum/mock_locations；payload 有上限；不访问本地文件路径、不检查 StorageNode。
   - 验收标准: VM-017、VM-018、VM-020 对 codec 层通过；无真实文件 IO。
 
-- [ ] T028 [US4] Add manifest boundary tests in tests/metadata_manifest_test.cpp
+- [x] T028 [US4] Add manifest boundary tests in tests/metadata_manifest_test.cpp
   - 目标: 验证模拟 manifest 和 payload 边界。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: `tests/metadata_manifest_test.cpp`
