@@ -226,7 +226,7 @@
   - 实现要求: `NOT_LEADER` 或 `TIMEOUT` 后不得生成新 request_id；可显示 leader hint；不读取真实文件。
   - 验收标准: VM-016 可通过客户端手动或脚本验证；输出包含 request_id、leader_id、leader_address、term、log_index。
 
-- [ ] T026 [P] [US3] Add client failover flow documentation in specs/005-strong-consistency-metadata-layer/client-design.md
+- [x] T026 [P] [US3] Add client failover flow documentation in specs/005-strong-consistency-metadata-layer/client-design.md
   - 目标: 记录 leader failover retry 的客户端使用流程。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/client-design.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/client-design.md`
