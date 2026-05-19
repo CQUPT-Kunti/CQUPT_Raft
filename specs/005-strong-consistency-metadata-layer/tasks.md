@@ -263,7 +263,7 @@
   - 实现要求: 不打开真实文件；checksum 是 mock 字符串；chunk_count 可自动计算；允许用户显式传入 mock_locations。
   - 验收标准: 客户端能发起 create 请求；输出明确 payload 是 metadata-only；不需要 StorageNode。
 
-- [ ] T030 [US4] Document future StorageNode boundary in specs/005-strong-consistency-metadata-layer/plan.md
+- [x] T030 [US4] Document future StorageNode boundary in specs/005-strong-consistency-metadata-layer/plan.md
   - 目标: 更新文档，说明当前 metadata manifest 与未来 StorageNode/ChunkStore 的扩展点。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/plan.md`, `specs/005-strong-consistency-metadata-layer/data-model.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/plan.md`

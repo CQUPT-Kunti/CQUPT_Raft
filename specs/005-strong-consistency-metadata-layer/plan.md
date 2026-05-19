@@ -131,6 +131,36 @@ apps/
 5. 服务层只做请求到 command 的转换和响应填充，不能持有 metadata 生命周期状态。
 6. 客户端从 KV 参数转向 metadata 子命令和模拟日志生成，但入口层保持薄。
 
+### Metadata Manifest 与未来数据面边界
+
+当前阶段的 metadata manifest 只属于 metadata-plane 契约，Raft 只复制和持久化小型 metadata command，不复制真实大文件 bytes。
+
+- 当前阶段只消费 `object_key`、`object_size`、`chunk_size`、`chunk_count`、`checksum`、`mock_locations`、`payload` 等 metadata-only 字段。
+- `payload` 只允许承载小型 metadata-only 附加信息，不能扩展成真实文件内容或 chunk bytes。
+- `mock_locations` 当前只是 location reference，用于表达未来 chunk 放置意图或 mock 节点提示；当前阶段不检查真实节点、不检查真实路径、不做本地文件 IO。
+- 当前的 Metadata Client create generator 也只生成 mock manifest，不读取真实文件、不生成真实 chunk、不访问 StorageNode 或 ChunkStore。
+
+后续若引入 `StorageNode` / `ChunkStore`，应作为后续 spec / 后续阶段的数据面能力，只能在当前 metadata manifest 边界之上消费以下信息：
+
+- `object_key` 作为对象标识。
+- `chunk_size`、`chunk_count` 和后续可细化的 chunk manifest 作为 chunk 布局描述。
+- `checksum` 作为对象级或 chunk 级完整性引用。
+- `mock_locations` 演进后的 location reference，供数据面映射到真实节点、卷或对象存储位置。
+
+后续数据面接入必须保持以下不变量：
+
+- Raft 仍只复制 metadata command，不复制真实大文件 bytes。
+- `HeadMetadataRecord` / `ListMetadataRecords` 仍然只暴露 `Committed` 记录，future data-plane 不得放宽 committed-only visibility。
+- `DeleteMetadataRecord` 的 tombstone / `Deleted` 语义保持不变；未来真实 chunk 清理、延迟回收或后台 GC 不得导致对象在 metadata 层重新可见。
+- 旧 create/commit 请求不得因后续数据面存在而复活已 tombstoned 的对象。
+
+当前 `005-strong-consistency-metadata-layer` 不扩展以下实现范围：
+
+- `StorageNode` / `ChunkStore` 具体实现。
+- 真实 chunk 文件存储、上传、下载或校验。
+- chunk replication、repair、rebalance、GC 调度。
+- S3 兼容协议、权限认证、多租户或配额控制。
+
 ### API Design Summary
 
 详见 [api.md](./api.md)。规划接口必须表达以下结果：
