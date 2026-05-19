@@ -150,6 +150,8 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_snapshot_test.cpp")
 else()
   message(STATUS "Skip test_metadata_snapshot: metadata_snapshot_test.cpp not found")
 endif()
+add_raft_gtest(test_metadata_failover metadata_failover_test.cpp
+  "platform-neutral")
 
 add_raft_gtest(test_state_machine test_state_machine.cpp
   "platform-neutral;platform-neutral-fallback")

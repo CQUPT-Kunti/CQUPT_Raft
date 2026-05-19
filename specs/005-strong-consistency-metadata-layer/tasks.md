@@ -205,7 +205,7 @@
 **Goal**: 使用现有 Raft failover 能力验证 committed metadata 不丢失，Pending 不暴露，request_id 可跨 leader 重试。  
 **Independent Test**: 提交若干 metadata 后切换 leader，新 leader 上 Head/List 仍可见 committed metadata；Pending 不可见；同 request_id retry 不重复。
 
-- [ ] T023 [US3] Add metadata integration test for leader failover in tests/metadata_failover_test.cpp
+- [x] T023 [US3] Add metadata integration test for leader failover in tests/metadata_failover_test.cpp
   - 目标: 验证 leader failover 后 committed metadata 可见且 Pending 不可见。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`, `proto/raft.proto`
   - 允许修改文件: `tests/metadata_failover_test.cpp`
