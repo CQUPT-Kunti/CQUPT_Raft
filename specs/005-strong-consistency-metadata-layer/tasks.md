@@ -175,7 +175,7 @@
   - 实现要求: 相同 delete request_id 返回幂等结果；旧 create/commit 不得使 Deleted 重新变为 Committed；不同 request_id 删除已 Deleted 的对外结果必须固定。
   - 验收标准: VM-008、VM-010 通过；幂等表和 tombstone 状态一致。
 
-- [ ] T020 [US2] Implement metadata snapshot save/load in modules/raft/state_machine/metadata_state_machine.cpp
+- [x] T020 [US2] Implement metadata snapshot save/load in modules/raft/state_machine/metadata_state_machine.cpp
   - 目标: 保存并加载 committed metadata、tombstone 和必要幂等表。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/state_machine/state_machine.cpp`, `modules/raft/state_machine/metadata_state_machine.h`, `specs/005-strong-consistency-metadata-layer/plan.md`
   - 允许修改文件: `modules/raft/state_machine/metadata_state_machine.cpp`
