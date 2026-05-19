@@ -25,6 +25,9 @@ namespace
     std::string command;
     std::string request_id;
     std::string object_key;
+    std::string prefix;
+    std::optional<std::uint32_t> limit;
+    std::string page_token;
     std::uint64_t object_size = 0;
     std::uint64_t chunk_size = 0;
     std::optional<std::uint64_t> chunk_count;
@@ -107,6 +110,17 @@ namespace
     }
   }
 
+  bool IsSupportedCommand(const std::string &command)
+  {
+    return command == "create" ||
+           command == "commit" ||
+           command == "delete" ||
+           command == "head" ||
+           command == "list" ||
+           command == "commit-retry" ||
+           command == "delete-retry";
+  }
+
   void PrintUsage()
   {
     std::cerr
@@ -118,6 +132,20 @@ namespace
         << " [--mock-location <value>]..."
         << " [--payload <metadata-only-payload>]"
         << " [--timeout-ms <ms>]\n"
+        << "  raft_metadata_client <addr> commit"
+        << " --request-id <id> --object-key <key>"
+        << " [--expected-create-request-id <id>] [--commit-info <text>]"
+        << " [--timeout-ms <ms>]\n"
+        << "  raft_metadata_client <addr> delete"
+        << " --request-id <id> --object-key <key>"
+        << " [--delete-info <text>]"
+        << " [--timeout-ms <ms>]\n"
+        << "  raft_metadata_client <addr> head"
+        << " --object-key <key>"
+        << " [--timeout-ms <ms>]\n"
+        << "  raft_metadata_client <addr> list"
+        << " [--prefix <prefix>] [--limit <n>] [--page-token <token>]"
+        << " [--timeout-ms <ms>]\n"
         << "  raft_metadata_client <addr> commit-retry"
         << " --request-id <id> --object-key <key>"
         << " [--expected-create-request-id <id>] [--commit-info <text>]"
@@ -126,6 +154,72 @@ namespace
         << " --request-id <id> --object-key <key>"
         << " [--delete-info <text>]"
         << " [--max-retries <n>] [--timeout-ms <ms>]\n";
+  }
+
+  [[noreturn]] void ExitUsageError(const std::string &message)
+  {
+    if (!message.empty())
+    {
+      std::cerr << message << '\n';
+    }
+    PrintUsage();
+    std::exit(2);
+  }
+
+  void ValidateArgs(const ParsedArgs &args)
+  {
+    if (!IsSupportedCommand(args.command))
+    {
+      ExitUsageError("unsupported command: " + args.command);
+    }
+
+    if (args.timeout_ms <= 0)
+    {
+      ExitUsageError("--timeout-ms must be > 0");
+    }
+
+    if (args.max_retries < 0)
+    {
+      ExitUsageError("--max-retries must be >= 0");
+    }
+
+    if (args.command == "create")
+    {
+      if (args.request_id.empty() || args.object_key.empty())
+      {
+        ExitUsageError("create requires --request-id and --object-key");
+      }
+      if (args.object_size == 0 || args.chunk_size == 0)
+      {
+        ExitUsageError("create requires --object-size > 0 and --chunk-size > 0");
+      }
+      if (args.chunk_count.has_value() && *args.chunk_count == 0)
+      {
+        ExitUsageError("--chunk-count must be > 0 when specified");
+      }
+      return;
+    }
+
+    if (args.command == "commit" ||
+        args.command == "delete" ||
+        args.command == "commit-retry" ||
+        args.command == "delete-retry")
+    {
+      if (args.request_id.empty() || args.object_key.empty())
+      {
+        ExitUsageError(args.command + " requires --request-id and --object-key");
+      }
+      return;
+    }
+
+    if (args.command == "head")
+    {
+      if (args.object_key.empty())
+      {
+        ExitUsageError("head requires --object-key");
+      }
+      return;
+    }
   }
 
   ParsedArgs ParseArgs(int argc, char **argv)
@@ -146,8 +240,7 @@ namespace
       auto require_value = [&](const char *name) -> std::string {
         if (i + 1 >= argc)
         {
-          std::cerr << "missing value for " << name << '\n';
-          std::exit(2);
+          ExitUsageError(std::string("missing value for ") + name);
         }
         return argv[++i];
       };
@@ -159,6 +252,19 @@ namespace
       else if (flag == "--object-key")
       {
         args.object_key = require_value("--object-key");
+      }
+      else if (flag == "--prefix")
+      {
+        args.prefix = require_value("--prefix");
+      }
+      else if (flag == "--limit")
+      {
+        args.limit =
+            static_cast<std::uint32_t>(ParsePositiveInt(require_value("--limit"), "--limit"));
+      }
+      else if (flag == "--page-token")
+      {
+        args.page_token = require_value("--page-token");
       }
       else if (flag == "--expected-create-request-id")
       {
@@ -208,52 +314,11 @@ namespace
       }
       else
       {
-        std::cerr << "unknown argument: " << flag << '\n';
-        PrintUsage();
-        std::exit(2);
+        ExitUsageError("unknown argument: " + flag);
       }
     }
 
-    if (args.command != "create" &&
-        args.command != "commit-retry" &&
-        args.command != "delete-retry")
-    {
-      std::cerr << "unsupported command: " << args.command << '\n';
-      PrintUsage();
-      std::exit(2);
-    }
-
-    if (args.request_id.empty() || args.object_key.empty())
-    {
-      std::cerr << "--request-id and --object-key are required\n";
-      std::exit(2);
-    }
-    if (args.command == "create")
-    {
-      if (args.object_size == 0 || args.chunk_size == 0)
-      {
-        std::cerr << "--object-size and --chunk-size must be > 0 for create\n";
-        std::exit(2);
-      }
-      if (args.chunk_count.has_value() && *args.chunk_count == 0)
-      {
-        std::cerr << "--chunk-count must be > 0 when specified\n";
-        std::exit(2);
-      }
-    }
-
-    if (args.max_retries < 0)
-    {
-      std::cerr << "--max-retries must be >= 0\n";
-      std::exit(2);
-    }
-
-    if (args.timeout_ms <= 0)
-    {
-      std::cerr << "--timeout-ms must be > 0\n";
-      std::exit(2);
-    }
-
+    ValidateArgs(args);
     return args;
   }
 
@@ -310,19 +375,35 @@ namespace
     return oss.str();
   }
 
-  void PrintSummary(const char *stage,
-                    int attempt,
-                    const std::string &target_address,
-                    const raft::MetadataResponseSummary &summary)
+  std::string SummaryRequestId(const ParsedArgs &args,
+                               const raft::MetadataResponseSummary &summary)
   {
-    std::cout << "stage=" << stage
-              << " attempt=" << attempt
-              << " target_address=" << target_address
+    return summary.request_id().empty() ? args.request_id : summary.request_id();
+  }
+
+  std::string SummaryObjectKey(const ParsedArgs &args,
+                               const raft::MetadataResponseSummary &summary)
+  {
+    return summary.object_key().empty() ? args.object_key : summary.object_key();
+  }
+
+  void PrintSummary(const char *stage,
+                    const ParsedArgs &args,
+                    const std::string &target_address,
+                    const raft::MetadataResponseSummary &summary,
+                    std::optional<int> attempt = std::nullopt)
+  {
+    std::cout << "stage=" << stage;
+    if (attempt.has_value())
+    {
+      std::cout << " attempt=" << *attempt;
+    }
+    std::cout << " target_address=" << target_address
               << " code=" << MetadataStatusCodeToString(summary.code())
               << " status=" << MetadataStatusCodeToString(summary.code())
               << " message=\"" << summary.message() << "\""
-              << " request_id=" << summary.request_id()
-              << " object_key=" << summary.object_key()
+              << " request_id=" << SummaryRequestId(args, summary)
+              << " object_key=" << SummaryObjectKey(args, summary)
               << " state=" << MetadataRecordStateToString(summary.state())
               << " leader_id=" << summary.leader_hint().leader_id()
               << " leader_address=" << summary.leader_hint().leader_address()
@@ -364,6 +445,69 @@ namespace
                           std::chrono::milliseconds(timeout_ms));
   }
 
+  void PrintRpcFailure(const char *stage,
+                       const ParsedArgs &args,
+                       const std::string &target_address,
+                       const grpc::Status &rpc_status,
+                       std::optional<int> attempt = std::nullopt)
+  {
+    std::cerr << "stage=" << stage;
+    if (attempt.has_value())
+    {
+      std::cerr << " attempt=" << *attempt;
+    }
+    std::cerr << " target_address=" << target_address
+              << " grpc_code=" << rpc_status.error_code()
+              << " grpc_message=\"" << rpc_status.error_message() << "\""
+              << " request_id=" << args.request_id
+              << " object_key=" << args.object_key
+              << " prefix=" << args.prefix
+              << '\n';
+  }
+
+  void PrintRecordDetails(const char *prefix, const raft::MetadataRecord &record)
+  {
+    std::vector<std::string> mock_locations;
+    mock_locations.reserve(static_cast<std::size_t>(record.manifest().mock_locations_size()));
+    for (const auto &location : record.manifest().mock_locations())
+    {
+      mock_locations.push_back(location);
+    }
+
+    std::cout << prefix
+              << " object_key=" << record.object_key()
+              << " state=" << MetadataRecordStateToString(record.state())
+              << " object_size=" << record.manifest().object_size()
+              << " chunk_size=" << record.manifest().chunk_size()
+              << " chunk_count=" << record.manifest().chunk_count()
+              << " checksum=" << record.manifest().checksum()
+              << " mock_locations=" << JoinItems(mock_locations)
+              << " create_request_id=" << record.create_request_id()
+              << " commit_request_id=" << record.commit_request_id()
+              << " delete_request_id=" << record.delete_request_id()
+              << " created_at_log_index=" << record.created_at_log_index()
+              << " committed_at_log_index=" << record.committed_at_log_index()
+              << " deleted_at_log_index=" << record.deleted_at_log_index()
+              << " commit_info=\"" << record.commit_info() << "\""
+              << " delete_info=\"" << record.delete_info() << "\""
+              << " payload_kind=metadata-only"
+              << " payload_bytes=" << record.payload().size()
+              << '\n';
+  }
+
+  int WriteStatusToExitCode(const raft::MetadataStatusCode code)
+  {
+    return code == raft::METADATA_STATUS_CODE_OK ||
+                   code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY
+               ? 0
+               : 1;
+  }
+
+  int ReadStatusToExitCode(const raft::MetadataStatusCode code)
+  {
+    return code == raft::METADATA_STATUS_CODE_OK ? 0 : 1;
+  }
+
   raft::CreateMetadataRecordResponse DoCreate(const ParsedArgs &args,
                                               std::uint64_t chunk_count,
                                               const std::string &checksum,
@@ -392,9 +536,9 @@ namespace
     return response;
   }
 
-  raft::CommitMetadataRecordResponse DoCommitAttempt(const ParsedArgs &args,
-                                                     const std::string &address,
-                                                     grpc::Status *rpc_status)
+  raft::CommitMetadataRecordResponse DoCommit(const ParsedArgs &args,
+                                              const std::string &address,
+                                              grpc::Status *rpc_status)
   {
     auto stub = MakeStub(address);
     raft::CommitMetadataRecordRequest request;
@@ -411,9 +555,9 @@ namespace
     return response;
   }
 
-  raft::DeleteMetadataRecordResponse DoDeleteAttempt(const ParsedArgs &args,
-                                                     const std::string &address,
-                                                     grpc::Status *rpc_status)
+  raft::DeleteMetadataRecordResponse DoDelete(const ParsedArgs &args,
+                                              const std::string &address,
+                                              grpc::Status *rpc_status)
   {
     auto stub = MakeStub(address);
     raft::DeleteMetadataRecordRequest request;
@@ -426,6 +570,39 @@ namespace
 
     raft::DeleteMetadataRecordResponse response;
     *rpc_status = stub->DeleteMetadataRecord(&context, request, &response);
+    return response;
+  }
+
+  raft::HeadMetadataRecordResponse DoHead(const ParsedArgs &args, grpc::Status *rpc_status)
+  {
+    auto stub = MakeStub(args.server_address);
+    raft::HeadMetadataRecordRequest request;
+    request.set_object_key(args.object_key);
+
+    grpc::ClientContext context;
+    ConfigureContext(&context, args.timeout_ms);
+
+    raft::HeadMetadataRecordResponse response;
+    *rpc_status = stub->HeadMetadataRecord(&context, request, &response);
+    return response;
+  }
+
+  raft::ListMetadataRecordsResponse DoList(const ParsedArgs &args, grpc::Status *rpc_status)
+  {
+    auto stub = MakeStub(args.server_address);
+    raft::ListMetadataRecordsRequest request;
+    request.set_prefix(args.prefix);
+    if (args.limit.has_value())
+    {
+      request.set_limit(*args.limit);
+    }
+    request.set_page_token(args.page_token);
+
+    grpc::ClientContext context;
+    ConfigureContext(&context, args.timeout_ms);
+
+    raft::ListMetadataRecordsResponse response;
+    *rpc_status = stub->ListMetadataRecords(&context, request, &response);
     return response;
   }
 
@@ -442,25 +619,15 @@ namespace
         DoCreate(args, chunk_count, checksum, mock_locations, &rpc_status);
     if (!rpc_status.ok())
     {
-      std::cerr << "stage=create"
-                << " target_address=" << args.server_address
-                << " grpc_code=" << rpc_status.error_code()
-                << " grpc_message=\"" << rpc_status.error_message() << "\""
-                << " request_id=" << args.request_id
-                << " object_key=" << args.object_key
-                << '\n';
+      PrintRpcFailure("create", args, args.server_address, rpc_status);
       return 1;
     }
 
     const raft::MetadataResponseSummary &summary = response.summary();
-    std::cout << "stage=create"
-              << " target_address=" << args.server_address
-              << " code=" << MetadataStatusCodeToString(summary.code())
-              << " status=" << MetadataStatusCodeToString(summary.code())
-              << " message=\"" << summary.message() << "\""
-              << " request_id=" << summary.request_id()
-              << " object_key=" << summary.object_key()
-              << " state=" << MetadataRecordStateToString(summary.state())
+    PrintSummary("create", args, args.server_address, summary);
+    std::cout << "create_manifest"
+              << " request_id=" << SummaryRequestId(args, summary)
+              << " object_key=" << SummaryObjectKey(args, summary)
               << " object_size=" << args.object_size
               << " chunk_size=" << args.chunk_size
               << " chunk_count=" << chunk_count
@@ -468,15 +635,87 @@ namespace
               << " mock_locations=" << JoinItems(mock_locations)
               << " payload_kind=metadata-only"
               << " payload_bytes=" << args.payload.size()
-              << " leader_id=" << summary.leader_hint().leader_id()
-              << " leader_address=" << summary.leader_hint().leader_address()
-              << " term=" << summary.term()
-              << " log_index=" << summary.log_index()
               << '\n';
-    return summary.code() == raft::METADATA_STATUS_CODE_OK ||
-                   summary.code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY
-               ? 0
-               : 1;
+    return WriteStatusToExitCode(summary.code());
+  }
+
+  int RunCommit(const ParsedArgs &args)
+  {
+    grpc::Status rpc_status;
+    const raft::CommitMetadataRecordResponse response =
+        DoCommit(args, args.server_address, &rpc_status);
+    if (!rpc_status.ok())
+    {
+      PrintRpcFailure("commit", args, args.server_address, rpc_status);
+      return 1;
+    }
+
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary("commit", args, args.server_address, summary);
+    return WriteStatusToExitCode(summary.code());
+  }
+
+  int RunDelete(const ParsedArgs &args)
+  {
+    grpc::Status rpc_status;
+    const raft::DeleteMetadataRecordResponse response =
+        DoDelete(args, args.server_address, &rpc_status);
+    if (!rpc_status.ok())
+    {
+      PrintRpcFailure("delete", args, args.server_address, rpc_status);
+      return 1;
+    }
+
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary("delete", args, args.server_address, summary);
+    return WriteStatusToExitCode(summary.code());
+  }
+
+  int RunHead(const ParsedArgs &args)
+  {
+    grpc::Status rpc_status;
+    const raft::HeadMetadataRecordResponse response = DoHead(args, &rpc_status);
+    if (!rpc_status.ok())
+    {
+      PrintRpcFailure("head", args, args.server_address, rpc_status);
+      return 1;
+    }
+
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary("head", args, args.server_address, summary);
+    std::cout << "head_result"
+              << " object_key=" << SummaryObjectKey(args, summary)
+              << " found=" << (response.found() ? "true" : "false")
+              << '\n';
+    if (response.found())
+    {
+      PrintRecordDetails("head_record", response.record());
+    }
+    return ReadStatusToExitCode(summary.code());
+  }
+
+  int RunList(const ParsedArgs &args)
+  {
+    grpc::Status rpc_status;
+    const raft::ListMetadataRecordsResponse response = DoList(args, &rpc_status);
+    if (!rpc_status.ok())
+    {
+      PrintRpcFailure("list", args, args.server_address, rpc_status);
+      return 1;
+    }
+
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary("list", args, args.server_address, summary);
+    std::cout << "list_result"
+              << " prefix=" << args.prefix
+              << " records_count=" << response.records_size()
+              << " next_page_token=" << response.next_page_token()
+              << '\n';
+    for (int i = 0; i < response.records_size(); ++i)
+    {
+      PrintRecordDetails(("list_record[" + std::to_string(i) + "]").c_str(), response.records(i));
+    }
+    return ReadStatusToExitCode(summary.code());
   }
 
   int RunCommitRetry(const ParsedArgs &args)
@@ -485,30 +724,20 @@ namespace
     for (int attempt = 1; attempt <= args.max_retries + 1; ++attempt)
     {
       grpc::Status rpc_status;
-      raft::CommitMetadataRecordResponse response =
-          DoCommitAttempt(args, current_address, &rpc_status);
+      const raft::CommitMetadataRecordResponse response =
+          DoCommit(args, current_address, &rpc_status);
 
       if (!rpc_status.ok())
       {
-        std::cerr << "stage=commit-retry"
-                  << " attempt=" << attempt
-                  << " target_address=" << current_address
-                  << " grpc_code=" << rpc_status.error_code()
-                  << " grpc_message=\"" << rpc_status.error_message() << "\""
-                  << " request_id=" << args.request_id
-                  << " object_key=" << args.object_key
-                  << '\n';
+        PrintRpcFailure("commit-retry", args, current_address, rpc_status, attempt);
         return 1;
       }
 
       const raft::MetadataResponseSummary &summary = response.summary();
-      PrintSummary("commit-retry", attempt, current_address, summary);
+      PrintSummary("commit-retry", args, current_address, summary, attempt);
       if (!NeedsRetry(summary.code()) || attempt > args.max_retries)
       {
-        return summary.code() == raft::METADATA_STATUS_CODE_OK ||
-                       summary.code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY
-                   ? 0
-                   : 1;
+        return WriteStatusToExitCode(summary.code());
       }
 
       const std::string next_address = ChooseNextAddress(current_address, summary);
@@ -525,30 +754,20 @@ namespace
     for (int attempt = 1; attempt <= args.max_retries + 1; ++attempt)
     {
       grpc::Status rpc_status;
-      raft::DeleteMetadataRecordResponse response =
-          DoDeleteAttempt(args, current_address, &rpc_status);
+      const raft::DeleteMetadataRecordResponse response =
+          DoDelete(args, current_address, &rpc_status);
 
       if (!rpc_status.ok())
       {
-        std::cerr << "stage=delete-retry"
-                  << " attempt=" << attempt
-                  << " target_address=" << current_address
-                  << " grpc_code=" << rpc_status.error_code()
-                  << " grpc_message=\"" << rpc_status.error_message() << "\""
-                  << " request_id=" << args.request_id
-                  << " object_key=" << args.object_key
-                  << '\n';
+        PrintRpcFailure("delete-retry", args, current_address, rpc_status, attempt);
         return 1;
       }
 
       const raft::MetadataResponseSummary &summary = response.summary();
-      PrintSummary("delete-retry", attempt, current_address, summary);
+      PrintSummary("delete-retry", args, current_address, summary, attempt);
       if (!NeedsRetry(summary.code()) || attempt > args.max_retries)
       {
-        return summary.code() == raft::METADATA_STATUS_CODE_OK ||
-                       summary.code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY
-                   ? 0
-                   : 1;
+        return WriteStatusToExitCode(summary.code());
       }
 
       const std::string next_address = ChooseNextAddress(current_address, summary);
@@ -567,6 +786,22 @@ int main(int argc, char **argv)
   if (args.command == "create")
   {
     return RunCreate(args);
+  }
+  if (args.command == "commit")
+  {
+    return RunCommit(args);
+  }
+  if (args.command == "delete")
+  {
+    return RunDelete(args);
+  }
+  if (args.command == "head")
+  {
+    return RunHead(args);
+  }
+  if (args.command == "list")
+  {
+    return RunList(args);
   }
   if (args.command == "commit-retry")
   {

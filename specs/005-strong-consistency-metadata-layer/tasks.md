@@ -278,7 +278,7 @@
 
 **Purpose**: 将客户端从 KV 操作演进为完整 Metadata Client，但不实现真实文件传输。
 
-- [ ] T031 Implement Metadata Client command dispatcher in apps/raft_metadata_client.cpp
+- [x] T031 Implement Metadata Client command dispatcher in apps/raft_metadata_client.cpp
   - 目标: 支持 create、commit、delete、head、list 子命令。
   - 允许读取文件: `NOTREAD.md`, `apps/AGENTS.md`, `apps/raft_kv_client.cpp`, `proto/raft.proto`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `apps/raft_metadata_client.cpp`
