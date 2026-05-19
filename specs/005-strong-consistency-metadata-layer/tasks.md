@@ -242,7 +242,7 @@
 **Goal**: 明确并验证当前阶段只处理 metadata control plane，未来 StorageNode/ChunkStore 可接入但不影响 committed-only visibility。  
 **Independent Test**: 使用不存在的 mock_locations 仍可 create/commit/head/list；系统不要求真实 chunk 文件或 StorageNode。
 
-- [ ] T027 [US4] Implement manifest boundary validation in modules/raft/common/metadata_command.cpp
+- [x] T027 [US4] Implement manifest boundary validation in modules/raft/common/metadata_command.cpp
   - 目标: 确保 manifest 只描述模拟位置和 metadata payload，不接收真实大文件数据。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/common/metadata_command.cpp`, `modules/raft/common/metadata_command.h`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `modules/raft/common/metadata_command.cpp`

@@ -387,60 +387,77 @@ namespace raftdemo
 
         bool ValidateCreateRecord(const MetadataRecord &record, std::string *error)
         {
-            if (record.state != MetadataRecordState::kPending)
-            {
+            auto set_error = [&](std::string_view message) {
                 if (error != nullptr)
                 {
-                    *error = "create record must start as pending";
+                    *error = std::string(message);
                 }
+            };
+
+            const auto is_blank = [](std::string_view value) {
+                for (const char ch : value)
+                {
+                    if (!std::isspace(static_cast<unsigned char>(ch)))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            if (record.state != MetadataRecordState::kPending)
+            {
+                set_error("create record must start as pending");
                 return false;
             }
             if (record.create_request_id.empty())
             {
-                if (error != nullptr)
-                {
-                    *error = "create record missing create_request_id";
-                }
+                set_error("create record missing create_request_id");
                 return false;
             }
             if (record.object_key.empty())
             {
-                if (error != nullptr)
-                {
-                    *error = "create record missing object_key";
-                }
+                set_error("create record missing object_key");
+                return false;
+            }
+            if (record.object_size == 0)
+            {
+                set_error("create record object_size must be positive");
                 return false;
             }
             if (record.chunk_size == 0 || record.chunk_count == 0)
             {
-                if (error != nullptr)
-                {
-                    *error = "create record chunk_size and chunk_count must be positive";
-                }
+                set_error("create record chunk_size and chunk_count must be positive");
+                return false;
+            }
+            const uint64_t expected_chunk_count =
+                1 + ((record.object_size - 1) / record.chunk_size);
+            if (record.chunk_count != expected_chunk_count)
+            {
+                set_error("create record chunk_count must match object_size and chunk_size");
                 return false;
             }
             if (record.mock_locations.empty())
             {
-                if (error != nullptr)
-                {
-                    *error = "create record missing mock_locations";
-                }
+                set_error("create record missing mock_locations");
                 return false;
             }
-            if (record.checksum.empty())
+            for (const auto &location : record.mock_locations)
             {
-                if (error != nullptr)
+                if (location.empty() || is_blank(location))
                 {
-                    *error = "create record missing checksum";
+                    set_error("create record mock_locations must not contain empty entries");
+                    return false;
                 }
+            }
+            if (record.checksum.empty() || is_blank(record.checksum))
+            {
+                set_error("create record missing checksum");
                 return false;
             }
             if (record.payload.size() > kMaxPayloadBytes)
             {
-                if (error != nullptr)
-                {
-                    *error = "create record payload exceeds limit";
-                }
+                set_error("create record payload exceeds limit");
                 return false;
             }
             return true;
