@@ -189,7 +189,7 @@
   - 实现要求: 若 `NOTREAD.md` 仍禁止读取 `tests/**`，不得读取既有测试；新增独立测试文件即可。
   - 验收标准: 覆盖 VM-011、VM-012、VM-013；测试使用测试临时目录，不读取运行数据目录。
 
-- [ ] T022 [US2] Add DeleteMetadataRecord adapter in modules/raft/service/metadata_service_impl.cpp
+- [x] T022 [US2] Add DeleteMetadataRecord adapter in modules/raft/service/metadata_service_impl.cpp
   - 目标: 将 DeleteMetadataRecord API 接入服务层。
   - 允许读取文件: `NOTREAD.md`, `modules/raft/service/metadata_service_impl.cpp`, `proto/raft.proto`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `modules/raft/service/metadata_service_impl.cpp`

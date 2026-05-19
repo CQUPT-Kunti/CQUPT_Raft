@@ -218,6 +218,16 @@ namespace raftdemo
       return command;
     }
 
+    MetadataCommand MakeDeleteMetadataCommand(const raft::DeleteMetadataRecordRequest &request)
+    {
+      MetadataCommand command;
+      command.operation = MetadataOperation::kDelete;
+      command.request_id = request.request_id();
+      command.object_key = request.object_key();
+      command.delete_info = request.delete_info();
+      return command;
+    }
+
     bool EnsureLeaderForRead(const NodeStatusSnapshot &status,
                              raft::MetadataResponseSummary *summary)
     {
@@ -332,11 +342,24 @@ namespace raftdemo
     auto *reactor = context->DefaultReactor();
     const auto status = node_.GetStatusSnapshot();
 
-    MetadataResponseSummary summary;
-    summary.request_id = request->request_id();
-    summary.object_key = request->object_key();
-    summary.message = "DeleteMetadataRecord is not implemented in T015";
-    FillSummary(status, MetadataStatusCode::kInternalError, summary, response->mutable_summary());
+    MetadataCommand command = MakeDeleteMetadataCommand(*request);
+    std::string validation_error;
+    if (!ValidateMetadataCommand(command, &validation_error))
+    {
+      MetadataResponseSummary summary;
+      summary.request_id = request->request_id();
+      summary.object_key = request->object_key();
+      summary.message = validation_error;
+      FillSummary(status, MetadataStatusCode::kInvalidArgument, summary, response->mutable_summary());
+      reactor->Finish(grpc::Status::OK);
+      return reactor;
+    }
+
+    const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
+    const auto latest_status = node_.GetStatusSnapshot();
+    FillWriteSummary(latest_status, result, request->request_id(), request->object_key(),
+                     MetadataRecordState::kDeleted, response->mutable_summary());
+
     reactor->Finish(grpc::Status::OK);
     return reactor;
   }
