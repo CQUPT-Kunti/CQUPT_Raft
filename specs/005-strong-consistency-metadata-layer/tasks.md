@@ -312,7 +312,7 @@
 
 **Purpose**: 收口文档、阶段边界和任务可追踪性；不修改业务逻辑。
 
-- [ ] T035 [P] Update API notes in specs/005-strong-consistency-metadata-layer/api.md
+- [x] T035 [P] Update API notes in specs/005-strong-consistency-metadata-layer/api.md
   - 目标: 将实现中固定的状态码、重复请求结果和 deleted-again 行为回填到 API 文档。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/api.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/api.md`
