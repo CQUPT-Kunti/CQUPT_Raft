@@ -373,7 +373,7 @@
   - 实现要求: 使用项目已有 Windows 兼容 CMake preset 或等价命令；优先保持 generator-agnostic；不得依赖 Linux-only shell 语义。
   - 验收标准: 构建 PASS；失败时记录命令、生成器、编译器、失败分类、关键错误、最后 50 行日志和完整日志路径。
 
-- [ ] T042 Run Windows unit and integration validation with CTest
+- [x] T042 Run Windows unit and integration validation with CTest
   - 目标: 验证 Windows 平台 metadata 相关单测和集成测试。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: 无
