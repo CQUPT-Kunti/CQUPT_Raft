@@ -326,7 +326,7 @@
   - 实现要求: 只更新文档；不得新增 StorageNode 数据模型为当前阶段任务。
   - 验收标准: 数据模型与实现任务中的字段和状态转换一致。
 
-- [ ] T037 [P] Update validation matrix status in specs/005-strong-consistency-metadata-layer/validation-matrix.md
+- [x] T037 [P] Update validation matrix status in specs/005-strong-consistency-metadata-layer/validation-matrix.md
   - 目标: 将已实现验证与待验证项映射到具体测试目标和平台。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
