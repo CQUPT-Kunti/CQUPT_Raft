@@ -185,5 +185,14 @@ target_link_libraries(raft_kv_client
     raft_proto
 )
 
+add_executable(raft_metadata_client
+  apps/raft_metadata_client.cpp
+)
+
+target_link_libraries(raft_metadata_client
+  PRIVATE
+    raft_proto
+)
+
 enable_testing()
 add_subdirectory(tests)

@@ -292,7 +292,7 @@
   - 实现要求: 验证模式只调用 Metadata API；不访问 Raft 内部日志或 snapshot；失败时输出期望与实际状态。
   - 验收标准: 可覆盖 VM-001、VM-002、VM-007 的客户端基本流程。
 
-- [ ] T033 Add client target wiring in CMakeLists.txt
+- [x] T033 Add client target wiring in CMakeLists.txt
   - 目标: 增加 Metadata Client 可执行目标。
   - 允许读取文件: `NOTREAD.md`, `CMakeLists.txt`, `apps/raft_metadata_client.cpp`
   - 允许修改文件: `CMakeLists.txt`
