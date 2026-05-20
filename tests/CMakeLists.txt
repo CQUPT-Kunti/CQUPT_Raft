@@ -154,6 +154,40 @@ else()
 endif()
 add_raft_gtest(test_metadata_failover metadata_failover_test.cpp
   "platform-neutral")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
+  add_executable(test_metadata_client_scenario
+    metadata_client_scenario_test.cpp
+  )
+
+  add_dependencies(test_metadata_client_scenario
+    raft_metadata_client
+  )
+
+  target_link_libraries(test_metadata_client_scenario
+    PRIVATE
+      raft_proto
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_metadata_client_scenario
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_compile_definitions(test_metadata_client_scenario
+    PRIVATE
+      RAFT_METADATA_CLIENT_PATH="$<TARGET_FILE:raft_metadata_client>"
+  )
+
+  gtest_discover_tests(test_metadata_client_scenario
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES
+      LABELS "platform-neutral"
+  )
+else()
+  message(STATUS "Skip test_metadata_client_scenario: metadata_client_scenario_test.cpp not found")
+endif()
 
 add_raft_gtest(test_state_machine test_state_machine.cpp
   "platform-neutral;platform-neutral-fallback")

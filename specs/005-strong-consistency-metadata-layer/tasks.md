@@ -299,7 +299,7 @@
   - 实现要求: 保持现有 target 名称不变；新增 target 不破坏 `raft_kv_client`；生成 protobuf/gRPC include 方式保持一致。
   - 验收标准: Linux 和 Windows CMake configure/build 均能生成 metadata client target。
 
-- [ ] T034 Add client scenario tests in tests/metadata_client_scenario_test.cpp
+- [x] T034 Add client scenario tests in tests/metadata_client_scenario_test.cpp
   - 目标: 覆盖 Metadata Client 的模拟日志和读后写验证。
   - 允许读取文件: `NOTREAD.md`, `apps/raft_metadata_client.cpp`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `tests/metadata_client_scenario_test.cpp`
