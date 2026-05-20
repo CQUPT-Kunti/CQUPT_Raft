@@ -339,7 +339,7 @@
 
 **Purpose**: 在 Linux 平台验证构建、单测/集成测试和 Metadata Client 基本流程。
 
-- [ ] T038 Run Linux configure and build validation with cmake presets
+- [x] T038 Run Linux configure and build validation with cmake presets
   - 目标: 确认 Linux 平台可配置和构建。
   - 允许读取文件: `NOTREAD.md`, `CMakeLists.txt`, `CMakePresets.json`, `specs/005-strong-consistency-metadata-layer/tasks.md`
   - 允许修改文件: 无
