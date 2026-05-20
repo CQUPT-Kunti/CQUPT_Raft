@@ -319,7 +319,7 @@
   - 实现要求: 只更新文档；不得改变源码。
   - 验收标准: API 文档不再存在“实现阶段需固定”的开放语句。
 
-- [ ] T036 [P] Update data model notes in specs/005-strong-consistency-metadata-layer/data-model.md
+- [x] T036 [P] Update data model notes in specs/005-strong-consistency-metadata-layer/data-model.md
   - 目标: 回填最终字段约束、payload 上限和 tombstone 保留策略。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/data-model.md`
   - 允许修改文件: `specs/005-strong-consistency-metadata-layer/data-model.md`
