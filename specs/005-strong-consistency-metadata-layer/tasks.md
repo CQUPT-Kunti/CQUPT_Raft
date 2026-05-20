@@ -366,7 +366,7 @@
 
 **Purpose**: 在 Windows 平台验证跨平台构建、测试和 Metadata Client 基本流程。
 
-- [ ] T041 Run Windows configure and build validation with CMake
+- [x] T041 Run Windows configure and build validation with CMake
   - 目标: 确认 Windows 平台可配置和构建。
   - 允许读取文件: `NOTREAD.md`, `CMakeLists.txt`, `CMakePresets.json`, `specs/005-strong-consistency-metadata-layer/tasks.md`
   - 允许修改文件: 无
