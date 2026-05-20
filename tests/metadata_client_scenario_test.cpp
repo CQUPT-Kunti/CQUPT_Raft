@@ -26,6 +26,10 @@
 
 #include "raft.grpc.pb.h"
 
+#ifdef _WIN32
+int raft_metadata_client_entry(int argc, char **argv);
+#endif
+
 namespace
 {
     using namespace std::chrono_literals;
@@ -69,6 +73,54 @@ namespace
 #endif
     }
 
+#ifdef _WIN32
+    ClientRunResult RunClientWindows(const std::vector<std::string> &args,
+                                     const std::filesystem::path &output_path)
+    {
+        std::vector<std::string> argv_storage;
+        argv_storage.reserve(args.size() + 1);
+        argv_storage.push_back(ClientBinaryPath());
+        argv_storage.insert(argv_storage.end(), args.begin(), args.end());
+
+        std::vector<char *> argv;
+        argv.reserve(argv_storage.size());
+        for (auto &value : argv_storage)
+        {
+            argv.push_back(value.data());
+        }
+
+        testing::internal::CaptureStdout();
+        testing::internal::CaptureStderr();
+
+        int exit_code = -1;
+        try
+        {
+            exit_code = raft_metadata_client_entry(
+                static_cast<int>(argv.size()), argv.data());
+        }
+        catch (const std::exception &ex)
+        {
+            std::cerr << "raft_metadata_client_entry threw exception: " << ex.what()
+                      << '\n';
+            exit_code = -1;
+        }
+        catch (...)
+        {
+            std::cerr << "raft_metadata_client_entry threw unknown exception\n";
+            exit_code = -1;
+        }
+
+        std::string output = testing::internal::GetCapturedStdout();
+        output += testing::internal::GetCapturedStderr();
+        std::ofstream(output_path, std::ios::binary) << output;
+
+        return ClientRunResult{
+            exit_code,
+            std::move(output),
+        };
+    }
+#endif
+
     ClientRunResult RunClient(const std::vector<std::string> &args,
                               const std::string &test_name)
     {
@@ -82,6 +134,9 @@ namespace
                               std::chrono::steady_clock::now().time_since_epoch().count())) +
                           ".log");
 
+#ifdef _WIN32
+        return RunClientWindows(args, output_path);
+#else
         std::ostringstream command;
         command << QuoteArg(ClientBinaryPath());
         for (const auto &arg : args)
@@ -100,6 +155,7 @@ namespace
             NormalizeSystemExitCode(raw_exit),
             buffer.str(),
         };
+#endif
     }
 
     bool Contains(const std::string &text, const std::string &needle)

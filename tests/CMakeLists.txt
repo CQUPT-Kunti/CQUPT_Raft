@@ -157,6 +157,13 @@ add_raft_gtest(test_metadata_failover metadata_failover_test.cpp
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
   add_executable(test_metadata_client_scenario
     metadata_client_scenario_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../apps/raft_metadata_client.cpp
+  )
+
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../apps/raft_metadata_client.cpp
+    PROPERTIES
+      COMPILE_DEFINITIONS "main=raft_metadata_client_entry"
   )
 
   add_dependencies(test_metadata_client_scenario

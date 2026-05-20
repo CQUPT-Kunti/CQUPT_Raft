@@ -366,21 +366,21 @@
 
 **Purpose**: 在 Windows 平台验证跨平台构建、测试和 Metadata Client 基本流程。
 
-- [ ] T041 Run Windows configure and build validation with CMake
+- [x] T041 Run Windows configure and build validation with CMake
   - 目标: 确认 Windows 平台可配置和构建。
   - 允许读取文件: `NOTREAD.md`, `CMakeLists.txt`, `CMakePresets.json`, `specs/005-strong-consistency-metadata-layer/tasks.md`
   - 允许修改文件: 无
   - 实现要求: 使用项目已有 Windows 兼容 CMake preset 或等价命令；优先保持 generator-agnostic；不得依赖 Linux-only shell 语义。
   - 验收标准: 构建 PASS；失败时记录命令、生成器、编译器、失败分类、关键错误、最后 50 行日志和完整日志路径。
 
-- [ ] T042 Run Windows unit and integration validation with CTest
+- [x] T042 Run Windows unit and integration validation with CTest
   - 目标: 验证 Windows 平台 metadata 相关单测和集成测试。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: 无
   - 实现要求: 使用 Windows 可用的 `ctest --test-dir <build-dir> --output-on-failure -R "Metadata"`；不得使用 Linux-only 环境变量作为唯一入口。
   - 验收标准: PASS；失败时记录失败测试名、关键断言、失败分类、最后 50 行日志和完整日志文件路径。
 
-- [ ] T043 Run Windows Metadata Client basic flow validation
+- [x] T043 Run Windows Metadata Client basic flow validation
   - 目标: 验证 Windows 平台 Metadata Client 的 create、head、commit、list、delete、head 流程。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/client-design.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: 无
