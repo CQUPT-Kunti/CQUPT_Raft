@@ -41,6 +41,13 @@ namespace
     int timeout_ms = 3000;
   };
 
+  struct CreateInputs
+  {
+    std::uint64_t chunk_count = 0;
+    std::string checksum;
+    std::vector<std::string> mock_locations;
+  };
+
   const char *MetadataStatusCodeToString(const raft::MetadataStatusCode code)
   {
     switch (code)
@@ -117,6 +124,7 @@ namespace
            command == "delete" ||
            command == "head" ||
            command == "list" ||
+           command == "verify-read-after-write" ||
            command == "commit-retry" ||
            command == "delete-retry";
   }
@@ -146,6 +154,14 @@ namespace
         << "  raft_metadata_client <addr> list"
         << " [--prefix <prefix>] [--limit <n>] [--page-token <token>]"
         << " [--timeout-ms <ms>]\n"
+        << "  raft_metadata_client <addr> verify-read-after-write"
+        << " --request-id <id> --object-key <key>"
+        << " --object-size <bytes> --chunk-size <bytes>"
+        << " [--chunk-count <n>] [--checksum <mock-checksum>]"
+        << " [--mock-location <value>]..."
+        << " [--payload <metadata-only-payload>]"
+        << " [--commit-info <text>] [--delete-info <text>]"
+        << " [--prefix <prefix>] [--limit <n>] [--timeout-ms <ms>]\n"
         << "  raft_metadata_client <addr> commit-retry"
         << " --request-id <id> --object-key <key>"
         << " [--expected-create-request-id <id>] [--commit-info <text>]"
@@ -183,15 +199,15 @@ namespace
       ExitUsageError("--max-retries must be >= 0");
     }
 
-    if (args.command == "create")
+    if (args.command == "create" || args.command == "verify-read-after-write")
     {
       if (args.request_id.empty() || args.object_key.empty())
       {
-        ExitUsageError("create requires --request-id and --object-key");
+        ExitUsageError(args.command + " requires --request-id and --object-key");
       }
       if (args.object_size == 0 || args.chunk_size == 0)
       {
-        ExitUsageError("create requires --object-size > 0 and --chunk-size > 0");
+        ExitUsageError(args.command + " requires --object-size > 0 and --chunk-size > 0");
       }
       if (args.chunk_count.has_value() && *args.chunk_count == 0)
       {
@@ -361,6 +377,17 @@ namespace
     return locations;
   }
 
+  CreateInputs PrepareCreateInputs(const ParsedArgs &args)
+  {
+    CreateInputs inputs;
+    inputs.chunk_count =
+        args.chunk_count.value_or(ComputeChunkCount(args.object_size, args.chunk_size));
+    inputs.checksum =
+        args.checksum.empty() ? MakeMockChecksum(args, inputs.chunk_count) : args.checksum;
+    inputs.mock_locations = MakeMockLocations(args, inputs.chunk_count);
+    return inputs;
+  }
+
   std::string JoinItems(const std::vector<std::string> &items)
   {
     std::ostringstream oss;
@@ -410,6 +437,57 @@ namespace
               << " term=" << summary.term()
               << " log_index=" << summary.log_index()
               << '\n';
+  }
+
+  void PrintVerificationCheck(const char *step,
+                              const std::string &request_id,
+                              const std::string &object_key,
+                              const std::string &status,
+                              const std::string &message,
+                              int leader_id,
+                              const std::string &leader_address,
+                              std::uint64_t term,
+                              std::uint64_t log_index,
+                              const std::string &expected,
+                              const std::string &actual,
+                              bool pass)
+  {
+    std::cout << "verification_check"
+              << " step=" << step
+              << " result=" << (pass ? "PASS" : "FAIL")
+              << " request_id=" << request_id
+              << " object_key=" << object_key
+              << " status=" << status
+              << " message=\"" << message << "\""
+              << " leader_id=" << leader_id
+              << " leader_address=" << leader_address
+              << " term=" << term
+              << " log_index=" << log_index
+              << " expected=\"" << expected << "\""
+              << " actual=\"" << actual << "\""
+              << '\n';
+  }
+
+  void PrintVerificationCheck(const char *step,
+                              const std::string &request_id,
+                              const std::string &object_key,
+                              const raft::MetadataResponseSummary &summary,
+                              const std::string &expected,
+                              const std::string &actual,
+                              bool pass)
+  {
+    PrintVerificationCheck(step,
+                           request_id,
+                           object_key,
+                           MetadataStatusCodeToString(summary.code()),
+                           summary.message(),
+                           summary.leader_hint().leader_id(),
+                           summary.leader_hint().leader_address(),
+                           summary.term(),
+                           summary.log_index(),
+                           expected,
+                           actual,
+                           pass);
   }
 
   void PrintRetryDecision(int next_attempt,
@@ -465,6 +543,23 @@ namespace
               << '\n';
   }
 
+  void PrintCreateManifest(const ParsedArgs &args,
+                           const raft::MetadataResponseSummary &summary,
+                           const CreateInputs &inputs)
+  {
+    std::cout << "create_manifest"
+              << " request_id=" << SummaryRequestId(args, summary)
+              << " object_key=" << SummaryObjectKey(args, summary)
+              << " object_size=" << args.object_size
+              << " chunk_size=" << args.chunk_size
+              << " chunk_count=" << inputs.chunk_count
+              << " checksum=" << inputs.checksum
+              << " mock_locations=" << JoinItems(inputs.mock_locations)
+              << " payload_kind=metadata-only"
+              << " payload_bytes=" << args.payload.size()
+              << '\n';
+  }
+
   void PrintRecordDetails(const char *prefix, const raft::MetadataRecord &record)
   {
     std::vector<std::string> mock_locations;
@@ -495,6 +590,41 @@ namespace
               << '\n';
   }
 
+  void PrintHeadResponse(const ParsedArgs &args,
+                         const raft::HeadMetadataRecordResponse &response,
+                         const std::string &target_address,
+                         const char *stage)
+  {
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary(stage, args, target_address, summary);
+    std::cout << "head_result"
+              << " object_key=" << SummaryObjectKey(args, summary)
+              << " found=" << (response.found() ? "true" : "false")
+              << '\n';
+    if (response.found())
+    {
+      PrintRecordDetails("head_record", response.record());
+    }
+  }
+
+  void PrintListResponse(const ParsedArgs &args,
+                         const raft::ListMetadataRecordsResponse &response,
+                         const std::string &target_address,
+                         const char *stage)
+  {
+    const raft::MetadataResponseSummary &summary = response.summary();
+    PrintSummary(stage, args, target_address, summary);
+    std::cout << "list_result"
+              << " prefix=" << args.prefix
+              << " records_count=" << response.records_size()
+              << " next_page_token=" << response.next_page_token()
+              << '\n';
+    for (int i = 0; i < response.records_size(); ++i)
+    {
+      PrintRecordDetails(("list_record[" + std::to_string(i) + "]").c_str(), response.records(i));
+    }
+  }
+
   int WriteStatusToExitCode(const raft::MetadataStatusCode code)
   {
     return code == raft::METADATA_STATUS_CODE_OK ||
@@ -506,6 +636,24 @@ namespace
   int ReadStatusToExitCode(const raft::MetadataStatusCode code)
   {
     return code == raft::METADATA_STATUS_CODE_OK ? 0 : 1;
+  }
+
+  bool IsWriteSuccess(const raft::MetadataStatusCode code)
+  {
+    return WriteStatusToExitCode(code) == 0;
+  }
+
+  bool ListContainsObject(const raft::ListMetadataRecordsResponse &response,
+                          const std::string &object_key)
+  {
+    for (const auto &record : response.records())
+    {
+      if (record.object_key() == object_key)
+      {
+        return true;
+      }
+    }
+    return false;
   }
 
   raft::CreateMetadataRecordResponse DoCreate(const ParsedArgs &args,
@@ -608,15 +756,11 @@ namespace
 
   int RunCreate(const ParsedArgs &args)
   {
-    const std::uint64_t chunk_count =
-        args.chunk_count.value_or(ComputeChunkCount(args.object_size, args.chunk_size));
-    const std::string checksum =
-        args.checksum.empty() ? MakeMockChecksum(args, chunk_count) : args.checksum;
-    const std::vector<std::string> mock_locations = MakeMockLocations(args, chunk_count);
+    const CreateInputs inputs = PrepareCreateInputs(args);
 
     grpc::Status rpc_status;
     const raft::CreateMetadataRecordResponse response =
-        DoCreate(args, chunk_count, checksum, mock_locations, &rpc_status);
+        DoCreate(args, inputs.chunk_count, inputs.checksum, inputs.mock_locations, &rpc_status);
     if (!rpc_status.ok())
     {
       PrintRpcFailure("create", args, args.server_address, rpc_status);
@@ -625,17 +769,7 @@ namespace
 
     const raft::MetadataResponseSummary &summary = response.summary();
     PrintSummary("create", args, args.server_address, summary);
-    std::cout << "create_manifest"
-              << " request_id=" << SummaryRequestId(args, summary)
-              << " object_key=" << SummaryObjectKey(args, summary)
-              << " object_size=" << args.object_size
-              << " chunk_size=" << args.chunk_size
-              << " chunk_count=" << chunk_count
-              << " checksum=" << checksum
-              << " mock_locations=" << JoinItems(mock_locations)
-              << " payload_kind=metadata-only"
-              << " payload_bytes=" << args.payload.size()
-              << '\n';
+    PrintCreateManifest(args, summary, inputs);
     return WriteStatusToExitCode(summary.code());
   }
 
@@ -681,17 +815,8 @@ namespace
       return 1;
     }
 
-    const raft::MetadataResponseSummary &summary = response.summary();
-    PrintSummary("head", args, args.server_address, summary);
-    std::cout << "head_result"
-              << " object_key=" << SummaryObjectKey(args, summary)
-              << " found=" << (response.found() ? "true" : "false")
-              << '\n';
-    if (response.found())
-    {
-      PrintRecordDetails("head_record", response.record());
-    }
-    return ReadStatusToExitCode(summary.code());
+    PrintHeadResponse(args, response, args.server_address, "head");
+    return ReadStatusToExitCode(response.summary().code());
   }
 
   int RunList(const ParsedArgs &args)
@@ -704,18 +829,467 @@ namespace
       return 1;
     }
 
-    const raft::MetadataResponseSummary &summary = response.summary();
-    PrintSummary("list", args, args.server_address, summary);
-    std::cout << "list_result"
-              << " prefix=" << args.prefix
-              << " records_count=" << response.records_size()
-              << " next_page_token=" << response.next_page_token()
-              << '\n';
-    for (int i = 0; i < response.records_size(); ++i)
+    PrintListResponse(args, response, args.server_address, "list");
+    return ReadStatusToExitCode(response.summary().code());
+  }
+
+  int RunVerifyReadAfterWrite(const ParsedArgs &args)
+  {
+    const CreateInputs inputs = PrepareCreateInputs(args);
+
+    ParsedArgs create_args = args;
+    create_args.command = "create";
+    create_args.request_id = args.request_id + ":create";
+
+    ParsedArgs commit_args = args;
+    commit_args.command = "commit";
+    commit_args.request_id = args.request_id + ":commit";
+    commit_args.expected_create_request_id = create_args.request_id;
+
+    ParsedArgs delete_args = args;
+    delete_args.command = "delete";
+    delete_args.request_id = args.request_id + ":delete";
+
+    ParsedArgs create_read_args = create_args;
+    ParsedArgs commit_read_args = commit_args;
+    ParsedArgs delete_read_args = delete_args;
+
+    create_read_args.command = "head";
+    commit_read_args.command = "head";
+    delete_read_args.command = "head";
+
+    ParsedArgs create_list_args = create_args;
+    ParsedArgs commit_list_args = commit_args;
+    ParsedArgs delete_list_args = delete_args;
+    create_list_args.command = "list";
+    commit_list_args.command = "list";
+    delete_list_args.command = "list";
+    if (create_list_args.prefix.empty())
     {
-      PrintRecordDetails(("list_record[" + std::to_string(i) + "]").c_str(), response.records(i));
+      create_list_args.prefix = args.object_key;
+      commit_list_args.prefix = args.object_key;
+      delete_list_args.prefix = args.object_key;
     }
-    return ReadStatusToExitCode(summary.code());
+
+    grpc::Status create_status;
+    const raft::CreateMetadataRecordResponse create_response =
+        DoCreate(create_args,
+                 inputs.chunk_count,
+                 inputs.checksum,
+                 inputs.mock_locations,
+                 &create_status);
+    if (!create_status.ok())
+    {
+      PrintRpcFailure("verify-create", create_args, create_args.server_address, create_status);
+      PrintVerificationCheck("create-write",
+                             create_args.request_id,
+                             create_args.object_key,
+                             "GRPC_ERROR",
+                             create_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "create accepted",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintSummary("verify-create", create_args, create_args.server_address, create_response.summary());
+    PrintCreateManifest(create_args, create_response.summary(), inputs);
+    const bool create_ok = IsWriteSuccess(create_response.summary().code());
+    PrintVerificationCheck("create-write",
+                           create_args.request_id,
+                           create_args.object_key,
+                           create_response.summary(),
+                           "OK or IDEMPOTENT_REPLAY",
+                           MetadataStatusCodeToString(create_response.summary().code()),
+                           create_ok);
+    if (!create_ok)
+    {
+      return 1;
+    }
+
+    grpc::Status create_head_status;
+    const raft::HeadMetadataRecordResponse create_head_response =
+        DoHead(create_read_args, &create_head_status);
+    if (!create_head_status.ok())
+    {
+      PrintRpcFailure("verify-after-create-head",
+                      create_read_args,
+                      create_read_args.server_address,
+                      create_head_status);
+      PrintVerificationCheck("create-head-invisible",
+                             create_read_args.request_id,
+                             create_read_args.object_key,
+                             "GRPC_ERROR",
+                             create_head_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "not found or found=false",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintHeadResponse(create_read_args,
+                      create_head_response,
+                      create_read_args.server_address,
+                      "verify-after-create-head");
+    const bool create_head_hidden =
+        create_head_response.summary().code() == raft::METADATA_STATUS_CODE_NOT_FOUND ||
+        (!create_head_response.found() &&
+         create_head_response.summary().code() == raft::METADATA_STATUS_CODE_OK);
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(create_head_response.summary().code())
+             << ",found=" << (create_head_response.found() ? "true" : "false");
+      PrintVerificationCheck("create-head-invisible",
+                             create_read_args.request_id,
+                             create_read_args.object_key,
+                             create_head_response.summary(),
+                             "not found or found=false",
+                             actual.str(),
+                             create_head_hidden);
+    }
+    if (!create_head_hidden)
+    {
+      return 1;
+    }
+
+    grpc::Status create_list_status;
+    const raft::ListMetadataRecordsResponse create_list_response =
+        DoList(create_list_args, &create_list_status);
+    if (!create_list_status.ok())
+    {
+      PrintRpcFailure("verify-after-create-list",
+                      create_list_args,
+                      create_list_args.server_address,
+                      create_list_status);
+      PrintVerificationCheck("create-list-invisible",
+                             create_list_args.request_id,
+                             create_list_args.object_key,
+                             "GRPC_ERROR",
+                             create_list_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "object absent from list",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintListResponse(create_list_args,
+                      create_list_response,
+                      create_list_args.server_address,
+                      "verify-after-create-list");
+    const bool create_list_hidden =
+        create_list_response.summary().code() == raft::METADATA_STATUS_CODE_OK &&
+        !ListContainsObject(create_list_response, args.object_key);
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(create_list_response.summary().code())
+             << ",contains_object="
+             << (ListContainsObject(create_list_response, args.object_key) ? "true" : "false")
+             << ",records_count=" << create_list_response.records_size();
+      PrintVerificationCheck("create-list-invisible",
+                             create_list_args.request_id,
+                             create_list_args.object_key,
+                             create_list_response.summary(),
+                             "object absent from list",
+                             actual.str(),
+                             create_list_hidden);
+    }
+    if (!create_list_hidden)
+    {
+      return 1;
+    }
+
+    grpc::Status commit_status;
+    const raft::CommitMetadataRecordResponse commit_response =
+        DoCommit(commit_args, commit_args.server_address, &commit_status);
+    if (!commit_status.ok())
+    {
+      PrintRpcFailure("verify-commit", commit_args, commit_args.server_address, commit_status);
+      PrintVerificationCheck("commit-write",
+                             commit_args.request_id,
+                             commit_args.object_key,
+                             "GRPC_ERROR",
+                             commit_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "commit accepted",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintSummary("verify-commit", commit_args, commit_args.server_address, commit_response.summary());
+    const bool commit_ok = IsWriteSuccess(commit_response.summary().code());
+    PrintVerificationCheck("commit-write",
+                           commit_args.request_id,
+                           commit_args.object_key,
+                           commit_response.summary(),
+                           "OK or IDEMPOTENT_REPLAY",
+                           MetadataStatusCodeToString(commit_response.summary().code()),
+                           commit_ok);
+    if (!commit_ok)
+    {
+      return 1;
+    }
+
+    grpc::Status commit_head_status;
+    const raft::HeadMetadataRecordResponse commit_head_response =
+        DoHead(commit_read_args, &commit_head_status);
+    if (!commit_head_status.ok())
+    {
+      PrintRpcFailure("verify-after-commit-head",
+                      commit_read_args,
+                      commit_read_args.server_address,
+                      commit_head_status);
+      PrintVerificationCheck("commit-head-visible",
+                             commit_read_args.request_id,
+                             commit_read_args.object_key,
+                             "GRPC_ERROR",
+                             commit_head_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "found=true,state=COMMITTED",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintHeadResponse(commit_read_args,
+                      commit_head_response,
+                      commit_read_args.server_address,
+                      "verify-after-commit-head");
+    const bool commit_head_visible =
+        commit_head_response.summary().code() == raft::METADATA_STATUS_CODE_OK &&
+        commit_head_response.found() &&
+        commit_head_response.record().object_key() == args.object_key &&
+        commit_head_response.record().state() == raft::METADATA_RECORD_STATE_COMMITTED;
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(commit_head_response.summary().code())
+             << ",found=" << (commit_head_response.found() ? "true" : "false")
+             << ",state="
+             << (commit_head_response.found()
+                     ? MetadataRecordStateToString(commit_head_response.record().state())
+                     : "UNSPECIFIED");
+      PrintVerificationCheck("commit-head-visible",
+                             commit_read_args.request_id,
+                             commit_read_args.object_key,
+                             commit_head_response.summary(),
+                             "found=true,state=COMMITTED",
+                             actual.str(),
+                             commit_head_visible);
+    }
+    if (!commit_head_visible)
+    {
+      return 1;
+    }
+
+    grpc::Status commit_list_status;
+    const raft::ListMetadataRecordsResponse commit_list_response =
+        DoList(commit_list_args, &commit_list_status);
+    if (!commit_list_status.ok())
+    {
+      PrintRpcFailure("verify-after-commit-list",
+                      commit_list_args,
+                      commit_list_args.server_address,
+                      commit_list_status);
+      PrintVerificationCheck("commit-list-visible",
+                             commit_list_args.request_id,
+                             commit_list_args.object_key,
+                             "GRPC_ERROR",
+                             commit_list_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "object present in list",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintListResponse(commit_list_args,
+                      commit_list_response,
+                      commit_list_args.server_address,
+                      "verify-after-commit-list");
+    const bool commit_list_visible =
+        commit_list_response.summary().code() == raft::METADATA_STATUS_CODE_OK &&
+        ListContainsObject(commit_list_response, args.object_key);
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(commit_list_response.summary().code())
+             << ",contains_object="
+             << (ListContainsObject(commit_list_response, args.object_key) ? "true" : "false")
+             << ",records_count=" << commit_list_response.records_size();
+      PrintVerificationCheck("commit-list-visible",
+                             commit_list_args.request_id,
+                             commit_list_args.object_key,
+                             commit_list_response.summary(),
+                             "object present in list",
+                             actual.str(),
+                             commit_list_visible);
+    }
+    if (!commit_list_visible)
+    {
+      return 1;
+    }
+
+    grpc::Status delete_status;
+    const raft::DeleteMetadataRecordResponse delete_response =
+        DoDelete(delete_args, delete_args.server_address, &delete_status);
+    if (!delete_status.ok())
+    {
+      PrintRpcFailure("verify-delete", delete_args, delete_args.server_address, delete_status);
+      PrintVerificationCheck("delete-write",
+                             delete_args.request_id,
+                             delete_args.object_key,
+                             "GRPC_ERROR",
+                             delete_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "delete accepted",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintSummary("verify-delete", delete_args, delete_args.server_address, delete_response.summary());
+    const bool delete_ok = IsWriteSuccess(delete_response.summary().code());
+    PrintVerificationCheck("delete-write",
+                           delete_args.request_id,
+                           delete_args.object_key,
+                           delete_response.summary(),
+                           "OK or IDEMPOTENT_REPLAY",
+                           MetadataStatusCodeToString(delete_response.summary().code()),
+                           delete_ok);
+    if (!delete_ok)
+    {
+      return 1;
+    }
+
+    grpc::Status delete_head_status;
+    const raft::HeadMetadataRecordResponse delete_head_response =
+        DoHead(delete_read_args, &delete_head_status);
+    if (!delete_head_status.ok())
+    {
+      PrintRpcFailure("verify-after-delete-head",
+                      delete_read_args,
+                      delete_read_args.server_address,
+                      delete_head_status);
+      PrintVerificationCheck("delete-head-invisible",
+                             delete_read_args.request_id,
+                             delete_read_args.object_key,
+                             "GRPC_ERROR",
+                             delete_head_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "not found or found=false",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintHeadResponse(delete_read_args,
+                      delete_head_response,
+                      delete_read_args.server_address,
+                      "verify-after-delete-head");
+    const bool delete_head_hidden =
+        delete_head_response.summary().code() == raft::METADATA_STATUS_CODE_NOT_FOUND ||
+        (!delete_head_response.found() &&
+         delete_head_response.summary().code() == raft::METADATA_STATUS_CODE_OK);
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(delete_head_response.summary().code())
+             << ",found=" << (delete_head_response.found() ? "true" : "false");
+      PrintVerificationCheck("delete-head-invisible",
+                             delete_read_args.request_id,
+                             delete_read_args.object_key,
+                             delete_head_response.summary(),
+                             "not found or found=false",
+                             actual.str(),
+                             delete_head_hidden);
+    }
+    if (!delete_head_hidden)
+    {
+      return 1;
+    }
+
+    grpc::Status delete_list_status;
+    const raft::ListMetadataRecordsResponse delete_list_response =
+        DoList(delete_list_args, &delete_list_status);
+    if (!delete_list_status.ok())
+    {
+      PrintRpcFailure("verify-after-delete-list",
+                      delete_list_args,
+                      delete_list_args.server_address,
+                      delete_list_status);
+      PrintVerificationCheck("delete-list-invisible",
+                             delete_list_args.request_id,
+                             delete_list_args.object_key,
+                             "GRPC_ERROR",
+                             delete_list_status.error_message(),
+                             0,
+                             "",
+                             0,
+                             0,
+                             "object absent from list",
+                             "grpc failure",
+                             false);
+      return 1;
+    }
+
+    PrintListResponse(delete_list_args,
+                      delete_list_response,
+                      delete_list_args.server_address,
+                      "verify-after-delete-list");
+    const bool delete_list_hidden =
+        delete_list_response.summary().code() == raft::METADATA_STATUS_CODE_OK &&
+        !ListContainsObject(delete_list_response, args.object_key);
+    {
+      std::ostringstream actual;
+      actual << "code=" << MetadataStatusCodeToString(delete_list_response.summary().code())
+             << ",contains_object="
+             << (ListContainsObject(delete_list_response, args.object_key) ? "true" : "false")
+             << ",records_count=" << delete_list_response.records_size();
+      PrintVerificationCheck("delete-list-invisible",
+                             delete_list_args.request_id,
+                             delete_list_args.object_key,
+                             delete_list_response.summary(),
+                             "object absent from list",
+                             actual.str(),
+                             delete_list_hidden);
+    }
+    if (!delete_list_hidden)
+    {
+      return 1;
+    }
+
+    std::cout << "verification_result"
+              << " mode=read-after-write"
+              << " request_id_base=" << args.request_id
+              << " object_key=" << args.object_key
+              << " result=PASS"
+              << '\n';
+    return 0;
   }
 
   int RunCommitRetry(const ParsedArgs &args)
@@ -802,6 +1376,10 @@ int main(int argc, char **argv)
   if (args.command == "list")
   {
     return RunList(args);
+  }
+  if (args.command == "verify-read-after-write")
+  {
+    return RunVerifyReadAfterWrite(args);
   }
   if (args.command == "commit-retry")
   {

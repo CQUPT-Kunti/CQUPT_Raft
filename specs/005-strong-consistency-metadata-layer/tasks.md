@@ -285,7 +285,7 @@
   - 实现要求: 入口层只解析参数和发起 RPC；不写业务状态机；不读取真实文件。
   - 验收标准: 每个子命令参数错误返回非 0 并打印 usage；RPC 成功输出稳定字段。
 
-- [ ] T032 Add client read-after-write verification mode in apps/raft_metadata_client.cpp
+- [x] T032 Add client read-after-write verification mode in apps/raft_metadata_client.cpp
   - 目标: 支持 create 后验证不可见、commit 后验证可见、delete 后验证不可见。
   - 允许读取文件: `NOTREAD.md`, `apps/raft_metadata_client.cpp`, `specs/005-strong-consistency-metadata-layer/client-design.md`
   - 允许修改文件: `apps/raft_metadata_client.cpp`
