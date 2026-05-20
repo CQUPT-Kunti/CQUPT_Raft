@@ -353,7 +353,7 @@
   - 实现要求: 建议执行 `CTEST_PARALLEL_LEVEL=1 ctest --test-dir build --output-on-failure -R "Metadata"`；如果实际测试名不同，使用明确 metadata test regex；不得全文输出日志。
   - 验收标准: PASS；失败时只输出失败测试名、关键断言、失败分类、最后 50 行日志和完整日志文件路径。
 
-- [ ] T040 Run Linux Metadata Client basic flow validation
+- [x] T040 Run Linux Metadata Client basic flow validation
   - 目标: 验证客户端 create、head、commit、list、delete、head 基本流程。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/client-design.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: 无
