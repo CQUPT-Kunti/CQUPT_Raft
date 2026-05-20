@@ -346,7 +346,7 @@
   - 实现要求: 执行 `cmake --preset debug-ninja-low-parallel` 和 `cmake --build --preset debug-ninja-low-parallel`；不得读取 build 产物内容，除非命令失败时只摘录必要错误摘要。
   - 验收标准: 构建 PASS；失败时记录命令、失败分类、关键编译错误、最后 50 行日志和完整日志路径。
 
-- [ ] T039 Run Linux unit and integration validation with CTest
+- [x] T039 Run Linux unit and integration validation with CTest
   - 目标: 验证 metadata common/state_machine/service/client 相关测试。
   - 允许读取文件: `NOTREAD.md`, `specs/005-strong-consistency-metadata-layer/validation-matrix.md`
   - 允许修改文件: 无
