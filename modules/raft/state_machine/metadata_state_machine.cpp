@@ -1112,7 +1112,7 @@ namespace raftdemo
         }
 
         const std::string fingerprint = ComputeMetadataCommandFingerprint(command);
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::shared_mutex> lk(mu_);
         const auto existing_request = requests_.find(command.request_id);
         if (existing_request != requests_.end())
         {
@@ -1457,7 +1457,7 @@ namespace raftdemo
         std::uint64_t last_applied_index = 0;
         std::uint64_t last_applied_term = 0;
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::shared_lock<std::shared_mutex> lk(mu_);
             last_applied_index = last_applied_index_;
             last_applied_term = last_applied_term_;
             buckets.assign(buckets_.begin(), buckets_.end());
@@ -1803,7 +1803,7 @@ namespace raftdemo
         }
 
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::unique_lock<std::shared_mutex> lk(mu_);
             last_applied_index_ = last_applied_index;
             last_applied_term_ = last_applied_term;
             buckets_ = std::move(new_buckets);
@@ -1831,7 +1831,7 @@ namespace raftdemo
                 std::nullopt};
         }
 
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto bucket_it = buckets_.find(query.bucket);
         if (bucket_it == buckets_.end() || bucket_it->second.deleted)
         {
@@ -1913,7 +1913,7 @@ namespace raftdemo
                 {}};
         }
 
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto bucket_it = buckets_.find(query.bucket);
         if (bucket_it == buckets_.end() || bucket_it->second.deleted)
         {
@@ -1985,44 +1985,44 @@ namespace raftdemo
 
     std::uint64_t MetadataStateMachine::LastAppliedIndex() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return last_applied_index_;
     }
 
     std::uint64_t MetadataStateMachine::LastAppliedTerm() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return last_applied_term_;
     }
 
     std::size_t MetadataStateMachine::BucketCount() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return buckets_.size();
     }
 
     std::size_t MetadataStateMachine::ObjectCount() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return objects_.size();
     }
 
     std::size_t MetadataStateMachine::RequestCount() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return requests_.size();
     }
 
     std::size_t MetadataStateMachine::TombstoneCount() const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         return tombstones_.size();
     }
 
     std::optional<BucketRecord> MetadataStateMachine::FindBucket(
         std::string_view bucket) const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto it = buckets_.find(std::string(bucket));
         if (it == buckets_.end())
         {
@@ -2035,7 +2035,7 @@ namespace raftdemo
         std::string_view bucket,
         std::string_view object_key) const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto it = objects_.find(MakeObjectIdentity(bucket, object_key));
         if (it == objects_.end())
         {
@@ -2048,7 +2048,7 @@ namespace raftdemo
         std::string_view bucket,
         std::string_view object_key) const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto it = object_index_.find(MakeObjectIdentity(bucket, object_key));
         if (it == object_index_.end() || it->second.empty())
         {
@@ -2061,7 +2061,7 @@ namespace raftdemo
         std::string_view bucket,
         std::string_view object_key) const
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::shared_lock<std::shared_mutex> lk(mu_);
         const auto it = chunk_ref_index_.find(MakeObjectIdentity(bucket, object_key));
         if (it == chunk_ref_index_.end())
         {

@@ -26,6 +26,7 @@
 - `MetadataStateMachine` 当前可承载 request_id 最小幂等去重占位
 - `MetadataStateMachine` 当前可承载 bucket/object/index/request/tombstone/applied-boundary 的最小 snapshot save/load
 - `MetadataStateMachine` 当前需要通过状态机级测试验证 snapshot 后 replay 边界和幂等延续
+- `MetadataStateMachine` 当前使用 shared/read 与 unique/write 的最小并发保护边界
 - 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
 - 保存和加载状态机 snapshot

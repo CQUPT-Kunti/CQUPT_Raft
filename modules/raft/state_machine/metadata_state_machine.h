@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -55,7 +56,7 @@ namespace raftdemo
                                                            std::string_view object_key) const;
 
     private:
-        mutable std::mutex mu_;
+        mutable std::shared_mutex mu_;
         std::uint64_t last_applied_index_{0};
         std::uint64_t last_applied_term_{0};
         std::unordered_map<std::string, BucketRecord> buckets_;
