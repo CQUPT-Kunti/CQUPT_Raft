@@ -15,8 +15,10 @@ namespace raftdemo
 {
     namespace
     {
-        constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U;   // "MDS1"
+        constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
         constexpr std::uint32_t kMetadataSnapshotVersion = 1U;
+        constexpr char kMetadataSkeletonNotImplemented[] =
+            "metadata state machine skeleton not implemented";
 
         ApplyResult MakeApplyFailure(const std::string &message)
         {
@@ -550,6 +552,138 @@ namespace raftdemo
             return true;
         }
     } // namespace
+
+    ApplyResult MetadataStateMachine::Apply(std::uint64_t index,
+                                            const std::string &command_data)
+    {
+        if (index == 0)
+        {
+            return MakeApplyFailure("metadata state machine skeleton requires index > 0");
+        }
+        if (command_data.empty())
+        {
+            return MakeApplyFailure("metadata state machine skeleton requires non-empty command");
+        }
+        return MakeApplyFailure(kMetadataSkeletonNotImplemented);
+    }
+
+    SnapshotResult MetadataStateMachine::SaveSnapshot(const std::string &file_path) const
+    {
+        if (file_path.empty())
+        {
+            return {SnapshotStatus::kInvalidArgument, "snapshot file path is empty"};
+        }
+        return {SnapshotStatus::kInternalError,
+                "metadata state machine skeleton snapshot save not implemented"};
+    }
+
+    SnapshotResult MetadataStateMachine::LoadSnapshot(const std::string &file_path)
+    {
+        if (file_path.empty())
+        {
+            return {SnapshotStatus::kInvalidArgument, "snapshot file path is empty"};
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(file_path, ec))
+        {
+            return {SnapshotStatus::kNotFound, "snapshot file not found: " + file_path};
+        }
+
+        return {SnapshotStatus::kInternalError,
+                "metadata state machine skeleton snapshot load not implemented"};
+    }
+
+    MetadataHeadObjectResponse MetadataStateMachine::HeadObject(
+        const HeadObjectQuery &query) const
+    {
+        if (query.bucket.empty() || query.object_key.empty())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kInvalidArgument,
+                    {.object_key = query.object_key,
+                     .message = "bucket and object_key are required"}),
+                std::nullopt};
+        }
+
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::string object_identity = query.bucket + "\n" + query.object_key;
+        const auto it = objects_.find(object_identity);
+        if (it == objects_.end())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton object not found"}),
+                std::nullopt};
+        }
+
+        return {
+            MakeMetadataResult(
+                MetadataStatusCode::kOk,
+                {.object_key = query.object_key,
+                 .message = "ok"}),
+            it->second};
+    }
+
+    MetadataListObjectsResponse MetadataStateMachine::ListObjects(
+        const ListObjectsQuery &query) const
+    {
+        if (query.bucket.empty())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kInvalidArgument,
+                    {.message = "bucket is required"}),
+                {},
+                {}};
+        }
+
+        std::lock_guard<std::mutex> lk(mu_);
+        return {
+            MakeMetadataResult(MetadataStatusCode::kOk,
+                               {.message = "metadata skeleton returns no visible objects"}),
+            {},
+            {}};
+    }
+
+    std::uint64_t MetadataStateMachine::LastAppliedIndex() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return last_applied_index_;
+    }
+
+    std::uint64_t MetadataStateMachine::LastAppliedTerm() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return last_applied_term_;
+    }
+
+    std::size_t MetadataStateMachine::BucketCount() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return buckets_.size();
+    }
+
+    std::size_t MetadataStateMachine::ObjectCount() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return objects_.size();
+    }
+
+    std::size_t MetadataStateMachine::RequestCount() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return requests_.size();
+    }
+
+    std::size_t MetadataStateMachine::TombstoneCount() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return tombstones_.size();
+    }
 
     ApplyResult StrongConsistencyMetadataStateMachine::Apply(std::uint64_t index,
                                                              const std::string &command_data)

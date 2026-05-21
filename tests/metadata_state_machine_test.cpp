@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace raftdemo
@@ -42,6 +43,64 @@ namespace
         return command;
     }
 } // namespace
+
+TEST(MetadataStateMachineTest, SkeletonImplementsIStateMachineAndStartsEmpty)
+{
+    static_assert(std::is_base_of_v<raftdemo::IStateMachine, raftdemo::MetadataStateMachine>);
+
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_EQ(machine.LastAppliedIndex(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.BucketCount(), 0U);
+    EXPECT_EQ(machine.ObjectCount(), 0U);
+    EXPECT_EQ(machine.RequestCount(), 0U);
+    EXPECT_EQ(machine.TombstoneCount(), 0U);
+}
+
+TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitPlaceholderResults)
+{
+    raftdemo::MetadataStateMachine machine;
+
+    const raftdemo::ApplyResult apply = machine.Apply(1, "placeholder-command");
+    EXPECT_FALSE(apply.Ok);
+    EXPECT_EQ(apply.message, "metadata state machine skeleton not implemented");
+    EXPECT_EQ(machine.LastAppliedIndex(), 0U);
+
+    const raftdemo::SnapshotResult save_empty = machine.SaveSnapshot("");
+    EXPECT_EQ(save_empty.status, raftdemo::SnapshotStatus::kInvalidArgument);
+
+    const raftdemo::SnapshotResult save_placeholder =
+        machine.SaveSnapshot("tmp/metadata-skeleton.snapshot");
+    EXPECT_EQ(save_placeholder.status, raftdemo::SnapshotStatus::kInternalError);
+
+    const raftdemo::SnapshotResult load_missing =
+        machine.LoadSnapshot("tmp/non-existent-metadata-skeleton.snapshot");
+    EXPECT_EQ(load_missing.status, raftdemo::SnapshotStatus::kNotFound);
+}
+
+TEST(MetadataStateMachineTest, SkeletonHeadAndListExposePlaceholderQueryBoundary)
+{
+    raftdemo::MetadataStateMachine machine;
+
+    const raftdemo::MetadataHeadObjectResponse invalid_head =
+        machine.HeadObject({.bucket = "", .object_key = "object-a"});
+    EXPECT_EQ(invalid_head.result.code, raftdemo::MetadataStatusCode::kInvalidArgument);
+    EXPECT_FALSE(invalid_head.record.has_value());
+
+    const raftdemo::MetadataHeadObjectResponse head =
+        machine.HeadObject({.bucket = "bucket-a", .object_key = "object-a"});
+    EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+    EXPECT_FALSE(head.record.has_value());
+
+    const raftdemo::MetadataListObjectsResponse invalid_list =
+        machine.ListObjects({.bucket = ""});
+    EXPECT_EQ(invalid_list.result.code, raftdemo::MetadataStatusCode::kInvalidArgument);
+
+    const raftdemo::MetadataListObjectsResponse list =
+        machine.ListObjects({.bucket = "bucket-a", .prefix = "object/"});
+    EXPECT_EQ(list.result.code, raftdemo::MetadataStatusCode::kOk);
+    EXPECT_TRUE(list.records.empty());
+}
 
 TEST(MetadataStateMachineTest, CreateLeavesPendingInvisibleToHeadAndList)
 {

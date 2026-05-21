@@ -68,11 +68,11 @@
 ### Tests for User Story 1
 
 - [x] T010 [P] [US1] 在 `tests/node_admin_service_test.cpp` 中补齐不依赖 `KvService` 的 `Status` / `Health` / `Metrics` 管理面回归测试
-- [ ] T011 [P] [US1] 在 `tests/metadata_main_path_test.cpp` 中补齐默认 `RaftNode` 仅通过 `MetadataService` 跑通单节点与三节点 smoke 的回归测试
+- [x] T011 [P] [US1] 在 `tests/metadata_main_path_test.cpp` 中补齐默认 `RaftNode` 仅通过 `MetadataService` 跑通单节点与三节点 smoke 的回归测试
 
 ### Implementation for User Story 1
 
-- [ ] T012 [US1] 从 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp` 中移除 `CompositeKvMetadataStateMachine`，并把默认 `RaftNode` 构造切换为 metadata-only 业务状态机装配
+- [x] T012 [US1] 从 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp` 中移除 `CompositeKvMetadataStateMachine`，并把默认 `RaftNode` 构造切换为 metadata-only 业务状态机装配
 - [ ] T013 [US1] 将 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp` 中 `Describe()`、`DebugGetValue()`、KV 相关 `RpcKind` 与状态机 dynamic_cast 调试路径改为 metadata-oriented 主路径
 - [ ] T014 [US1] 新增 `modules/raft/service/node_admin_service_impl.h`、`modules/raft/service/node_admin_service_impl.cpp`，并在 `modules/raft/node/raft_node.cpp` 中注册 non-KV 管理面服务替代 `KvService` 上的状态接口
 - [ ] T015 [US1] 更新 `apps/main.cpp` 与 `CMakeLists.txt`，让 `raft_demo` 启动时只暴露 `RaftService`、`MetadataService` 与 non-KV 管理面服务，并让 `raft_metadata_client` 成为唯一业务 CLI target

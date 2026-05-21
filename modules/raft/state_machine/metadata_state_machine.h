@@ -14,6 +14,50 @@
 
 namespace raftdemo
 {
+    struct MetadataHeadObjectResponse
+    {
+        MetadataResult result;
+        std::optional<ObjectRecord> record;
+    };
+
+    struct MetadataListObjectsResponse
+    {
+        MetadataResult result;
+        std::vector<ObjectRecord> records;
+        std::string next_page_token;
+    };
+
+    class MetadataStateMachine final : public IStateMachine
+    {
+    public:
+        ApplyResult Apply(std::uint64_t index,
+                          const std::string &command_data) override;
+
+        SnapshotResult SaveSnapshot(const std::string &file_path) const override;
+        SnapshotResult LoadSnapshot(const std::string &file_path) override;
+
+        MetadataHeadObjectResponse HeadObject(const HeadObjectQuery &query) const;
+        MetadataListObjectsResponse ListObjects(const ListObjectsQuery &query) const;
+
+        std::uint64_t LastAppliedIndex() const;
+        std::uint64_t LastAppliedTerm() const;
+        std::size_t BucketCount() const;
+        std::size_t ObjectCount() const;
+        std::size_t RequestCount() const;
+        std::size_t TombstoneCount() const;
+
+    private:
+        mutable std::mutex mu_;
+        std::uint64_t last_applied_index_{0};
+        std::uint64_t last_applied_term_{0};
+        std::unordered_map<std::string, BucketRecord> buckets_;
+        std::unordered_map<std::string, ObjectRecord> objects_;
+        std::unordered_map<std::string, std::vector<std::string>> object_index_;
+        std::unordered_map<std::string, std::vector<ChunkRef>> chunk_ref_index_;
+        std::unordered_map<ClientRequestId, RequestRecord> requests_;
+        std::unordered_map<std::string, Tombstone> tombstones_;
+    };
+
     struct MetadataHeadRequest
     {
         std::string object_key;

@@ -16,6 +16,7 @@
 
 - 定义统一的 `IStateMachine` / `Apply` / `SaveSnapshot` / `LoadSnapshot` 抽象边界
 - 应用 `SET` / `DEL` 命令
+- 提供 `MetadataStateMachine` V2 骨架占位
 - 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
 - 保存和加载状态机 snapshot
@@ -37,6 +38,8 @@
 - 不要改命令语义
 - 不要改状态机 snapshot 二进制格式
 - 路径调整之外，不要在这里补 Raft 逻辑
+- `MetadataStateMachine` 骨架可以返回明确的未实现错误，但不能静默 no-op 后返回成功
+- `StrongConsistencyMetadataStateMachine` 仍代表现有 metadata V1 行为，不要在未明确任务时替换默认 wiring
 
 ## Relevant Tests
 
