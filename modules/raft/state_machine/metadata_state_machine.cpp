@@ -694,7 +694,19 @@ namespace raftdemo
             return MakeApplyFailure("unsupported metadata command type: unknown");
         }
 
+        const std::string fingerprint = ComputeMetadataCommandFingerprint(command);
         std::lock_guard<std::mutex> lk(mu_);
+        const auto existing_request = requests_.find(command.request_id);
+        if (existing_request != requests_.end())
+        {
+            const auto fingerprint_it = request_fingerprints_.find(command.request_id);
+            if (fingerprint_it != request_fingerprints_.end() &&
+                fingerprint_it->second == fingerprint)
+            {
+                return MakeReplaySuccess();
+            }
+            return MakeReplayConflictFailure();
+        }
 
         if (command.IsCreateBucketCommand())
         {
@@ -716,6 +728,7 @@ namespace raftdemo
             buckets_[record.bucket] = record;
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};
@@ -753,6 +766,7 @@ namespace raftdemo
 
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, it->second.bucket, "ok", index);
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};
@@ -786,6 +800,7 @@ namespace raftdemo
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
             requests_[command.request_id].object_key = record.object_key;
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};
@@ -850,6 +865,7 @@ namespace raftdemo
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
             requests_[command.request_id].object_key = record.object_key;
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};
@@ -923,6 +939,7 @@ namespace raftdemo
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
             requests_[command.request_id].object_key = record.object_key;
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};
@@ -996,6 +1013,7 @@ namespace raftdemo
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
             requests_[command.request_id].object_key = record.object_key;
+            request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
             last_applied_term_ = 0;
             return {true, "ok"};

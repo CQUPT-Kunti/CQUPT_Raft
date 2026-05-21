@@ -323,6 +323,19 @@ TEST(MetadataStateMachineTest, RepeatedOrUnsupportedBucketCommandsReturnExplicit
     EXPECT_EQ(machine.LastAppliedIndex(), 20U);
 }
 
+TEST(MetadataStateMachineTest, EmptyRequestIdReturnsExplicitErrorAndIsNotRecorded)
+{
+    raftdemo::MetadataStateMachine machine;
+    const raftdemo::ApplyResult apply = machine.Apply(
+        24, raftdemo::SerializeMetadataCommand(
+                MakeCreateBucketCommand("bucket-empty", "")));
+
+    EXPECT_FALSE(apply.Ok);
+    EXPECT_EQ(apply.message, "invalid metadata command: missing request_id");
+    EXPECT_EQ(machine.RequestCount(), 0U);
+    EXPECT_EQ(machine.LastAppliedIndex(), 0U);
+}
+
 TEST(MetadataStateMachineTest, CreateObjectApplyCreatesPendingRecordAndIndexEntry)
 {
     raftdemo::MetadataStateMachine machine;
@@ -1101,6 +1114,167 @@ TEST(MetadataStateMachineTest, ListObjectsReturnsCommittedObjectsWithPrefixOrder
     ASSERT_EQ(continued.result.code, raftdemo::MetadataStatusCode::kOk);
     ASSERT_EQ(continued.records.size(), 1U);
     EXPECT_EQ(continued.records[0].object_key, "logs/b");
+}
+
+TEST(MetadataStateMachineTest, DuplicateRequestIdReplaysSuccessWithoutReapplyingLifecycleCommands)
+{
+    raftdemo::MetadataStateMachine create_bucket_machine;
+    const std::string create_bucket = raftdemo::SerializeMetadataCommand(
+        MakeCreateBucketCommand("bucket-idem-a", "idem-bucket-create"));
+    EXPECT_TRUE(create_bucket_machine.Apply(260, create_bucket).Ok);
+    const raftdemo::ApplyResult create_bucket_replay =
+        create_bucket_machine.Apply(261, create_bucket);
+    EXPECT_TRUE(create_bucket_replay.Ok);
+    EXPECT_EQ(create_bucket_replay.message, "idempotent replay");
+    EXPECT_EQ(create_bucket_machine.BucketCount(), 1U);
+    EXPECT_EQ(create_bucket_machine.RequestCount(), 1U);
+    EXPECT_EQ(create_bucket_machine.LastAppliedIndex(), 260U);
+
+    raftdemo::MetadataStateMachine delete_bucket_machine;
+    EXPECT_TRUE(delete_bucket_machine.Apply(
+                                    270, raftdemo::SerializeMetadataCommand(
+                                             MakeCreateBucketCommand("bucket-idem-b",
+                                                                     "idem-bucket-setup")))
+                    .Ok);
+    const std::string delete_bucket = raftdemo::SerializeMetadataCommand(
+        MakeDeleteBucketCommand("bucket-idem-b", "idem-bucket-delete"));
+    EXPECT_TRUE(delete_bucket_machine.Apply(271, delete_bucket).Ok);
+    const raftdemo::ApplyResult delete_bucket_replay =
+        delete_bucket_machine.Apply(272, delete_bucket);
+    EXPECT_TRUE(delete_bucket_replay.Ok);
+    EXPECT_EQ(delete_bucket_replay.message, "idempotent replay");
+    EXPECT_EQ(delete_bucket_machine.RequestCount(), 2U);
+    EXPECT_EQ(delete_bucket_machine.LastAppliedIndex(), 271U);
+
+    raftdemo::MetadataStateMachine create_object_machine;
+    EXPECT_TRUE(create_object_machine.Apply(
+                                    280, raftdemo::SerializeMetadataCommand(
+                                             MakeCreateBucketCommand("bucket-idem-c",
+                                                                     "idem-object-setup")))
+                    .Ok);
+    const std::string create_object = raftdemo::SerializeMetadataCommand(
+        MakeCreateObjectCommand("bucket-idem-c", "object/a", "obj-36", "idem-object-create"));
+    EXPECT_TRUE(create_object_machine.Apply(281, create_object).Ok);
+    const raftdemo::ApplyResult create_object_replay =
+        create_object_machine.Apply(282, create_object);
+    EXPECT_TRUE(create_object_replay.Ok);
+    EXPECT_EQ(create_object_replay.message, "idempotent replay");
+    EXPECT_EQ(create_object_machine.ObjectCount(), 1U);
+    EXPECT_EQ(create_object_machine.RequestCount(), 2U);
+    EXPECT_EQ(create_object_machine.LastAppliedIndex(), 281U);
+
+    raftdemo::MetadataStateMachine commit_machine;
+    EXPECT_TRUE(commit_machine.Apply(
+                             290, raftdemo::SerializeMetadataCommand(
+                                      MakeCreateBucketCommand("bucket-idem-d",
+                                                              "idem-commit-setup-bucket")))
+                    .Ok);
+    EXPECT_TRUE(commit_machine.Apply(
+                             291, raftdemo::SerializeMetadataCommand(
+                                      MakeCreateObjectCommand("bucket-idem-d", "object/a", "obj-37",
+                                                              "idem-commit-setup-object")))
+                    .Ok);
+    const std::string commit_object = raftdemo::SerializeMetadataCommand(
+        MakeCommitObjectCommand("bucket-idem-d", "object/a", "obj-37", "idem-object-commit"));
+    EXPECT_TRUE(commit_machine.Apply(292, commit_object).Ok);
+    const auto chunks_before = commit_machine.FindChunkRefs("bucket-idem-d", "object/a");
+    ASSERT_TRUE(chunks_before.has_value());
+    ASSERT_EQ(chunks_before->size(), 2U);
+    const raftdemo::ApplyResult commit_replay = commit_machine.Apply(293, commit_object);
+    EXPECT_TRUE(commit_replay.Ok);
+    EXPECT_EQ(commit_replay.message, "idempotent replay");
+    const auto chunks_after = commit_machine.FindChunkRefs("bucket-idem-d", "object/a");
+    ASSERT_TRUE(chunks_after.has_value());
+    EXPECT_EQ(chunks_after->size(), 2U);
+    EXPECT_EQ(commit_machine.RequestCount(), 3U);
+    EXPECT_EQ(commit_machine.LastAppliedIndex(), 292U);
+
+    raftdemo::MetadataStateMachine abort_machine;
+    EXPECT_TRUE(abort_machine.Apply(
+                            300, raftdemo::SerializeMetadataCommand(
+                                     MakeCreateBucketCommand("bucket-idem-e",
+                                                             "idem-abort-setup-bucket")))
+                    .Ok);
+    EXPECT_TRUE(abort_machine.Apply(
+                            301, raftdemo::SerializeMetadataCommand(
+                                     MakeCreateObjectCommand("bucket-idem-e", "object/a", "obj-38",
+                                                             "idem-abort-setup-object")))
+                    .Ok);
+    const std::string abort_object = raftdemo::SerializeMetadataCommand(
+        MakeAbortObjectCommand("bucket-idem-e", "object/a", "obj-38", "idem-object-abort"));
+    EXPECT_TRUE(abort_machine.Apply(302, abort_object).Ok);
+    EXPECT_EQ(abort_machine.TombstoneCount(), 1U);
+    EXPECT_FALSE(abort_machine.FindIndexedObjectId("bucket-idem-e", "object/a").has_value());
+    const raftdemo::ApplyResult abort_replay = abort_machine.Apply(303, abort_object);
+    EXPECT_TRUE(abort_replay.Ok);
+    EXPECT_EQ(abort_replay.message, "idempotent replay");
+    EXPECT_EQ(abort_machine.TombstoneCount(), 1U);
+    EXPECT_FALSE(abort_machine.FindIndexedObjectId("bucket-idem-e", "object/a").has_value());
+    EXPECT_EQ(abort_machine.RequestCount(), 3U);
+    EXPECT_EQ(abort_machine.LastAppliedIndex(), 302U);
+
+    raftdemo::MetadataStateMachine delete_machine;
+    EXPECT_TRUE(delete_machine.Apply(
+                             310, raftdemo::SerializeMetadataCommand(
+                                      MakeCreateBucketCommand("bucket-idem-f",
+                                                              "idem-delete-setup-bucket")))
+                    .Ok);
+    EXPECT_TRUE(delete_machine.Apply(
+                             311, raftdemo::SerializeMetadataCommand(
+                                      MakeCreateObjectCommand("bucket-idem-f", "object/a", "obj-39",
+                                                              "idem-delete-setup-object")))
+                    .Ok);
+    EXPECT_TRUE(delete_machine.Apply(
+                             312, raftdemo::SerializeMetadataCommand(
+                                      MakeCommitObjectCommand("bucket-idem-f", "object/a", "obj-39",
+                                                              "idem-delete-setup-commit")))
+                    .Ok);
+    const std::string delete_object = raftdemo::SerializeMetadataCommand(
+        MakeDeleteObjectCommand("bucket-idem-f", "object/a", "obj-39", "idem-object-delete"));
+    EXPECT_TRUE(delete_machine.Apply(313, delete_object).Ok);
+    EXPECT_EQ(delete_machine.TombstoneCount(), 1U);
+    EXPECT_FALSE(delete_machine.FindIndexedObjectId("bucket-idem-f", "object/a").has_value());
+    const raftdemo::ApplyResult delete_replay = delete_machine.Apply(314, delete_object);
+    EXPECT_TRUE(delete_replay.Ok);
+    EXPECT_EQ(delete_replay.message, "idempotent replay");
+    EXPECT_EQ(delete_machine.TombstoneCount(), 1U);
+    EXPECT_FALSE(delete_machine.FindIndexedObjectId("bucket-idem-f", "object/a").has_value());
+    EXPECT_EQ(delete_machine.RequestCount(), 4U);
+    EXPECT_EQ(delete_machine.LastAppliedIndex(), 313U);
+}
+
+TEST(MetadataStateMachineTest, SameRequestIdWithDifferentPayloadOrCommandTypeReturnsConflict)
+{
+    raftdemo::MetadataStateMachine payload_machine;
+    EXPECT_TRUE(payload_machine.Apply(
+                                     320, raftdemo::SerializeMetadataCommand(
+                                              MakeCreateBucketCommand("bucket-conflict-a",
+                                                                      "same-request-id")))
+                    .Ok);
+    const raftdemo::ApplyResult payload_conflict = payload_machine.Apply(
+        321, raftdemo::SerializeMetadataCommand(
+                 MakeCreateBucketCommand("bucket-conflict-b", "same-request-id")));
+    EXPECT_FALSE(payload_conflict.Ok);
+    EXPECT_EQ(payload_conflict.message,
+              "idempotency conflict: request_id maps to different command");
+    EXPECT_EQ(payload_machine.BucketCount(), 1U);
+    EXPECT_EQ(payload_machine.RequestCount(), 1U);
+    EXPECT_EQ(payload_machine.LastAppliedIndex(), 320U);
+
+    raftdemo::MetadataStateMachine type_machine;
+    EXPECT_TRUE(type_machine.Apply(
+                                  330, raftdemo::SerializeMetadataCommand(
+                                           MakeCreateBucketCommand("bucket-conflict-c",
+                                                                   "request-type-id")))
+                    .Ok);
+    const raftdemo::ApplyResult type_conflict = type_machine.Apply(
+        331, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteBucketCommand("bucket-conflict-c", "request-type-id")));
+    EXPECT_FALSE(type_conflict.Ok);
+    EXPECT_EQ(type_conflict.message,
+              "idempotency conflict: request_id maps to different command");
+    EXPECT_EQ(type_machine.RequestCount(), 1U);
+    EXPECT_EQ(type_machine.LastAppliedIndex(), 330U);
 }
 
 TEST(MetadataStateMachineTest, CreateLeavesPendingInvisibleToHeadAndList)

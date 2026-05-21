@@ -63,6 +63,7 @@ namespace raftdemo
         std::unordered_map<std::string, std::vector<std::string>> object_index_;
         std::unordered_map<std::string, std::vector<ChunkRef>> chunk_ref_index_;
         std::unordered_map<ClientRequestId, RequestRecord> requests_;
+        std::unordered_map<ClientRequestId, std::string> request_fingerprints_;
         std::unordered_map<std::string, Tombstone> tombstones_;
     };
 
