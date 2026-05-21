@@ -98,8 +98,8 @@
 ### Implementation for User Story 2
 
 - [x] T021 [US2] 重构 `modules/raft/common/metadata_command.h`、`modules/raft/common/metadata_command.cpp`、`modules/raft/common/metadata_result.h` 为 bucket/object/request/tombstone V2 模型与状态码
-- [ ] T022 [US2] 重构 `modules/raft/state_machine/metadata_state_machine.h`、`modules/raft/state_machine/metadata_state_machine.cpp`，引入 `bucket_table`、`object_table`、`object_index`、`chunk_ref_table`、`request_table`、`tombstone_table`
-- [ ] T023 [US2] 更新 `proto/raft.proto`，把当前 record-centric `CreateMetadataRecord` / `CommitMetadataRecord` / `DeleteMetadataRecord` / `HeadMetadataRecord` / `ListMetadataRecords` 升级为 bucket/object V2 RPC
+- [x] T022 [US2] 重构 `modules/raft/state_machine/metadata_state_machine.h`、`modules/raft/state_machine/metadata_state_machine.cpp`，引入 `bucket_table`、`object_table`、`object_index`、`chunk_ref_table`、`request_table`、`tombstone_table`
+- [x] T023 [US2] 更新 `proto/raft.proto`，把当前 record-centric `CreateMetadataRecord` / `CommitMetadataRecord` / `DeleteMetadataRecord` / `HeadMetadataRecord` / `ListMetadataRecords` 升级为 bucket/object V2 RPC
 - [ ] T024 [US2] 更新 `modules/raft/service/metadata_service_impl.h`、`modules/raft/service/metadata_service_impl.cpp`，让 MetadataService 按 bucket/object 语义提案 `MetadataCommand` 并返回显式冲突/重放结果
 - [ ] T025 [US2] 扩展 `apps/raft_metadata_client.cpp`，实现 `create-bucket`、`delete-bucket`、`create-object`、`commit-object`、`abort-object`、`delete-object`、`head-object`、`list-objects`
 - [ ] T026 [US2] 更新 `tests/metadata_client_scenario_test.cpp` 与 `tests/CMakeLists.txt`，将 client scenario 从 V1 record 流程切换为 bucket/object 主路径

@@ -150,12 +150,12 @@ namespace raftdemo
   }
 
   RaftNode::RaftNode(NodeConfig config)
-      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<CompositeKvMetadataStateMachine>())
+      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<MetadataStateMachine>())
   {
   }
 
   RaftNode::RaftNode(NodeConfig config, snapshotConfig snapshot_config)
-      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<CompositeKvMetadataStateMachine>())
+      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<MetadataStateMachine>())
   {
   }
 
@@ -595,6 +595,16 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       return false;
     }
     return composite_sm->GetValue(key, value);
+  }
+
+  MetadataStateMachine *RaftNode::GetMetadataStateMachineV2()
+  {
+    return dynamic_cast<MetadataStateMachine *>(state_machine_.get());
+  }
+
+  const MetadataStateMachine *RaftNode::GetMetadataStateMachineV2() const
+  {
+    return dynamic_cast<const MetadataStateMachine *>(state_machine_.get());
   }
 
   void RaftNode::CancelElectionTimerLocked()

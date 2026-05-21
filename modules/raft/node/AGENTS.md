@@ -59,7 +59,8 @@
 
 - 先读 `raft_node.h`
 - 关注状态机装配时，先确认这里只依赖 `IStateMachine` 抽象，再看具体实现类型
-- 过渡期 `CompositeKvMetadataStateMachine` 仅应作为 node 内部实现细节存在，不应扩散到公共头边界
+- 默认业务状态机装配应优先指向 `MetadataStateMachine`
+- 过渡期 `CompositeKvMetadataStateMachine` 仅应作为非默认内部兼容细节存在，不应再作为默认主路径或扩散到公共头边界
 - 再读 `raft_node.cpp` 中目标函数附近
 - 需要复制细节时再读 `raft/replication`
 - 需要持久化边界时再读 `raft/storage`

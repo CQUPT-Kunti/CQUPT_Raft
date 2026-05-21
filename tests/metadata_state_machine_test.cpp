@@ -1,10 +1,12 @@
 #include "raft/common/metadata_command.h"
 #include "raft/common/metadata_result.h"
+#include "raft/node/raft_node.h"
 #include "raft/state_machine/metadata_state_machine.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -204,6 +206,29 @@ namespace
         return dir / filename;
     }
 
+    raftdemo::NodeConfig MakeSingleNodeConfig(const std::filesystem::path &root)
+    {
+        raftdemo::NodeConfig cfg;
+        cfg.node_id = 1;
+        cfg.address = "127.0.0.1:0";
+        cfg.election_timeout_min = std::chrono::milliseconds(200);
+        cfg.election_timeout_max = std::chrono::milliseconds(350);
+        cfg.heartbeat_interval = std::chrono::milliseconds(60);
+        cfg.rpc_deadline = std::chrono::milliseconds(250);
+        cfg.data_dir = (root / "data" / "node_1").string();
+        return cfg;
+    }
+
+    raftdemo::snapshotConfig MakeSingleNodeSnapshotConfig(const std::filesystem::path &root)
+    {
+        raftdemo::snapshotConfig cfg;
+        cfg.enabled = false;
+        cfg.snapshot_dir = (root / "snapshots" / "node_1").string();
+        cfg.load_on_startup = false;
+        cfg.file_prefix = "snapshot";
+        return cfg;
+    }
+
     template <typename T>
     void WritePod(std::ofstream &out, const T &value)
     {
@@ -222,6 +247,22 @@ TEST(MetadataStateMachineTest, SkeletonImplementsIStateMachineAndStartsEmpty)
     EXPECT_EQ(machine.ObjectCount(), 0U);
     EXPECT_EQ(machine.RequestCount(), 0U);
     EXPECT_EQ(machine.TombstoneCount(), 0U);
+}
+
+TEST(MetadataStateMachineTest, RaftNodeDefaultStateMachineWiringUsesMetadataStateMachine)
+{
+    const std::filesystem::path root = MakeSnapshotPath("raft-node-default-metadata-wiring");
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    raftdemo::RaftNode node(MakeSingleNodeConfig(root), MakeSingleNodeSnapshotConfig(root));
+
+    EXPECT_NE(node.GetMetadataStateMachineV2(), nullptr);
+    EXPECT_EQ(node.GetMetadataStateMachine(), nullptr);
+
+    std::string value;
+    EXPECT_FALSE(node.DebugGetValue("legacy-kv-key", &value));
 }
 
 TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitResults)
