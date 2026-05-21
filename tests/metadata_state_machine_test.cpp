@@ -136,6 +136,33 @@ namespace
         return command;
     }
 
+    raftdemo::MetadataCommand MakeDeleteObjectCommand(
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        const std::string &request_id)
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kDeleteObject;
+        command.request_id = request_id;
+        command.delete_object = raftdemo::DeleteObjectCommandPayload{
+            bucket,
+            object_key,
+            object_id,
+            1,
+            1710000007};
+        command.request_context = raftdemo::RequestRecord{
+            request_id,
+            raftdemo::MetadataRequestType::kDeleteObject,
+            bucket,
+            object_key,
+            "accepted",
+            0,
+            1710000007,
+            std::nullopt};
+        return command;
+    }
+
     raftdemo::MetadataRecord MakeCreateRecord(const std::string &object_key,
                                               const std::string &request_id,
                                               const std::string &payload = "payload")
@@ -269,12 +296,16 @@ TEST(MetadataStateMachineTest, RepeatedOrUnsupportedBucketCommandsReturnExplicit
     EXPECT_EQ(missing_delete.message, "not found: bucket does not exist");
     EXPECT_EQ(machine.LastAppliedIndex(), 20U);
 
-    raftdemo::MetadataCommand unsupported;
-    unsupported.command_type = raftdemo::MetadataCommandType::kDeleteObject;
-    unsupported.request_id = "object-delete-1";
-    unsupported.delete_object = raftdemo::DeleteObjectCommandPayload{
-        "bucket-c", "object/demo", "obj-1", 1, 1710000002};
-    unsupported.request_context = raftdemo::RequestRecord{
+    raftdemo::MetadataCommand invalid;
+    invalid.command_type = raftdemo::MetadataCommandType::kDeleteObject;
+    invalid.request_id = "object-delete-1";
+    invalid.delete_object = raftdemo::DeleteObjectCommandPayload{
+        "bucket-c",
+        "object/demo",
+        "",
+        1,
+        1710000002};
+    invalid.request_context = raftdemo::RequestRecord{
         "object-delete-1",
         raftdemo::MetadataRequestType::kDeleteObject,
         "bucket-c",
@@ -284,10 +315,11 @@ TEST(MetadataStateMachineTest, RepeatedOrUnsupportedBucketCommandsReturnExplicit
         1710000002,
         std::nullopt};
 
-    const raftdemo::ApplyResult unsupported_apply =
-        machine.Apply(23, raftdemo::SerializeMetadataCommand(unsupported));
-    EXPECT_FALSE(unsupported_apply.Ok);
-    EXPECT_EQ(unsupported_apply.message, "unsupported metadata command type: delete_object");
+    const raftdemo::ApplyResult invalid_apply =
+        machine.Apply(23, raftdemo::SerializeMetadataCommand(invalid));
+    EXPECT_FALSE(invalid_apply.Ok);
+    EXPECT_EQ(invalid_apply.message,
+              "invalid metadata command: delete_object command missing object_id");
     EXPECT_EQ(machine.LastAppliedIndex(), 20U);
 }
 
@@ -674,6 +706,181 @@ TEST(MetadataStateMachineTest, AbortObjectApplyRejectsMissingBucketObjectIdAndSt
     EXPECT_FALSE(already_aborted.Ok);
     EXPECT_EQ(already_aborted.message, "state conflict: object already aborted");
     EXPECT_EQ(aborted_machine.LastAppliedIndex(), 162U);
+}
+
+TEST(MetadataStateMachineTest, DeleteObjectApplyMarksCommittedObjectDeletedAndHidesIt)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(machine.Apply(
+                           170,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-r", "create-bucket-19")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           171,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-r", "object/a", "obj-21",
+                                                       "create-object-13")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           172,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-r", "object/a", "obj-21",
+                                                       "commit-object-9")))
+                    .Ok);
+
+    const raftdemo::ApplyResult apply = machine.Apply(
+        173, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-r", "object/a", "obj-21", "delete-object-1")));
+
+    EXPECT_TRUE(apply.Ok);
+    EXPECT_EQ(apply.message, "ok");
+    EXPECT_EQ(machine.LastAppliedIndex(), 173U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.RequestCount(), 4U);
+    EXPECT_EQ(machine.TombstoneCount(), 1U);
+
+    const std::optional<raftdemo::ObjectRecord> object =
+        machine.FindObject("bucket-r", "object/a");
+    ASSERT_TRUE(object.has_value());
+    EXPECT_TRUE(object->IsDeleted());
+    ASSERT_TRUE(object->delete_time.has_value());
+    EXPECT_EQ(*object->delete_time, 1710000007U);
+
+    const std::optional<std::string> indexed_id =
+        machine.FindIndexedObjectId("bucket-r", "object/a");
+    EXPECT_FALSE(indexed_id.has_value());
+
+    const std::optional<std::vector<raftdemo::ChunkRef>> indexed_chunks =
+        machine.FindChunkRefs("bucket-r", "object/a");
+    EXPECT_FALSE(indexed_chunks.has_value());
+
+    const raftdemo::MetadataHeadObjectResponse head =
+        machine.HeadObject({.bucket = "bucket-r", .object_key = "object/a"});
+    EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+    EXPECT_FALSE(head.record.has_value());
+}
+
+TEST(MetadataStateMachineTest, DeleteObjectApplyRejectsMissingBucketObjectIdAndStateConflicts)
+{
+    raftdemo::MetadataStateMachine machine;
+
+    const raftdemo::ApplyResult missing_bucket = machine.Apply(
+        180, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-missing", "object/a", "obj-22", "delete-object-2")));
+    EXPECT_FALSE(missing_bucket.Ok);
+    EXPECT_EQ(missing_bucket.message, "not found: bucket does not exist");
+    EXPECT_EQ(machine.LastAppliedIndex(), 0U);
+
+    EXPECT_TRUE(machine.Apply(
+                           181,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-s", "create-bucket-20")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           182,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeDeleteBucketCommand("bucket-s", "delete-bucket-6")))
+                    .Ok);
+
+    const raftdemo::ApplyResult deleted_bucket = machine.Apply(
+        183, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-s", "object/a", "obj-23", "delete-object-3")));
+    EXPECT_FALSE(deleted_bucket.Ok);
+    EXPECT_EQ(deleted_bucket.message, "state conflict: bucket is deleted");
+    EXPECT_EQ(machine.LastAppliedIndex(), 182U);
+
+    raftdemo::MetadataStateMachine missing_object_machine;
+    EXPECT_TRUE(missing_object_machine.Apply(
+                                   190,
+                                   raftdemo::SerializeMetadataCommand(
+                                       MakeCreateBucketCommand("bucket-t", "create-bucket-21")))
+                    .Ok);
+
+    const raftdemo::ApplyResult missing_object = missing_object_machine.Apply(
+        191, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-t", "object/a", "obj-24", "delete-object-4")));
+    EXPECT_FALSE(missing_object.Ok);
+    EXPECT_EQ(missing_object.message, "not found: object does not exist");
+    EXPECT_EQ(missing_object_machine.LastAppliedIndex(), 190U);
+
+    raftdemo::MetadataStateMachine mismatch_machine;
+    EXPECT_TRUE(mismatch_machine.Apply(
+                                   200,
+                                   raftdemo::SerializeMetadataCommand(
+                                       MakeCreateBucketCommand("bucket-u", "create-bucket-22")))
+                    .Ok);
+    EXPECT_TRUE(mismatch_machine.Apply(
+                                   201,
+                                   raftdemo::SerializeMetadataCommand(
+                                       MakeCreateObjectCommand("bucket-u", "object/a", "obj-25",
+                                                               "create-object-14")))
+                    .Ok);
+    EXPECT_TRUE(mismatch_machine.Apply(
+                                   202,
+                                   raftdemo::SerializeMetadataCommand(
+                                       MakeCommitObjectCommand("bucket-u", "object/a", "obj-25",
+                                                               "commit-object-10")))
+                    .Ok);
+
+    const raftdemo::ApplyResult object_id_mismatch = mismatch_machine.Apply(
+        203, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-u", "object/a", "obj-26", "delete-object-5")));
+    EXPECT_FALSE(object_id_mismatch.Ok);
+    EXPECT_EQ(object_id_mismatch.message, "state conflict: object_id mismatch");
+    EXPECT_EQ(mismatch_machine.LastAppliedIndex(), 202U);
+
+    raftdemo::MetadataStateMachine pending_machine;
+    EXPECT_TRUE(pending_machine.Apply(
+                                  210,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeCreateBucketCommand("bucket-v", "create-bucket-23")))
+                    .Ok);
+    EXPECT_TRUE(pending_machine.Apply(
+                                  211,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeCreateObjectCommand("bucket-v", "object/a", "obj-27",
+                                                              "create-object-15")))
+                    .Ok);
+
+    const raftdemo::ApplyResult pending_delete = pending_machine.Apply(
+        212, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-v", "object/a", "obj-27", "delete-object-6")));
+    EXPECT_FALSE(pending_delete.Ok);
+    EXPECT_EQ(pending_delete.message, "state conflict: object is not committed");
+    EXPECT_EQ(pending_machine.LastAppliedIndex(), 211U);
+
+    raftdemo::MetadataStateMachine deleted_machine;
+    EXPECT_TRUE(deleted_machine.Apply(
+                                  220,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeCreateBucketCommand("bucket-w", "create-bucket-24")))
+                    .Ok);
+    EXPECT_TRUE(deleted_machine.Apply(
+                                  221,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeCreateObjectCommand("bucket-w", "object/a", "obj-28",
+                                                              "create-object-16")))
+                    .Ok);
+    EXPECT_TRUE(deleted_machine.Apply(
+                                  222,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeCommitObjectCommand("bucket-w", "object/a", "obj-28",
+                                                              "commit-object-11")))
+                    .Ok);
+    EXPECT_TRUE(deleted_machine.Apply(
+                                  223,
+                                  raftdemo::SerializeMetadataCommand(
+                                      MakeDeleteObjectCommand("bucket-w", "object/a", "obj-28",
+                                                              "delete-object-7")))
+                    .Ok);
+
+    const raftdemo::ApplyResult already_deleted = deleted_machine.Apply(
+        224, raftdemo::SerializeMetadataCommand(
+                 MakeDeleteObjectCommand("bucket-w", "object/a", "obj-28", "delete-object-8")));
+    EXPECT_FALSE(already_deleted.Ok);
+    EXPECT_EQ(already_deleted.message, "state conflict: object already deleted");
+    EXPECT_EQ(deleted_machine.LastAppliedIndex(), 223U);
 }
 
 TEST(MetadataStateMachineTest, SkeletonHeadAndListExposePlaceholderQueryBoundary)
