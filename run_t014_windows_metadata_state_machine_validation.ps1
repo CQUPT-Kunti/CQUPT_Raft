@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $OutDir = "tmp"
-$LogFile = Join-Path $OutDir "t016-windows-metadata-state-machine-test.log"
+$LogFile = Join-Path $OutDir "t017-windows-metadata-state-machine-test.log"
 
 if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir | Out-Null
@@ -37,7 +37,7 @@ function Run-Cmd {
 Start-Transcript -Path $LogFile -Force
 
 try {
-    Write-Host "==== T016 Windows MetadataStateMachine Validation ===="
+    Write-Host "==== T017 Windows MetadataStateMachine Validation ===="
     Write-Host "time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Write-Host "repo: $(Get-Location)"
     Write-Host "cmake: $CMakeExe"
@@ -71,7 +71,7 @@ try {
 
     Write-Host ""
     Write-Host "==== Result ===="
-    Write-Host "T016 Windows MetadataStateMachine validation PASS"
+    Write-Host "T017 Windows MetadataStateMachine validation PASS"
     Write-Host "Only related target/test was run; full CTest was not run."
     Write-Host "log saved to: $LogFile"
 }
