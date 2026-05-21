@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "raft.grpc.pb.h"
+#include "kv.grpc.pb.h"
 
 namespace
 {

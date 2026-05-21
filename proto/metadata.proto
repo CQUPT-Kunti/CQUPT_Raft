@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package raft;
+
+import "common.proto";
+
+service MetadataService {
+  rpc CreateMetadataRecord(CreateMetadataRecordRequest) returns (CreateMetadataRecordResponse);
+  rpc CommitMetadataRecord(CommitMetadataRecordRequest) returns (CommitMetadataRecordResponse);
+  rpc DeleteMetadataRecord(DeleteMetadataRecordRequest) returns (DeleteMetadataRecordResponse);
+  rpc HeadMetadataRecord(HeadMetadataRecordRequest) returns (HeadMetadataRecordResponse);
+  rpc ListMetadataRecords(ListMetadataRecordsRequest) returns (ListMetadataRecordsResponse);
+}
+
+message CreateMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  MetadataManifest manifest = 3;
+  string payload = 4;
+  uint64 client_timestamp = 5;
+}
+
+message CreateMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  MetadataRecord record = 2;
+}
+
+message CommitMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  string expected_create_request_id = 3;
+  string commit_info = 4;
+  uint64 client_timestamp = 5;
+}
+
+message CommitMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  MetadataRecord record = 2;
+}
+
+message DeleteMetadataRecordRequest {
+  string request_id = 1;
+  string object_key = 2;
+  string delete_info = 3;
+  uint64 client_timestamp = 4;
+}
+
+message DeleteMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+}
+
+message HeadMetadataRecordRequest {
+  string object_key = 1;
+  uint64 client_timestamp = 2;
+}
+
+message HeadMetadataRecordResponse {
+  MetadataResponseSummary summary = 1;
+  bool found = 2;
+  MetadataRecord record = 3;
+}
+
+message ListMetadataRecordsRequest {
+  string prefix = 1;
+  uint32 limit = 2;
+  string page_token = 3;
+  uint64 client_timestamp = 4;
+}
+
+message ListMetadataRecordsResponse {
+  MetadataResponseSummary summary = 1;
+  repeated MetadataRecord records = 2;
+  string next_page_token = 3;
+}

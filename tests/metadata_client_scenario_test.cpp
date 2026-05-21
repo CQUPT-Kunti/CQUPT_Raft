@@ -24,7 +24,7 @@
 #include <sys/wait.h>
 #endif
 
-#include "raft.grpc.pb.h"
+#include "metadata.grpc.pb.h"
 
 #ifdef _WIN32
 int raft_metadata_client_entry(int argc, char **argv);

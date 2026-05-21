@@ -79,7 +79,18 @@ find_package(Threads REQUIRED)
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
-set(PROTO_FILE ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto)
+set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+set(PROTO_FILES
+  ${PROTO_DIR}/common.proto
+  ${PROTO_DIR}/raft.proto
+  ${PROTO_DIR}/metadata.proto
+  ${PROTO_DIR}/kv.proto
+)
+set(GRPC_PROTO_FILES
+  ${PROTO_DIR}/raft.proto
+  ${PROTO_DIR}/metadata.proto
+  ${PROTO_DIR}/kv.proto
+)
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(PROJECT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/modules)
 
@@ -93,25 +104,54 @@ else()
   set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
 endif()
 
-set(PROTO_SRCS ${GENERATED_DIR}/raft.pb.cc)
-set(PROTO_HDRS ${GENERATED_DIR}/raft.pb.h)
-set(GRPC_SRCS ${GENERATED_DIR}/raft.grpc.pb.cc)
-set(GRPC_HDRS ${GENERATED_DIR}/raft.grpc.pb.h)
+set(PROTO_SRCS
+  ${GENERATED_DIR}/common.pb.cc
+  ${GENERATED_DIR}/raft.pb.cc
+  ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/kv.pb.cc
+)
+set(PROTO_HDRS
+  ${GENERATED_DIR}/common.pb.h
+  ${GENERATED_DIR}/raft.pb.h
+  ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/kv.pb.h
+)
+set(GRPC_SRCS
+  ${GENERATED_DIR}/raft.grpc.pb.cc
+  ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/kv.grpc.pb.cc
+)
+set(GRPC_HDRS
+  ${GENERATED_DIR}/raft.grpc.pb.h
+  ${GENERATED_DIR}/metadata.grpc.pb.h
+  ${GENERATED_DIR}/kv.grpc.pb.h
+)
 
 add_custom_command(
   OUTPUT
     ${PROTO_SRCS}
     ${PROTO_HDRS}
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS
+    --proto_path=${PROTO_DIR}
+    --cpp_out=${GENERATED_DIR}
+    ${PROTO_FILES}
+  DEPENDS ${PROTO_FILES}
+  ${RAFT_PROTO_JOB_POOL_ARGS}
+  VERBATIM
+)
+
+add_custom_command(
+  OUTPUT
     ${GRPC_SRCS}
     ${GRPC_HDRS}
   COMMAND ${_PROTOBUF_PROTOC}
   ARGS
-    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
-    --cpp_out=${GENERATED_DIR}
+    --proto_path=${PROTO_DIR}
     --grpc_out=${GENERATED_DIR}
     --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
-    ${PROTO_FILE}
-  DEPENDS ${PROTO_FILE}
+    ${GRPC_PROTO_FILES}
+  DEPENDS ${PROTO_FILES}
   ${RAFT_PROTO_JOB_POOL_ARGS}
   VERBATIM
 )

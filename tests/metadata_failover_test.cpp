@@ -12,7 +12,7 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "raft.grpc.pb.h"
+#include "metadata.grpc.pb.h"
 #include "raft/common/config.h"
 #include "raft/node/raft_node.h"
 

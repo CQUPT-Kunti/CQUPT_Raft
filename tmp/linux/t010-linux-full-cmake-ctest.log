@@ -1,0 +1,482 @@
+==== T010 Linux Full CMake/CTest Validation ====
+time: 2026-05-21 11:03:17
+repo: /home/yangjilei/Code/C++/CQUPT_Raft
+log: tmp/linux/t010-linux-full-cmake-ctest.log
+
+==== Git status ====
+ M CMakeLists.txt
+ M apps/AGENTS.md
+ M apps/raft_kv_client.cpp
+ M apps/raft_metadata_client.cpp
+ M modules/raft/service/AGENTS.md
+ M modules/raft/service/kv_service_impl.h
+ M modules/raft/service/metadata_service_impl.h
+ M proto/AGENTS.md
+ M proto/raft.proto
+ M tests/metadata_client_scenario_test.cpp
+ M tests/metadata_failover_test.cpp
+ M tests/test_kv_service.cpp
+?? proto/common.proto
+?? proto/kv.proto
+?? proto/metadata.proto
+?? specs/006-remove-kv-metadata-state-machine/task-reports/t010-proto-boundary-split.md
+?? tmp/linux/t010-linux-full-cmake-ctest.log
+
+==== Configure ====
+Preset CMake variables:
+
+  CMAKE_BUILD_TYPE="Debug"
+  CMAKE_TOOLCHAIN_FILE="/home/yangjilei/vcpkg/scripts/buildsystems/vcpkg.cmake"
+  RAFT_BUILD_JOBS="2"
+  RAFT_LINK_JOBS="1"
+  RAFT_PROTO_JOBS="1"
+  VCPKG_TARGET_TRIPLET="x64-linux"
+
+-- Running vcpkg install
+Detecting compiler hash for triplet x64-linux...
+Compiler found: /usr/bin/c++
+The following packages are already installed:
+  * abseil:x64-linux@20250512.1 -- git+https://github.com/microsoft/vcpkg@2999911d2655e693394770d9dd7600b277a86f37
+  * c-ares:x64-linux@1.34.5#1 -- git+https://github.com/microsoft/vcpkg@d733716f373cf3ccd5da4f42ea1369064853d751
+    grpc[codegen,core]:x64-linux@1.71.0#3 -- git+https://github.com/microsoft/vcpkg@daebe29c41aa900ce183614afe15c73b3ca4f643
+  * openssl:x64-linux@3.5.3 -- git+https://github.com/microsoft/vcpkg@434958e7b6123c21e39b055218bd27f29baaebb5
+    protobuf:x64-linux@5.29.5#2 -- git+https://github.com/microsoft/vcpkg@b71ee5bb425cd832ed1615601bd92573f07e9206
+  * re2:x64-linux@2025-08-12 -- git+https://github.com/microsoft/vcpkg@265578651312c753b182e63fcafd5afb428c301f
+  * utf8-range:x64-linux@5.29.5 -- git+https://github.com/microsoft/vcpkg@5d28e170bfcc212d629bb070520e72492240ce65
+  * vcpkg-cmake:x64-linux@2024-04-23 -- git+https://github.com/microsoft/vcpkg@e74aa1e8f93278a8e71372f1fa08c3df420eb840
+  * vcpkg-cmake-config:x64-linux@2024-05-23 -- git+https://github.com/microsoft/vcpkg@97a63e4bc1a17422ffe4eff71da53b4b561a7841
+  * vcpkg-cmake-get-vars:x64-linux@2025-05-29 -- git+https://github.com/microsoft/vcpkg@d6510f888dd526c7828f6b973349e7f30be51254
+  * zlib:x64-linux@1.3.1 -- git+https://github.com/microsoft/vcpkg@3f05e04b9aededb96786a911a16193cdb711f0c9
+protobuf provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(protobuf CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE protobuf::libprotoc protobuf::libprotobuf protobuf::libprotobuf-lite)
+
+protobuf provides pkg-config modules:
+
+  # Google's Data Interchange Format
+  protobuf-lite
+
+  # Google's Data Interchange Format
+  protobuf
+
+grpc provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(gRPC CONFIG REQUIRED)
+  # note: 15 additional targets are not displayed.
+  target_link_libraries(main PRIVATE gRPC::gpr gRPC::grpc gRPC::grpc++ gRPC::grpc++_alts)
+
+grpc provides pkg-config modules:
+
+  # gRPC platform support library
+  gpr
+
+  # C++ wrapper for gRPC
+  grpc++
+
+  # C++ wrapper for gRPC without SSL
+  grpc++_unsecure
+
+  # high performance general RPC framework
+  grpc
+
+  # high performance general RPC framework without SSL
+  grpc_unsecure
+
+All requested installations completed successfully in: 115 us
+-- Running vcpkg install - done
+-- Found RE2 via CMake.
+-- Using protobuf 29.5.0
+-- Using gRPC 1.71.0
+CMake Warning (dev) at /usr/share/cmake-3.28/Modules/FetchContent.cmake:1331 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  tests/CMakeLists.txt:8 (FetchContent_Declare)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Configuring done (2.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/yangjilei/Code/C++/CQUPT_Raft/build/linux
+
+==== Build all ====
+[1/38] Linking CXX executable tests/test_command
+[2/38] Linking CXX executable tests/test_metadata_command
+[3/38] Linking CXX executable tests/test_metadata_records
+[4/38] Linking CXX executable tests/test_metadata_command_types
+[5/38] Linking CXX executable tests/test_metadata_manifest
+[6/38] Linking CXX executable tests/test_metadata_state_machine
+[7/38] Building CXX object tests/CMakeFiles/test_metadata_snapshot.dir/metadata_snapshot_test.cpp.o
+[8/38] Linking CXX executable tests/test_state_machine
+[9/38] Linking CXX executable tests/test_metadata_snapshot
+[10/38] Linking CXX executable tests/test_min_heap_timer
+[11/38] Linking CXX executable tests/test_thread_pool
+[12/38] Building CXX object tests/CMakeFiles/test_raft_election.dir/test_raft_election.cpp.o
+[13/38] Building CXX object tests/CMakeFiles/test_raft_log_replication.dir/test_raft_log_replication.cpp.o
+[14/38] Building CXX object tests/CMakeFiles/test_raft_commit_apply.dir/test_raft_commit_apply.cpp.o
+[15/38] Building CXX object tests/CMakeFiles/test_raft_split_brain.dir/test_raft_split_brain.cpp.o
+[16/38] Building CXX object tests/CMakeFiles/test_t017_leader_switch_ordering.dir/test_t017_leader_switch_ordering.cpp.o
+[17/38] Building CXX object tests/CMakeFiles/persistence_test.dir/persistence_test.cpp.o
+[18/38] Building CXX object tests/CMakeFiles/snapshot_test.dir/snapshot_test.cpp.o
+[19/38] Building CXX object tests/CMakeFiles/raft_integration_test.dir/raft_integration_test.cpp.o
+[20/38] Building CXX object tests/CMakeFiles/test_raft_snapshot_catchup.dir/test_raft_snapshot_catchup.cpp.o
+[21/38] Building CXX object tests/CMakeFiles/test_raft_snapshot_restart.dir/test_raft_snapshot_restart.cpp.o
+[22/38] Building CXX object tests/CMakeFiles/test_raft_snapshot_diagnosis.dir/test_raft_snapshot_diagnosis.cpp.o
+[23/38] Linking CXX executable tests/test_snapshot_storage_reliability
+[24/38] Building CXX object tests/CMakeFiles/test_raft_segment_storage.dir/test_raft_segment_storage.cpp.o
+[25/38] Building CXX object tests/CMakeFiles/test_raft_replicator_behavior.dir/test_raft_replicator_behavior.cpp.o
+[26/38] Linking CXX executable tests/test_raft_election
+[27/38] Linking CXX executable tests/test_raft_log_replication
+[28/38] Linking CXX executable tests/test_raft_commit_apply
+[29/38] Linking CXX executable tests/test_raft_split_brain
+[30/38] Linking CXX executable tests/test_t017_leader_switch_ordering
+[31/38] Linking CXX executable tests/persistence_test
+[32/38] Linking CXX executable tests/snapshot_test
+[33/38] Linking CXX executable tests/raft_integration_test
+[34/38] Linking CXX executable tests/test_raft_snapshot_catchup
+[35/38] Linking CXX executable tests/test_raft_snapshot_restart
+[36/38] Linking CXX executable tests/test_raft_snapshot_diagnosis
+[37/38] Linking CXX executable tests/test_raft_segment_storage
+[38/38] Linking CXX executable tests/test_raft_replicator_behavior
+
+==== Full CTest ====
+Internal ctest changing into directory: /home/yangjilei/Code/C++/CQUPT_Raft/build/linux
+Test project /home/yangjilei/Code/C++/CQUPT_Raft/build/linux
+        Start   1: CommandTest.SetCommandSerializeAndDeserialize
+  1/158 Test   #1: CommandTest.SetCommandSerializeAndDeserialize ................................................................   Passed    0.00 sec
+        Start   2: CommandTest.DeleteCommandSerializeAndDeserialize
+  2/158 Test   #2: CommandTest.DeleteCommandSerializeAndDeserialize .............................................................   Passed    0.00 sec
+        Start   3: CommandTest.EmptyKeyIsInvalid
+  3/158 Test   #3: CommandTest.EmptyKeyIsInvalid ................................................................................   Passed    0.00 sec
+        Start   4: CommandTest.UnknownCommandIsInvalid
+  4/158 Test   #4: CommandTest.UnknownCommandIsInvalid ..........................................................................   Passed    0.00 sec
+        Start   5: CommandTest.DeserializeRejectsBadInput
+  5/158 Test   #5: CommandTest.DeserializeRejectsBadInput .......................................................................   Passed    0.00 sec
+        Start   6: MetadataCommandTest.CreateCommandSerializeParseValidateSucceeds
+  6/158 Test   #6: MetadataCommandTest.CreateCommandSerializeParseValidateSucceeds ..............................................   Passed    0.00 sec
+        Start   7: MetadataCommandTest.CommitCommandSerializeParseValidateSucceeds
+  7/158 Test   #7: MetadataCommandTest.CommitCommandSerializeParseValidateSucceeds ..............................................   Passed    0.00 sec
+        Start   8: MetadataCommandTest.DeleteCommandSerializeParseValidateSucceeds
+  8/158 Test   #8: MetadataCommandTest.DeleteCommandSerializeParseValidateSucceeds ..............................................   Passed    0.00 sec
+        Start   9: MetadataCommandTest.MissingRequestIdIsRejected
+  9/158 Test   #9: MetadataCommandTest.MissingRequestIdIsRejected ...............................................................   Passed    0.00 sec
+        Start  10: MetadataCommandTest.EmptyObjectKeyIsRejected
+ 10/158 Test  #10: MetadataCommandTest.EmptyObjectKeyIsRejected .................................................................   Passed    0.00 sec
+        Start  11: MetadataCommandTest.PayloadOverLimitIsRejected
+ 11/158 Test  #11: MetadataCommandTest.PayloadOverLimitIsRejected ...............................................................   Passed    0.00 sec
+        Start  12: MetadataCommandTest.FingerprintChangesWhenSameRequestIdCarriesDifferentContent
+ 12/158 Test  #12: MetadataCommandTest.FingerprintChangesWhenSameRequestIdCarriesDifferentContent ...............................   Passed    0.00 sec
+        Start  13: MetadataCommandTest.MockLocationsParseAndValidateSucceeds
+ 13/158 Test  #13: MetadataCommandTest.MockLocationsParseAndValidateSucceeds ....................................................   Passed    0.00 sec
+        Start  14: MetadataCommandTest.MetadataResultHelpersRemainLightweight
+ 14/158 Test  #14: MetadataCommandTest.MetadataResultHelpersRemainLightweight ...................................................   Passed    0.00 sec
+        Start  15: MetadataCommandTest.CreateBucketCommandSerializeParseValidateSucceeds
+ 15/158 Test  #15: MetadataCommandTest.CreateBucketCommandSerializeParseValidateSucceeds ........................................   Passed    0.00 sec
+        Start  16: MetadataCommandTest.DeleteBucketCommandSerializeParseValidateSucceeds
+ 16/158 Test  #16: MetadataCommandTest.DeleteBucketCommandSerializeParseValidateSucceeds ........................................   Passed    0.00 sec
+        Start  17: MetadataCommandTest.CreateObjectV2CommandSerializeParseValidateSucceeds
+ 17/158 Test  #17: MetadataCommandTest.CreateObjectV2CommandSerializeParseValidateSucceeds ......................................   Passed    0.00 sec
+        Start  18: MetadataCommandTest.CommitObjectV2CommandSerializeParseValidateSucceeds
+ 18/158 Test  #18: MetadataCommandTest.CommitObjectV2CommandSerializeParseValidateSucceeds ......................................   Passed    0.00 sec
+        Start  19: MetadataCommandTest.AbortObjectV2CommandSerializeParseValidateSucceeds
+ 19/158 Test  #19: MetadataCommandTest.AbortObjectV2CommandSerializeParseValidateSucceeds .......................................   Passed    0.00 sec
+        Start  20: MetadataCommandTest.DeleteObjectV2CommandSerializeParseValidateSucceeds
+ 20/158 Test  #20: MetadataCommandTest.DeleteObjectV2CommandSerializeParseValidateSucceeds ......................................   Passed    0.00 sec
+        Start  21: MetadataCommandTest.UnknownCommandTypeIsRejectedDuringParse
+ 21/158 Test  #21: MetadataCommandTest.UnknownCommandTypeIsRejectedDuringParse ..................................................   Passed    0.00 sec
+        Start  22: MetadataCommandTest.TruncatedCommitChunkPayloadIsRejectedDuringParse
+ 22/158 Test  #22: MetadataCommandTest.TruncatedCommitChunkPayloadIsRejectedDuringParse .........................................   Passed    0.00 sec
+        Start  23: MetadataCommandTest.CorruptedCommitChunkListIsRejectedDuringParse
+ 23/158 Test  #23: MetadataCommandTest.CorruptedCommitChunkListIsRejectedDuringParse ............................................   Passed    0.00 sec
+        Start  24: MetadataCommandTest.RequestContextCommandTypeMismatchIsRejected
+ 24/158 Test  #24: MetadataCommandTest.RequestContextCommandTypeMismatchIsRejected ..............................................   Passed    0.00 sec
+        Start  25: MetadataRecordTypesTest.ObjectStateDefaultsToPendingAndKeepsStableValues
+ 25/158 Test  #25: MetadataRecordTypesTest.ObjectStateDefaultsToPendingAndKeepsStableValues .....................................   Passed    0.00 sec
+        Start  26: MetadataRecordTypesTest.ChunkRefOnlyCarriesReferenceMetadata
+ 26/158 Test  #26: MetadataRecordTypesTest.ChunkRefOnlyCarriesReferenceMetadata .................................................   Passed    0.00 sec
+        Start  27: MetadataRecordTypesTest.BucketAndObjectRecordsCaptureLifecycleFields
+ 27/158 Test  #27: MetadataRecordTypesTest.BucketAndObjectRecordsCaptureLifecycleFields .........................................   Passed    0.00 sec
+        Start  28: MetadataRecordTypesTest.RequestRecordTracksIdempotencyAndApplyFacts
+ 28/158 Test  #28: MetadataRecordTypesTest.RequestRecordTracksIdempotencyAndApplyFacts ..........................................   Passed    0.00 sec
+        Start  29: MetadataCommandTypesTest.EnumValuesCoverAllWriteCommandKinds
+ 29/158 Test  #29: MetadataCommandTypesTest.EnumValuesCoverAllWriteCommandKinds .................................................   Passed    0.00 sec
+        Start  30: MetadataCommandTypesTest.CreateBucketCommandKeepsRequestIdAndBucketRecord
+ 30/158 Test  #30: MetadataCommandTypesTest.CreateBucketCommandKeepsRequestIdAndBucketRecord ....................................   Passed    0.00 sec
+        Start  31: MetadataCommandTypesTest.CreateAndDeleteObjectCommandsUseObjectIdentityPayloads
+ 31/158 Test  #31: MetadataCommandTypesTest.CreateAndDeleteObjectCommandsUseObjectIdentityPayloads ..............................   Passed    0.00 sec
+        Start  32: MetadataCommandTypesTest.CommitObjectCommandCarriesChunkRefs
+ 32/158 Test  #32: MetadataCommandTypesTest.CommitObjectCommandCarriesChunkRefs .................................................   Passed    0.00 sec
+        Start  33: MetadataCommandTypesTest.AbortObjectCommandPreservesRequestIdForIdempotency
+ 33/158 Test  #33: MetadataCommandTypesTest.AbortObjectCommandPreservesRequestIdForIdempotency ..................................   Passed    0.00 sec
+        Start  34: MetadataCommandTypesTest.HeadAndListQueriesRemainReadOnlyModels
+ 34/158 Test  #34: MetadataCommandTypesTest.HeadAndListQueriesRemainReadOnlyModels ..............................................   Passed    0.00 sec
+        Start  35: MetadataManifestTest.LegalManifestPassesValidation
+ 35/158 Test  #35: MetadataManifestTest.LegalManifestPassesValidation ...........................................................   Passed    0.00 sec
+        Start  36: MetadataManifestTest.ZeroChunkSizeIsRejected
+ 36/158 Test  #36: MetadataManifestTest.ZeroChunkSizeIsRejected .................................................................   Passed    0.00 sec
+        Start  37: MetadataManifestTest.ChunkCountMismatchIsRejected
+ 37/158 Test  #37: MetadataManifestTest.ChunkCountMismatchIsRejected ............................................................   Passed    0.00 sec
+        Start  38: MetadataManifestTest.MissingChecksumIsRejected
+ 38/158 Test  #38: MetadataManifestTest.MissingChecksumIsRejected ...............................................................   Passed    0.00 sec
+        Start  39: MetadataManifestTest.PayloadOverLimitIsRejected
+ 39/158 Test  #39: MetadataManifestTest.PayloadOverLimitIsRejected ..............................................................   Passed    0.00 sec
+        Start  40: MetadataManifestTest.EmptyMockLocationsIsRejected
+ 40/158 Test  #40: MetadataManifestTest.EmptyMockLocationsIsRejected ............................................................   Passed    0.00 sec
+        Start  41: MetadataManifestTest.NonExistentMockStorageNodeLocationsRemainAllowed
+ 41/158 Test  #41: MetadataManifestTest.NonExistentMockStorageNodeLocationsRemainAllowed ........................................   Passed    0.00 sec
+        Start  42: MetadataStateMachineTest.CreateLeavesPendingInvisibleToHeadAndList
+ 42/158 Test  #42: MetadataStateMachineTest.CreateLeavesPendingInvisibleToHeadAndList ...........................................   Passed    0.00 sec
+        Start  43: MetadataStateMachineTest.CommitMakesCommittedRecordVisibleToHeadAndList
+ 43/158 Test  #43: MetadataStateMachineTest.CommitMakesCommittedRecordVisibleToHeadAndList ......................................   Passed    0.00 sec
+        Start  44: MetadataStateMachineTest.DuplicateCreateWithSameRequestIdReturnsIdempotentReplay
+ 44/158 Test  #44: MetadataStateMachineTest.DuplicateCreateWithSameRequestIdReturnsIdempotentReplay .............................   Passed    0.00 sec
+        Start  45: MetadataStateMachineTest.DuplicateCommitDoesNotProduceDuplicateVisibleRecord
+ 45/158 Test  #45: MetadataStateMachineTest.DuplicateCommitDoesNotProduceDuplicateVisibleRecord .................................   Passed    0.00 sec
+        Start  46: MetadataStateMachineTest.SameRequestIdDifferentContentTriggersIdempotencyConflict
+ 46/158 Test  #46: MetadataStateMachineTest.SameRequestIdDifferentContentTriggersIdempotencyConflict ............................   Passed    0.00 sec
+        Start  47: MetadataStateMachineTest.MissingPendingCommitReturnsExplicitError
+ 47/158 Test  #47: MetadataStateMachineTest.MissingPendingCommitReturnsExplicitError ............................................   Passed    0.00 sec
+        Start  48: MetadataSnapshotTest.SaveAndLoadRestoresCommittedAndKeepsPendingInvisible
+ 48/158 Test  #48: MetadataSnapshotTest.SaveAndLoadRestoresCommittedAndKeepsPendingInvisible ....................................   Passed    0.00 sec
+        Start  49: MetadataSnapshotTest.SaveAndLoadPreservesTombstoneAndReplaySemantics
+ 49/158 Test  #49: MetadataSnapshotTest.SaveAndLoadPreservesTombstoneAndReplaySemantics .........................................   Passed    0.01 sec
+        Start  50: MetadataSnapshotTest.LoadSnapshotRejectsCorruptedSnapshot
+ 50/158 Test  #50: MetadataSnapshotTest.LoadSnapshotRejectsCorruptedSnapshot ....................................................   Passed    0.00 sec
+        Start  51: MetadataSnapshotTest.LoadSnapshotRejectsMagicMismatch
+ 51/158 Test  #51: MetadataSnapshotTest.LoadSnapshotRejectsMagicMismatch ........................................................   Passed    0.00 sec
+        Start  52: MetadataSnapshotTest.LoadSnapshotRejectsVersionMismatch
+ 52/158 Test  #52: MetadataSnapshotTest.LoadSnapshotRejectsVersionMismatch ......................................................   Passed    0.00 sec
+        Start  53: MetadataFailoverTest.NewLeaderKeepsCommittedVisibleAndPendingHidden
+ 53/158 Test  #53: MetadataFailoverTest.NewLeaderKeepsCommittedVisibleAndPendingHidden ..........................................   Passed    1.82 sec
+        Start  54: MetadataFailoverTest.SameCommitRequestIdCanBeRetriedOnNewLeader
+ 54/158 Test  #54: MetadataFailoverTest.SameCommitRequestIdCanBeRetriedOnNewLeader ..............................................   Passed    1.67 sec
+        Start  55: MetadataClientScenarioTest.CreateScenarioBuildsMetadataOnlyManifest
+ 55/158 Test  #55: MetadataClientScenarioTest.CreateScenarioBuildsMetadataOnlyManifest ..........................................   Passed    0.09 sec
+        Start  56: MetadataClientScenarioTest.CreateCommitHeadListDeleteFlowSucceeds
+ 56/158 Test  #56: MetadataClientScenarioTest.CreateCommitHeadListDeleteFlowSucceeds ............................................   Passed    0.08 sec
+        Start  57: MetadataClientScenarioTest.VerifyReadAfterWriteModeReportsPass
+ 57/158 Test  #57: MetadataClientScenarioTest.VerifyReadAfterWriteModeReportsPass ...............................................   Passed    0.05 sec
+        Start  58: MetadataClientScenarioTest.DuplicateRequestIdDoesNotCreateDuplicateVisibleRecord
+ 58/158 Test  #58: MetadataClientScenarioTest.DuplicateRequestIdDoesNotCreateDuplicateVisibleRecord .............................   Passed    0.06 sec
+        Start  59: MetadataClientScenarioTest.PayloadBoundaryAndMockLocationsBehaviorAreExposed
+ 59/158 Test  #59: MetadataClientScenarioTest.PayloadBoundaryAndMockLocationsBehaviorAreExposed .................................   Passed    0.03 sec
+        Start  60: KvStateMachineTest.ApplySetThenReadBack
+ 60/158 Test  #60: KvStateMachineTest.ApplySetThenReadBack ......................................................................   Passed    0.00 sec
+        Start  61: KvStateMachineTest.ApplySetCanOverwriteOldValue
+ 61/158 Test  #61: KvStateMachineTest.ApplySetCanOverwriteOldValue ..............................................................   Passed    0.00 sec
+        Start  62: KvStateMachineTest.ApplyDeleteRemovesExistingKey
+ 62/158 Test  #62: KvStateMachineTest.ApplyDeleteRemovesExistingKey .............................................................   Passed    0.00 sec
+        Start  63: KvStateMachineTest.DeleteMissingKeyStillSucceeds
+ 63/158 Test  #63: KvStateMachineTest.DeleteMissingKeyStillSucceeds .............................................................   Passed    0.00 sec
+        Start  64: KvStateMachineTest.InvalidCommandDataReturnsFailure
+ 64/158 Test  #64: KvStateMachineTest.InvalidCommandDataReturnsFailure ..........................................................   Passed    0.00 sec
+        Start  65: KvStateMachineTest.DebugStringShowsSortedKeys
+ 65/158 Test  #65: KvStateMachineTest.DebugStringShowsSortedKeys ................................................................   Passed    0.00 sec
+        Start  66: KvStateMachineTest.ReplayStyleOverwriteAndDeleteLeaveExpectedFinalView
+ 66/158 Test  #66: KvStateMachineTest.ReplayStyleOverwriteAndDeleteLeaveExpectedFinalView .......................................   Passed    0.00 sec
+        Start  67: TimerSchedulerTest.ScheduledTaskRuns
+ 67/158 Test  #67: TimerSchedulerTest.ScheduledTaskRuns .........................................................................   Passed    0.05 sec
+        Start  68: TimerSchedulerTest.CancelledTaskDoesNotRun
+ 68/158 Test  #68: TimerSchedulerTest.CancelledTaskDoesNotRun ...................................................................   Passed    0.20 sec
+        Start  69: TimerSchedulerTest.StopClearsPendingTasks
+ 69/158 Test  #69: TimerSchedulerTest.StopClearsPendingTasks ....................................................................   Passed    0.25 sec
+        Start  70: ThreadPoolTest.SubmittedTasksAreExecuted
+ 70/158 Test  #70: ThreadPoolTest.SubmittedTasksAreExecuted .....................................................................   Passed    0.00 sec
+        Start  71: ThreadPoolTest.StopPreventsNewTasksFromRunning
+ 71/158 Test  #71: ThreadPoolTest.StopPreventsNewTasksFromRunning ...............................................................   Passed    0.10 sec
+        Start  72: ThreadPoolTest.QueuedTasksFinishBeforeStopReturns
+ 72/158 Test  #72: ThreadPoolTest.QueuedTasksFinishBeforeStopReturns ............................................................   Passed    0.06 sec
+        Start  73: RaftKvServiceTest.SingleNodeSupportsPutGetDeleteAndStatusHealth
+ 73/158 Test  #73: RaftKvServiceTest.SingleNodeSupportsPutGetDeleteAndStatusHealth ..............................................   Passed    0.65 sec
+        Start  74: RaftKvServiceTest.ThreeNodeFollowerRedirectsWritesAndReadsToLeader
+ 74/158 Test  #74: RaftKvServiceTest.ThreeNodeFollowerRedirectsWritesAndReadsToLeader ...........................................   Passed    0.89 sec
+        Start  75: RaftKvServiceTest.DataDirectoryIdentityMismatchIsRejected
+ 75/158 Test  #75: RaftKvServiceTest.DataDirectoryIdentityMismatchIsRejected ....................................................   Passed    0.01 sec
+        Start  76: RaftElectionTest.ThreeNodeClusterElectsExactlyOneLeader
+ 76/158 Test  #76: RaftElectionTest.ThreeNodeClusterElectsExactlyOneLeader ......................................................   Passed    0.97 sec
+        Start  77: RaftElectionTest.FollowerRejectsClientProposeAfterLeaderIsElected
+ 77/158 Test  #77: RaftElectionTest.FollowerRejectsClientProposeAfterLeaderIsElected ............................................   Passed    0.74 sec
+        Start  78: RaftLogReplicationTest.LeaderProposeReplicatesLogToAllNodes
+ 78/158 Test  #78: RaftLogReplicationTest.LeaderProposeReplicatesLogToAllNodes ..................................................   Passed    1.09 sec
+        Start  79: RaftLogReplicationTest.MultipleSequentialEntriesStayConsistentAcrossCluster
+ 79/158 Test  #79: RaftLogReplicationTest.MultipleSequentialEntriesStayConsistentAcrossCluster ..................................   Passed    1.47 sec
+        Start  80: RaftCommitApplyTest.CommitAndApplyIndexesAdvanceAfterSuccessfulPropose
+ 80/158 Test  #80: RaftCommitApplyTest.CommitAndApplyIndexesAdvanceAfterSuccessfulPropose .......................................   Passed    1.10 sec
+        Start  81: RaftCommitApplyTest.DeleteCommandIsAppliedToAllNodes
+ 81/158 Test  #81: RaftCommitApplyTest.DeleteCommandIsAppliedToAllNodes .........................................................   Passed    1.26 sec
+        Start  82: RaftSplitBrainTest.MinorityLeaderTimesOutAndDoesNotApplyUncommittedCommand
+ 82/158 Test  #82: RaftSplitBrainTest.MinorityLeaderTimesOutAndDoesNotApplyUncommittedCommand ...................................   Passed   11.29 sec
+        Start  83: RaftSplitBrainTest.LeaderStepsDownWhenHigherTermAppendEntriesArrives
+ 83/158 Test  #83: RaftSplitBrainTest.LeaderStepsDownWhenHigherTermAppendEntriesArrives .........................................   Passed    0.65 sec
+        Start  84: RaftSplitBrainTest.StaleAppendEntriesIsRejectedAfterNodeObservesHigherTerm
+ 84/158 Test  #84: RaftSplitBrainTest.StaleAppendEntriesIsRejectedAfterNodeObservesHigherTerm ...................................   Passed    0.06 sec
+        Start  85: RaftSplitBrainTest.SameTermSecondCandidateVoteIsRejected
+ 85/158 Test  #85: RaftSplitBrainTest.SameTermSecondCandidateVoteIsRejected .....................................................   Passed    0.06 sec
+        Start  86: RaftSplitBrainTest.StaleCandidateVoteRequestIsRejectedEvenWithHigherTerm
+ 86/158 Test  #86: RaftSplitBrainTest.StaleCandidateVoteRequestIsRejectedEvenWithHigherTerm .....................................   Passed    1.14 sec
+        Start  87: RaftSplitBrainTest.AppendEntriesRejectionIncludesFastBacktrackHint
+ 87/158 Test  #87: RaftSplitBrainTest.AppendEntriesRejectionIncludesFastBacktrackHint ...........................................   Passed    0.07 sec
+        Start  88: RaftSplitBrainTest.InstallSnapshotDiscardsSuffixWhenBoundaryTermDiffers
+ 88/158 Test  #88: RaftSplitBrainTest.InstallSnapshotDiscardsSuffixWhenBoundaryTermDiffers ......................................   Passed    0.19 sec
+        Start  89: RaftLeaderSwitchOrderingTest.CommittedStateSurvivesLeaderSwitchAndNewLeaderContinuesReplication
+ 89/158 Test  #89: RaftLeaderSwitchOrderingTest.CommittedStateSurvivesLeaderSwitchAndNewLeaderContinuesReplication ..............   Passed    3.52 sec
+        Start  90: RaftLeaderSwitchOrderingTest.LaggingFollowerCatchesUpDuringLeaderSwitchWithoutCommitApplyReordering
+ 90/158 Test  #90: RaftLeaderSwitchOrderingTest.LaggingFollowerCatchesUpDuringLeaderSwitchWithoutCommitApplyReordering ..........   Passed   19.87 sec
+        Start  91: PersistenceTest.FullClusterRestartRecovery
+ 91/158 Test  #91: PersistenceTest.FullClusterRestartRecovery ...................................................................   Passed    4.68 sec
+        Start  92: PersistenceTest.RestartedFollowerCatchesUp
+ 92/158 Test  #92: PersistenceTest.RestartedFollowerCatchesUp ...................................................................   Passed    4.22 sec
+        Start  93: PersistenceTest.ColdRestartPreservesPersistedHardStateBeforeStart
+ 93/158 Test  #93: PersistenceTest.ColdRestartPreservesPersistedHardStateBeforeStart ............................................   Passed    0.82 sec
+        Start  94: PersistenceTest.ColdRestartClampsCommitAndApplyBoundariesToLastLogIndex
+ 94/158 Test  #94: PersistenceTest.ColdRestartClampsCommitAndApplyBoundariesToLastLogIndex ......................................   Passed    0.12 sec
+        Start  95: PersistenceTest.ColdRestartUsesPreviouslyTrustedMetaBoundaryWhenNewLogPublishesBeforeMeta
+ 95/158 Test  #95: PersistenceTest.ColdRestartUsesPreviouslyTrustedMetaBoundaryWhenNewLogPublishesBeforeMeta ....................   Passed    0.17 sec
+        Start  96: PersistenceTest.ColdRestartClampsCommitIndexToLastLogAndReplaysCommittedPrefix
+ 96/158 Test  #96: PersistenceTest.ColdRestartClampsCommitIndexToLastLogAndReplaysCommittedPrefix ...............................   Passed    0.12 sec
+        Start  97: PersistenceTest.ColdRestartClampsLastAppliedToCommitIndexWhenAppliedExceedsCommit
+ 97/158 Test  #97: PersistenceTest.ColdRestartClampsLastAppliedToCommitIndexWhenAppliedExceedsCommit ............................   Passed    0.08 sec
+        Start  98: PersistenceTest.ColdRestartClampsLastAppliedToTrustedLogPrefixWhenAppliedPointsPastAvailableLog
+ 98/158 Test  #98: PersistenceTest.ColdRestartClampsLastAppliedToTrustedLogPrefixWhenAppliedPointsPastAvailableLog ..............   Passed    0.10 sec
+        Start  99: PersistenceTest.ColdRestartUsesOlderMetaTermAndVoteWhenNewerLogTreeIsVisible
+ 99/158 Test  #99: PersistenceTest.ColdRestartUsesOlderMetaTermAndVoteWhenNewerLogTreeIsVisible .................................   Passed    0.13 sec
+        Start 100: PersistenceTest.NewMetaWithOldLogBoundaryRejectsUntrustedCurrentTermAndVote
+100/158 Test #100: PersistenceTest.NewMetaWithOldLogBoundaryRejectsUntrustedCurrentTermAndVote ..................................   Passed    0.05 sec
+        Start 101: PersistenceTest.MetaFileSyncFailureNeedsExactFailureInjectionSeam
+101/158 Test #101: PersistenceTest.MetaFileSyncFailureNeedsExactFailureInjectionSeam ............................................   Passed    0.11 sec
+        Start 102: PersistenceTest.MetaDirectorySyncFailureNeedsExactFailureInjectionSeam
+102/158 Test #102: PersistenceTest.MetaDirectorySyncFailureNeedsExactFailureInjectionSeam .......................................   Passed    0.13 sec
+        Start 103: RaftSnapshotRecoveryTest.SavesSnapshotAndRestoresAfterRestart
+103/158 Test #103: RaftSnapshotRecoveryTest.SavesSnapshotAndRestoresAfterRestart ................................................   Passed    8.76 sec
+        Start 104: RaftIntegrationTest.ElectsSingleLeaderInThreeNodeCluster
+104/158 Test #104: RaftIntegrationTest.ElectsSingleLeaderInThreeNodeCluster .....................................................   Passed    0.67 sec
+        Start 105: RaftIntegrationTest.ReplicatesSetAndDeleteCommandsToAllNodes
+105/158 Test #105: RaftIntegrationTest.ReplicatesSetAndDeleteCommandsToAllNodes .................................................   Passed    1.59 sec
+        Start 106: RaftIntegrationTest.ElectsNewLeaderAfterCurrentLeaderStops
+106/158 Test #106: RaftIntegrationTest.ElectsNewLeaderAfterCurrentLeaderStops ...................................................   Passed    1.56 sec
+        Start 107: RaftIntegrationTest.GeneratesSnapshotMetaFileAfterEnoughAppliedLogs
+107/158 Test #107: RaftIntegrationTest.GeneratesSnapshotMetaFileAfterEnoughAppliedLogs ..........................................   Passed    2.30 sec
+        Start 108: RaftIntegrationTest.LaggingFollowerInstallsSnapshotAndReplaysTailDeleteAcrossCompactionBoundary
+108/158 Test #108: RaftIntegrationTest.LaggingFollowerInstallsSnapshotAndReplaysTailDeleteAcrossCompactionBoundary ..............   Passed    6.10 sec
+        Start 109: RaftSnapshotCatchupTest.RestartedFollowerCatchesUpLargeGapWithBatchedAppendEntries
+109/158 Test #109: RaftSnapshotCatchupTest.RestartedFollowerCatchesUpLargeGapWithBatchedAppendEntries ...........................   Passed   83.13 sec
+        Start 110: RaftSnapshotCatchupTest.LaggingFollowerReplaysLiveLogWithoutBreakingCommittedDeleteOrdering
+110/158 Test #110: RaftSnapshotCatchupTest.LaggingFollowerReplaysLiveLogWithoutBreakingCommittedDeleteOrdering ..................   Passed   30.62 sec
+        Start 111: RaftSnapshotCatchupTest.RestartedFollowerInstallsSnapshotWhenLeaderCompactedLogs
+111/158 Test #111: RaftSnapshotCatchupTest.RestartedFollowerInstallsSnapshotWhenLeaderCompactedLogs .............................   Passed   11.05 sec
+        Start 112: RaftSnapshotCatchupTest.FollowerContinuesReplicatingLogsAfterInstallingSnapshot
+112/158 Test #112: RaftSnapshotCatchupTest.FollowerContinuesReplicatingLogsAfterInstallingSnapshot ..............................   Passed   10.87 sec
+        Start 113: RaftSnapshotRestartTest.FollowerKeepsStateAfterInstallSnapshotAndRestart
+113/158 Test #113: RaftSnapshotRestartTest.FollowerKeepsStateAfterInstallSnapshotAndRestart .....................................   Passed   17.96 sec
+        Start 114: RaftSnapshotRestartTest.LeaderKeepsCompactedSnapshotStateAfterRestart
+114/158 Test #114: RaftSnapshotRestartTest.LeaderKeepsCompactedSnapshotStateAfterRestart ........................................   Passed   10.50 sec
+        Start 115: RaftSnapshotRestartTest.FullClusterRestartsAfterSnapshotAndContinuesWriting
+115/158 Test #115: RaftSnapshotRestartTest.FullClusterRestartsAfterSnapshotAndContinuesWriting ..................................   Passed   12.81 sec
+        Start 116: RaftSnapshotRestartTest.SnapshotAndPostSnapshotLogsRecoverAfterFullRestart
+116/158 Test #116: RaftSnapshotRestartTest.SnapshotAndPostSnapshotLogsRecoverAfterFullRestart ...................................   Passed   13.03 sec
+        Start 117: RaftSnapshotRecoveryTest.FullRestartReplaysSnapshotTailWithoutLosingDeletesOrOverwrites
+117/158 Test #117: RaftSnapshotRecoveryTest.FullRestartReplaysSnapshotTailWithoutLosingDeletesOrOverwrites ......................   Passed   10.08 sec
+        Start 118: RaftSnapshotRecoveryTest.RestartedFollowerAppliesCommittedTailExactlyOnceAfterSnapshotLoad
+118/158 Test #118: RaftSnapshotRecoveryTest.RestartedFollowerAppliesCommittedTailExactlyOnceAfterSnapshotLoad ...................   Passed   10.90 sec
+        Start 119: RaftSnapshotRecoveryTest.StandaloneRestartFallsBackToOlderTrustedSnapshotWhenNewestSnapshotIsCorrupted
+119/158 Test #119: RaftSnapshotRecoveryTest.StandaloneRestartFallsBackToOlderTrustedSnapshotWhenNewestSnapshotIsCorrupted .......   Passed   14.03 sec
+        Start 120: RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam
+120/158 Test #120: RaftSnapshotRecoveryTest.RestartAfterSnapshotPublishFailureNeedsExactFailureInjectionSeam ....................   Passed   13.75 sec
+        Start 121: RaftSnapshotRecoveryTest.StandaloneRestartRejectsMetadataMismatchedVisibleSnapshotAndKeepsTrustedBoundary
+121/158 Test #121: RaftSnapshotRecoveryTest.StandaloneRestartRejectsMetadataMismatchedVisibleSnapshotAndKeepsTrustedBoundary ....   Passed    9.09 sec
+        Start 122: RaftSnapshotRecoveryTest.AllPublishedSnapshotsInvalidYieldNoTrustedSnapshot
+122/158 Test #122: RaftSnapshotRecoveryTest.AllPublishedSnapshotsInvalidYieldNoTrustedSnapshot ..................................   Passed    8.32 sec
+        Start 123: RaftSnapshotDiagnosisTest.RestartedSingleNodeLoadsSnapshotAndTailLogsWithoutPeers
+123/158 Test #123: RaftSnapshotDiagnosisTest.RestartedSingleNodeLoadsSnapshotAndTailLogsWithoutPeers ............................   Passed    7.48 sec
+        Start 124: RaftSnapshotDiagnosisTest.CompactedClusterReplicatesNewLogAfterRestartedLeaderStepsDown
+124/158 Test #124: RaftSnapshotDiagnosisTest.CompactedClusterReplicatesNewLogAfterRestartedLeaderStepsDown ......................   Passed    8.21 sec
+        Start 125: RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot
+125/158 Test #125: RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot .........   Passed    9.63 sec
+        Start 126: RaftSnapshotDiagnosisTest.RestartedSingleNodeSkipsMetadataMismatchedVisibleSnapshotAndReplaysCommittedTail
+126/158 Test #126: RaftSnapshotDiagnosisTest.RestartedSingleNodeSkipsMetadataMismatchedVisibleSnapshotAndReplaysCommittedTail ...   Passed    7.00 sec
+        Start 127: RaftSegmentStorageTest.WritesMultipleSegmentFilesUnderBuildDirectory
+127/158 Test #127: RaftSegmentStorageTest.WritesMultipleSegmentFilesUnderBuildDirectory .........................................   Passed    0.04 sec
+        Start 128: RaftSegmentStorageTest.AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave
+128/158 Test #128: RaftSegmentStorageTest.AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave ...............................   Passed    0.07 sec
+        Start 129: RaftSegmentStorageTest.TruncatesCorruptedSegmentTailDuringRecovery
+129/158 Test #129: RaftSegmentStorageTest.TruncatesCorruptedSegmentTailDuringRecovery ...........................................   Passed    0.05 sec
+        Start 130: RaftSegmentStorageTest.TruncatesPartialSegmentHeaderDuringRecovery
+130/158 Test #130: RaftSegmentStorageTest.TruncatesPartialSegmentHeaderDuringRecovery ...........................................   Passed    0.04 sec
+        Start 131: RaftSegmentStorageTest.SaveDoesNotLeaveTemporaryOrBackupLogDirectories
+131/158 Test #131: RaftSegmentStorageTest.SaveDoesNotLeaveTemporaryOrBackupLogDirectories .......................................   Passed    0.08 sec
+        Start 132: RaftSegmentStorageTest.SavePublishesMetaFileWithoutLeavingMetaTempFile
+132/158 Test #132: RaftSegmentStorageTest.SavePublishesMetaFileWithoutLeavingMetaTempFile .......................................   Passed    0.03 sec
+        Start 133: RaftSegmentStorageTest.RecoveryIgnoresTemporaryPublishArtifacts
+133/158 Test #133: RaftSegmentStorageTest.RecoveryIgnoresTemporaryPublishArtifacts ..............................................   Passed    0.03 sec
+        Start 134: RaftSegmentStorageTest.MetaAndLogPublishWindowUsesOnlyTrustedBoundary
+134/158 Test #134: RaftSegmentStorageTest.MetaAndLogPublishWindowUsesOnlyTrustedBoundary ........................................   Passed    0.06 sec
+        Start 135: RaftSegmentStorageTest.MissingFirstSegmentFailsBeforeTrustingPublishedBoundary
+135/158 Test #135: RaftSegmentStorageTest.MissingFirstSegmentFailsBeforeTrustingPublishedBoundary ...............................   Passed    0.04 sec
+        Start 136: RaftSegmentStorageTest.FinalSegmentTailTruncateKeepsTrustedLogPrefixAndClampsCommitApply
+136/158 Test #136: RaftSegmentStorageTest.FinalSegmentTailTruncateKeepsTrustedLogPrefixAndClampsCommitApply .....................   Passed    0.05 sec
+        Start 137: RaftSegmentStorageTest.LogDirectoryReplaceFailureNeedsExactFailureInjectionSeam
+137/158 Test #137: RaftSegmentStorageTest.LogDirectoryReplaceFailureNeedsExactFailureInjectionSeam ..............................   Passed    0.05 sec
+        Start 138: RaftSegmentStorageTest.LogDirectorySyncFailureNeedsExactFailureInjectionSeam
+138/158 Test #138: RaftSegmentStorageTest.LogDirectorySyncFailureNeedsExactFailureInjectionSeam .................................   Passed    0.04 sec
+        Start 139: RaftSegmentStorageTest.FinalSegmentPartialWriteNeedsExactFailureInjectionSeam
+139/158 Test #139: RaftSegmentStorageTest.FinalSegmentPartialWriteNeedsExactFailureInjectionSeam ................................   Passed    0.04 sec
+        Start 140: RaftSegmentStorageTest.MissingMetaFileCausesLoadToReportNoPersistedState
+140/158 Test #140: RaftSegmentStorageTest.MissingMetaFileCausesLoadToReportNoPersistedState .....................................   Passed    0.03 sec
+        Start 141: RaftSegmentStorageTest.CorruptedMetaFileFailsLoad
+141/158 Test #141: RaftSegmentStorageTest.CorruptedMetaFileFailsLoad ............................................................   Passed    0.03 sec
+        Start 142: RaftSegmentStorageTest.UnsupportedMetaVersionFailsLoadWithPathAndVersion
+142/158 Test #142: RaftSegmentStorageTest.UnsupportedMetaVersionFailsLoadWithPathAndVersion .....................................   Passed    0.03 sec
+        Start 143: RaftSegmentStorageTest.InconsistentMetaLogBoundaryFailsBeforeTrustingSegments
+143/158 Test #143: RaftSegmentStorageTest.InconsistentMetaLogBoundaryFailsBeforeTrustingSegments ................................   Passed    0.03 sec
+        Start 144: RaftSegmentStorageTest.CorruptedEarlierSegmentTailCleansLaterSegmentsAndReportsDiagnostics
+144/158 Test #144: RaftSegmentStorageTest.CorruptedEarlierSegmentTailCleansLaterSegmentsAndReportsDiagnostics ...................   Passed    0.05 sec
+        Start 145: RaftSegmentStorageTest.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory
+145/158 Test #145: RaftSegmentStorageTest.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory ....................   Passed   36.65 sec
+        Start 146: SnapshotStorageReliabilityTest.SavesSnapshotAsDirectoryWithDataAndMeta
+146/158 Test #146: SnapshotStorageReliabilityTest.SavesSnapshotAsDirectoryWithDataAndMeta .......................................   Passed    0.03 sec
+        Start 147: SnapshotStorageReliabilityTest.PublishesSnapshotWithCompatibleFinalLayout
+147/158 Test #147: SnapshotStorageReliabilityTest.PublishesSnapshotWithCompatibleFinalLayout ....................................   Passed    0.06 sec
+        Start 148: SnapshotStorageReliabilityTest.IgnoresStagingAndIncompleteSnapshotDirectories
+148/158 Test #148: SnapshotStorageReliabilityTest.IgnoresStagingAndIncompleteSnapshotDirectories ................................   Passed    0.04 sec
+        Start 149: SnapshotStorageReliabilityTest.ReportsValidationIssuesForSkippedSnapshotEntries
+149/158 Test #149: SnapshotStorageReliabilityTest.ReportsValidationIssuesForSkippedSnapshotEntries ..............................   Passed    0.09 sec
+        Start 150: SnapshotStorageReliabilityTest.FallsBackToOlderSnapshotWhenNewestIsCorrupted
+150/158 Test #150: SnapshotStorageReliabilityTest.FallsBackToOlderSnapshotWhenNewestIsCorrupted .................................   Passed    0.06 sec
+        Start 151: SnapshotStorageReliabilityTest.AllInvalidSnapshotsReturnNoTrustedSnapshotWithDiagnostics
+151/158 Test #151: SnapshotStorageReliabilityTest.AllInvalidSnapshotsReturnNoTrustedSnapshotWithDiagnostics .....................   Passed    0.06 sec
+        Start 152: SnapshotStorageReliabilityTest.SameIndexSameTermSaveIsIdempotent
+152/158 Test #152: SnapshotStorageReliabilityTest.SameIndexSameTermSaveIsIdempotent .............................................   Passed    0.04 sec
+        Start 153: SnapshotStorageReliabilityTest.PrunesOldSnapshotDirectoriesByIndex
+153/158 Test #153: SnapshotStorageReliabilityTest.PrunesOldSnapshotDirectoriesByIndex ...........................................   Passed    0.14 sec
+        Start 154: SnapshotStorageReliabilityTest.StagedSnapshotPublishFailureNeedsExactFailureInjectionSeam
+154/158 Test #154: SnapshotStorageReliabilityTest.StagedSnapshotPublishFailureNeedsExactFailureInjectionSeam ....................   Passed    0.05 sec
+        Start 155: SnapshotStorageReliabilityTest.SnapshotDirectorySyncFailureNeedsExactFailureInjectionSeam
+155/158 Test #155: SnapshotStorageReliabilityTest.SnapshotDirectorySyncFailureNeedsExactFailureInjectionSeam ....................   Passed    0.05 sec
+        Start 156: SnapshotStorageReliabilityTest.SnapshotPruneRemoveFailureNeedsExactFailureInjectionSeam
+156/158 Test #156: SnapshotStorageReliabilityTest.SnapshotPruneRemoveFailureNeedsExactFailureInjectionSeam ......................   Passed    0.10 sec
+        Start 157: RaftReplicatorBehaviorTest.SlowFollowerDoesNotBlockMajorityCommit
+157/158 Test #157: RaftReplicatorBehaviorTest.SlowFollowerDoesNotBlockMajorityCommit ............................................   Passed   12.42 sec
+        Start 158: RaftReplicatorBehaviorTest.SlowFollowerCatchesUpWhileLeaderKeepsAcceptingNewLogs
+158/158 Test #158: RaftReplicatorBehaviorTest.SlowFollowerCatchesUpWhileLeaderKeepsAcceptingNewLogs .............................   Passed   31.33 sec
+
+100% tests passed, 0 tests failed out of 158
+
+Label Time Summary:
+durability-boundary    =  32.32 sec*proc (4 tests)
+platform-neutral       = 419.40 sec*proc (154 tests)
+
+Total Test time (real) = 452.59 sec
+
+==== Result ====
+Linux full CMake/CTest validation PASS
+log saved to: tmp/linux/t010-linux-full-cmake-ctest.log
+]633;D;0]633;P;Cwd=/home/yangjilei/Code/C++/CQUPT_Raft[?2004h]633;A(base) ]0;yangjilei@CQUPT-LDJ: ~/Code/C++/CQUPT_Raft[01;32myangjilei@CQUPT-LDJ[00m:[01;34m~/Code/C++/CQUPT_Raft[00m$ ]633;B

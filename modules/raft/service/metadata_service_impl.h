@@ -2,7 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "raft.grpc.pb.h"
+#include "metadata.grpc.pb.h"
 
 namespace raftdemo
 {

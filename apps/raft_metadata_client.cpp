@@ -13,8 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "raft.grpc.pb.h"
-#include "raft.pb.h"
+#include "metadata.grpc.pb.h"
 
 namespace
 {
