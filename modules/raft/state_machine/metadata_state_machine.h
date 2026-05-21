@@ -51,6 +51,8 @@ namespace raftdemo
                                                std::string_view object_key) const;
         std::optional<std::string> FindIndexedObjectId(std::string_view bucket,
                                                        std::string_view object_key) const;
+        std::optional<std::vector<ChunkRef>> FindChunkRefs(std::string_view bucket,
+                                                           std::string_view object_key) const;
 
     private:
         mutable std::mutex mu_;
