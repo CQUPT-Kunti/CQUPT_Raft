@@ -16,7 +16,8 @@ namespace raftdemo
     namespace
     {
         constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
-        constexpr std::uint32_t kMetadataSnapshotVersion = 1U;
+        constexpr std::uint32_t kStrongConsistencyMetadataSnapshotVersion = 1U;
+        constexpr std::uint32_t kMetadataStateMachineSnapshotVersion = 2U;
         ApplyResult MakeApplyFailure(const std::string &message)
         {
             return {false, message};
@@ -210,6 +211,36 @@ namespace raftdemo
             case MetadataOperation::kDelete:
                 return true;
             case MetadataOperation::kUnknown:
+            default:
+                return false;
+            }
+        }
+
+        bool IsValidObjectState(const ObjectState state)
+        {
+            switch (state)
+            {
+            case ObjectState::PENDING:
+            case ObjectState::COMMITTED:
+            case ObjectState::DELETED:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool IsValidMetadataRequestType(const MetadataRequestType type)
+        {
+            switch (type)
+            {
+            case MetadataRequestType::kUnknown:
+            case MetadataRequestType::kCreateBucket:
+            case MetadataRequestType::kDeleteBucket:
+            case MetadataRequestType::kCreateObject:
+            case MetadataRequestType::kCommitObject:
+            case MetadataRequestType::kAbortObject:
+            case MetadataRequestType::kDeleteObject:
+                return true;
             default:
                 return false;
             }
@@ -442,6 +473,198 @@ namespace raftdemo
             return true;
         }
 
+        bool WriteBucketRecord(std::ofstream &out,
+                               const BucketRecord &record)
+        {
+            return WriteString(out, record.bucket) &&
+                   WritePod(out, record.create_time) &&
+                   WritePod(out, static_cast<std::uint8_t>(record.deleted ? 1U : 0U)) &&
+                   WriteOptionalUInt64(out, record.delete_time);
+        }
+
+        bool ReadBucketRecord(std::ifstream &in,
+                              BucketRecord *record)
+        {
+            if (record == nullptr)
+            {
+                return false;
+            }
+
+            BucketRecord decoded;
+            std::uint8_t deleted = 0;
+            if (!ReadString(in, &decoded.bucket) ||
+                !ReadPod(in, &decoded.create_time) ||
+                !ReadPod(in, &deleted) ||
+                deleted > 1U ||
+                !ReadOptionalUInt64(in, &decoded.delete_time))
+            {
+                return false;
+            }
+            decoded.deleted = deleted == 1U;
+            *record = std::move(decoded);
+            return true;
+        }
+
+        bool WriteChunkRef(std::ofstream &out,
+                           const ChunkRef &chunk)
+        {
+            return WriteString(out, chunk.chunk_id) &&
+                   WritePod(out, chunk.offset) &&
+                   WritePod(out, chunk.size) &&
+                   WriteStringVector(out, chunk.replica_nodes) &&
+                   WriteString(out, chunk.checksum);
+        }
+
+        bool ReadChunkRef(std::ifstream &in,
+                          ChunkRef *chunk)
+        {
+            if (chunk == nullptr)
+            {
+                return false;
+            }
+
+            ChunkRef decoded;
+            if (!ReadString(in, &decoded.chunk_id) ||
+                !ReadPod(in, &decoded.offset) ||
+                !ReadPod(in, &decoded.size) ||
+                !ReadStringVector(in, &decoded.replica_nodes) ||
+                !ReadString(in, &decoded.checksum))
+            {
+                return false;
+            }
+            *chunk = std::move(decoded);
+            return true;
+        }
+
+        bool WriteChunkRefVector(std::ofstream &out,
+                                 const std::vector<ChunkRef> &chunks)
+        {
+            const std::uint64_t size = static_cast<std::uint64_t>(chunks.size());
+            if (!WritePod(out, size))
+            {
+                return false;
+            }
+            for (const ChunkRef &chunk : chunks)
+            {
+                if (!WriteChunkRef(out, chunk))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool ReadChunkRefVector(std::ifstream &in,
+                                std::vector<ChunkRef> *chunks)
+        {
+            if (chunks == nullptr)
+            {
+                return false;
+            }
+
+            std::uint64_t size = 0;
+            if (!ReadPod(in, &size))
+            {
+                return false;
+            }
+
+            std::vector<ChunkRef> decoded;
+            decoded.reserve(static_cast<std::size_t>(size));
+            for (std::uint64_t i = 0; i < size; ++i)
+            {
+                ChunkRef chunk;
+                if (!ReadChunkRef(in, &chunk))
+                {
+                    return false;
+                }
+                decoded.push_back(std::move(chunk));
+            }
+            *chunks = std::move(decoded);
+            return true;
+        }
+
+        bool WriteObjectRecord(std::ofstream &out,
+                               const ObjectRecord &record)
+        {
+            return WriteString(out, record.bucket) &&
+                   WriteString(out, record.object_key) &&
+                   WriteString(out, record.object_id) &&
+                   WritePod(out, record.version) &&
+                   WritePod(out, record.size) &&
+                   WriteString(out, record.etag) &&
+                   WriteEnum(out, record.state) &&
+                   WriteChunkRefVector(out, record.chunks) &&
+                   WritePod(out, record.create_time) &&
+                   WriteOptionalUInt64(out, record.commit_time) &&
+                   WriteOptionalUInt64(out, record.delete_time);
+        }
+
+        bool ReadObjectRecord(std::ifstream &in,
+                              ObjectRecord *record)
+        {
+            if (record == nullptr)
+            {
+                return false;
+            }
+
+            ObjectRecord decoded;
+            if (!ReadString(in, &decoded.bucket) ||
+                !ReadString(in, &decoded.object_key) ||
+                !ReadString(in, &decoded.object_id) ||
+                !ReadPod(in, &decoded.version) ||
+                !ReadPod(in, &decoded.size) ||
+                !ReadString(in, &decoded.etag) ||
+                !ReadEnum(in, &decoded.state) ||
+                !IsValidObjectState(decoded.state) ||
+                !ReadChunkRefVector(in, &decoded.chunks) ||
+                !ReadPod(in, &decoded.create_time) ||
+                !ReadOptionalUInt64(in, &decoded.commit_time) ||
+                !ReadOptionalUInt64(in, &decoded.delete_time))
+            {
+                return false;
+            }
+            *record = std::move(decoded);
+            return true;
+        }
+
+        bool WriteRequestRecord(std::ofstream &out,
+                                const RequestRecord &record)
+        {
+            return WriteString(out, record.request_id) &&
+                   WriteEnum(out, record.command_type) &&
+                   WriteString(out, record.bucket) &&
+                   WriteString(out, record.object_key) &&
+                   WriteString(out, record.result_status) &&
+                   WritePod(out, record.applied_index) &&
+                   WritePod(out, record.create_time) &&
+                   WriteOptionalUInt64(out, record.finish_time);
+        }
+
+        bool ReadRequestRecord(std::ifstream &in,
+                               RequestRecord *record)
+        {
+            if (record == nullptr)
+            {
+                return false;
+            }
+
+            RequestRecord decoded;
+            if (!ReadString(in, &decoded.request_id) ||
+                !ReadEnum(in, &decoded.command_type) ||
+                !IsValidMetadataRequestType(decoded.command_type) ||
+                !ReadString(in, &decoded.bucket) ||
+                !ReadString(in, &decoded.object_key) ||
+                !ReadString(in, &decoded.result_status) ||
+                !ReadPod(in, &decoded.applied_index) ||
+                !ReadPod(in, &decoded.create_time) ||
+                !ReadOptionalUInt64(in, &decoded.finish_time))
+            {
+                return false;
+            }
+            *record = std::move(decoded);
+            return true;
+        }
+
         bool WriteMetadataRecord(std::ofstream &out,
                                  const MetadataRecord &record)
         {
@@ -661,6 +884,200 @@ namespace raftdemo
             }
 
             *entry = std::move(decoded);
+            return true;
+        }
+
+        bool ChunkRefEquals(const ChunkRef &left,
+                            const ChunkRef &right)
+        {
+            return left.chunk_id == right.chunk_id &&
+                   left.offset == right.offset &&
+                   left.size == right.size &&
+                   left.replica_nodes == right.replica_nodes &&
+                   left.checksum == right.checksum;
+        }
+
+        bool ChunkRefVectorEquals(const std::vector<ChunkRef> &left,
+                                  const std::vector<ChunkRef> &right)
+        {
+            if (left.size() != right.size())
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < left.size(); ++i)
+            {
+                if (!ChunkRefEquals(left[i], right[i]))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool ValidateLoadedMetadataState(
+            const std::unordered_map<std::string, BucketRecord> &buckets,
+            const std::unordered_map<std::string, ObjectRecord> &objects,
+            const std::unordered_map<std::string, std::vector<std::string>> &object_index,
+            const std::unordered_map<std::string, std::vector<ChunkRef>> &chunk_ref_index,
+            const std::unordered_map<ClientRequestId, RequestRecord> &requests,
+            const std::unordered_map<ClientRequestId, std::string> &request_fingerprints,
+            const std::unordered_map<std::string, Tombstone> &tombstones,
+            std::string *error)
+        {
+            auto set_error = [error](std::string message)
+            {
+                if (error != nullptr)
+                {
+                    *error = std::move(message);
+                }
+                return false;
+            };
+
+            for (const auto &[request_id, record] : requests)
+            {
+                if (request_id.empty() || record.request_id != request_id)
+                {
+                    return set_error("invalid request table entry");
+                }
+                const auto fingerprint_it = request_fingerprints.find(request_id);
+                if (fingerprint_it == request_fingerprints.end() ||
+                    fingerprint_it->second.empty())
+                {
+                    return set_error("request fingerprint is missing");
+                }
+            }
+
+            if (requests.size() != request_fingerprints.size())
+            {
+                return set_error("request table and fingerprint table size mismatch");
+            }
+
+            for (const auto &[request_id, fingerprint] : request_fingerprints)
+            {
+                if (request_id.empty() || fingerprint.empty())
+                {
+                    return set_error("invalid request fingerprint entry");
+                }
+                if (requests.find(request_id) == requests.end())
+                {
+                    return set_error("request fingerprint has no matching request");
+                }
+            }
+
+            for (const auto &[identity, record] : objects)
+            {
+                if (identity != MakeObjectIdentity(record.bucket, record.object_key))
+                {
+                    return set_error("object identity does not match object record");
+                }
+                if (buckets.find(record.bucket) == buckets.end())
+                {
+                    return set_error("object references missing bucket");
+                }
+
+                const auto index_it = object_index.find(identity);
+                if (record.IsDeleted())
+                {
+                    if (index_it != object_index.end())
+                    {
+                        return set_error("deleted object still present in object index");
+                    }
+                    if (chunk_ref_index.find(identity) != chunk_ref_index.end())
+                    {
+                        return set_error("deleted object still present in chunk ref index");
+                    }
+                    const auto tombstone_it = tombstones.find(identity);
+                    if (tombstone_it == tombstones.end() ||
+                        tombstone_it->second.object_key != record.object_key)
+                    {
+                        return set_error("deleted object is missing tombstone");
+                    }
+                    continue;
+                }
+
+                if (index_it == object_index.end() || index_it->second.empty())
+                {
+                    return set_error("live object is missing object index entry");
+                }
+                if (std::find(index_it->second.begin(), index_it->second.end(), record.object_id) ==
+                    index_it->second.end())
+                {
+                    return set_error("object index does not reference object_id");
+                }
+                if (tombstones.find(identity) != tombstones.end())
+                {
+                    return set_error("live object unexpectedly has tombstone");
+                }
+
+                const auto chunk_it = chunk_ref_index.find(identity);
+                if (record.IsCommitted())
+                {
+                    if (chunk_it == chunk_ref_index.end())
+                    {
+                        return set_error("committed object is missing chunk ref index");
+                    }
+                    if (!ChunkRefVectorEquals(chunk_it->second, record.chunks))
+                    {
+                        return set_error("chunk ref index does not match committed object");
+                    }
+                }
+                else if (chunk_it != chunk_ref_index.end())
+                {
+                    return set_error("non-committed object unexpectedly has chunk ref index");
+                }
+            }
+
+            for (const auto &[identity, ids] : object_index)
+            {
+                const auto object_it = objects.find(identity);
+                if (object_it == objects.end())
+                {
+                    return set_error("object index references missing object");
+                }
+                if (object_it->second.IsDeleted())
+                {
+                    return set_error("object index references deleted object");
+                }
+                if (ids.empty())
+                {
+                    return set_error("object index entry is empty");
+                }
+            }
+
+            for (const auto &[identity, chunks] : chunk_ref_index)
+            {
+                const auto object_it = objects.find(identity);
+                if (object_it == objects.end())
+                {
+                    return set_error("chunk ref index references missing object");
+                }
+                if (!object_it->second.IsCommitted())
+                {
+                    return set_error("chunk ref index references non-committed object");
+                }
+                if (!ChunkRefVectorEquals(chunks, object_it->second.chunks))
+                {
+                    return set_error("chunk ref index entry does not match object chunks");
+                }
+            }
+
+            for (const auto &[identity, tombstone] : tombstones)
+            {
+                const auto object_it = objects.find(identity);
+                if (object_it == objects.end())
+                {
+                    return set_error("tombstone references missing object");
+                }
+                if (!object_it->second.IsDeleted())
+                {
+                    return set_error("tombstone references non-deleted object");
+                }
+                if (tombstone.object_key != object_it->second.object_key)
+                {
+                    return set_error("tombstone object_key mismatch");
+                }
+            }
+
             return true;
         }
     } // namespace
@@ -1029,8 +1446,172 @@ namespace raftdemo
         {
             return {SnapshotStatus::kInvalidArgument, "snapshot file path is empty"};
         }
-        return {SnapshotStatus::kInternalError,
-                "metadata state machine skeleton snapshot save not implemented"};
+
+        std::vector<std::pair<std::string, BucketRecord>> buckets;
+        std::vector<std::pair<std::string, ObjectRecord>> objects;
+        std::vector<std::pair<std::string, std::vector<std::string>>> object_index;
+        std::vector<std::pair<std::string, std::vector<ChunkRef>>> chunk_ref_index;
+        std::vector<std::pair<ClientRequestId, RequestRecord>> requests;
+        std::vector<std::pair<ClientRequestId, std::string>> request_fingerprints;
+        std::vector<std::pair<std::string, Tombstone>> tombstones;
+        std::uint64_t last_applied_index = 0;
+        std::uint64_t last_applied_term = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            last_applied_index = last_applied_index_;
+            last_applied_term = last_applied_term_;
+            buckets.assign(buckets_.begin(), buckets_.end());
+            objects.assign(objects_.begin(), objects_.end());
+            object_index.assign(object_index_.begin(), object_index_.end());
+            chunk_ref_index.assign(chunk_ref_index_.begin(), chunk_ref_index_.end());
+            requests.assign(requests_.begin(), requests_.end());
+            request_fingerprints.assign(request_fingerprints_.begin(), request_fingerprints_.end());
+            tombstones.assign(tombstones_.begin(), tombstones_.end());
+        }
+
+        auto sort_by_key = [](auto &entries)
+        {
+            std::sort(entries.begin(), entries.end(),
+                      [](const auto &left, const auto &right)
+                      {
+                          return left.first < right.first;
+                      });
+        };
+        sort_by_key(buckets);
+        sort_by_key(objects);
+        sort_by_key(object_index);
+        sort_by_key(chunk_ref_index);
+        sort_by_key(requests);
+        sort_by_key(request_fingerprints);
+        sort_by_key(tombstones);
+
+        std::error_code ec;
+        const std::filesystem::path snapshot_path(file_path);
+        const std::filesystem::path parent = snapshot_path.parent_path();
+        const std::filesystem::path temp_path = parent /
+                                                (snapshot_path.filename().string() + ".tmp");
+
+        if (!parent.empty())
+        {
+            std::filesystem::create_directories(parent, ec);
+            if (ec)
+            {
+                return {SnapshotStatus::kIoError,
+                        "create metadata state machine snapshot directory failed: " + ec.message()};
+            }
+        }
+
+        {
+            std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+            if (!out.is_open())
+            {
+                return {SnapshotStatus::kIoError,
+                        "open temp metadata state machine snapshot file failed: " + temp_path.string()};
+            }
+
+            if (!WritePod(out, kMetadataSnapshotMagic) ||
+                !WritePod(out, kMetadataStateMachineSnapshotVersion) ||
+                !WritePod(out, last_applied_index) ||
+                !WritePod(out, last_applied_term) ||
+                !WritePod(out, static_cast<std::uint64_t>(buckets.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(objects.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(object_index.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(chunk_ref_index.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(requests.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(request_fingerprints.size())) ||
+                !WritePod(out, static_cast<std::uint64_t>(tombstones.size())))
+            {
+                return {SnapshotStatus::kIoError,
+                        "write metadata state machine snapshot header failed"};
+            }
+
+            for (const auto &[key, record] : buckets)
+            {
+                if (key != record.bucket || !WriteBucketRecord(out, record))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine bucket failed"};
+                }
+            }
+            for (const auto &[key, record] : objects)
+            {
+                if (key != MakeObjectIdentity(record.bucket, record.object_key) ||
+                    !WriteObjectRecord(out, record))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine object failed"};
+                }
+            }
+            for (const auto &[key, values] : object_index)
+            {
+                if (!WriteString(out, key) || !WriteStringVector(out, values))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine object index failed"};
+                }
+            }
+            for (const auto &[key, values] : chunk_ref_index)
+            {
+                if (!WriteString(out, key) || !WriteChunkRefVector(out, values))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine chunk ref index failed"};
+                }
+            }
+            for (const auto &[key, record] : requests)
+            {
+                if (key != record.request_id || !WriteRequestRecord(out, record))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine request failed"};
+                }
+            }
+            for (const auto &[key, value] : request_fingerprints)
+            {
+                if (!WriteString(out, key) || !WriteString(out, value))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine request fingerprint failed"};
+                }
+            }
+            for (const auto &[key, tombstone] : tombstones)
+            {
+                if (!WriteString(out, key) || !WriteTombstone(out, tombstone))
+                {
+                    return {SnapshotStatus::kIoError,
+                            "write metadata state machine tombstone failed"};
+                }
+            }
+
+            out.flush();
+            if (!out)
+            {
+                return {SnapshotStatus::kIoError,
+                        "flush metadata state machine snapshot file failed"};
+            }
+        }
+
+        ec.clear();
+        if (std::filesystem::exists(snapshot_path, ec))
+        {
+            ec.clear();
+            std::filesystem::remove(snapshot_path, ec);
+            if (ec)
+            {
+                return {SnapshotStatus::kIoError,
+                        "remove old metadata state machine snapshot file failed: " + ec.message()};
+            }
+        }
+
+        ec.clear();
+        std::filesystem::rename(temp_path, snapshot_path, ec);
+        if (ec)
+        {
+            return {SnapshotStatus::kIoError,
+                    "rename metadata state machine snapshot file failed: " + ec.message()};
+        }
+
+        return {SnapshotStatus::kOk, "ok"};
     }
 
     SnapshotResult MetadataStateMachine::LoadSnapshot(const std::string &file_path)
@@ -1046,8 +1627,195 @@ namespace raftdemo
             return {SnapshotStatus::kNotFound, "snapshot file not found: " + file_path};
         }
 
-        return {SnapshotStatus::kInternalError,
-                "metadata state machine skeleton snapshot load not implemented"};
+        std::ifstream in(file_path, std::ios::binary);
+        if (!in.is_open())
+        {
+            return {SnapshotStatus::kIoError,
+                    "failed to open metadata state machine snapshot file: " + file_path};
+        }
+
+        std::uint32_t magic = 0;
+        std::uint32_t version = 0;
+        std::uint64_t last_applied_index = 0;
+        std::uint64_t last_applied_term = 0;
+        std::uint64_t bucket_count = 0;
+        std::uint64_t object_count = 0;
+        std::uint64_t object_index_count = 0;
+        std::uint64_t chunk_ref_index_count = 0;
+        std::uint64_t request_count = 0;
+        std::uint64_t request_fingerprint_count = 0;
+        std::uint64_t tombstone_count = 0;
+        if (!ReadPod(in, &magic) ||
+            !ReadPod(in, &version) ||
+            !ReadPod(in, &last_applied_index) ||
+            !ReadPod(in, &last_applied_term) ||
+            !ReadPod(in, &bucket_count) ||
+            !ReadPod(in, &object_count) ||
+            !ReadPod(in, &object_index_count) ||
+            !ReadPod(in, &chunk_ref_index_count) ||
+            !ReadPod(in, &request_count) ||
+            !ReadPod(in, &request_fingerprint_count) ||
+            !ReadPod(in, &tombstone_count))
+        {
+            return {SnapshotStatus::kCorruptedData,
+                    "failed to read metadata state machine snapshot header"};
+        }
+        if (magic != kMetadataSnapshotMagic)
+        {
+            return {SnapshotStatus::kCorruptedData,
+                    "invalid metadata state machine snapshot magic"};
+        }
+        if (version != kMetadataStateMachineSnapshotVersion)
+        {
+            return {SnapshotStatus::kVersionMismatch,
+                    "unsupported metadata state machine snapshot version"};
+        }
+
+        std::unordered_map<std::string, BucketRecord> new_buckets;
+        for (std::uint64_t i = 0; i < bucket_count; ++i)
+        {
+            BucketRecord record;
+            if (!ReadBucketRecord(in, &record))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine bucket"};
+            }
+            if (!new_buckets.emplace(record.bucket, std::move(record)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine bucket key"};
+            }
+        }
+
+        std::unordered_map<std::string, ObjectRecord> new_objects;
+        for (std::uint64_t i = 0; i < object_count; ++i)
+        {
+            ObjectRecord record;
+            if (!ReadObjectRecord(in, &record))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine object"};
+            }
+            const std::string identity = MakeObjectIdentity(record.bucket, record.object_key);
+            if (!new_objects.emplace(identity, std::move(record)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine object key"};
+            }
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> new_object_index;
+        for (std::uint64_t i = 0; i < object_index_count; ++i)
+        {
+            std::string key;
+            std::vector<std::string> values;
+            if (!ReadString(in, &key) || !ReadStringVector(in, &values))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine object index"};
+            }
+            if (!new_object_index.emplace(std::move(key), std::move(values)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine object index key"};
+            }
+        }
+
+        std::unordered_map<std::string, std::vector<ChunkRef>> new_chunk_ref_index;
+        for (std::uint64_t i = 0; i < chunk_ref_index_count; ++i)
+        {
+            std::string key;
+            std::vector<ChunkRef> values;
+            if (!ReadString(in, &key) || !ReadChunkRefVector(in, &values))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine chunk ref index"};
+            }
+            if (!new_chunk_ref_index.emplace(std::move(key), std::move(values)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine chunk ref index key"};
+            }
+        }
+
+        std::unordered_map<ClientRequestId, RequestRecord> new_requests;
+        for (std::uint64_t i = 0; i < request_count; ++i)
+        {
+            RequestRecord record;
+            if (!ReadRequestRecord(in, &record))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine request"};
+            }
+            if (!new_requests.emplace(record.request_id, std::move(record)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine request_id"};
+            }
+        }
+
+        std::unordered_map<ClientRequestId, std::string> new_request_fingerprints;
+        for (std::uint64_t i = 0; i < request_fingerprint_count; ++i)
+        {
+            std::string key;
+            std::string value;
+            if (!ReadString(in, &key) || !ReadString(in, &value))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine request fingerprint"};
+            }
+            if (!new_request_fingerprints.emplace(std::move(key), std::move(value)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine request fingerprint key"};
+            }
+        }
+
+        std::unordered_map<std::string, Tombstone> new_tombstones;
+        for (std::uint64_t i = 0; i < tombstone_count; ++i)
+        {
+            std::string key;
+            Tombstone tombstone;
+            if (!ReadString(in, &key) || !ReadTombstone(in, &tombstone))
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "failed to read metadata state machine tombstone"};
+            }
+            if (!new_tombstones.emplace(std::move(key), std::move(tombstone)).second)
+            {
+                return {SnapshotStatus::kCorruptedData,
+                        "duplicate metadata state machine tombstone key"};
+            }
+        }
+
+        std::string validation_error;
+        if (!ValidateLoadedMetadataState(new_buckets,
+                                         new_objects,
+                                         new_object_index,
+                                         new_chunk_ref_index,
+                                         new_requests,
+                                         new_request_fingerprints,
+                                         new_tombstones,
+                                         &validation_error))
+        {
+            return {SnapshotStatus::kCorruptedData,
+                    "invalid metadata state machine snapshot state: " + validation_error};
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            last_applied_index_ = last_applied_index;
+            last_applied_term_ = last_applied_term;
+            buckets_ = std::move(new_buckets);
+            objects_ = std::move(new_objects);
+            object_index_ = std::move(new_object_index);
+            chunk_ref_index_ = std::move(new_chunk_ref_index);
+            requests_ = std::move(new_requests);
+            request_fingerprints_ = std::move(new_request_fingerprints);
+            tombstones_ = std::move(new_tombstones);
+        }
+
+        return {SnapshotStatus::kOk, "ok"};
     }
 
     MetadataHeadObjectResponse MetadataStateMachine::HeadObject(
@@ -1506,7 +2274,7 @@ namespace raftdemo
             }
 
             const std::uint32_t magic = kMetadataSnapshotMagic;
-            const std::uint32_t version = kMetadataSnapshotVersion;
+            const std::uint32_t version = kStrongConsistencyMetadataSnapshotVersion;
             const std::uint64_t record_count = static_cast<std::uint64_t>(records.size());
             const std::uint64_t tombstone_count = static_cast<std::uint64_t>(tombstones.size());
             const std::uint64_t replay_count = static_cast<std::uint64_t>(replay_entries.size());
@@ -1612,7 +2380,7 @@ namespace raftdemo
         {
             return {SnapshotStatus::kCorruptedData, "invalid metadata snapshot magic"};
         }
-        if (version != kMetadataSnapshotVersion)
+        if (version != kStrongConsistencyMetadataSnapshotVersion)
         {
             return {SnapshotStatus::kVersionMismatch,
                     "unsupported metadata snapshot version"};

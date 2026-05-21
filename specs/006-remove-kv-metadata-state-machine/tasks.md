@@ -93,7 +93,7 @@
 
 - [x] T018 [P] [US2] 扩展 `tests/metadata_command_test.cpp`，覆盖 bucket/object/abort/delete 的 V2 序列化、反序列化、fingerprint 与非法输入约束
 - [x] T019 [P] [US2] 重写 `tests/metadata_state_machine_test.cpp`，覆盖 bucket 生命周期、对象 `PENDING/COMMITTED/DELETED` 状态转换、abort 语义、request_id 幂等与 stale retry 冲突
-- [ ] T020 [P] [US2] 新增 `tests/metadata_service_e2e_test.cpp`，覆盖 `CreateBucket`、`DeleteBucket`、`CreateObject`、`CommitObject`、`AbortObject`、`DeleteObject`、`HeadObject`、`ListObjects` 的端到端契约
+- [x] T020 [P] [US2] 新增 `tests/metadata_service_e2e_test.cpp`，覆盖 `CreateBucket`、`DeleteBucket`、`CreateObject`、`CommitObject`、`AbortObject`、`DeleteObject`、`HeadObject`、`ListObjects` 的端到端契约
 
 ### Implementation for User Story 2
 

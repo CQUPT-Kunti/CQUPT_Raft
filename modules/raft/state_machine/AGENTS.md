@@ -24,6 +24,7 @@
 - `MetadataStateMachine` 当前可承载 DeleteObject 的最小删除态 apply 占位
 - `MetadataStateMachine` 当前可承载 committed-only 的 HeadObject / ListObjects 最小查询占位
 - `MetadataStateMachine` 当前可承载 request_id 最小幂等去重占位
+- `MetadataStateMachine` 当前可承载 bucket/object/index/request/tombstone/applied-boundary 的最小 snapshot save/load
 - 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
 - 保存和加载状态机 snapshot
