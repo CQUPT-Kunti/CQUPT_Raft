@@ -119,6 +119,12 @@ namespace raftdemo
             return false;
         }
 
+        std::string MakeObjectIdentity(std::string_view bucket,
+                                       std::string_view object_key)
+        {
+            return std::string(bucket) + "\n" + std::string(object_key);
+        }
+
         bool StartsWith(const std::string &value, const std::string &prefix)
         {
             return value.size() >= prefix.size() &&
@@ -740,6 +746,39 @@ namespace raftdemo
             return {true, "ok"};
         }
 
+        if (command.IsCreateObjectCommand())
+        {
+            const ObjectRecord &payload = command.create_object->object_record;
+            const auto bucket_it = buckets_.find(payload.bucket);
+            if (bucket_it == buckets_.end())
+            {
+                return MakeApplyFailure("not found: bucket does not exist");
+            }
+            if (bucket_it->second.deleted)
+            {
+                return MakeApplyFailure("state conflict: bucket is deleted");
+            }
+
+            const std::string object_identity =
+                MakeObjectIdentity(payload.bucket, payload.object_key);
+            const auto existing = objects_.find(object_identity);
+            if (existing != objects_.end() && !existing->second.IsDeleted())
+            {
+                return MakeApplyFailure("state conflict: object already exists");
+            }
+
+            ObjectRecord record = payload;
+            record.state = ObjectState::PENDING;
+            objects_[object_identity] = record;
+            object_index_[object_identity] = {record.object_id};
+            requests_[command.request_id] =
+                MakeAppliedRequestRecord(command, record.bucket, "ok", index);
+            requests_[command.request_id].object_key = record.object_key;
+            last_applied_index_ = index;
+            last_applied_term_ = 0;
+            return {true, "ok"};
+        }
+
         return MakeApplyFailure("unsupported metadata command type: " +
                                 CommandTypeToString(command.command_type));
     }
@@ -872,6 +911,32 @@ namespace raftdemo
             return std::nullopt;
         }
         return it->second;
+    }
+
+    std::optional<ObjectRecord> MetadataStateMachine::FindObject(
+        std::string_view bucket,
+        std::string_view object_key) const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = objects_.find(MakeObjectIdentity(bucket, object_key));
+        if (it == objects_.end())
+        {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    std::optional<std::string> MetadataStateMachine::FindIndexedObjectId(
+        std::string_view bucket,
+        std::string_view object_key) const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = object_index_.find(MakeObjectIdentity(bucket, object_key));
+        if (it == object_index_.end() || it->second.empty())
+        {
+            return std::nullopt;
+        }
+        return it->second.front();
     }
 
     ApplyResult StrongConsistencyMetadataStateMachine::Apply(std::uint64_t index,

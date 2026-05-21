@@ -47,6 +47,10 @@ namespace raftdemo
         std::size_t RequestCount() const;
         std::size_t TombstoneCount() const;
         std::optional<BucketRecord> FindBucket(std::string_view bucket) const;
+        std::optional<ObjectRecord> FindObject(std::string_view bucket,
+                                               std::string_view object_key) const;
+        std::optional<std::string> FindIndexedObjectId(std::string_view bucket,
+                                                       std::string_view object_key) const;
 
     private:
         mutable std::mutex mu_;
