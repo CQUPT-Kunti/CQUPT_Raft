@@ -17,6 +17,7 @@
 
 - 定义 `Command`
 - 定义 metadata records / metadata command / metadata result 的共享契约
+- 定义 metadata command types 与 read-model query skeleton
 - 定义 `NodeConfig`、`snapshotConfig`
 - 定义 `ProposeResult`
 - 保持 `SET|key|value`、`DEL|key|` 命令格式
@@ -43,12 +44,14 @@
 - `tests/metadata_command_test.cpp`
 - `tests/metadata_manifest_test.cpp`
 - `tests/metadata_records_test.cpp`
+- `tests/metadata_command_types_test.cpp`
 - 大多数 Raft 集成测试会间接使用这里的定义
 
 ## Risk Areas
 
 - 命令字符串格式
 - metadata 共享结构字段稳定性
+- metadata command type / payload 结构稳定性
 - 配置字段默认值
 
 ## Context Hints

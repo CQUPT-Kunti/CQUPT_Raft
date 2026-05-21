@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -37,6 +38,17 @@ namespace raftdemo
     };
 
     enum class MetadataRequestType : uint8_t
+    {
+        kUnknown = 0,
+        kCreateBucket = 1,
+        kDeleteBucket = 2,
+        kCreateObject = 3,
+        kCommitObject = 4,
+        kAbortObject = 5,
+        kDeleteObject = 6,
+    };
+
+    enum class MetadataCommandType : uint8_t
     {
         kUnknown = 0,
         kCreateBucket = 1,
@@ -121,6 +133,73 @@ namespace raftdemo
         }
     };
 
+    struct CreateBucketCommandPayload
+    {
+        BucketRecord bucket_record;
+    };
+
+    struct DeleteBucketCommandPayload
+    {
+        std::string bucket;
+        bool if_empty = true;
+    };
+
+    struct CreateObjectCommandPayload
+    {
+        ObjectRecord object_record;
+    };
+
+    struct CommitObjectCommandPayload
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        uint64_t version = 0;
+        uint64_t size = 0;
+        std::string etag;
+        std::vector<ChunkRef> chunks;
+        std::optional<uint64_t> commit_time;
+
+        bool HasChunks() const
+        {
+            return !chunks.empty();
+        }
+    };
+
+    struct AbortObjectCommandPayload
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        uint64_t version = 0;
+    };
+
+    struct DeleteObjectCommandPayload
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        uint64_t version = 0;
+        std::optional<uint64_t> delete_time;
+    };
+
+    struct HeadObjectQuery
+    {
+        std::string bucket;
+        std::string object_key;
+        std::optional<std::string> object_id;
+        std::optional<uint64_t> version;
+    };
+
+    struct ListObjectsQuery
+    {
+        std::string bucket;
+        std::string prefix;
+        std::optional<std::size_t> limit;
+        std::string continuation_token;
+        bool include_deleted = false;
+    };
+
     struct MetadataRecord
     {
         std::string object_key;
@@ -179,6 +258,14 @@ namespace raftdemo
         std::optional<MetadataRecord> record;
         std::string commit_info;
         std::string delete_info;
+        MetadataCommandType command_type = MetadataCommandType::kUnknown;
+        std::optional<RequestRecord> request_context;
+        std::optional<CreateBucketCommandPayload> create_bucket;
+        std::optional<DeleteBucketCommandPayload> delete_bucket;
+        std::optional<CreateObjectCommandPayload> create_object;
+        std::optional<CommitObjectCommandPayload> commit_object;
+        std::optional<AbortObjectCommandPayload> abort_object;
+        std::optional<DeleteObjectCommandPayload> delete_object;
 
         bool IsCreate() const
         {
@@ -198,6 +285,46 @@ namespace raftdemo
         bool HasRecordPayload() const
         {
             return record.has_value();
+        }
+
+        bool IsWriteCommand() const
+        {
+            return command_type != MetadataCommandType::kUnknown;
+        }
+
+        bool IsCreateBucketCommand() const
+        {
+            return command_type == MetadataCommandType::kCreateBucket;
+        }
+
+        bool IsDeleteBucketCommand() const
+        {
+            return command_type == MetadataCommandType::kDeleteBucket;
+        }
+
+        bool IsCreateObjectCommand() const
+        {
+            return command_type == MetadataCommandType::kCreateObject;
+        }
+
+        bool IsCommitObjectCommand() const
+        {
+            return command_type == MetadataCommandType::kCommitObject;
+        }
+
+        bool IsAbortObjectCommand() const
+        {
+            return command_type == MetadataCommandType::kAbortObject;
+        }
+
+        bool IsDeleteObjectCommand() const
+        {
+            return command_type == MetadataCommandType::kDeleteObject;
+        }
+
+        bool CarriesChunkRefs() const
+        {
+            return commit_object.has_value() && commit_object->HasChunks();
         }
     };
 
