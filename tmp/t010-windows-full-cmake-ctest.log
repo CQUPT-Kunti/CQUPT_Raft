@@ -1,0 +1,64 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260521121051
+用户名: DESKTOP-DFVMAH9\Lei
+RunAs 用户: DESKTOP-DFVMAH9\Lei
+配置名称: 
+计算机: DESKTOP-DFVMAH9 (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File ./run_t010_windows_full_validation.ps1
+进程 ID: 10144
+PSVersion: 5.1.26100.8457
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8457
+BuildVersion: 10.0.26100.8457
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 tmp\t010-windows-full-cmake-ctest.log
+==== T010 Windows Full CMake/CTest Validation ====
+time: 2026-05-21 12:10:51
+repo: D:\Code\C++\CQUPT_Raft
+cmake: C:\Program Files\CMake\bin\cmake.exe
+ctest: C:\Program Files\CMake\bin\ctest.exe
+log: tmp\t010-windows-full-cmake-ctest.log
+
+==== Git status ====
+
+>>>> git status --short
+?? run_t010_windows_full_validation.ps1
+?? tmp/t010-windows-full-cmake-ctest.log
+
+==== Configure ====
+
+>>>> C:\Program Files\CMake\bin\cmake.exe --preset windows
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  tests/CMakeLists.txt:8 (FetchContent_Declare)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Configuring done (4.6s)
+-- Generating done (2.3s)
+-- Build files have been written to: D:/Code/C++/CQUPT_Raft/build/windows
+
+==== Build all ====
+
+>>>> C:\Program Files\CMake\bin\cmake.exe --build --preset windows-debug
+
+
+==== Full CTest ====
+
+>>>> C:\Program Files\CMake\bin\ctest.exe --preset windows-debug-managed-tests
+
+
+==== Result ====
+Windows full CMake/CTest validation PASS
+log saved to: tmp\t010-windows-full-cmake-ctest.log
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260521122126
+**********************
