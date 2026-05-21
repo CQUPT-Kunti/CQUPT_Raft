@@ -100,6 +100,8 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_command_test.cpp")
 else()
   message(STATUS "Skip test_metadata_command: metadata_command_test.cpp not found")
 endif()
+add_raft_gtest(test_metadata_records metadata_records_test.cpp
+  "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_metadata_manifest metadata_manifest_test.cpp
   "platform-neutral;platform-neutral-fallback")
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_state_machine_test.cpp")

@@ -7,12 +7,16 @@
 
 - `command.h`
 - `command.cpp`
+- `metadata_command.h`
+- `metadata_command.cpp`
+- `metadata_result.h`
 - `config.h`
 - `propose.h`
 
 ## Responsibilities
 
 - 定义 `Command`
+- 定义 metadata records / metadata command / metadata result 的共享契约
 - 定义 `NodeConfig`、`snapshotConfig`
 - 定义 `ProposeResult`
 - 保持 `SET|key|value`、`DEL|key|` 命令格式
@@ -36,15 +40,20 @@
 ## Relevant Tests
 
 - `tests/test_command.cpp`
+- `tests/metadata_command_test.cpp`
+- `tests/metadata_manifest_test.cpp`
+- `tests/metadata_records_test.cpp`
 - 大多数 Raft 集成测试会间接使用这里的定义
 
 ## Risk Areas
 
 - 命令字符串格式
+- metadata 共享结构字段稳定性
 - 配置字段默认值
 
 ## Context Hints
 
 - 修改命令相关内容时先读 `command.h` 和 `command.cpp`
+- 修改 metadata 共享结构时先读 `metadata_command.h`、`metadata_command.cpp`、`metadata_result.h`
 - 修改配置相关内容时先读 `config.h`
 - 不要为这类变更默认扫描 `raft/node`
