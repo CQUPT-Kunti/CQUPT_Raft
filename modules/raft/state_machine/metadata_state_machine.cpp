@@ -17,12 +17,106 @@ namespace raftdemo
     {
         constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
         constexpr std::uint32_t kMetadataSnapshotVersion = 1U;
-        constexpr char kMetadataSkeletonNotImplemented[] =
-            "metadata state machine skeleton not implemented";
-
         ApplyResult MakeApplyFailure(const std::string &message)
         {
             return {false, message};
+        }
+
+        std::string CommandTypeToString(const MetadataCommandType type)
+        {
+            switch (type)
+            {
+            case MetadataCommandType::kCreateBucket:
+                return "create_bucket";
+            case MetadataCommandType::kDeleteBucket:
+                return "delete_bucket";
+            case MetadataCommandType::kCreateObject:
+                return "create_object";
+            case MetadataCommandType::kCommitObject:
+                return "commit_object";
+            case MetadataCommandType::kAbortObject:
+                return "abort_object";
+            case MetadataCommandType::kDeleteObject:
+                return "delete_object";
+            case MetadataCommandType::kUnknown:
+            default:
+                return "unknown";
+            }
+        }
+
+        bool ParseMetadataStateMachineCommand(const std::string &command_data,
+                                             MetadataCommand *command)
+        {
+            if (command == nullptr)
+            {
+                return false;
+            }
+
+            if (ParseMetadataCommand(command_data, command))
+            {
+                return true;
+            }
+
+            Command wrapped_command;
+            if (!Command::Deserialize(command_data, &wrapped_command) ||
+                wrapped_command.type != CommandType::kMetadata)
+            {
+                return false;
+            }
+
+            return ParseMetadataCommand(wrapped_command.metadata_payload, command);
+        }
+
+        RequestRecord MakeAppliedRequestRecord(const MetadataCommand &command,
+                                              const std::string &bucket,
+                                              const std::string &result_status,
+                                              const std::uint64_t index)
+        {
+            RequestRecord request;
+            request.request_id = command.request_id;
+            request.bucket = bucket;
+            request.result_status = result_status;
+            request.applied_index = index;
+
+            if (command.request_context.has_value())
+            {
+                request = *command.request_context;
+                request.request_id = command.request_id;
+                request.bucket = bucket;
+                request.result_status = result_status;
+                request.applied_index = index;
+                return request;
+            }
+
+            switch (command.command_type)
+            {
+            case MetadataCommandType::kCreateBucket:
+                request.command_type = MetadataRequestType::kCreateBucket;
+                break;
+            case MetadataCommandType::kDeleteBucket:
+                request.command_type = MetadataRequestType::kDeleteBucket;
+                break;
+            default:
+                request.command_type = MetadataRequestType::kUnknown;
+                break;
+            }
+
+            return request;
+        }
+
+        bool BucketHasActiveObjects(
+            const std::unordered_map<std::string, ObjectRecord> &objects,
+            const std::string &bucket)
+        {
+            for (const auto &[identity, object] : objects)
+            {
+                static_cast<void>(identity);
+                if (object.bucket == bucket && !object.IsDeleted())
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         bool StartsWith(const std::string &value, const std::string &prefix)
@@ -564,7 +658,90 @@ namespace raftdemo
         {
             return MakeApplyFailure("metadata state machine skeleton requires non-empty command");
         }
-        return MakeApplyFailure(kMetadataSkeletonNotImplemented);
+
+        MetadataCommand command;
+        if (!ParseMetadataStateMachineCommand(command_data, &command))
+        {
+            return MakeApplyFailure("failed to parse metadata command");
+        }
+
+        std::string validation_error;
+        if (!ValidateMetadataCommand(command, &validation_error))
+        {
+            return MakeApplyFailure("invalid metadata command: " + validation_error);
+        }
+
+        if (command.command_type == MetadataCommandType::kUnknown)
+        {
+            return MakeApplyFailure("unsupported metadata command type: unknown");
+        }
+
+        std::lock_guard<std::mutex> lk(mu_);
+
+        if (command.IsCreateBucketCommand())
+        {
+            const BucketRecord &payload = command.create_bucket->bucket_record;
+            auto it = buckets_.find(payload.bucket);
+            if (it != buckets_.end() && !it->second.deleted)
+            {
+                return MakeApplyFailure("state conflict: bucket already exists");
+            }
+
+            BucketRecord record = payload;
+            record.deleted = false;
+            record.delete_time.reset();
+            if (record.create_time == 0 && command.request_context.has_value())
+            {
+                record.create_time = command.request_context->create_time;
+            }
+
+            buckets_[record.bucket] = record;
+            requests_[command.request_id] =
+                MakeAppliedRequestRecord(command, record.bucket, "ok", index);
+            last_applied_index_ = index;
+            last_applied_term_ = 0;
+            return {true, "ok"};
+        }
+
+        if (command.IsDeleteBucketCommand())
+        {
+            auto it = buckets_.find(command.delete_bucket->bucket);
+            if (it == buckets_.end())
+            {
+                return MakeApplyFailure("not found: bucket does not exist");
+            }
+            if (it->second.deleted)
+            {
+                return MakeApplyFailure("state conflict: bucket already deleted");
+            }
+            if (command.delete_bucket->if_empty &&
+                BucketHasActiveObjects(objects_, command.delete_bucket->bucket))
+            {
+                return MakeApplyFailure("state conflict: bucket is not empty");
+            }
+
+            it->second.deleted = true;
+            if (command.request_context.has_value())
+            {
+                if (command.request_context->finish_time.has_value())
+                {
+                    it->second.delete_time = command.request_context->finish_time;
+                }
+                else if (command.request_context->create_time != 0)
+                {
+                    it->second.delete_time = command.request_context->create_time;
+                }
+            }
+
+            requests_[command.request_id] =
+                MakeAppliedRequestRecord(command, it->second.bucket, "ok", index);
+            last_applied_index_ = index;
+            last_applied_term_ = 0;
+            return {true, "ok"};
+        }
+
+        return MakeApplyFailure("unsupported metadata command type: " +
+                                CommandTypeToString(command.command_type));
     }
 
     SnapshotResult MetadataStateMachine::SaveSnapshot(const std::string &file_path) const
@@ -683,6 +860,18 @@ namespace raftdemo
     {
         std::lock_guard<std::mutex> lk(mu_);
         return tombstones_.size();
+    }
+
+    std::optional<BucketRecord> MetadataStateMachine::FindBucket(
+        std::string_view bucket) const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = buckets_.find(std::string(bucket));
+        if (it == buckets_.end())
+        {
+            return std::nullopt;
+        }
+        return it->second;
     }
 
     ApplyResult StrongConsistencyMetadataStateMachine::Apply(std::uint64_t index,

@@ -15,6 +15,38 @@ namespace raftdemo
 
 namespace
 {
+    raftdemo::MetadataCommand MakeCreateBucketCommand(const std::string &bucket,
+                                                      const std::string &request_id,
+                                                      const std::uint64_t create_time = 1710000000)
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kCreateBucket;
+        command.request_id = request_id;
+        command.create_bucket = raftdemo::CreateBucketCommandPayload{
+            raftdemo::BucketRecord{bucket, create_time, false, std::nullopt}};
+        command.request_context = raftdemo::RequestRecord{
+            request_id,
+            raftdemo::MetadataRequestType::kCreateBucket,
+            bucket,
+            "",
+            "accepted",
+            0,
+            create_time,
+            std::nullopt};
+        return command;
+    }
+
+    raftdemo::MetadataCommand MakeDeleteBucketCommand(const std::string &bucket,
+                                                      const std::string &request_id,
+                                                      const bool if_empty = true)
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kDeleteBucket;
+        command.request_id = request_id;
+        command.delete_bucket = raftdemo::DeleteBucketCommandPayload{bucket, if_empty};
+        return command;
+    }
+
     raftdemo::MetadataRecord MakeCreateRecord(const std::string &object_key,
                                               const std::string &request_id,
                                               const std::string &payload = "payload")
@@ -63,7 +95,7 @@ TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitPlaceholder
 
     const raftdemo::ApplyResult apply = machine.Apply(1, "placeholder-command");
     EXPECT_FALSE(apply.Ok);
-    EXPECT_EQ(apply.message, "metadata state machine skeleton not implemented");
+    EXPECT_EQ(apply.message, "failed to parse metadata command");
     EXPECT_EQ(machine.LastAppliedIndex(), 0U);
 
     const raftdemo::SnapshotResult save_empty = machine.SaveSnapshot("");
@@ -76,6 +108,99 @@ TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitPlaceholder
     const raftdemo::SnapshotResult load_missing =
         machine.LoadSnapshot("tmp/non-existent-metadata-skeleton.snapshot");
     EXPECT_EQ(load_missing.status, raftdemo::SnapshotStatus::kNotFound);
+}
+
+TEST(MetadataStateMachineTest, CreateBucketApplyCreatesBucketAndUpdatesApplyPosition)
+{
+    raftdemo::MetadataStateMachine machine;
+
+    const raftdemo::ApplyResult apply = machine.Apply(
+        7, raftdemo::SerializeMetadataCommand(
+               MakeCreateBucketCommand("bucket-a", "create-bucket-1")));
+
+    EXPECT_TRUE(apply.Ok);
+    EXPECT_EQ(apply.message, "ok");
+    EXPECT_EQ(machine.LastAppliedIndex(), 7U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.BucketCount(), 1U);
+    EXPECT_EQ(machine.RequestCount(), 1U);
+
+    const std::optional<raftdemo::BucketRecord> bucket = machine.FindBucket("bucket-a");
+    ASSERT_TRUE(bucket.has_value());
+    EXPECT_EQ(bucket->bucket, "bucket-a");
+    EXPECT_FALSE(bucket->deleted);
+    EXPECT_FALSE(bucket->delete_time.has_value());
+}
+
+TEST(MetadataStateMachineTest, DeleteBucketApplyMarksBucketDeletedAndUpdatesApplyPosition)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(machine.Apply(
+                           10,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-b", "create-bucket-2")))
+                    .Ok);
+
+    const raftdemo::ApplyResult apply = machine.Apply(
+        11, raftdemo::SerializeMetadataCommand(
+                MakeDeleteBucketCommand("bucket-b", "delete-bucket-1")));
+
+    EXPECT_TRUE(apply.Ok);
+    EXPECT_EQ(apply.message, "ok");
+    EXPECT_EQ(machine.LastAppliedIndex(), 11U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.BucketCount(), 1U);
+    EXPECT_EQ(machine.RequestCount(), 2U);
+
+    const std::optional<raftdemo::BucketRecord> bucket = machine.FindBucket("bucket-b");
+    ASSERT_TRUE(bucket.has_value());
+    EXPECT_TRUE(bucket->deleted);
+}
+
+TEST(MetadataStateMachineTest, RepeatedOrUnsupportedBucketCommandsReturnExplicitErrors)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(machine.Apply(
+                           20,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-c", "create-bucket-3")))
+                    .Ok);
+
+    const raftdemo::ApplyResult duplicate_create = machine.Apply(
+        21, raftdemo::SerializeMetadataCommand(
+                MakeCreateBucketCommand("bucket-c", "create-bucket-4")));
+    EXPECT_FALSE(duplicate_create.Ok);
+    EXPECT_EQ(duplicate_create.message, "state conflict: bucket already exists");
+    EXPECT_EQ(machine.LastAppliedIndex(), 20U);
+
+    const raftdemo::ApplyResult missing_delete = machine.Apply(
+        22, raftdemo::SerializeMetadataCommand(
+                MakeDeleteBucketCommand("bucket-missing", "delete-bucket-2")));
+    EXPECT_FALSE(missing_delete.Ok);
+    EXPECT_EQ(missing_delete.message, "not found: bucket does not exist");
+    EXPECT_EQ(machine.LastAppliedIndex(), 20U);
+
+    raftdemo::MetadataCommand unsupported;
+    unsupported.command_type = raftdemo::MetadataCommandType::kCreateObject;
+    unsupported.request_id = "object-create-1";
+    unsupported.create_object = raftdemo::CreateObjectCommandPayload{
+        raftdemo::ObjectRecord{"bucket-c",
+                               "object/demo",
+                               "obj-1",
+                               1,
+                               64,
+                               "etag-1",
+                               raftdemo::ObjectState::PENDING,
+                               {},
+                               1710000001,
+                               std::nullopt,
+                               std::nullopt}};
+
+    const raftdemo::ApplyResult unsupported_apply =
+        machine.Apply(23, raftdemo::SerializeMetadataCommand(unsupported));
+    EXPECT_FALSE(unsupported_apply.Ok);
+    EXPECT_EQ(unsupported_apply.message, "unsupported metadata command type: create_object");
+    EXPECT_EQ(machine.LastAppliedIndex(), 20U);
 }
 
 TEST(MetadataStateMachineTest, SkeletonHeadAndListExposePlaceholderQueryBoundary)

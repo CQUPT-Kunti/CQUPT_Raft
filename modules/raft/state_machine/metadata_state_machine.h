@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +46,7 @@ namespace raftdemo
         std::size_t ObjectCount() const;
         std::size_t RequestCount() const;
         std::size_t TombstoneCount() const;
+        std::optional<BucketRecord> FindBucket(std::string_view bucket) const;
 
     private:
         mutable std::mutex mu_;
