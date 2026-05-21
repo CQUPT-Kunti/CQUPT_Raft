@@ -18,6 +18,7 @@
 - 回填 protobuf 响应
 - 记录 RPC 延迟指标
 - 维护按 proto 文件拆分后的 include 边界
+- 维护与 proto target 对应的最小链接边界
 
 ## Out of Scope
 
@@ -38,6 +39,10 @@
 - `raft_service_impl` 只应依赖 `raft.proto` 生成头
 - `metadata_service_impl` 只应依赖 `metadata.proto` 生成头
 - `kv_service_impl` 只应依赖 `kv.proto` / `common.proto` 生成头
+- `raft_core` 内的 service 实现应最小化消费：
+  - `raft_service_impl` -> `raft_proto`
+  - `metadata_service_impl` -> `metadata_proto`
+  - `kv_service_impl` -> `kv_proto`
 
 ## Relevant Tests
 
@@ -58,3 +63,4 @@
 - 先读对应 proto：`raft.proto` / `metadata.proto` / `kv.proto`
 - 再读对应 service 实现
 - 需要行为确认时再进入 `raft/node`
+- 如果问题出在链接面或生成头暴露面，同时检查根 `CMakeLists.txt` 和 `tests/CMakeLists.txt`
