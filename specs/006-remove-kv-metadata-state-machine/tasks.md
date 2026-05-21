@@ -67,7 +67,7 @@
 
 ### Tests for User Story 1
 
-- [ ] T010 [P] [US1] 在 `tests/node_admin_service_test.cpp` 中补齐不依赖 `KvService` 的 `Status` / `Health` / `Metrics` 管理面回归测试
+- [x] T010 [P] [US1] 在 `tests/node_admin_service_test.cpp` 中补齐不依赖 `KvService` 的 `Status` / `Health` / `Metrics` 管理面回归测试
 - [ ] T011 [P] [US1] 在 `tests/metadata_main_path_test.cpp` 中补齐默认 `RaftNode` 仅通过 `MetadataService` 跑通单节点与三节点 smoke 的回归测试
 
 ### Implementation for User Story 1

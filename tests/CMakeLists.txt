@@ -158,6 +158,9 @@ else()
 endif()
 add_raft_gtest(test_metadata_failover metadata_failover_test.cpp
   "platform-neutral")
+target_link_libraries(test_metadata_failover
+  PRIVATE
+    metadata_proto)
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
   add_executable(test_metadata_client_scenario
     metadata_client_scenario_test.cpp
@@ -176,7 +179,7 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
 
   target_link_libraries(test_metadata_client_scenario
     PRIVATE
-      raft_proto
+      metadata_proto
       GTest::gtest_main
   )
 
@@ -208,6 +211,9 @@ add_raft_gtest(test_thread_pool test_thread_pool.cpp
   "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_kv_service test_kv_service.cpp
   "platform-neutral")
+target_link_libraries(test_kv_service
+  PRIVATE
+    kv_proto)
 
 # =========================
 # Platform-neutral baseline:

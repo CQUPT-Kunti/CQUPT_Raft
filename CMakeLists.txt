@@ -156,9 +156,26 @@ add_custom_command(
   VERBATIM
 )
 
+add_library(common_proto
+  ${GENERATED_DIR}/common.pb.cc
+  ${GENERATED_DIR}/common.pb.h
+)
+
+target_include_directories(common_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(common_proto
+  PUBLIC
+    protobuf::libprotobuf
+)
+
 add_library(raft_proto
-  ${PROTO_SRCS}
-  ${GRPC_SRCS}
+  ${GENERATED_DIR}/raft.pb.cc
+  ${GENERATED_DIR}/raft.pb.h
+  ${GENERATED_DIR}/raft.grpc.pb.cc
+  ${GENERATED_DIR}/raft.grpc.pb.h
 )
 
 target_include_directories(raft_proto
@@ -172,11 +189,49 @@ target_link_libraries(raft_proto
     gRPC::grpc++
 )
 
+add_library(metadata_proto
+  ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/metadata.grpc.pb.h
+)
+
+target_include_directories(metadata_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(metadata_proto
+  PUBLIC
+    common_proto
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
+add_library(kv_proto
+  ${GENERATED_DIR}/kv.pb.cc
+  ${GENERATED_DIR}/kv.pb.h
+  ${GENERATED_DIR}/kv.grpc.pb.cc
+  ${GENERATED_DIR}/kv.grpc.pb.h
+)
+
+target_include_directories(kv_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(kv_proto
+  PUBLIC
+    common_proto
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
 if(WIN32)
-  target_link_libraries(raft_proto
-    PUBLIC
-      Ws2_32
-  )
+  target_link_libraries(common_proto PUBLIC Ws2_32)
+  target_link_libraries(raft_proto PUBLIC Ws2_32)
+  target_link_libraries(metadata_proto PUBLIC Ws2_32)
+  target_link_libraries(kv_proto PUBLIC Ws2_32)
 endif()
 
 add_library(raft_core
@@ -198,12 +253,16 @@ add_library(raft_core
 target_include_directories(raft_core
   PUBLIC
     ${PROJECT_INCLUDE_DIR}
+  PRIVATE
     ${GENERATED_DIR}
 )
 
 target_link_libraries(raft_core
   PUBLIC
     raft_proto
+  PRIVATE
+    metadata_proto
+    kv_proto
     Threads::Threads
 )
 
@@ -222,7 +281,7 @@ add_executable(raft_kv_client
 
 target_link_libraries(raft_kv_client
   PRIVATE
-    raft_proto
+    kv_proto
 )
 
 add_executable(raft_metadata_client
@@ -231,7 +290,7 @@ add_executable(raft_metadata_client
 
 target_link_libraries(raft_metadata_client
   PRIVATE
-    raft_proto
+    metadata_proto
 )
 
 enable_testing()

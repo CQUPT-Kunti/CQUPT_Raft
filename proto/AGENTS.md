@@ -15,6 +15,11 @@
 - 定义 `MetadataService`
 - 定义共享 request/response/message/enum
 - 仅在过渡期于 `kv.proto` 中定义 `KvService`
+- 维护生成 target 边界：
+  - `common_proto`
+  - `raft_proto`
+  - `metadata_proto`
+  - `kv_proto`
 
 ## Out of Scope
 
@@ -37,6 +42,9 @@
   - `metadata.proto` 只承载 metadata 业务 RPC
   - `common.proto` 只承载可复用公共消息
   - `kv.proto` 只承载遗留 KV RPC，避免重新混回 `raft.proto`
+- 优先维持 target 边界清晰：
+  - `raft_proto` 不应依赖 KV/metadata 生成代码
+  - `metadata_proto` / `kv_proto` 通过 `common_proto` 复用公共消息
 
 ## Relevant Tests
 

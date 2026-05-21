@@ -14,6 +14,7 @@
 - 文本配置解析
 - CLI 客户端命令发起
 - 维护客户端对分拆后 proto 生成头的最小依赖
+- 维护客户端 target 对 proto target 的最小链接边界
 
 ## Out of Scope
 
@@ -32,6 +33,8 @@
 - 优先把复杂逻辑留在模块内，入口层保持薄
 - `raft_kv_client` 只消费 `kv.proto` 生成头
 - `raft_metadata_client` 只消费 `metadata.proto` 生成头
+- `raft_kv_client` 只应链接 `kv_proto`
+- `raft_metadata_client` 只应链接 `metadata_proto`
 
 ## Relevant Tests
 
