@@ -903,8 +903,204 @@ TEST(MetadataStateMachineTest, SkeletonHeadAndListExposePlaceholderQueryBoundary
 
     const raftdemo::MetadataListObjectsResponse list =
         machine.ListObjects({.bucket = "bucket-a", .prefix = "object/"});
-    EXPECT_EQ(list.result.code, raftdemo::MetadataStatusCode::kOk);
+    EXPECT_EQ(list.result.code, raftdemo::MetadataStatusCode::kNotFound);
     EXPECT_TRUE(list.records.empty());
+}
+
+TEST(MetadataStateMachineTest, HeadObjectOnlyReturnsCommittedVisibleObject)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(machine.Apply(
+                           230,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-x", "create-bucket-25")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           231,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-x", "pending", "obj-29",
+                                                       "create-object-17")))
+                    .Ok);
+
+    const raftdemo::MetadataHeadObjectResponse pending_head =
+        machine.HeadObject({.bucket = "bucket-x", .object_key = "pending"});
+    EXPECT_EQ(pending_head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+    EXPECT_FALSE(pending_head.record.has_value());
+
+    EXPECT_TRUE(machine.Apply(
+                           232,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-x", "committed", "obj-30",
+                                                       "create-object-18")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           233,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-x", "committed", "obj-30",
+                                                       "commit-object-12")))
+                    .Ok);
+
+    const raftdemo::MetadataHeadObjectResponse committed_head =
+        machine.HeadObject({.bucket = "bucket-x", .object_key = "committed"});
+    ASSERT_EQ(committed_head.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_TRUE(committed_head.record.has_value());
+    EXPECT_EQ(committed_head.record->object_key, "committed");
+    EXPECT_TRUE(committed_head.record->IsCommitted());
+
+    const raftdemo::MetadataHeadObjectResponse matched_id_head =
+        machine.HeadObject({.bucket = "bucket-x",
+                            .object_key = "committed",
+                            .object_id = std::string("obj-30")});
+    EXPECT_EQ(matched_id_head.result.code, raftdemo::MetadataStatusCode::kOk);
+
+    const raftdemo::MetadataHeadObjectResponse mismatched_id_head =
+        machine.HeadObject({.bucket = "bucket-x",
+                            .object_key = "committed",
+                            .object_id = std::string("obj-31")});
+    EXPECT_EQ(mismatched_id_head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+
+    EXPECT_TRUE(machine.Apply(
+                           234,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeDeleteObjectCommand("bucket-x", "committed", "obj-30",
+                                                       "delete-object-9")))
+                    .Ok);
+    const raftdemo::MetadataHeadObjectResponse deleted_head =
+        machine.HeadObject({.bucket = "bucket-x", .object_key = "committed"});
+    EXPECT_EQ(deleted_head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+    EXPECT_FALSE(deleted_head.record.has_value());
+
+    EXPECT_TRUE(machine.Apply(
+                           235,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-y", "create-bucket-26")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           236,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeDeleteBucketCommand("bucket-y", "delete-bucket-7")))
+                    .Ok);
+    const raftdemo::MetadataHeadObjectResponse deleted_bucket_head =
+        machine.HeadObject({.bucket = "bucket-y", .object_key = "anything"});
+    EXPECT_EQ(deleted_bucket_head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+}
+
+TEST(MetadataStateMachineTest, ListObjectsReturnsCommittedObjectsWithPrefixOrderAndLimit)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(machine.Apply(
+                           240,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-z", "create-bucket-27")))
+                    .Ok);
+
+    EXPECT_TRUE(machine.Apply(
+                           241,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-z", "logs/b", "obj-31",
+                                                       "create-object-19")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           242,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-z", "logs/b", "obj-31",
+                                                       "commit-object-13")))
+                    .Ok);
+
+    EXPECT_TRUE(machine.Apply(
+                           243,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-z", "logs/a", "obj-32",
+                                                       "create-object-20")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           244,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-z", "logs/a", "obj-32",
+                                                       "commit-object-14")))
+                    .Ok);
+
+    EXPECT_TRUE(machine.Apply(
+                           245,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-z", "logs/pending", "obj-33",
+                                                       "create-object-21")))
+                    .Ok);
+
+    EXPECT_TRUE(machine.Apply(
+                           246,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-z", "logs/deleted", "obj-34",
+                                                       "create-object-22")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           247,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-z", "logs/deleted", "obj-34",
+                                                       "commit-object-15")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           248,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeDeleteObjectCommand("bucket-z", "logs/deleted", "obj-34",
+                                                       "delete-object-10")))
+                    .Ok);
+
+    EXPECT_TRUE(machine.Apply(
+                           249,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateObjectCommand("bucket-z", "other/x", "obj-35",
+                                                       "create-object-23")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           250,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCommitObjectCommand("bucket-z", "other/x", "obj-35",
+                                                       "commit-object-16")))
+                    .Ok);
+
+    const raftdemo::MetadataListObjectsResponse missing_bucket =
+        machine.ListObjects({.bucket = "bucket-missing"});
+    EXPECT_EQ(missing_bucket.result.code, raftdemo::MetadataStatusCode::kNotFound);
+
+    EXPECT_TRUE(machine.Apply(
+                           251,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeCreateBucketCommand("bucket-deleted", "create-bucket-28")))
+                    .Ok);
+    EXPECT_TRUE(machine.Apply(
+                           252,
+                           raftdemo::SerializeMetadataCommand(
+                               MakeDeleteBucketCommand("bucket-deleted", "delete-bucket-8")))
+                    .Ok);
+    const raftdemo::MetadataListObjectsResponse deleted_bucket =
+        machine.ListObjects({.bucket = "bucket-deleted"});
+    EXPECT_EQ(deleted_bucket.result.code, raftdemo::MetadataStatusCode::kNotFound);
+
+    const raftdemo::MetadataListObjectsResponse filtered =
+        machine.ListObjects({.bucket = "bucket-z", .prefix = "logs/"});
+    ASSERT_EQ(filtered.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_EQ(filtered.records.size(), 2U);
+    EXPECT_EQ(filtered.records[0].object_key, "logs/a");
+    EXPECT_EQ(filtered.records[1].object_key, "logs/b");
+    EXPECT_TRUE(filtered.records[0].IsCommitted());
+    EXPECT_TRUE(filtered.records[1].IsCommitted());
+    EXPECT_TRUE(filtered.next_page_token.empty());
+
+    const raftdemo::MetadataListObjectsResponse limited =
+        machine.ListObjects({.bucket = "bucket-z", .prefix = "logs/", .limit = 1});
+    ASSERT_EQ(limited.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_EQ(limited.records.size(), 1U);
+    EXPECT_EQ(limited.records[0].object_key, "logs/a");
+    EXPECT_EQ(limited.next_page_token, "logs/a");
+
+    const raftdemo::MetadataListObjectsResponse continued =
+        machine.ListObjects({.bucket = "bucket-z",
+                             .prefix = "logs/",
+                             .continuation_token = limited.next_page_token});
+    ASSERT_EQ(continued.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_EQ(continued.records.size(), 1U);
+    EXPECT_EQ(continued.records[0].object_key, "logs/b");
 }
 
 TEST(MetadataStateMachineTest, CreateLeavesPendingInvisibleToHeadAndList)

@@ -1046,6 +1046,17 @@ namespace raftdemo
         }
 
         std::lock_guard<std::mutex> lk(mu_);
+        const auto bucket_it = buckets_.find(query.bucket);
+        if (bucket_it == buckets_.end() || bucket_it->second.deleted)
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton bucket not found"}),
+                std::nullopt};
+        }
+
         const std::string object_identity = query.bucket + "\n" + query.object_key;
         const auto it = objects_.find(object_identity);
         if (it == objects_.end())
@@ -1057,7 +1068,35 @@ namespace raftdemo
                      .message = "metadata skeleton object not found"}),
                 std::nullopt};
         }
-        if (it->second.IsDeleted())
+        if (!it->second.IsCommitted())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton object not found"}),
+                std::nullopt};
+        }
+        const auto indexed = object_index_.find(object_identity);
+        if (indexed == object_index_.end() || indexed->second.empty())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton object not found"}),
+                std::nullopt};
+        }
+        if (query.object_id.has_value() && *query.object_id != it->second.object_id)
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton object not found"}),
+                std::nullopt};
+        }
+        if (query.version.has_value() && *query.version != it->second.version)
         {
             return {
                 MakeMetadataResult(
@@ -1089,11 +1128,73 @@ namespace raftdemo
         }
 
         std::lock_guard<std::mutex> lk(mu_);
+        const auto bucket_it = buckets_.find(query.bucket);
+        if (bucket_it == buckets_.end() || bucket_it->second.deleted)
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.message = "metadata skeleton bucket not found"}),
+                {},
+                {}};
+        }
+
+        std::vector<ObjectRecord> visible_records;
+        visible_records.reserve(objects_.size());
+        for (const auto &[identity, object] : objects_)
+        {
+            static_cast<void>(identity);
+            if (object.bucket != query.bucket || !object.IsCommitted())
+            {
+                continue;
+            }
+            if (!query.prefix.empty() &&
+                !StartsWith(object.object_key, query.prefix))
+            {
+                continue;
+            }
+            if (!query.continuation_token.empty() &&
+                object.object_key <= query.continuation_token)
+            {
+                continue;
+            }
+
+            const auto indexed = object_index_.find(
+                MakeObjectIdentity(object.bucket, object.object_key));
+            if (indexed == object_index_.end() || indexed->second.empty())
+            {
+                continue;
+            }
+            if (tombstones_.find(MakeObjectIdentity(object.bucket, object.object_key)) !=
+                tombstones_.end())
+            {
+                continue;
+            }
+
+            visible_records.push_back(object);
+        }
+
+        std::sort(visible_records.begin(), visible_records.end(),
+                  [](const ObjectRecord &lhs, const ObjectRecord &rhs)
+                  {
+                      return lhs.object_key < rhs.object_key;
+                  });
+
+        std::string next_page_token;
+        if (query.limit.has_value() && visible_records.size() > *query.limit)
+        {
+            visible_records.resize(*query.limit);
+            if (!visible_records.empty())
+            {
+                next_page_token = visible_records.back().object_key;
+            }
+        }
+
         return {
             MakeMetadataResult(MetadataStatusCode::kOk,
-                               {.message = "metadata skeleton returns no visible objects"}),
-            {},
-            {}};
+                               {.message = "ok"}),
+            std::move(visible_records),
+            next_page_token};
     }
 
     std::uint64_t MetadataStateMachine::LastAppliedIndex() const
