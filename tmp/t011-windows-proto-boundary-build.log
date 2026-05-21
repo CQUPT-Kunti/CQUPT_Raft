@@ -1,0 +1,49 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260521130837
+用户名: DESKTOP-DFVMAH9\Lei
+RunAs 用户: DESKTOP-DFVMAH9\Lei
+配置名称: 
+计算机: DESKTOP-DFVMAH9 (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File ./06-temp_test.ps1
+进程 ID: 9984
+PSVersion: 5.1.26100.8457
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8457
+BuildVersion: 10.0.26100.8457
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 tmp\t011-windows-proto-boundary-build.log
+==== T011 Windows Proto Boundary Validation ====
+time: 2026-05-21 13:08:37
+repo: D:\Code\C++\CQUPT_Raft
+cmake: C:\Program Files\CMake\bin\cmake.exe
+log: tmp\t011-windows-proto-boundary-build.log
+
+==== Git status ====
+
+>>>> git status --short
+
+
+==== Configure ====
+
+>>>> C:\Program Files\CMake\bin\cmake.exe --preset windows
+
+
+==== Build affected T011 targets ====
+
+>>>> C:\Program Files\CMake\bin\cmake.exe --build --preset windows-debug --target common_proto raft_proto metadata_proto kv_proto raft_demo raft_kv_client raft_metadata_client test_kv_service test_metadata_client_scenario test_metadata_failover
+
+
+==== Result ====
+T011 Windows proto/service/client boundary validation PASS
+Only configure + affected target build was run.
+Full CTest was not run for this task.
+log saved to: tmp\t011-windows-proto-boundary-build.log
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260521131113
+**********************
