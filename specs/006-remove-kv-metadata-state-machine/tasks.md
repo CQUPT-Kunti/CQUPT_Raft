@@ -76,7 +76,7 @@
 - [x] T013 [US1] 将 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp` 中 `Describe()`、`DebugGetValue()`、KV 相关 `RpcKind` 与状态机 dynamic_cast 调试路径改为 metadata-oriented 主路径
 - [x] T014 [US1] 新增 `modules/raft/service/node_admin_service_impl.h`、`modules/raft/service/node_admin_service_impl.cpp`，并在 `modules/raft/node/raft_node.cpp` 中注册 non-KV 管理面服务替代 `KvService` 上的状态接口
 - [x] T015 [US1] 更新 `apps/main.cpp` 与 `CMakeLists.txt`，让 `raft_demo` 启动时只暴露 `RaftService`、`MetadataService` 与 non-KV 管理面服务，并让 `raft_metadata_client` 成为唯一业务 CLI target
-- [ ] T016 [US1] 更新 `tests/CMakeLists.txt`、`test.sh`、`test.ps1`，删除 `kv-service` / `KvStateMachineTest` / `raft_kv_client` 的主入口宣传与默认执行路径，改为 metadata-only 主验证入口
+- [x] T016 [US1] 更新 `tests/CMakeLists.txt`、`test.sh`、`test.ps1`，删除 `kv-service` / `KvStateMachineTest` / `raft_kv_client` 的主入口宣传与默认执行路径，改为 metadata-only 主验证入口
 - [ ] T017 [US1] 运行 US1 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T017-us1-main-path-validation.md`
 
 **Checkpoint**: 默认业务主路径已经 metadata-only，但此时允许仓库里仍暂存未删除的 KV 残留文件，只要它们不再是主构建/主测试/主运行路径
