@@ -6,6 +6,7 @@
 
 ## Files
 
+- `state_machine_interface.h`
 - `state_machine.h`
 - `state_machine.cpp`
 - `metadata_state_machine.h`
@@ -13,6 +14,7 @@
 
 ## Responsibilities
 
+- 定义统一的 `IStateMachine` / `Apply` / `SaveSnapshot` / `LoadSnapshot` 抽象边界
 - 应用 `SET` / `DEL` 命令
 - 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
@@ -23,6 +25,7 @@
 - 不负责 quorum、term、vote、leader
 - 不负责 snapshot catalog 管理
 - 不负责 gRPC 适配
+- 不决定默认业务主路径选择
 
 ## Dependencies
 
@@ -49,10 +52,12 @@
 - snapshot 文件头
 - key/value 序列化顺序
 - metadata state machine 的查询/快照边界
+- 过渡期 `CompositeKvMetadataStateMachine` 与统一接口的关系
 - noop 命令处理
 
 ## Context Hints
 
+- 先读 `state_machine_interface.h`
 - 先读 `state_machine.h`
 - metadata-only 路径先读 `metadata_state_machine.h`
 - 再读 `Apply`、`SaveSnapshot`、`LoadSnapshot`

@@ -10,7 +10,7 @@
 
 #include "raft/common/metadata_command.h"
 #include "raft/common/metadata_result.h"
-#include "raft/state_machine/state_machine.h"
+#include "raft/state_machine/state_machine_interface.h"
 
 namespace raftdemo
 {

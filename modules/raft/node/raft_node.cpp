@@ -20,11 +20,29 @@
 #include "raft/service/metadata_service_impl.h"
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/state_machine/state_machine.h"
 #include "raft/storage/snapshot_storage.h"
 
 namespace raftdemo
 {
+  class CompositeKvMetadataStateMachine final : public IStateMachine
+  {
+  public:
+    ApplyResult Apply(std::uint64_t index, const std::string &command_data) override;
+    SnapshotResult SaveSnapshot(const std::string &file_path) const override;
+    SnapshotResult LoadSnapshot(const std::string &file_path) override;
+
+    bool GetValue(const std::string &key, std::string *value) const;
+    std::string DebugString() const;
+    StrongConsistencyMetadataStateMachine *MetadataStateMachine();
+    const StrongConsistencyMetadataStateMachine *MetadataStateMachine() const;
+
+  private:
+    KvStateMachine kv_;
+    StrongConsistencyMetadataStateMachine metadata_;
+  };
+
   namespace
   {
 

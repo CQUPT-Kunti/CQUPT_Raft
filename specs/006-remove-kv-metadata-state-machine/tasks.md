@@ -53,7 +53,7 @@
 - [x] T006 [P] 新增 `tests/metadata_test_utils.h`、`tests/metadata_test_utils.cpp`，提供 bucket/object request builder、metadata cluster fixture、跨平台数据目录 helper、metadata 断言 helper
 - [x] T007 更新 `proto/raft.proto`，为 metadata-only 业务 RPC 与非-KV 管理面 RPC 预留协议骨架，同时保留 `RaftService` 不变
 - [x] T008 在 `tests/metadata_node_wiring_test.cpp` 与 `tests/CMakeLists.txt` 中建立 metadata-only 默认装配回归测试骨架，保证后续翻转 `RaftNode` 主路径时有明确失败信号
-- [ ] T009 [P] 新增 `tests/no_kv_surface_audit.cmake` 并在 `tests/CMakeLists.txt` 接入跨平台审计骨架，用于最终验证主构建/主测试路径不再依赖 KV target、KV service、KV state machine
+- [x] T009 [P] 新增 `tests/no_kv_surface_audit.cmake` 并在 `tests/CMakeLists.txt` 接入跨平台审计骨架，用于最终验证主构建/主测试路径不再依赖 KV target、KV service、KV state machine
 
 **Checkpoint**: metadata-only 迁移骨架到位，可以开始实现用户故事
 

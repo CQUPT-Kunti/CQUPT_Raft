@@ -52,11 +52,14 @@
 - commit/apply 顺序
 - snapshot 裁剪边界
 - startup replay
+- `IStateMachine` 抽象边界与过渡期 composite 装配
 - 并发锁顺序
 
 ## Context Hints
 
 - 先读 `raft_node.h`
+- 关注状态机装配时，先确认这里只依赖 `IStateMachine` 抽象，再看具体实现类型
+- 过渡期 `CompositeKvMetadataStateMachine` 仅应作为 node 内部实现细节存在，不应扩散到公共头边界
 - 再读 `raft_node.cpp` 中目标函数附近
 - 需要复制细节时再读 `raft/replication`
 - 需要持久化边界时再读 `raft/storage`

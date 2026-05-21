@@ -23,8 +23,7 @@
 #include "raft/common/propose.h"
 #include "raft/storage/raft_storage.h"
 #include "raft/storage/snapshot_storage.h"
-#include "raft/state_machine/metadata_state_machine.h"
-#include "raft/state_machine/state_machine.h"
+#include "raft/state_machine/state_machine_interface.h"
 #include "raft/runtime/thread_pool.h"
 
 namespace raftdemo
@@ -34,6 +33,7 @@ namespace raftdemo
   class KvServiceImpl;
   class MetadataServiceImpl;
   class Replicator;
+  class StrongConsistencyMetadataStateMachine;
 
   enum class Role
   {
@@ -91,23 +91,6 @@ namespace raftdemo
     std::uint64_t last_log_index{0};
     std::uint64_t snapshot_index{0};
     std::vector<PeerReplicationStatus> peers;
-  };
-
-  class CompositeKvMetadataStateMachine final : public IStateMachine
-  {
-  public:
-    ApplyResult Apply(std::uint64_t index, const std::string &command_data) override;
-    SnapshotResult SaveSnapshot(const std::string &file_path) const override;
-    SnapshotResult LoadSnapshot(const std::string &file_path) override;
-
-    bool GetValue(const std::string &key, std::string *value) const;
-    std::string DebugString() const;
-    StrongConsistencyMetadataStateMachine *MetadataStateMachine();
-    const StrongConsistencyMetadataStateMachine *MetadataStateMachine() const;
-
-  private:
-    KvStateMachine kv_;
-    StrongConsistencyMetadataStateMachine metadata_;
   };
 
   class RaftNode : public std::enable_shared_from_this<RaftNode>
