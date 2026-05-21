@@ -20,6 +20,7 @@
 - `MetadataStateMachine` 当前可承载 bucket 级最小 apply 占位
 - `MetadataStateMachine` 当前可承载 CreateObject 的最小 PENDING apply 占位
 - `MetadataStateMachine` 当前可承载 CommitObject 的最小 COMMITTED apply 占位
+- `MetadataStateMachine` 当前可承载 AbortObject 的最小终止态 apply 占位
 - 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
 - 保存和加载状态机 snapshot

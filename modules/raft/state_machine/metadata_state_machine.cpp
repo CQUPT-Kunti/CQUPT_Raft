@@ -855,6 +855,79 @@ namespace raftdemo
             return {true, "ok"};
         }
 
+        if (command.IsAbortObjectCommand())
+        {
+            const AbortObjectCommandPayload &payload = *command.abort_object;
+            const auto bucket_it = buckets_.find(payload.bucket);
+            if (bucket_it == buckets_.end())
+            {
+                return MakeApplyFailure("not found: bucket does not exist");
+            }
+            if (bucket_it->second.deleted)
+            {
+                return MakeApplyFailure("state conflict: bucket is deleted");
+            }
+
+            const std::string object_identity =
+                MakeObjectIdentity(payload.bucket, payload.object_key);
+            const auto object_it = objects_.find(object_identity);
+            if (object_it == objects_.end())
+            {
+                return MakeApplyFailure("not found: object does not exist");
+            }
+            if (object_it->second.object_id != payload.object_id)
+            {
+                return MakeApplyFailure("state conflict: object_id mismatch");
+            }
+            if (object_it->second.IsCommitted())
+            {
+                return MakeApplyFailure("state conflict: object already committed");
+            }
+            if (object_it->second.IsDeleted())
+            {
+                return MakeApplyFailure("state conflict: object already aborted");
+            }
+            if (!object_it->second.IsPending())
+            {
+                return MakeApplyFailure("state conflict: object is not pending");
+            }
+
+            ObjectRecord &record = object_it->second;
+            record.state = ObjectState::DELETED;
+            if (command.request_context.has_value())
+            {
+                if (command.request_context->finish_time.has_value())
+                {
+                    record.delete_time = command.request_context->finish_time;
+                }
+                else if (command.request_context->create_time != 0)
+                {
+                    record.delete_time = command.request_context->create_time;
+                }
+            }
+
+            object_index_.erase(object_identity);
+            chunk_ref_index_.erase(object_identity);
+
+            Tombstone tombstone;
+            tombstone.object_key = record.object_key;
+            tombstone.delete_request_id = command.request_id;
+            tombstone.deleted_at_log_index = index;
+            if (!record.etag.empty())
+            {
+                tombstone.checksum = record.etag;
+            }
+            tombstone.delete_info = "aborted pending object";
+            tombstones_[object_identity] = std::move(tombstone);
+
+            requests_[command.request_id] =
+                MakeAppliedRequestRecord(command, record.bucket, "ok", index);
+            requests_[command.request_id].object_key = record.object_key;
+            last_applied_index_ = index;
+            last_applied_term_ = 0;
+            return {true, "ok"};
+        }
+
         return MakeApplyFailure("unsupported metadata command type: " +
                                 CommandTypeToString(command.command_type));
     }
@@ -903,6 +976,15 @@ namespace raftdemo
         const std::string object_identity = query.bucket + "\n" + query.object_key;
         const auto it = objects_.find(object_identity);
         if (it == objects_.end())
+        {
+            return {
+                MakeMetadataResult(
+                    MetadataStatusCode::kNotFound,
+                    {.object_key = query.object_key,
+                     .message = "metadata skeleton object not found"}),
+                std::nullopt};
+        }
+        if (it->second.IsDeleted())
         {
             return {
                 MakeMetadataResult(
