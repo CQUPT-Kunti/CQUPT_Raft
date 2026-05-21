@@ -1,13 +1,23 @@
 $ErrorActionPreference = "Stop"
 
 $OutDir = "tmp"
-$LogFile = Join-Path $OutDir "t011-windows-proto-boundary-build.log"
+$LogFile = Join-Path $OutDir "t014-windows-metadata-state-machine-test.log"
 
 if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir | Out-Null
 }
 
 $CMakeExe = (Get-Command cmake -ErrorAction Stop).Source
+$CMakeDir = Split-Path $CMakeExe -Parent
+$CTestExe = Join-Path $CMakeDir "ctest.exe"
+
+if (-not (Test-Path $CTestExe)) {
+    $CTestCmd = Get-Command ctest -ErrorAction SilentlyContinue
+    if ($null -eq $CTestCmd) {
+        throw "ctest.exe not found. cmake.exe path: $CMakeExe"
+    }
+    $CTestExe = $CTestCmd.Source
+}
 
 function Run-Cmd {
     param(
@@ -27,10 +37,11 @@ function Run-Cmd {
 Start-Transcript -Path $LogFile -Force
 
 try {
-    Write-Host "==== T011 Windows Proto Boundary Validation ===="
+    Write-Host "==== T014 Windows MetadataStateMachine Validation ===="
     Write-Host "time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Write-Host "repo: $(Get-Location)"
     Write-Host "cmake: $CMakeExe"
+    Write-Host "ctest: $CTestExe"
     Write-Host "log: $LogFile"
 
     Write-Host ""
@@ -42,27 +53,26 @@ try {
     Run-Cmd $CMakeExe @("--preset", "windows")
 
     Write-Host ""
-    Write-Host "==== Build affected T011 targets ===="
+    Write-Host "==== Build test_metadata_state_machine ===="
     Run-Cmd $CMakeExe @(
         "--build", "--preset", "windows-debug",
-        "--target",
-        "common_proto",
-        "raft_proto",
-        "metadata_proto",
-        "kv_proto",
-        "raft_demo",
-        "raft_kv_client",
-        "raft_metadata_client",
-        "test_kv_service",
-        "test_metadata_client_scenario",
-        "test_metadata_failover"
+        "--target", "test_metadata_state_machine"
+    )
+
+    Write-Host ""
+    Write-Host "==== Run MetadataStateMachineTest ===="
+    $env:CTEST_PARALLEL_LEVEL = "1"
+    Run-Cmd $CTestExe @(
+        "--test-dir", "build/windows",
+        "-C", "Debug",
+        "--output-on-failure",
+        "-R", "^MetadataStateMachineTest\."
     )
 
     Write-Host ""
     Write-Host "==== Result ===="
-    Write-Host "T011 Windows proto/service/client boundary validation PASS"
-    Write-Host "Only configure + affected target build was run."
-    Write-Host "Full CTest was not run for this task."
+    Write-Host "T014 Windows MetadataStateMachine validation PASS"
+    Write-Host "Only related target/test was run; full CTest was not run."
     Write-Host "log saved to: $LogFile"
 }
 finally {
