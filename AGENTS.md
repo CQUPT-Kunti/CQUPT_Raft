@@ -37,6 +37,8 @@
 
 - `modules/raft/common`
   - 共享配置、提案结果、命令编解码
+- `modules/raft/metadata`
+  - metadata-only 业务类型、命令 payload、查询模型
 - `modules/raft/runtime`
   - 日志、定时器、线程池
 - `modules/raft/service`
@@ -48,7 +50,7 @@
 - `modules/raft/storage`
   - Raft 硬状态、segment log、snapshot catalog 持久化
 - `modules/raft/state_machine`
-  - KV 状态机与状态机快照格式
+  - KV / metadata 状态机与状态机快照格式
 - `proto`
   - RPC/Protobuf 契约层
 - `apps`
@@ -124,6 +126,7 @@ CTEST_PARALLEL_LEVEL=1 ./test.sh --group all
 - 项目源码和测试统一从 `modules/` 作为 include 根目录。
 - 头文件按模块引用：
   - `raft/common/...`
+  - `raft/metadata/...`
   - `raft/runtime/...`
   - `raft/service/...`
   - `raft/node/...`

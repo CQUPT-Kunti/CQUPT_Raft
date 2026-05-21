@@ -1,6 +1,6 @@
 # Scope
 
-负责 KV 状态机与状态机快照格式。
+负责 KV / metadata 状态机与状态机快照格式。
 
 本模块遵守根 AGENTS.md 的 C++ 头文件 / 源文件规则：`.h` 表达接口和契约，`.cpp` 承担具体实现。
 
@@ -8,10 +8,13 @@
 
 - `state_machine.h`
 - `state_machine.cpp`
+- `metadata_state_machine.h`
+- `metadata_state_machine.cpp`
 
 ## Responsibilities
 
 - 应用 `SET` / `DEL` 命令
+- 应用 metadata-only 状态机查询与生命周期逻辑
 - 提供 `Get` 与 `DebugString`
 - 保存和加载状态机 snapshot
 
@@ -35,6 +38,8 @@
 ## Relevant Tests
 
 - `tests/test_state_machine.cpp`
+- `tests/metadata_state_machine_test.cpp`
+- `tests/metadata_snapshot_test.cpp`
 - `tests/test_raft_commit_apply.cpp`
 - `tests/snapshot_test.cpp`
 - `tests/test_raft_snapshot_restart.cpp`
@@ -43,10 +48,12 @@
 
 - snapshot 文件头
 - key/value 序列化顺序
+- metadata state machine 的查询/快照边界
 - noop 命令处理
 
 ## Context Hints
 
 - 先读 `state_machine.h`
+- metadata-only 路径先读 `metadata_state_machine.h`
 - 再读 `Apply`、`SaveSnapshot`、`LoadSnapshot`
 - 不需要时不要默认进入 `raft/node`

@@ -1,4 +1,4 @@
-#include "raft/common/metadata_command.h"
+#include "raft/metadata/metadata_records.h"
 
 #include <gtest/gtest.h>
 
