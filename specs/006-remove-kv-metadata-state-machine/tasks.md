@@ -38,7 +38,7 @@
 
 - [x] T001 盘点 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp`、`apps/main.cpp` 中 `RaftNode` 默认装配与 `KvStateMachine` / `MetadataStateMachine` 注入关系，并记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T001-node-wiring-audit.md`
 - [x] T002 盘点 `proto/raft.proto`、`CMakeLists.txt`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1`、`apps/raft_kv_client.cpp` 中 KV service/target/script 依赖，并记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T002-kv-surface-audit.md`
-- [ ] T003 建立 `specs/006-remove-kv-metadata-state-machine/task-reports/` 的任务报告命名规范与跨平台验证命令清单，并记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T003-reporting-contract.md`
+- [x] T003 建立 `specs/006-remove-kv-metadata-state-machine/task-reports/` 的任务报告命名规范与跨平台验证命令清单，并记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T003-reporting-contract.md`
 
 ---
 
