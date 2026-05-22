@@ -19,6 +19,9 @@
 - 记录 RPC 延迟指标
 - 维护按 proto 文件拆分后的 include 边界
 - 维护与 proto target 对应的最小链接边界
+- `MetadataService` 写路径必须封装 `MetadataCommand` 并通过 `RaftNode::ProposeMetadata(...)` 进入 Raft
+- `MetadataService` 读路径只允许走 `MetadataStateMachine` 本地查询，不把 `Head/List` 伪装成写日志命令
+- `MetadataService` 不允许回退到 `KvService` / KV message / `KvStateMachine`
 
 ## Out of Scope
 
@@ -43,6 +46,8 @@
   - `raft_service_impl` -> `raft_proto`
   - `metadata_service_impl` -> `metadata_proto`
   - `kv_service_impl` -> `kv_proto`
+- `metadata_service_impl` 的 leader redirect / timeout / conflict / not-found 语义必须通过 metadata 状态码显式回传
+- `metadata_service_impl` 可以保留 leader 本地读，但如果没有 `ReadIndex` / leader lease，必须把“非严格线性一致读”的风险写入报告
 
 ## Relevant Tests
 

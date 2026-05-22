@@ -2,6 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -9,7 +10,6 @@
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -32,876 +32,1113 @@ int raft_metadata_client_entry(int argc, char **argv);
 
 namespace
 {
-    using namespace std::chrono_literals;
+  std::string ClientBinaryPath()
+  {
+    return RAFT_METADATA_CLIENT_PATH;
+  }
 
-    std::string ClientBinaryPath()
+  std::string QuoteArg(const std::string &value)
+  {
+    std::string quoted = "\"";
+    for (const char ch : value)
     {
-        return RAFT_METADATA_CLIENT_PATH;
+      if (ch == '"' || ch == '\\')
+      {
+        quoted.push_back('\\');
+      }
+      quoted.push_back(ch);
     }
+    quoted.push_back('"');
+    return quoted;
+  }
 
-    std::string QuoteArg(const std::string &value)
-    {
-        std::string quoted = "\"";
-        for (const char ch : value)
-        {
-            if (ch == '"' || ch == '\\')
-            {
-                quoted.push_back('\\');
-            }
-            quoted.push_back(ch);
-        }
-        quoted.push_back('"');
-        return quoted;
-    }
+  struct ClientRunResult
+  {
+    int exit_code = -1;
+    std::string output;
+  };
 
-    struct ClientRunResult
-    {
-        int exit_code = -1;
-        std::string output;
-    };
-
-    int NormalizeSystemExitCode(const int raw_code)
-    {
+  int NormalizeSystemExitCode(const int raw_code)
+  {
 #ifdef _WIN32
-        return raw_code;
+    return raw_code;
 #else
-        if (raw_code >= 0 && WIFEXITED(raw_code))
-        {
-            return WEXITSTATUS(raw_code);
-        }
-        return raw_code;
-#endif
+    if (raw_code >= 0 && WIFEXITED(raw_code))
+    {
+      return WEXITSTATUS(raw_code);
     }
+    return raw_code;
+#endif
+  }
 
 #ifdef _WIN32
-    ClientRunResult RunClientWindows(const std::vector<std::string> &args,
-                                     const std::filesystem::path &output_path)
+  ClientRunResult RunClientWindows(const std::vector<std::string> &args,
+                                   const std::filesystem::path &output_path)
+  {
+    std::vector<std::string> argv_storage;
+    argv_storage.reserve(args.size() + 1);
+    argv_storage.push_back(ClientBinaryPath());
+    argv_storage.insert(argv_storage.end(), args.begin(), args.end());
+
+    std::vector<char *> argv;
+    argv.reserve(argv_storage.size());
+    for (auto &value : argv_storage)
     {
-        std::vector<std::string> argv_storage;
-        argv_storage.reserve(args.size() + 1);
-        argv_storage.push_back(ClientBinaryPath());
-        argv_storage.insert(argv_storage.end(), args.begin(), args.end());
-
-        std::vector<char *> argv;
-        argv.reserve(argv_storage.size());
-        for (auto &value : argv_storage)
-        {
-            argv.push_back(value.data());
-        }
-
-        testing::internal::CaptureStdout();
-        testing::internal::CaptureStderr();
-
-        int exit_code = -1;
-        try
-        {
-            exit_code = raft_metadata_client_entry(
-                static_cast<int>(argv.size()), argv.data());
-        }
-        catch (const std::exception &ex)
-        {
-            std::cerr << "raft_metadata_client_entry threw exception: " << ex.what()
-                      << '\n';
-            exit_code = -1;
-        }
-        catch (...)
-        {
-            std::cerr << "raft_metadata_client_entry threw unknown exception\n";
-            exit_code = -1;
-        }
-
-        std::string output = testing::internal::GetCapturedStdout();
-        output += testing::internal::GetCapturedStderr();
-        std::ofstream(output_path, std::ios::binary) << output;
-
-        return ClientRunResult{
-            exit_code,
-            std::move(output),
-        };
+      argv.push_back(value.data());
     }
+
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+
+    int exit_code = -1;
+    try
+    {
+      exit_code = raft_metadata_client_entry(
+          static_cast<int>(argv.size()), argv.data());
+    }
+    catch (const std::exception &ex)
+    {
+      std::cerr << "raft_metadata_client_entry threw exception: " << ex.what() << '\n';
+      exit_code = -1;
+    }
+    catch (...)
+    {
+      std::cerr << "raft_metadata_client_entry threw unknown exception\n";
+      exit_code = -1;
+    }
+
+    std::string output = testing::internal::GetCapturedStdout();
+    output += testing::internal::GetCapturedStderr();
+    std::ofstream(output_path, std::ios::binary) << output;
+    return {exit_code, std::move(output)};
+  }
 #endif
 
-    ClientRunResult RunClient(const std::vector<std::string> &args,
-                              const std::string &test_name)
-    {
-        const auto output_dir =
-            std::filesystem::current_path() / "metadata_client_scenario_outputs";
-        std::filesystem::create_directories(output_dir);
+  ClientRunResult RunClient(const std::vector<std::string> &args,
+                            const std::string &test_name)
+  {
+    const auto output_dir =
+        std::filesystem::current_path() / "metadata_client_scenario_outputs";
+    std::filesystem::create_directories(output_dir);
 
-        const auto output_path =
-            output_dir / (test_name + "_" +
-                          std::to_string(static_cast<std::uint64_t>(
-                              std::chrono::steady_clock::now().time_since_epoch().count())) +
-                          ".log");
+    const auto output_path =
+        output_dir / (test_name + "_" +
+                      std::to_string(static_cast<std::uint64_t>(
+                          std::chrono::steady_clock::now().time_since_epoch().count())) +
+                      ".log");
 
 #ifdef _WIN32
-        return RunClientWindows(args, output_path);
+    return RunClientWindows(args, output_path);
 #else
-        std::ostringstream command;
-        command << QuoteArg(ClientBinaryPath());
-        for (const auto &arg : args)
-        {
-            command << ' ' << QuoteArg(arg);
-        }
-        command << " > " << QuoteArg(output_path.string()) << " 2>&1";
+    std::ostringstream command;
+    command << QuoteArg(ClientBinaryPath());
+    for (const auto &arg : args)
+    {
+      command << ' ' << QuoteArg(arg);
+    }
+    command << " > " << QuoteArg(output_path.string()) << " 2>&1";
 
-        const int raw_exit = std::system(command.str().c_str());
-
-        std::ifstream input(output_path);
-        std::ostringstream buffer;
-        buffer << input.rdbuf();
-
-        return ClientRunResult{
-            NormalizeSystemExitCode(raw_exit),
-            buffer.str(),
-        };
+    const int raw_exit = std::system(command.str().c_str());
+    std::ifstream input(output_path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return {NormalizeSystemExitCode(raw_exit), buffer.str()};
 #endif
+  }
+
+  bool Contains(const std::string &text, const std::string &needle)
+  {
+    return text.find(needle) != std::string::npos;
+  }
+
+  std::string ObjectIdentity(const std::string &bucket, const std::string &object_key)
+  {
+    return bucket + "\n" + object_key;
+  }
+
+  template <typename Response>
+  struct ReplayEntry
+  {
+    std::string fingerprint;
+    Response response;
+  };
+
+  class FakeMetadataService final : public raft::MetadataService::Service
+  {
+  public:
+    explicit FakeMetadataService(std::string leader_address)
+        : leader_address_(std::move(leader_address))
+    {
     }
 
-    bool Contains(const std::string &text, const std::string &needle)
+    void SetLeaderAddress(std::string leader_address)
     {
-        return text.find(needle) != std::string::npos;
+      std::lock_guard<std::mutex> lock(mu_);
+      leader_address_ = std::move(leader_address);
     }
 
-    class FakeMetadataService final : public raft::MetadataService::Service
+    struct Snapshot
     {
-    public:
-        explicit FakeMetadataService(std::string leader_address)
-            : leader_address_(std::move(leader_address))
-        {
-        }
-
-        void SetLeaderAddress(std::string leader_address)
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            leader_address_ = std::move(leader_address);
-        }
-
-        struct Snapshot
-        {
-            std::size_t record_count = 0;
-            std::optional<raft::MetadataRecord> record;
-            std::size_t create_calls = 0;
-            std::size_t commit_calls = 0;
-            std::size_t delete_calls = 0;
-        };
-
-        Snapshot TakeSnapshot(const std::string &object_key) const
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            Snapshot snapshot;
-            snapshot.record_count = records_.size();
-            snapshot.create_calls = create_calls_;
-            snapshot.commit_calls = commit_calls_;
-            snapshot.delete_calls = delete_calls_;
-
-            const auto it = records_.find(object_key);
-            if (it != records_.end())
-            {
-                snapshot.record = it->second;
-            }
-            return snapshot;
-        }
-
-        grpc::Status CreateMetadataRecord(
-            grpc::ServerContext *,
-            const raft::CreateMetadataRecordRequest *request,
-            raft::CreateMetadataRecordResponse *response) override
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            ++create_calls_;
-
-            const std::string fingerprint = CreateFingerprint(*request);
-            auto replay_it = create_replays_.find(request->request_id());
-            if (replay_it != create_replays_.end())
-            {
-                if (replay_it->second.fingerprint != fingerprint)
-                {
-                    response->mutable_summary()->CopyFrom(
-                        MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
-                                    "create request_id conflict",
-                                    request->request_id(),
-                                    request->object_key(),
-                                    raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                    CurrentLogIndex()));
-                    return grpc::Status::OK;
-                }
-
-                *response = replay_it->second.response;
-                response->mutable_summary()->set_code(
-                    raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
-                response->mutable_summary()->set_message("create replayed");
-                return grpc::Status::OK;
-            }
-
-            std::string error;
-            if (!ValidateCreateRequest(*request, &error))
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
-                                error,
-                                request->request_id(),
-                                request->object_key(),
-                                raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            raft::MetadataRecord record;
-            record.set_object_key(request->object_key());
-            record.set_state(raft::METADATA_RECORD_STATE_PENDING);
-            record.mutable_manifest()->CopyFrom(request->manifest());
-            record.set_payload(request->payload());
-            record.set_create_request_id(request->request_id());
-            record.set_created_at_log_index(NextLogIndex());
-
-            records_[request->object_key()] = record;
-
-            response->mutable_summary()->CopyFrom(
-                MakeSummary(raft::METADATA_STATUS_CODE_OK,
-                            "create applied",
-                            request->request_id(),
-                            request->object_key(),
-                            raft::METADATA_RECORD_STATE_PENDING,
-                            record.created_at_log_index()));
-            response->mutable_record()->CopyFrom(record);
-
-            create_replays_[request->request_id()] = {fingerprint, *response};
-            return grpc::Status::OK;
-        }
-
-        grpc::Status CommitMetadataRecord(
-            grpc::ServerContext *,
-            const raft::CommitMetadataRecordRequest *request,
-            raft::CommitMetadataRecordResponse *response) override
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            ++commit_calls_;
-
-            const std::string fingerprint = CommitFingerprint(*request);
-            auto replay_it = commit_replays_.find(request->request_id());
-            if (replay_it != commit_replays_.end())
-            {
-                if (replay_it->second.fingerprint != fingerprint)
-                {
-                    response->mutable_summary()->CopyFrom(
-                        MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
-                                    "commit request_id conflict",
-                                    request->request_id(),
-                                    request->object_key(),
-                                    raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                    CurrentLogIndex()));
-                    return grpc::Status::OK;
-                }
-
-                *response = replay_it->second.response;
-                response->mutable_summary()->set_code(
-                    raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
-                response->mutable_summary()->set_message("commit replayed");
-                return grpc::Status::OK;
-            }
-
-            auto it = records_.find(request->object_key());
-            if (it == records_.end())
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
-                                "commit target not found",
-                                request->request_id(),
-                                request->object_key(),
-                                raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            if (!request->expected_create_request_id().empty() &&
-                request->expected_create_request_id() != it->second.create_request_id())
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
-                                "unexpected create_request_id",
-                                request->request_id(),
-                                request->object_key(),
-                                it->second.state(),
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            if (it->second.state() == raft::METADATA_RECORD_STATE_DELETED)
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
-                                "cannot commit deleted object",
-                                request->request_id(),
-                                request->object_key(),
-                                it->second.state(),
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            it->second.set_state(raft::METADATA_RECORD_STATE_COMMITTED);
-            it->second.set_commit_request_id(request->request_id());
-            it->second.set_commit_info(request->commit_info());
-            it->second.set_committed_at_log_index(NextLogIndex());
-
-            response->mutable_summary()->CopyFrom(
-                MakeSummary(raft::METADATA_STATUS_CODE_OK,
-                            "commit applied",
-                            request->request_id(),
-                            request->object_key(),
-                            raft::METADATA_RECORD_STATE_COMMITTED,
-                            it->second.committed_at_log_index()));
-            response->mutable_record()->CopyFrom(it->second);
-
-            commit_replays_[request->request_id()] = {fingerprint, *response};
-            return grpc::Status::OK;
-        }
-
-        grpc::Status DeleteMetadataRecord(
-            grpc::ServerContext *,
-            const raft::DeleteMetadataRecordRequest *request,
-            raft::DeleteMetadataRecordResponse *response) override
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            ++delete_calls_;
-
-            const std::string fingerprint = DeleteFingerprint(*request);
-            auto replay_it = delete_replays_.find(request->request_id());
-            if (replay_it != delete_replays_.end())
-            {
-                if (replay_it->second.fingerprint != fingerprint)
-                {
-                    response->mutable_summary()->CopyFrom(
-                        MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
-                                    "delete request_id conflict",
-                                    request->request_id(),
-                                    request->object_key(),
-                                    raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                    CurrentLogIndex()));
-                    return grpc::Status::OK;
-                }
-
-                *response = replay_it->second.response;
-                response->mutable_summary()->set_code(
-                    raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
-                response->mutable_summary()->set_message("delete replayed");
-                return grpc::Status::OK;
-            }
-
-            auto it = records_.find(request->object_key());
-            if (it == records_.end())
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
-                                "delete target not found",
-                                request->request_id(),
-                                request->object_key(),
-                                raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            if (it->second.state() != raft::METADATA_RECORD_STATE_COMMITTED)
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
-                                "delete requires committed state",
-                                request->request_id(),
-                                request->object_key(),
-                                it->second.state(),
-                                CurrentLogIndex()));
-                return grpc::Status::OK;
-            }
-
-            it->second.set_state(raft::METADATA_RECORD_STATE_DELETED);
-            it->second.set_delete_request_id(request->request_id());
-            it->second.set_delete_info(request->delete_info());
-            it->second.set_deleted_at_log_index(NextLogIndex());
-
-            response->mutable_summary()->CopyFrom(
-                MakeSummary(raft::METADATA_STATUS_CODE_OK,
-                            "delete applied",
-                            request->request_id(),
-                            request->object_key(),
-                            raft::METADATA_RECORD_STATE_DELETED,
-                            it->second.deleted_at_log_index()));
-
-            delete_replays_[request->request_id()] = {fingerprint, *response};
-            return grpc::Status::OK;
-        }
-
-        grpc::Status HeadMetadataRecord(
-            grpc::ServerContext *,
-            const raft::HeadMetadataRecordRequest *request,
-            raft::HeadMetadataRecordResponse *response) override
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = records_.find(request->object_key());
-            if (it == records_.end() ||
-                it->second.state() != raft::METADATA_RECORD_STATE_COMMITTED)
-            {
-                response->mutable_summary()->CopyFrom(
-                    MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
-                                "head target not visible",
-                                "",
-                                request->object_key(),
-                                raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                                CurrentLogIndex()));
-                response->set_found(false);
-                return grpc::Status::OK;
-            }
-
-            response->mutable_summary()->CopyFrom(
-                MakeSummary(raft::METADATA_STATUS_CODE_OK,
-                            "head visible",
-                            "",
-                            request->object_key(),
-                            it->second.state(),
-                            CurrentLogIndex()));
-            response->set_found(true);
-            response->mutable_record()->CopyFrom(it->second);
-            return grpc::Status::OK;
-        }
-
-        grpc::Status ListMetadataRecords(
-            grpc::ServerContext *,
-            const raft::ListMetadataRecordsRequest *request,
-            raft::ListMetadataRecordsResponse *response) override
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            response->mutable_summary()->CopyFrom(
-                MakeSummary(raft::METADATA_STATUS_CODE_OK,
-                            "list complete",
-                            "",
-                            request->prefix(),
-                            raft::METADATA_RECORD_STATE_UNSPECIFIED,
-                            CurrentLogIndex()));
-
-            std::uint32_t emitted = 0;
-            const std::uint32_t limit =
-                request->limit() == 0 ? std::numeric_limits<std::uint32_t>::max()
-                                      : request->limit();
-            for (const auto &[key, record] : records_)
-            {
-                if (record.state() != raft::METADATA_RECORD_STATE_COMMITTED)
-                {
-                    continue;
-                }
-                if (!request->prefix().empty() && key.rfind(request->prefix(), 0) != 0)
-                {
-                    continue;
-                }
-                if (emitted >= limit)
-                {
-                    break;
-                }
-                response->add_records()->CopyFrom(record);
-                ++emitted;
-            }
-            response->set_next_page_token("");
-            return grpc::Status::OK;
-        }
-
-    private:
-        template <typename ResponseT>
-        struct ReplayEntry
-        {
-            std::string fingerprint;
-            ResponseT response;
-        };
-
-        static std::string CreateFingerprint(const raft::CreateMetadataRecordRequest &request)
-        {
-            std::ostringstream oss;
-            oss << request.object_key() << '|'
-                << request.manifest().object_size() << '|'
-                << request.manifest().chunk_size() << '|'
-                << request.manifest().chunk_count() << '|'
-                << request.manifest().checksum() << '|'
-                << request.payload();
-            for (const auto &location : request.manifest().mock_locations())
-            {
-                oss << '|' << location;
-            }
-            return oss.str();
-        }
-
-        static std::string CommitFingerprint(const raft::CommitMetadataRecordRequest &request)
-        {
-            return request.object_key() + "|" +
-                   request.expected_create_request_id() + "|" +
-                   request.commit_info();
-        }
-
-        static std::string DeleteFingerprint(const raft::DeleteMetadataRecordRequest &request)
-        {
-            return request.object_key() + "|" + request.delete_info();
-        }
-
-        bool ValidateCreateRequest(const raft::CreateMetadataRecordRequest &request,
-                                   std::string *error) const
-        {
-            if (request.request_id().empty())
-            {
-                *error = "missing request_id";
-                return false;
-            }
-            if (request.object_key().empty())
-            {
-                *error = "missing object_key";
-                return false;
-            }
-            if (request.manifest().object_size() == 0 ||
-                request.manifest().chunk_size() == 0 ||
-                request.manifest().chunk_count() == 0)
-            {
-                *error = "invalid manifest size fields";
-                return false;
-            }
-            if (request.manifest().checksum().empty())
-            {
-                *error = "missing checksum";
-                return false;
-            }
-            if (request.manifest().mock_locations_size() == 0)
-            {
-                *error = "missing mock_locations";
-                return false;
-            }
-            const std::uint64_t expected_chunk_count =
-                1 + ((request.manifest().object_size() - 1) /
-                     request.manifest().chunk_size());
-            if (expected_chunk_count != request.manifest().chunk_count())
-            {
-                *error = "chunk_count mismatch";
-                return false;
-            }
-            if (request.payload().size() > 4096)
-            {
-                *error = "payload exceeds limit";
-                return false;
-            }
-            return true;
-        }
-
-        raft::MetadataResponseSummary MakeSummary(raft::MetadataStatusCode code,
-                                                  const std::string &message,
-                                                  const std::string &request_id,
-                                                  const std::string &object_key,
-                                                  raft::MetadataRecordState state,
-                                                  std::uint64_t log_index) const
-        {
-            raft::MetadataResponseSummary summary;
-            summary.set_code(code);
-            summary.set_message(message);
-            summary.set_request_id(request_id);
-            summary.set_object_key(object_key);
-            summary.set_state(state);
-            summary.set_term(term_);
-            summary.set_log_index(log_index);
-            summary.mutable_leader_hint()->set_leader_id(leader_id_);
-            summary.mutable_leader_hint()->set_leader_address(leader_address_);
-            return summary;
-        }
-
-        std::uint64_t NextLogIndex()
-        {
-            return next_log_index_++;
-        }
-
-        std::uint64_t CurrentLogIndex() const
-        {
-            return next_log_index_ == 0 ? 0 : (next_log_index_ - 1);
-        }
-
-        mutable std::mutex mu_;
-        std::string leader_address_;
-        int leader_id_ = 1;
-        std::uint64_t term_ = 7;
-        std::uint64_t next_log_index_ = 1;
-        std::map<std::string, raft::MetadataRecord> records_;
-        std::map<std::string, ReplayEntry<raft::CreateMetadataRecordResponse>> create_replays_;
-        std::map<std::string, ReplayEntry<raft::CommitMetadataRecordResponse>> commit_replays_;
-        std::map<std::string, ReplayEntry<raft::DeleteMetadataRecordResponse>> delete_replays_;
-        std::size_t create_calls_ = 0;
-        std::size_t commit_calls_ = 0;
-        std::size_t delete_calls_ = 0;
+      bool bucket_exists = false;
+      bool bucket_deleted = false;
+      std::size_t object_count = 0;
+      std::optional<raft::ObjectRecord> object;
+      std::size_t create_bucket_calls = 0;
+      std::size_t create_object_calls = 0;
+      std::size_t commit_object_calls = 0;
+      std::size_t delete_object_calls = 0;
     };
 
-    class ScopedFakeMetadataServer
+    Snapshot TakeSnapshot(const std::string &bucket,
+                          const std::string &object_key) const
     {
-    public:
-        ScopedFakeMetadataServer()
-            : service_("pending")
-        {
-            grpc::ServerBuilder builder;
-            builder.AddListeningPort("127.0.0.1:0",
-                                     grpc::InsecureServerCredentials(),
-                                     &selected_port_);
-            builder.RegisterService(&service_);
-            server_ = builder.BuildAndStart();
-            address_ = "127.0.0.1:" + std::to_string(selected_port_);
-            service_.SetLeaderAddress(address_);
-        }
+      std::lock_guard<std::mutex> lock(mu_);
+      Snapshot snapshot;
+      snapshot.create_bucket_calls = create_bucket_calls_;
+      snapshot.create_object_calls = create_object_calls_;
+      snapshot.commit_object_calls = commit_object_calls_;
+      snapshot.delete_object_calls = delete_object_calls_;
+      snapshot.object_count = objects_.size();
 
-        ~ScopedFakeMetadataServer()
-        {
-            if (server_ != nullptr)
-            {
-                server_->Shutdown();
-            }
-        }
+      const auto bucket_it = buckets_.find(bucket);
+      if (bucket_it != buckets_.end())
+      {
+        snapshot.bucket_exists = true;
+        snapshot.bucket_deleted = bucket_it->second.deleted();
+      }
 
-        const std::string &address() const
-        {
-            return address_;
-        }
+      const auto object_it = objects_.find(ObjectIdentity(bucket, object_key));
+      if (object_it != objects_.end())
+      {
+        snapshot.object = object_it->second;
+      }
 
-        FakeMetadataService &service()
-        {
-            return service_;
-        }
+      return snapshot;
+    }
 
-    private:
-        int selected_port_ = 0;
-        std::string address_;
-        FakeMetadataService service_;
-        std::unique_ptr<grpc::Server> server_;
-    };
-
-    class MetadataClientScenarioTest : public ::testing::Test
+    grpc::Status CreateBucket(grpc::ServerContext *,
+                              const raft::CreateBucketRequest *request,
+                              raft::CreateBucketResponse *response) override
     {
-    protected:
-        ScopedFakeMetadataServer server_;
-    };
+      std::lock_guard<std::mutex> lock(mu_);
+      ++create_bucket_calls_;
+
+      const std::string fingerprint = CreateBucketFingerprint(*request);
+      auto replay = create_bucket_replays_.find(request->request_id());
+      if (replay != create_bucket_replays_.end())
+      {
+        if (replay->second.fingerprint != fingerprint)
+        {
+          response->mutable_summary()->CopyFrom(
+              MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
+                          "create bucket request_id conflict",
+                          request->request_id(),
+                          request->bucket(),
+                          "",
+                          "",
+                          raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                          CurrentLogIndex()));
+          return grpc::Status::OK;
+        }
+        *response = replay->second.response;
+        response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+        response->mutable_summary()->set_message("create bucket replayed");
+        return grpc::Status::OK;
+      }
+
+      if (request->request_id().empty() || request->bucket().empty())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
+                        "request_id and bucket are required",
+                        request->request_id(),
+                        request->bucket(),
+                        "",
+                        "",
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it != buckets_.end() && !bucket_it->second.deleted())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                        "bucket already exists",
+                        request->request_id(),
+                        request->bucket(),
+                        "",
+                        "",
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      raft::BucketRecord bucket_record;
+      bucket_record.set_bucket(request->bucket());
+      bucket_record.set_create_time(request->client_time_unix_ms());
+      bucket_record.set_deleted(false);
+      bucket_record.set_delete_time(0);
+      buckets_[request->bucket()] = bucket_record;
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      "",
+                      "",
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      NextLogIndex()));
+      response->mutable_bucket_record()->CopyFrom(bucket_record);
+      create_bucket_replays_[request->request_id()] = {fingerprint, *response};
+      return grpc::Status::OK;
+    }
+
+    grpc::Status DeleteBucket(grpc::ServerContext *,
+                              const raft::DeleteBucketRequest *request,
+                              raft::DeleteBucketResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it == buckets_.end())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "bucket not found",
+                        request->request_id(),
+                        request->bucket(),
+                        "",
+                        "",
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+      bucket_it->second.set_deleted(true);
+      bucket_it->second.set_delete_time(request->client_time_unix_ms());
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      "",
+                      "",
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      NextLogIndex()));
+      response->mutable_bucket_record()->CopyFrom(bucket_it->second);
+      return grpc::Status::OK;
+    }
+
+    grpc::Status CreateObject(grpc::ServerContext *,
+                              const raft::CreateObjectRequest *request,
+                              raft::CreateObjectResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++create_object_calls_;
+
+      const std::string fingerprint = CreateObjectFingerprint(*request);
+      auto replay = create_object_replays_.find(request->request_id());
+      if (replay != create_object_replays_.end())
+      {
+        if (replay->second.fingerprint != fingerprint)
+        {
+          response->mutable_summary()->CopyFrom(
+              MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
+                          "create object request_id conflict",
+                          request->request_id(),
+                          request->bucket(),
+                          request->object_key(),
+                          request->object_id(),
+                          raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                          CurrentLogIndex()));
+          return grpc::Status::OK;
+        }
+        *response = replay->second.response;
+        response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+        response->mutable_summary()->set_message("create object replayed");
+        return grpc::Status::OK;
+      }
+
+      const auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it == buckets_.end() || bucket_it->second.deleted())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "bucket not found",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      if (request->request_id().empty() || request->object_key().empty() ||
+          request->object_id().empty() || request->size() == 0)
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
+                        "request_id object_key object_id and size are required",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      const std::string key = ObjectIdentity(request->bucket(), request->object_key());
+      auto existing = objects_.find(key);
+      if (existing != objects_.end() &&
+          existing->second.state() != raft::METADATA_OBJECT_STATE_DELETED)
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                        "object already exists",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        existing->second.state(),
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      raft::ObjectRecord object;
+      object.set_bucket(request->bucket());
+      object.set_object_key(request->object_key());
+      object.set_object_id(request->object_id());
+      object.set_version(request->version());
+      object.set_size(request->size());
+      object.set_etag(request->etag());
+      object.set_state(raft::METADATA_OBJECT_STATE_PENDING);
+      object.set_create_time(request->client_time_unix_ms());
+      object.set_commit_time(0);
+      object.set_delete_time(0);
+      objects_[key] = object;
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      raft::METADATA_OBJECT_STATE_PENDING,
+                      NextLogIndex()));
+      response->mutable_object()->CopyFrom(object);
+      create_object_replays_[request->request_id()] = {fingerprint, *response};
+      return grpc::Status::OK;
+    }
+
+    grpc::Status CommitObject(grpc::ServerContext *,
+                              const raft::CommitObjectRequest *request,
+                              raft::CommitObjectResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++commit_object_calls_;
+
+      const std::string fingerprint = CommitObjectFingerprint(*request);
+      auto replay = commit_object_replays_.find(request->request_id());
+      if (replay != commit_object_replays_.end())
+      {
+        if (replay->second.fingerprint != fingerprint)
+        {
+          response->mutable_summary()->CopyFrom(
+              MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
+                          "commit object request_id conflict",
+                          request->request_id(),
+                          request->bucket(),
+                          request->object_key(),
+                          request->object_id(),
+                          raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                          CurrentLogIndex()));
+          return grpc::Status::OK;
+        }
+        *response = replay->second.response;
+        response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+        response->mutable_summary()->set_message("commit object replayed");
+        return grpc::Status::OK;
+      }
+
+      const auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it == buckets_.end() || bucket_it->second.deleted())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "bucket not found",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      const std::string key = ObjectIdentity(request->bucket(), request->object_key());
+      auto object_it = objects_.find(key);
+      if (object_it == objects_.end())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "object not found",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+      if (object_it->second.object_id() != request->object_id())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                        "object_id mismatch",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        object_it->second.state(),
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+      if (object_it->second.state() != raft::METADATA_OBJECT_STATE_PENDING)
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                        "object is not pending",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        object_it->second.state(),
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      object_it->second.set_state(raft::METADATA_OBJECT_STATE_COMMITTED);
+      object_it->second.set_version(request->version());
+      object_it->second.set_size(request->size());
+      object_it->second.set_etag(request->etag());
+      object_it->second.set_commit_time(request->client_time_unix_ms());
+      object_it->second.clear_chunks();
+      for (const auto &chunk : request->chunks())
+      {
+        object_it->second.add_chunks()->CopyFrom(chunk);
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      raft::METADATA_OBJECT_STATE_COMMITTED,
+                      NextLogIndex()));
+      response->mutable_object()->CopyFrom(object_it->second);
+      commit_object_replays_[request->request_id()] = {fingerprint, *response};
+      return grpc::Status::OK;
+    }
+
+    grpc::Status AbortObject(grpc::ServerContext *,
+                             const raft::AbortObjectRequest *request,
+                             raft::AbortObjectResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const std::string key = ObjectIdentity(request->bucket(), request->object_key());
+      auto object_it = objects_.find(key);
+      if (object_it == objects_.end())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "object not found",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+      object_it->second.set_state(raft::METADATA_OBJECT_STATE_DELETED);
+      object_it->second.set_delete_time(request->client_time_unix_ms());
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      raft::METADATA_OBJECT_STATE_DELETED,
+                      NextLogIndex()));
+      response->mutable_object()->CopyFrom(object_it->second);
+      return grpc::Status::OK;
+    }
+
+    grpc::Status DeleteObject(grpc::ServerContext *,
+                              const raft::DeleteObjectRequest *request,
+                              raft::DeleteObjectResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++delete_object_calls_;
+
+      const std::string fingerprint = DeleteObjectFingerprint(*request);
+      auto replay = delete_object_replays_.find(request->request_id());
+      if (replay != delete_object_replays_.end())
+      {
+        if (replay->second.fingerprint != fingerprint)
+        {
+          response->mutable_summary()->CopyFrom(
+              MakeSummary(raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT,
+                          "delete object request_id conflict",
+                          request->request_id(),
+                          request->bucket(),
+                          request->object_key(),
+                          request->object_id(),
+                          raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                          CurrentLogIndex()));
+          return grpc::Status::OK;
+        }
+        *response = replay->second.response;
+        response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+        response->mutable_summary()->set_message("delete object replayed");
+        return grpc::Status::OK;
+      }
+
+      const std::string key = ObjectIdentity(request->bucket(), request->object_key());
+      auto object_it = objects_.find(key);
+      if (object_it == objects_.end())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "object not found",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+      if (object_it->second.state() != raft::METADATA_OBJECT_STATE_COMMITTED)
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                        "object is not committed",
+                        request->request_id(),
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        object_it->second.state(),
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      object_it->second.set_state(raft::METADATA_OBJECT_STATE_DELETED);
+      object_it->second.set_delete_time(request->client_time_unix_ms());
+      object_it->second.clear_chunks();
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      raft::METADATA_OBJECT_STATE_DELETED,
+                      NextLogIndex()));
+      response->mutable_object()->CopyFrom(object_it->second);
+      delete_object_replays_[request->request_id()] = {fingerprint, *response};
+      return grpc::Status::OK;
+    }
+
+    grpc::Status HeadObject(grpc::ServerContext *,
+                            const raft::HeadObjectRequest *request,
+                            raft::HeadObjectResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it == buckets_.end() || bucket_it->second.deleted())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "bucket not found",
+                        "",
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        response->set_found(false);
+        return grpc::Status::OK;
+      }
+
+      const auto it = objects_.find(ObjectIdentity(request->bucket(), request->object_key()));
+      if (it == objects_.end() ||
+          it->second.state() != raft::METADATA_OBJECT_STATE_COMMITTED)
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "object not found",
+                        "",
+                        request->bucket(),
+                        request->object_key(),
+                        request->object_id(),
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        response->set_found(false);
+        return grpc::Status::OK;
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      "",
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      raft::METADATA_OBJECT_STATE_COMMITTED,
+                      CurrentLogIndex()));
+      response->set_found(true);
+      response->mutable_object()->CopyFrom(it->second);
+      return grpc::Status::OK;
+    }
+
+    grpc::Status ListObjects(grpc::ServerContext *,
+                             const raft::ListObjectsRequest *request,
+                             raft::ListObjectsResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto bucket_it = buckets_.find(request->bucket());
+      if (bucket_it == buckets_.end() || bucket_it->second.deleted())
+      {
+        response->mutable_summary()->CopyFrom(
+            MakeSummary(raft::METADATA_STATUS_CODE_NOT_FOUND,
+                        "bucket not found",
+                        "",
+                        request->bucket(),
+                        request->prefix(),
+                        "",
+                        raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                        CurrentLogIndex()));
+        return grpc::Status::OK;
+      }
+
+      std::vector<const raft::ObjectRecord *> visible;
+      for (const auto &[key, object] : objects_)
+      {
+        static_cast<void>(key);
+        if (object.bucket() != request->bucket() ||
+            object.state() != raft::METADATA_OBJECT_STATE_COMMITTED)
+        {
+          continue;
+        }
+        if (!request->prefix().empty() &&
+            object.object_key().rfind(request->prefix(), 0) != 0)
+        {
+          continue;
+        }
+        if (!request->continuation_token().empty() &&
+            object.object_key() <= request->continuation_token())
+        {
+          continue;
+        }
+        visible.push_back(&object);
+      }
+
+      std::sort(visible.begin(), visible.end(),
+                [](const raft::ObjectRecord *lhs, const raft::ObjectRecord *rhs)
+                {
+                  return lhs->object_key() < rhs->object_key();
+                });
+
+      std::string next_token;
+      if (request->limit() != 0 &&
+          visible.size() > static_cast<std::size_t>(request->limit()))
+      {
+        visible.resize(request->limit());
+        next_token = visible.back()->object_key();
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(raft::METADATA_STATUS_CODE_OK,
+                      "ok",
+                      "",
+                      request->bucket(),
+                      request->prefix(),
+                      "",
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      CurrentLogIndex()));
+      for (const auto *object : visible)
+      {
+        response->add_objects()->CopyFrom(*object);
+      }
+      response->set_next_continuation_token(next_token);
+      return grpc::Status::OK;
+    }
+
+  private:
+    static std::string CreateBucketFingerprint(const raft::CreateBucketRequest &request)
+    {
+      return request.request_id() + "|" + request.bucket() + "|" +
+             std::to_string(request.client_time_unix_ms());
+    }
+
+    static std::string CreateObjectFingerprint(const raft::CreateObjectRequest &request)
+    {
+      return request.request_id() + "|" + request.bucket() + "|" +
+             request.object_key() + "|" + request.object_id() + "|" +
+             std::to_string(request.version()) + "|" +
+             std::to_string(request.size()) + "|" + request.etag() + "|" +
+             std::to_string(request.client_time_unix_ms());
+    }
+
+    static std::string CommitObjectFingerprint(const raft::CommitObjectRequest &request)
+    {
+      std::ostringstream oss;
+      oss << request.request_id() << "|" << request.bucket() << "|"
+          << request.object_key() << "|" << request.object_id() << "|"
+          << request.version() << "|" << request.size() << "|"
+          << request.etag() << "|" << request.client_time_unix_ms();
+      for (const auto &chunk : request.chunks())
+      {
+        oss << "|" << chunk.chunk_id() << ":" << chunk.offset()
+            << ":" << chunk.size() << ":" << chunk.checksum();
+      }
+      return oss.str();
+    }
+
+    static std::string DeleteObjectFingerprint(const raft::DeleteObjectRequest &request)
+    {
+      return request.request_id() + "|" + request.bucket() + "|" +
+             request.object_key() + "|" + request.object_id() + "|" +
+             std::to_string(request.version()) + "|" +
+             std::to_string(request.client_time_unix_ms());
+    }
+
+    raft::MetadataResponseSummary MakeSummary(const raft::MetadataStatusCode code,
+                                              const std::string &message,
+                                              const std::string &request_id,
+                                              const std::string &bucket,
+                                              const std::string &object_key,
+                                              const std::string &object_id,
+                                              const raft::MetadataObjectState state,
+                                              const std::uint64_t log_index) const
+    {
+      raft::MetadataResponseSummary summary;
+      summary.set_code(code);
+      summary.set_message(message);
+      summary.set_request_id(request_id);
+      summary.set_bucket(bucket);
+      summary.set_object_key(object_key);
+      summary.set_object_id(object_id);
+      summary.set_state(state);
+      summary.set_term(term_);
+      summary.set_log_index(log_index);
+      summary.mutable_leader_hint()->set_leader_id(1);
+      summary.mutable_leader_hint()->set_leader_address(leader_address_);
+      return summary;
+    }
+
+    std::uint64_t CurrentLogIndex() const
+    {
+      return next_log_index_ == 0 ? 0 : next_log_index_ - 1;
+    }
+
+    std::uint64_t NextLogIndex()
+    {
+      return next_log_index_++;
+    }
+
+    mutable std::mutex mu_;
+    std::string leader_address_;
+    std::uint64_t term_ = 7;
+    std::uint64_t next_log_index_ = 1;
+    std::map<std::string, raft::BucketRecord> buckets_;
+    std::map<std::string, raft::ObjectRecord> objects_;
+    std::map<std::string, ReplayEntry<raft::CreateBucketResponse>> create_bucket_replays_;
+    std::map<std::string, ReplayEntry<raft::CreateObjectResponse>> create_object_replays_;
+    std::map<std::string, ReplayEntry<raft::CommitObjectResponse>> commit_object_replays_;
+    std::map<std::string, ReplayEntry<raft::DeleteObjectResponse>> delete_object_replays_;
+    std::size_t create_bucket_calls_ = 0;
+    std::size_t create_object_calls_ = 0;
+    std::size_t commit_object_calls_ = 0;
+    std::size_t delete_object_calls_ = 0;
+  };
+
+  class ScopedFakeMetadataServer
+  {
+  public:
+    ScopedFakeMetadataServer()
+        : service_("pending")
+    {
+      grpc::ServerBuilder builder;
+      builder.AddListeningPort("127.0.0.1:0",
+                               grpc::InsecureServerCredentials(),
+                               &selected_port_);
+      builder.RegisterService(&service_);
+      server_ = builder.BuildAndStart();
+      address_ = "127.0.0.1:" + std::to_string(selected_port_);
+      service_.SetLeaderAddress(address_);
+    }
+
+    ~ScopedFakeMetadataServer()
+    {
+      if (server_ != nullptr)
+      {
+        server_->Shutdown();
+      }
+    }
+
+    const std::string &address() const
+    {
+      return address_;
+    }
+
+    FakeMetadataService &service()
+    {
+      return service_;
+    }
+
+  private:
+    int selected_port_ = 0;
+    std::string address_;
+    FakeMetadataService service_;
+    std::unique_ptr<grpc::Server> server_;
+  };
+
+  class MetadataClientScenarioTest : public ::testing::Test
+  {
+  protected:
+    static constexpr const char *kBucket = "scenario-bucket";
+    ScopedFakeMetadataServer server_;
+  };
 
 } // namespace
 
-TEST_F(MetadataClientScenarioTest, CreateScenarioBuildsMetadataOnlyManifest)
+TEST_F(MetadataClientScenarioTest, CreateObjectScenarioCreatesPendingMetadataObject)
 {
-    const ClientRunResult result = RunClient(
-        {
-            server_.address(),
-            "create",
-            "--request-id", "req-create-1",
-            "--object-key", "scenario/object-a",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", "metadata-only",
-            "--mock-location", "node-missing-a/chunk-0",
-            "--mock-location", "fake/path/chunk-1",
-        },
-        "create_manifest");
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-bucket",
+                 "--request-id", "req-bucket-1",
+                 "--bucket", kBucket},
+                "create_bucket")
+                .exit_code,
+            0);
 
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "stage=create")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "payload_kind=metadata-only")) << result.output;
-    EXPECT_TRUE(Contains(result.output,
-                         "mock_locations=node-missing-a/chunk-0,fake/path/chunk-1"))
-        << result.output;
+  const ClientRunResult result = RunClient(
+      {server_.address(), "create-object",
+       "--request-id", "req-create-1",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-a",
+       "--object-id", "obj-a",
+       "--size", "16",
+       "--etag", "etag-a"},
+      "create_object");
 
-    const auto snapshot = server_.service().TakeSnapshot("scenario/object-a");
-    ASSERT_TRUE(snapshot.record.has_value());
-    EXPECT_EQ(snapshot.record->state(), raft::METADATA_RECORD_STATE_PENDING);
-    EXPECT_EQ(snapshot.record->manifest().chunk_count(), 2U);
-    EXPECT_EQ(snapshot.record->manifest().mock_locations_size(), 2);
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "stage=create-object")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "state=PENDING")) << result.output;
+
+  const auto snapshot = server_.service().TakeSnapshot(kBucket, "scenario/object-a");
+  ASSERT_TRUE(snapshot.bucket_exists);
+  ASSERT_TRUE(snapshot.object.has_value());
+  EXPECT_EQ(snapshot.object->state(), raft::METADATA_OBJECT_STATE_PENDING);
+  EXPECT_EQ(snapshot.object->size(), 16U);
+  EXPECT_EQ(snapshot.object->etag(), "etag-a");
 }
 
 TEST_F(MetadataClientScenarioTest, CreateCommitHeadListDeleteFlowSucceeds)
 {
-    ASSERT_EQ(RunClient(
-                  {
-                      server_.address(),
-                      "create",
-                      "--request-id", "req-flow-create",
-                      "--object-key", "scenario/object-flow",
-                      "--object-size", "24",
-                      "--chunk-size", "8",
-                      "--payload", "payload-flow",
-                  },
-                  "flow_create")
-                  .exit_code,
-              0);
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-bucket",
+                 "--request-id", "req-flow-bucket",
+                 "--bucket", kBucket},
+                "flow_create_bucket")
+                .exit_code,
+            0);
 
-    ClientRunResult result = RunClient(
-        {
-            server_.address(),
-            "commit",
-            "--request-id", "req-flow-commit",
-            "--object-key", "scenario/object-flow",
-            "--expected-create-request-id", "req-flow-create",
-            "--commit-info", "commit-flow",
-        },
-        "flow_commit");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "stage=commit")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "status=OK")) << result.output;
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-object",
+                 "--request-id", "req-flow-create",
+                 "--bucket", kBucket,
+                 "--object-key", "scenario/object-flow",
+                 "--object-id", "obj-flow",
+                 "--size", "24"},
+                "flow_create_object")
+                .exit_code,
+            0);
 
-    result = RunClient(
-        {
-            server_.address(),
-            "head",
-            "--object-key", "scenario/object-flow",
-        },
-        "flow_head");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "found=true")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "state=COMMITTED")) << result.output;
+  ClientRunResult result = RunClient(
+      {server_.address(), "commit-object",
+       "--request-id", "req-flow-commit",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-flow",
+       "--object-id", "obj-flow",
+       "--size", "24",
+       "--chunk-size", "8"},
+      "flow_commit");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "stage=commit-object")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "status=OK")) << result.output;
 
-    result = RunClient(
-        {
-            server_.address(),
-            "list",
-            "--prefix", "scenario/object-flow",
-        },
-        "flow_list");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "records_count=1")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "list_record[0] object_key=scenario/object-flow"))
-        << result.output;
+  result = RunClient(
+      {server_.address(), "head-object",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-flow"},
+      "flow_head");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "found=true")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "state=COMMITTED")) << result.output;
 
-    result = RunClient(
-        {
-            server_.address(),
-            "delete",
-            "--request-id", "req-flow-delete",
-            "--object-key", "scenario/object-flow",
-            "--delete-info", "delete-flow",
-        },
-        "flow_delete");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "stage=delete")) << result.output;
+  result = RunClient(
+      {server_.address(), "list-objects",
+       "--bucket", kBucket,
+       "--prefix", "scenario/object-flow"},
+      "flow_list");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "objects_count=1")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "list_object[0] bucket=scenario-bucket")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "object_key=scenario/object-flow")) << result.output;
 
-    result = RunClient(
-        {
-            server_.address(),
-            "head",
-            "--object-key", "scenario/object-flow",
-        },
-        "flow_head_after_delete");
-    ASSERT_NE(result.exit_code, 0);
-    EXPECT_TRUE(Contains(result.output, "status=NOT_FOUND")) << result.output;
+  result = RunClient(
+      {server_.address(), "delete-object",
+       "--request-id", "req-flow-delete",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-flow",
+       "--object-id", "obj-flow"},
+      "flow_delete");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "stage=delete-object")) << result.output;
+
+  result = RunClient(
+      {server_.address(), "head-object",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-flow"},
+      "flow_head_after_delete");
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=NOT_FOUND")) << result.output;
 }
 
 TEST_F(MetadataClientScenarioTest, VerifyReadAfterWriteModeReportsPass)
 {
-    const ClientRunResult result = RunClient(
-        {
-            server_.address(),
-            "verify-read-after-write",
-            "--request-id", "req-verify",
-            "--object-key", "scenario/object-verify",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", "verify-payload",
-            "--mock-location", "node-a/chunk-0",
-            "--mock-location", "node-b/chunk-1",
-            "--commit-info", "commit-verify",
-            "--delete-info", "delete-verify",
-        },
-        "verify_raw");
+  const ClientRunResult result = RunClient(
+      {server_.address(), "verify-read-after-write",
+       "--request-id", "req-verify",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-verify",
+       "--object-id", "obj-verify",
+       "--size", "16",
+       "--chunk-size", "8"},
+      "verify_raw");
 
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "verification_check step=create-head-invisible result=PASS"))
-        << result.output;
-    EXPECT_TRUE(Contains(result.output, "verification_check step=commit-head-visible result=PASS"))
-        << result.output;
-    EXPECT_TRUE(Contains(result.output, "verification_check step=delete-list-invisible result=PASS"))
-        << result.output;
-    EXPECT_TRUE(Contains(result.output, "verification_result mode=read-after-write")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "result=PASS")) << result.output;
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "verification_check step=create-head-invisible result=PASS"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "verification_check step=commit-head-visible result=PASS"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "verification_check step=delete-list-invisible result=PASS"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "verification_result mode=read-after-write result=PASS"))
+      << result.output;
 }
 
-TEST_F(MetadataClientScenarioTest, DuplicateRequestIdDoesNotCreateDuplicateVisibleRecord)
+TEST_F(MetadataClientScenarioTest, DuplicateRequestIdDoesNotCreateDuplicateVisibleObject)
 {
-    ClientRunResult result = RunClient(
-        {
-            server_.address(),
-            "create",
-            "--request-id", "req-dup-create",
-            "--object-key", "scenario/object-dup",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", "dup-payload",
-        },
-        "dup_create_first");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-bucket",
+                 "--request-id", "req-dup-bucket",
+                 "--bucket", kBucket},
+                "dup_bucket")
+                .exit_code,
+            0);
 
-    result = RunClient(
-        {
-            server_.address(),
-            "create",
-            "--request-id", "req-dup-create",
-            "--object-key", "scenario/object-dup",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", "dup-payload",
-        },
-        "dup_create_second");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "status=IDEMPOTENT_REPLAY")) << result.output;
+  ClientRunResult result = RunClient(
+      {server_.address(), "create-object",
+       "--request-id", "req-dup-create",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-dup",
+       "--object-id", "obj-dup",
+       "--size", "16"},
+      "dup_create_first");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
 
-    result = RunClient(
-        {
-            server_.address(),
-            "commit",
-            "--request-id", "req-dup-commit",
-            "--object-key", "scenario/object-dup",
-            "--expected-create-request-id", "req-dup-create",
-        },
-        "dup_commit");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
+  result = RunClient(
+      {server_.address(), "create-object",
+       "--request-id", "req-dup-create",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-dup",
+       "--object-id", "obj-dup",
+       "--size", "16"},
+      "dup_create_second");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "status=IDEMPOTENT_REPLAY")) << result.output;
 
-    result = RunClient(
-        {
-            server_.address(),
-            "list",
-            "--prefix", "scenario/object-dup",
-        },
-        "dup_list");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "records_count=1")) << result.output;
+  result = RunClient(
+      {server_.address(), "commit-object",
+       "--request-id", "req-dup-commit",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-dup",
+       "--object-id", "obj-dup",
+       "--size", "16",
+       "--chunk-size", "8"},
+      "dup_commit");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
 
-    const auto snapshot = server_.service().TakeSnapshot("scenario/object-dup");
-    ASSERT_TRUE(snapshot.record.has_value());
-    EXPECT_EQ(snapshot.record->state(), raft::METADATA_RECORD_STATE_COMMITTED);
-    EXPECT_EQ(snapshot.record_count, 1U);
+  result = RunClient(
+      {server_.address(), "list-objects",
+       "--bucket", kBucket,
+       "--prefix", "scenario/object-dup"},
+      "dup_list");
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "objects_count=1")) << result.output;
+
+  const auto snapshot = server_.service().TakeSnapshot(kBucket, "scenario/object-dup");
+  ASSERT_TRUE(snapshot.object.has_value());
+  EXPECT_EQ(snapshot.object->state(), raft::METADATA_OBJECT_STATE_COMMITTED);
+  EXPECT_EQ(snapshot.object_count, 1U);
 }
 
-TEST_F(MetadataClientScenarioTest, PayloadBoundaryAndMockLocationsBehaviorAreExposed)
+TEST_F(MetadataClientScenarioTest, ChunkLayoutAndCustomEtagAreExposed)
 {
-    ClientRunResult result = RunClient(
-        {
-            server_.address(),
-            "create",
-            "--request-id", "req-payload-ok",
-            "--object-key", "scenario/object-payload-ok",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", std::string(4096, 'x'),
-            "--mock-location", "definitely-missing-node/chunk-0",
-            "--mock-location", "nowhere/chunk-1",
-        },
-        "payload_ok");
-    ASSERT_EQ(result.exit_code, 0) << result.output;
-    EXPECT_TRUE(Contains(result.output, "payload_bytes=4096")) << result.output;
-    EXPECT_TRUE(Contains(result.output,
-                         "mock_locations=definitely-missing-node/chunk-0,nowhere/chunk-1"))
-        << result.output;
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-bucket",
+                 "--request-id", "req-layout-bucket",
+                 "--bucket", kBucket},
+                "layout_bucket")
+                .exit_code,
+            0);
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-object",
+                 "--request-id", "req-layout-create",
+                 "--bucket", kBucket,
+                 "--object-key", "scenario/object-layout",
+                 "--object-id", "obj-layout",
+                 "--size", "18",
+                 "--etag", "custom-etag"},
+                "layout_create")
+                .exit_code,
+            0);
 
-    result = RunClient(
-        {
-            server_.address(),
-            "create",
-            "--request-id", "req-payload-too-large",
-            "--object-key", "scenario/object-payload-bad",
-            "--object-size", "16",
-            "--chunk-size", "8",
-            "--payload", std::string(4097, 'y'),
-            "--mock-location", "node-x/chunk-0",
-        },
-        "payload_too_large");
-    ASSERT_NE(result.exit_code, 0);
-    EXPECT_TRUE(Contains(result.output, "status=INVALID_ARGUMENT")) << result.output;
-    EXPECT_TRUE(Contains(result.output, "payload exceeds limit")) << result.output;
+  const ClientRunResult result = RunClient(
+      {server_.address(), "commit-object",
+       "--request-id", "req-layout-commit",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-layout",
+       "--object-id", "obj-layout",
+       "--size", "18",
+       "--chunk-size", "8",
+       "--etag", "custom-etag"},
+      "layout_commit");
+
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(Contains(result.output, "etag=custom-etag")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "chunks=3")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "object_record.chunk[0]")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "object_record.chunk[2]")) << result.output;
 }

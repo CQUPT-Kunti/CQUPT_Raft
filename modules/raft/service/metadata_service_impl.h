@@ -14,30 +14,45 @@ namespace raftdemo
   public:
     explicit MetadataServiceImpl(RaftNode &node);
 
-    grpc::ServerUnaryReactor *CreateMetadataRecord(
+    grpc::ServerUnaryReactor *CreateBucket(
         grpc::CallbackServerContext *context,
-        const raft::CreateMetadataRecordRequest *request,
-        raft::CreateMetadataRecordResponse *response) override;
+        const raft::CreateBucketRequest *request,
+        raft::CreateBucketResponse *response) override;
 
-    grpc::ServerUnaryReactor *CommitMetadataRecord(
+    grpc::ServerUnaryReactor *DeleteBucket(
         grpc::CallbackServerContext *context,
-        const raft::CommitMetadataRecordRequest *request,
-        raft::CommitMetadataRecordResponse *response) override;
+        const raft::DeleteBucketRequest *request,
+        raft::DeleteBucketResponse *response) override;
 
-    grpc::ServerUnaryReactor *DeleteMetadataRecord(
+    grpc::ServerUnaryReactor *CreateObject(
         grpc::CallbackServerContext *context,
-        const raft::DeleteMetadataRecordRequest *request,
-        raft::DeleteMetadataRecordResponse *response) override;
+        const raft::CreateObjectRequest *request,
+        raft::CreateObjectResponse *response) override;
 
-    grpc::ServerUnaryReactor *HeadMetadataRecord(
+    grpc::ServerUnaryReactor *CommitObject(
         grpc::CallbackServerContext *context,
-        const raft::HeadMetadataRecordRequest *request,
-        raft::HeadMetadataRecordResponse *response) override;
+        const raft::CommitObjectRequest *request,
+        raft::CommitObjectResponse *response) override;
 
-    grpc::ServerUnaryReactor *ListMetadataRecords(
+    grpc::ServerUnaryReactor *AbortObject(
         grpc::CallbackServerContext *context,
-        const raft::ListMetadataRecordsRequest *request,
-        raft::ListMetadataRecordsResponse *response) override;
+        const raft::AbortObjectRequest *request,
+        raft::AbortObjectResponse *response) override;
+
+    grpc::ServerUnaryReactor *DeleteObject(
+        grpc::CallbackServerContext *context,
+        const raft::DeleteObjectRequest *request,
+        raft::DeleteObjectResponse *response) override;
+
+    grpc::ServerUnaryReactor *HeadObject(
+        grpc::CallbackServerContext *context,
+        const raft::HeadObjectRequest *request,
+        raft::HeadObjectResponse *response) override;
+
+    grpc::ServerUnaryReactor *ListObjects(
+        grpc::CallbackServerContext *context,
+        const raft::ListObjectsRequest *request,
+        raft::ListObjectsResponse *response) override;
 
   private:
     RaftNode &node_;

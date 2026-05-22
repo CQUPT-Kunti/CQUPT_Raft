@@ -20,6 +20,11 @@
   - `raft_proto`
   - `metadata_proto`
   - `kv_proto`
+- `metadata.proto` 当前主路径负责 bucket/object 生命周期 RPC：
+  - `CreateBucket` / `DeleteBucket`
+  - `CreateObject` / `CommitObject` / `AbortObject` / `DeleteObject`
+  - `HeadObject` / `ListObjects`
+- `common.proto` 当前主路径承载 metadata 公共状态码、`BucketRecord`、`ObjectRecord`、`ChunkRef`、leader hint 与 response summary
 
 ## Out of Scope
 
@@ -39,7 +44,7 @@
 - 字段编号、消息名、状态码都视为稳定契约
 - 优先维持文件边界清晰：
   - `raft.proto` 只承载共识 RPC 与 Raft 消息
-  - `metadata.proto` 只承载 metadata 业务 RPC
+  - `metadata.proto` 只承载 metadata 业务 RPC，不能复用 KV RPC / KV message
   - `common.proto` 只承载可复用公共消息
   - `kv.proto` 只承载遗留 KV RPC，避免重新混回 `raft.proto`
 - 优先维持 target 边界清晰：

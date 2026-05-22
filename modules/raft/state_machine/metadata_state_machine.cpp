@@ -15,6 +15,7 @@ namespace raftdemo
 {
     namespace
     {
+        constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
         constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
         constexpr std::uint32_t kStrongConsistencyMetadataSnapshotVersion = 1U;
         constexpr std::uint32_t kMetadataStateMachineSnapshotVersion = 2U;
@@ -1088,6 +1089,13 @@ namespace raftdemo
         if (index == 0)
         {
             return MakeApplyFailure("metadata state machine skeleton requires index > 0");
+        }
+        if (command_data == kInternalNoOpCommand)
+        {
+            std::unique_lock<std::shared_mutex> lk(mu_);
+            last_applied_index_ = index;
+            last_applied_term_ = 0;
+            return {true, "ok"};
         }
         if (command_data.empty())
         {

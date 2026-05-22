@@ -80,11 +80,11 @@ enum MetadataStatusCode {
   METADATA_STATUS_CODE_TIMEOUT = 9;
 }
 
-enum MetadataRecordState {
-  METADATA_RECORD_STATE_UNSPECIFIED = 0;
-  METADATA_RECORD_STATE_PENDING = 1;
-  METADATA_RECORD_STATE_COMMITTED = 2;
-  METADATA_RECORD_STATE_DELETED = 3;
+enum MetadataObjectState {
+  METADATA_OBJECT_STATE_UNSPECIFIED = 0;
+  METADATA_OBJECT_STATE_PENDING = 1;
+  METADATA_OBJECT_STATE_COMMITTED = 2;
+  METADATA_OBJECT_STATE_DELETED = 3;
 }
 
 message MetadataLeaderHint {
@@ -92,36 +92,44 @@ message MetadataLeaderHint {
   string leader_address = 2;
 }
 
-message MetadataManifest {
-  uint64 object_size = 1;
-  uint64 chunk_size = 2;
-  uint64 chunk_count = 3;
-  string checksum = 4;
-  repeated string mock_locations = 5;
+message ChunkRef {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+  repeated string replica_nodes = 4;
+  string checksum = 5;
 }
 
-message MetadataRecord {
-  string object_key = 1;
-  MetadataRecordState state = 2;
-  MetadataManifest manifest = 3;
-  string payload = 4;
-  string create_request_id = 5;
-  string commit_request_id = 6;
-  string delete_request_id = 7;
-  uint64 created_at_log_index = 8;
-  uint64 committed_at_log_index = 9;
-  uint64 deleted_at_log_index = 10;
-  string commit_info = 11;
-  string delete_info = 12;
+message BucketRecord {
+  string bucket = 1;
+  uint64 create_time = 2;
+  bool deleted = 3;
+  uint64 delete_time = 4;
+}
+
+message ObjectRecord {
+  string bucket = 1;
+  string object_key = 2;
+  string object_id = 3;
+  uint64 version = 4;
+  uint64 size = 5;
+  string etag = 6;
+  MetadataObjectState state = 7;
+  repeated ChunkRef chunks = 8;
+  uint64 create_time = 9;
+  uint64 commit_time = 10;
+  uint64 delete_time = 11;
 }
 
 message MetadataResponseSummary {
   MetadataStatusCode code = 1;
   string message = 2;
   string request_id = 3;
-  string object_key = 4;
-  MetadataRecordState state = 5;
-  uint64 term = 6;
-  uint64 log_index = 7;
-  MetadataLeaderHint leader_hint = 8;
+  string bucket = 4;
+  string object_key = 5;
+  string object_id = 6;
+  MetadataObjectState state = 7;
+  uint64 term = 8;
+  uint64 log_index = 9;
+  MetadataLeaderHint leader_hint = 10;
 }

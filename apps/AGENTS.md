@@ -35,6 +35,8 @@
 - `raft_metadata_client` 只消费 `metadata.proto` 生成头
 - `raft_kv_client` 只应链接 `kv_proto`
 - `raft_metadata_client` 只应链接 `metadata_proto`
+- `raft_metadata_client` 当前主路径面向 bucket/object metadata RPC，不能通过 KV fallback 访问 metadata
+- `raft_metadata_client` 的读写输出要保留 request_id / leader hint / status code 等工业化排障信息
 
 ## Relevant Tests
 

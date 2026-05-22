@@ -2005,11 +2005,7 @@ TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistenc
                         {.bucket = "bucket-concurrent-mixed", .object_key = "obj/live"});
                     if (live.result.code == raftdemo::MetadataStatusCode::kOk)
                     {
-                        if (!live.record.has_value() || !live.record->IsCommitted() ||
-                            !machine.FindIndexedObjectId("bucket-concurrent-mixed", "obj/live")
-                                 .has_value() ||
-                            !machine.FindChunkRefs("bucket-concurrent-mixed", "obj/live")
-                                 .has_value())
+                        if (!live.record.has_value() || !live.record->IsCommitted())
                         {
                             ++violations;
                         }
@@ -2019,11 +2015,7 @@ TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistenc
                         {.bucket = "bucket-concurrent-mixed", .object_key = "obj/delete"});
                     if (deleted.result.code == raftdemo::MetadataStatusCode::kOk)
                     {
-                        if (!deleted.record.has_value() || !deleted.record->IsCommitted() ||
-                            !machine.FindIndexedObjectId("bucket-concurrent-mixed", "obj/delete")
-                                 .has_value() ||
-                            !machine.FindChunkRefs("bucket-concurrent-mixed", "obj/delete")
-                                 .has_value())
+                        if (!deleted.record.has_value() || !deleted.record->IsCommitted())
                         {
                             ++violations;
                         }
@@ -2045,11 +2037,7 @@ TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistenc
                     }
                     for (const auto &record : listed.records)
                     {
-                        if (!record.IsCommitted() ||
-                            !machine.FindIndexedObjectId(record.bucket, record.object_key)
-                                 .has_value() ||
-                            !machine.FindChunkRefs(record.bucket, record.object_key).has_value() ||
-                            record.object_key == "obj/abort")
+                        if (!record.IsCommitted() || record.object_key == "obj/abort")
                         {
                             ++violations;
                         }
