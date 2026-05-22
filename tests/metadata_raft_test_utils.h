@@ -11,6 +11,7 @@
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
 #include "raft/state_machine/metadata_state_machine.h"
+#include "support/metadata_test_utils.h"
 
 namespace raftdemo::test
 {
@@ -43,120 +44,6 @@ namespace raftdemo::test
             }
         }
         return false;
-    }
-
-    inline MetadataCommand MakeCreateBucketCommand(const std::string &bucket,
-                                                   const std::string &request_id,
-                                                   const std::uint64_t create_time = 1710000000)
-    {
-        MetadataCommand command;
-        command.command_type = MetadataCommandType::kCreateBucket;
-        command.request_id = request_id;
-        command.create_bucket = CreateBucketCommandPayload{
-            BucketRecord{bucket, create_time, false, std::nullopt}};
-        command.request_context = RequestRecord{
-            request_id,
-            MetadataRequestType::kCreateBucket,
-            bucket,
-            "",
-            "accepted",
-            0,
-            create_time,
-            std::nullopt};
-        return command;
-    }
-
-    inline MetadataCommand MakeCreateObjectCommand(const std::string &bucket,
-                                                   const std::string &object_key,
-                                                   const std::string &object_id,
-                                                   const std::string &request_id,
-                                                   const std::uint64_t create_time = 1710000001)
-    {
-        MetadataCommand command;
-        command.command_type = MetadataCommandType::kCreateObject;
-        command.request_id = request_id;
-        command.create_object = CreateObjectCommandPayload{
-            ObjectRecord{bucket,
-                         object_key,
-                         object_id,
-                         1,
-                         64,
-                         "etag-" + object_id,
-                         ObjectState::PENDING,
-                         {},
-                         create_time,
-                         std::nullopt,
-                         std::nullopt}};
-        command.request_context = RequestRecord{
-            request_id,
-            MetadataRequestType::kCreateObject,
-            bucket,
-            object_key,
-            "accepted",
-            0,
-            create_time,
-            std::nullopt};
-        return command;
-    }
-
-    inline MetadataCommand MakeCommitObjectCommand(
-        const std::string &bucket,
-        const std::string &object_key,
-        const std::string &object_id,
-        const std::string &request_id,
-        const std::uint64_t commit_time = 1710000005)
-    {
-        MetadataCommand command;
-        command.command_type = MetadataCommandType::kCommitObject;
-        command.request_id = request_id;
-        command.commit_object = CommitObjectCommandPayload{
-            bucket,
-            object_key,
-            object_id,
-            1,
-            512,
-            "etag-commit-" + object_id,
-            {ChunkRef{"chunk-a", 0, 256, {"node-a", "node-b"}, "checksum-a"},
-             ChunkRef{"chunk-b", 256, 256, {"node-c"}, "checksum-b"}},
-            commit_time};
-        command.request_context = RequestRecord{
-            request_id,
-            MetadataRequestType::kCommitObject,
-            bucket,
-            object_key,
-            "accepted",
-            0,
-            commit_time,
-            std::nullopt};
-        return command;
-    }
-
-    inline MetadataCommand MakeDeleteObjectCommand(
-        const std::string &bucket,
-        const std::string &object_key,
-        const std::string &object_id,
-        const std::string &request_id,
-        const std::uint64_t delete_time = 1710000007)
-    {
-        MetadataCommand command;
-        command.command_type = MetadataCommandType::kDeleteObject;
-        command.request_id = request_id;
-        command.delete_object = DeleteObjectCommandPayload{
-            bucket,
-            object_key,
-            object_id,
-            1,
-            delete_time};
-        command.request_context = RequestRecord{
-            request_id,
-            MetadataRequestType::kDeleteObject,
-            bucket,
-            object_key,
-            "accepted",
-            0,
-            delete_time,
-            std::nullopt};
-        return command;
     }
 
     inline ProposeResult ProposeMetadataCommand(

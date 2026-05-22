@@ -69,6 +69,36 @@ function(add_raft_gtest target_name source_file test_labels)
   )
 endfunction()
 
+function(add_raft_gtest_sources target_name test_labels)
+  set(source_files ${ARGN})
+  foreach(source_file IN LISTS source_files)
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
+      message(STATUS "Skip ${target_name}: ${source_file} not found")
+      return()
+    endif()
+  endforeach()
+
+  add_executable(${target_name} ${source_files})
+
+  target_link_libraries(${target_name}
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(${target_name}
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  gtest_discover_tests(${target_name}
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES
+      LABELS "${test_labels}"
+  )
+endfunction()
+
 # =========================
 # Platform-neutral baseline:
 # basic unit tests
@@ -107,26 +137,13 @@ add_raft_gtest(test_metadata_command_types metadata_command_types_test.cpp
 add_raft_gtest(test_metadata_manifest metadata_manifest_test.cpp
   "platform-neutral;platform-neutral-fallback")
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_state_machine_test.cpp")
-  add_executable(test_metadata_state_machine
+  add_raft_gtest_sources(test_metadata_state_machine
+    "platform-neutral;platform-neutral-fallback"
     metadata_state_machine_test.cpp
-  )
-
-  target_link_libraries(test_metadata_state_machine
-    PRIVATE
-      raft_core
-      GTest::gtest_main
-  )
-
-  target_include_directories(test_metadata_state_machine
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}
-  )
-
-  gtest_discover_tests(test_metadata_state_machine
-    DISCOVERY_TIMEOUT 60
-    DISCOVERY_MODE PRE_TEST
-    PROPERTIES
-      LABELS "platform-neutral;platform-neutral-fallback"
+    metadata_state_machine_query_test.cpp
+    metadata_state_machine_snapshot_test.cpp
+    metadata_state_machine_concurrency_test.cpp
+    metadata_state_machine_legacy_test.cpp
   )
 else()
   message(STATUS "Skip test_metadata_state_machine: metadata_state_machine_test.cpp not found")
@@ -243,8 +260,10 @@ add_raft_gtest(raft_integration_test raft_integration_test.cpp
 # =========================
 add_raft_gtest(test_raft_snapshot_catchup test_raft_snapshot_catchup.cpp
   "platform-neutral")
-add_raft_gtest(test_raft_snapshot_restart test_raft_snapshot_restart.cpp
-  "platform-neutral;durability-boundary;linux-specific-failure-injection")
+add_raft_gtest_sources(test_raft_snapshot_restart
+  "platform-neutral;durability-boundary;linux-specific-failure-injection"
+  test_raft_snapshot_restart.cpp
+  test_raft_snapshot_recovery.cpp)
 add_raft_gtest(test_raft_snapshot_diagnosis test_raft_snapshot_diagnosis.cpp
   "durability-boundary;linux-primary-diagnosis")
 
