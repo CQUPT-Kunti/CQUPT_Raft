@@ -1,8 +1,10 @@
 #include "raft/service/metadata_service_impl.h"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "raft/common/metadata_command.h"
@@ -267,20 +269,20 @@ namespace raftdemo
                   out);
     }
 
-    bool EnsureLeaderForRead(const NodeStatusSnapshot &status,
-                             const std::string &bucket,
-                             const std::string &object_key,
-                             const std::string &object_id,
-                             raft::MetadataResponseSummary *summary)
+    template <typename Response>
+    grpc::ServerUnaryReactor *FinishReadError(grpc::CallbackServerContext *context,
+                                              const NodeStatusSnapshot &status,
+                                              const raft::MetadataStatusCode code,
+                                              const std::string &message,
+                                              const std::string &bucket,
+                                              const std::string &object_key,
+                                              const std::string &object_id,
+                                              Response *response)
     {
-      if (status.role == "Leader")
-      {
-        return true;
-      }
-
+      auto *reactor = context->DefaultReactor();
       FillSummary(status,
-                  MetadataStatusCode::kNotLeader,
-                  "node is not the leader",
+                  code,
+                  message,
                   "",
                   bucket,
                   object_key,
@@ -288,8 +290,109 @@ namespace raftdemo
                   std::nullopt,
                   std::nullopt,
                   status.term,
-                  summary);
-      return false;
+                  response->mutable_summary());
+      if constexpr (std::is_same_v<Response, raft::HeadObjectResponse>)
+      {
+        response->set_found(false);
+      }
+      if constexpr (std::is_same_v<Response, raft::ListObjectsResponse>)
+      {
+        response->clear_objects();
+        response->set_next_continuation_token("");
+      }
+      reactor->Finish(grpc::Status::OK);
+      return reactor;
+    }
+
+    bool IsDeadlineExpired(grpc::CallbackServerContext *context)
+    {
+      return context != nullptr &&
+             context->deadline() <= std::chrono::system_clock::now();
+    }
+
+    template <typename Response>
+    grpc::ServerUnaryReactor *FinishReadAdmissionIfRejected(
+        const RaftNode &node,
+        grpc::CallbackServerContext *context,
+        const NodeStatusSnapshot &status,
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        Response *response)
+    {
+      if (IsDeadlineExpired(context))
+      {
+        return FinishReadError(context,
+                               status,
+                               raft::METADATA_STATUS_CODE_TIMEOUT,
+                               "read deadline already expired before admission",
+                               bucket,
+                               object_key,
+                               object_id,
+                               response);
+      }
+
+      if (!node.IsRunning())
+      {
+        return FinishReadError(context,
+                               status,
+                               raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE,
+                               "node is stopping",
+                               bucket,
+                               object_key,
+                               object_id,
+                               response);
+      }
+
+      if (status.role != "Leader")
+      {
+        return FinishReadError(context,
+                               status,
+                               raft::METADATA_STATUS_CODE_NOT_LEADER,
+                               "node is not the leader",
+                               bucket,
+                               object_key,
+                               object_id,
+                               response);
+      }
+
+      return nullptr;
+    }
+
+    bool ValidateHeadObjectRequest(const raft::HeadObjectRequest &request,
+                                   std::string *reason)
+    {
+      if (request.bucket().empty())
+      {
+        if (reason != nullptr)
+        {
+          *reason = "bucket is required";
+        }
+        return false;
+      }
+      if (request.object_key().empty())
+      {
+        if (reason != nullptr)
+        {
+          *reason = "object_key is required";
+        }
+        return false;
+      }
+      return true;
+    }
+
+    bool ValidateListObjectsRequest(const raft::ListObjectsRequest &request,
+                                    std::string *reason)
+    {
+      if (request.bucket().empty())
+      {
+        if (reason != nullptr)
+        {
+          *reason = "bucket is required";
+        }
+        return false;
+      }
+      return true;
     }
 
     RequestRecord MakeRequestContext(const std::string &request_id,
@@ -805,36 +908,44 @@ namespace raftdemo
       const raft::HeadObjectRequest *request,
       raft::HeadObjectResponse *response)
   {
-    auto *reactor = context->DefaultReactor();
     const NodeStatusSnapshot status = node_.GetStatusSnapshot();
-    if (!EnsureLeaderForRead(status,
+    if (auto *reactor = FinishReadAdmissionIfRejected(
+            node_,
+            context,
+            status,
+            request->bucket(),
+            request->object_key(),
+            request->object_id(),
+            response);
+        reactor != nullptr)
+    {
+      return reactor;
+    }
+
+    std::string validation_error;
+    if (!ValidateHeadObjectRequest(*request, &validation_error))
+    {
+      return FinishReadError(context,
+                             status,
+                             raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
+                             validation_error,
                              request->bucket(),
                              request->object_key(),
                              request->object_id(),
-                             response->mutable_summary()))
-    {
-      response->set_found(false);
-      reactor->Finish(grpc::Status::OK);
-      return reactor;
+                             response);
     }
 
     const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
     if (metadata_state_machine == nullptr)
     {
-      FillSummary(status,
-                  MetadataStatusCode::kInternalError,
-                  "metadata state machine is not configured",
-                  "",
-                  request->bucket(),
-                  request->object_key(),
-                  request->object_id(),
-                  std::nullopt,
-                  std::nullopt,
-                  status.term,
-                  response->mutable_summary());
-      response->set_found(false);
-      reactor->Finish(grpc::Status::OK);
-      return reactor;
+      return FinishReadError(context,
+                             status,
+                             raft::METADATA_STATUS_CODE_INTERNAL_ERROR,
+                             "metadata state machine is not configured",
+                             request->bucket(),
+                             request->object_key(),
+                             request->object_id(),
+                             response);
     }
 
     HeadObjectQuery query;
@@ -867,6 +978,7 @@ namespace raftdemo
       FillObjectRecord(*head.record, response->mutable_object());
     }
 
+    auto *reactor = context->DefaultReactor();
     reactor->Finish(grpc::Status::OK);
     return reactor;
   }
@@ -876,34 +988,44 @@ namespace raftdemo
       const raft::ListObjectsRequest *request,
       raft::ListObjectsResponse *response)
   {
-    auto *reactor = context->DefaultReactor();
     const NodeStatusSnapshot status = node_.GetStatusSnapshot();
-    if (!EnsureLeaderForRead(status,
+    if (auto *reactor = FinishReadAdmissionIfRejected(
+            node_,
+            context,
+            status,
+            request->bucket(),
+            request->prefix(),
+            "",
+            response);
+        reactor != nullptr)
+    {
+      return reactor;
+    }
+
+    std::string validation_error;
+    if (!ValidateListObjectsRequest(*request, &validation_error))
+    {
+      return FinishReadError(context,
+                             status,
+                             raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
+                             validation_error,
                              request->bucket(),
                              request->prefix(),
                              "",
-                             response->mutable_summary()))
-    {
-      reactor->Finish(grpc::Status::OK);
-      return reactor;
+                             response);
     }
 
     const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
     if (metadata_state_machine == nullptr)
     {
-      FillSummary(status,
-                  MetadataStatusCode::kInternalError,
-                  "metadata state machine is not configured",
-                  "",
-                  request->bucket(),
-                  request->prefix(),
-                  "",
-                  std::nullopt,
-                  std::nullopt,
-                  status.term,
-                  response->mutable_summary());
-      reactor->Finish(grpc::Status::OK);
-      return reactor;
+      return FinishReadError(context,
+                             status,
+                             raft::METADATA_STATUS_CODE_INTERNAL_ERROR,
+                             "metadata state machine is not configured",
+                             request->bucket(),
+                             request->prefix(),
+                             "",
+                             response);
     }
 
     ListObjectsQuery query;
@@ -934,6 +1056,7 @@ namespace raftdemo
     }
     response->set_next_continuation_token(list.next_page_token);
 
+    auto *reactor = context->DefaultReactor();
     reactor->Finish(grpc::Status::OK);
     return reactor;
   }

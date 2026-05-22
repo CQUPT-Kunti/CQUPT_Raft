@@ -713,6 +713,141 @@ namespace raftdemo
       EXPECT_EQ(response.summary().request_id(), "write-on-follower");
     }
 
+    TEST_F(MetadataFailoverTest, FollowerHeadAndListReturnNotLeader)
+    {
+      const std::string bucket = "follower-read-bucket";
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto bucket_response = InvokeWriteViaCurrentLeader<
+          raft::CreateBucketRequest, raft::CreateBucketResponse>(
+          cluster.Nodes(), configs, MakeCreateBucketRequest("follower-read-bucket-create", bucket), 5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateBucketRequest &request,
+             raft::CreateBucketResponse *response)
+          {
+            return stub->CreateBucket(context, request, response);
+          });
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      const auto create_response = InvokeWriteViaCurrentLeader<
+          raft::CreateObjectRequest, raft::CreateObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateObjectRequest("follower-read-create", bucket,
+                                  "object/readable", "obj-readable"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateObjectRequest &request,
+             raft::CreateObjectResponse *response)
+          {
+            return stub->CreateObject(context, request, response);
+          });
+      ASSERT_EQ(create_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << create_response.summary().message();
+
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCommitObjectRequest("follower-read-commit", bucket,
+                                  "object/readable", "obj-readable"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
+      ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << commit_response.summary().message();
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      std::size_t follower_index = cluster.Nodes().size();
+      for (std::size_t i = 0; i < cluster.Nodes().size(); ++i)
+      {
+        if (i != leader_index)
+        {
+          follower_index = i;
+          break;
+        }
+      }
+      ASSERT_LT(follower_index, cluster.Nodes().size());
+
+      auto follower_stub = MakeMetadataStub(configs[follower_index].address);
+      grpc::ClientContext head_context;
+      raft::HeadObjectRequest head_request;
+      head_request.set_bucket(bucket);
+      head_request.set_object_key("object/readable");
+      raft::HeadObjectResponse head_response;
+      ASSERT_TRUE(follower_stub->HeadObject(&head_context, head_request, &head_response).ok());
+      EXPECT_EQ(head_response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER)
+          << head_response.summary().message();
+      EXPECT_FALSE(head_response.found());
+
+      grpc::ClientContext list_context;
+      raft::ListObjectsRequest list_request;
+      list_request.set_bucket(bucket);
+      list_request.set_prefix("object/");
+      raft::ListObjectsResponse list_response;
+      ASSERT_TRUE(follower_stub->ListObjects(&list_context, list_request, &list_response).ok());
+      EXPECT_EQ(list_response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER)
+          << list_response.summary().message();
+      EXPECT_EQ(list_response.objects_size(), 0);
+    }
+
+    TEST_F(MetadataFailoverTest, LeaderHeadAndListInvalidRequestReturnInvalidArgument)
+    {
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      auto leader_stub = MakeMetadataStub(configs[leader_index].address);
+
+      grpc::ClientContext invalid_head_context;
+      raft::HeadObjectRequest invalid_head_request;
+      invalid_head_request.set_bucket("");
+      invalid_head_request.set_object_key("");
+      raft::HeadObjectResponse invalid_head_response;
+      ASSERT_TRUE(leader_stub->HeadObject(
+                              &invalid_head_context,
+                              invalid_head_request,
+                              &invalid_head_response)
+                      .ok());
+      EXPECT_EQ(invalid_head_response.summary().code(),
+                raft::METADATA_STATUS_CODE_INVALID_ARGUMENT)
+          << invalid_head_response.summary().message();
+      EXPECT_FALSE(invalid_head_response.found());
+
+      grpc::ClientContext invalid_list_context;
+      raft::ListObjectsRequest invalid_list_request;
+      invalid_list_request.set_bucket("");
+      raft::ListObjectsResponse invalid_list_response;
+      ASSERT_TRUE(leader_stub->ListObjects(
+                              &invalid_list_context,
+                              invalid_list_request,
+                              &invalid_list_response)
+                      .ok());
+      EXPECT_EQ(invalid_list_response.summary().code(),
+                raft::METADATA_STATUS_CODE_INVALID_ARGUMENT)
+          << invalid_list_response.summary().message();
+      EXPECT_EQ(invalid_list_response.objects_size(), 0);
+    }
+
     TEST_F(MetadataFailoverTest, LeaderWriteTimeoutReturnsTimeoutAndSameRequestIdCanRetry)
     {
       const std::string bucket = "timeout-bucket";

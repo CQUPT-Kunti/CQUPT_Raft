@@ -186,6 +186,26 @@ namespace
           ForcedWriteResponse{code, std::move(message)};
     }
 
+    void ForceHeadResponse(const std::string &bucket,
+                           const std::string &object_key,
+                           const raft::MetadataStatusCode code,
+                           std::string message)
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      forced_head_responses_[ObjectIdentity(bucket, object_key)] =
+          ForcedReadResponse{code, std::move(message)};
+    }
+
+    void ForceListResponse(const std::string &bucket,
+                           const std::string &prefix,
+                           const raft::MetadataStatusCode code,
+                           std::string message)
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      forced_list_responses_[ObjectIdentity(bucket, prefix)] =
+          ForcedReadResponse{code, std::move(message)};
+    }
+
     struct Snapshot
     {
       bool bucket_exists = false;
@@ -719,6 +739,10 @@ namespace
                             raft::HeadObjectResponse *response) override
     {
       std::lock_guard<std::mutex> lock(mu_);
+      if (MaybeServeForcedHeadResponse(request->bucket(), request->object_key(), response))
+      {
+        return grpc::Status::OK;
+      }
       const auto bucket_it = buckets_.find(request->bucket());
       if (bucket_it == buckets_.end() || bucket_it->second.deleted())
       {
@@ -771,6 +795,10 @@ namespace
                              raft::ListObjectsResponse *response) override
     {
       std::lock_guard<std::mutex> lock(mu_);
+      if (MaybeServeForcedListResponse(request->bucket(), request->prefix(), response))
+      {
+        return grpc::Status::OK;
+      }
       const auto bucket_it = buckets_.find(request->bucket());
       if (bucket_it == buckets_.end() || bucket_it->second.deleted())
       {
@@ -846,6 +874,12 @@ namespace
       std::string message;
     };
 
+    struct ForcedReadResponse
+    {
+      raft::MetadataStatusCode code;
+      std::string message;
+    };
+
     template <typename Response>
     bool MaybeServeForcedWriteResponse(const std::string &request_id,
                                        const std::string &bucket,
@@ -868,6 +902,53 @@ namespace
                       object_id,
                       raft::METADATA_OBJECT_STATE_UNSPECIFIED,
                       CurrentLogIndex()));
+      return true;
+    }
+
+    bool MaybeServeForcedHeadResponse(const std::string &bucket,
+                                      const std::string &object_key,
+                                      raft::HeadObjectResponse *response)
+    {
+      const auto it = forced_head_responses_.find(ObjectIdentity(bucket, object_key));
+      if (it == forced_head_responses_.end())
+      {
+        return false;
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(it->second.code,
+                      it->second.message,
+                      "",
+                      bucket,
+                      object_key,
+                      "",
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      CurrentLogIndex()));
+      response->set_found(false);
+      return true;
+    }
+
+    bool MaybeServeForcedListResponse(const std::string &bucket,
+                                      const std::string &prefix,
+                                      raft::ListObjectsResponse *response)
+    {
+      const auto it = forced_list_responses_.find(ObjectIdentity(bucket, prefix));
+      if (it == forced_list_responses_.end())
+      {
+        return false;
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(it->second.code,
+                      it->second.message,
+                      "",
+                      bucket,
+                      prefix,
+                      "",
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      CurrentLogIndex()));
+      response->clear_objects();
+      response->set_next_continuation_token("");
       return true;
     }
 
@@ -950,6 +1031,8 @@ namespace
     std::map<std::string, raft::BucketRecord> buckets_;
     std::map<std::string, raft::ObjectRecord> objects_;
     std::map<std::string, ForcedWriteResponse> forced_write_responses_;
+    std::map<std::string, ForcedReadResponse> forced_head_responses_;
+    std::map<std::string, ForcedReadResponse> forced_list_responses_;
     std::map<std::string, ReplayEntry<raft::CreateBucketResponse>> create_bucket_replays_;
     std::map<std::string, ReplayEntry<raft::CreateObjectResponse>> create_object_replays_;
     std::map<std::string, ReplayEntry<raft::CommitObjectResponse>> commit_object_replays_;
@@ -1261,6 +1344,47 @@ TEST_F(MetadataClientScenarioTest, ClientShowsIdempotencyConflictAsNonRetryable)
   ASSERT_NE(result.exit_code, 0);
   EXPECT_TRUE(Contains(result.output, "status=IDEMPOTENCY_CONFLICT")) << result.output;
   EXPECT_TRUE(Contains(result.output, "retryable=false")) << result.output;
+}
+
+TEST_F(MetadataClientScenarioTest, ReadCommandsShowRetryableAdmissionStatuses)
+{
+  server_.service().ForceHeadResponse(
+      "head-not-leader-bucket", "object/not-leader",
+      raft::METADATA_STATUS_CODE_NOT_LEADER, "node is not the leader");
+  server_.service().ForceHeadResponse(
+      "head-timeout-bucket", "object/timeout",
+      raft::METADATA_STATUS_CODE_TIMEOUT,
+      "read deadline already expired before admission");
+  server_.service().ForceListResponse(
+      "list-stopped-bucket", "prefix/stopped",
+      raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE, "node is stopping");
+
+  ClientRunResult result = RunClient(
+      {server_.address(), "head-object",
+       "--bucket", "head-not-leader-bucket",
+       "--object-key", "object/not-leader"},
+      "read_head_not_leader");
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=NOT_LEADER")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
+
+  result = RunClient(
+      {server_.address(), "head-object",
+       "--bucket", "head-timeout-bucket",
+       "--object-key", "object/timeout"},
+      "read_head_timeout");
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=TIMEOUT")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
+
+  result = RunClient(
+      {server_.address(), "list-objects",
+       "--bucket", "list-stopped-bucket",
+       "--prefix", "prefix/stopped"},
+      "read_list_service_unavailable");
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=SERVICE_UNAVAILABLE")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
 }
 
 TEST_F(MetadataClientScenarioTest, ChunkLayoutAndCustomEtagAreExposed)
