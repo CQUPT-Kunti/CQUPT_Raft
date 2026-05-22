@@ -13,6 +13,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "metadata.grpc.pb.h"
+#include "metadata_raft_test_utils.h"
 #include "raft/common/config.h"
 #include "raft/node/raft_node.h"
 
@@ -627,15 +628,29 @@ namespace raftdemo
       const auto commit_request =
           MakeCommitObjectRequest("commit-retry", bucket, "object/retry", "obj-retry");
 
-      grpc::ClientContext create_context;
-      raft::CreateObjectResponse create_response;
-      ASSERT_TRUE(leader_stub->CreateObject(&create_context, create_request, &create_response).ok());
+      const auto create_response = InvokeWriteViaCurrentLeader<
+          raft::CreateObjectRequest, raft::CreateObjectResponse>(
+          cluster.Nodes(), configs, create_request, 5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateObjectRequest &request,
+             raft::CreateObjectResponse *response)
+          {
+            return stub->CreateObject(context, request, response);
+          });
       ASSERT_EQ(create_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << create_response.summary().message();
 
-      grpc::ClientContext commit_context;
-      raft::CommitObjectResponse commit_response;
-      ASSERT_TRUE(leader_stub->CommitObject(&commit_context, commit_request, &commit_response).ok());
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(), configs, commit_request, 5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
       ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << commit_response.summary().message();
 
@@ -883,10 +898,16 @@ namespace raftdemo
       ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << bucket_response.summary().message();
 
+      leader = WaitForSingleLeader(cluster.Nodes(), 2s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+      const auto current_leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(current_leader_index, cluster.Nodes().size());
+      leader_stub = MakeMetadataStub(configs[current_leader_index].address);
+
       std::vector<std::size_t> follower_indexes;
       for (std::size_t i = 0; i < cluster.Nodes().size(); ++i)
       {
-        if (i != leader_index)
+        if (i != current_leader_index)
         {
           follower_indexes.push_back(i);
           cluster.StopNode(i);
@@ -947,9 +968,9 @@ namespace raftdemo
 
       auto current_leader = WaitForSingleLeader(cluster.Nodes(), 8s);
       ASSERT_NE(current_leader, nullptr) << DescribeCluster(cluster.Nodes());
-      const auto current_leader_index = FindNodeIndex(cluster.Nodes(), current_leader);
-      ASSERT_LT(current_leader_index, configs.size());
-      auto current_leader_stub = MakeMetadataStub(configs[current_leader_index].address);
+      const auto retry_leader_index = FindNodeIndex(cluster.Nodes(), current_leader);
+      ASSERT_LT(retry_leader_index, configs.size());
+      auto current_leader_stub = MakeMetadataStub(configs[retry_leader_index].address);
 
       grpc::ClientContext commit_context;
       raft::CommitObjectResponse commit_response;
@@ -968,6 +989,21 @@ namespace raftdemo
           << head_response.summary().message();
       ASSERT_TRUE(head_response.found());
       EXPECT_EQ(head_response.object().object_id(), "obj-timeout");
+
+      raftdemo::test::MetadataRecoveryExpectation expectation;
+      expectation.bucket = bucket;
+      expectation.objects = {{
+          "object/timeout",
+          "obj-timeout",
+          2U,
+          false,
+      }};
+      expectation.visible_keys = {"object/timeout"};
+      expectation.expected_request_count = 3U;
+      expectation.expected_tombstone_count = 0U;
+      expectation.expected_last_applied_index = commit_response.summary().log_index();
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+          cluster.Nodes(), expectation, 10s));
     }
 
     TEST_F(MetadataFailoverTest, ConcurrentDuplicateCreateObjectRequestsShareSameLogIndex)
@@ -1027,6 +1063,173 @@ namespace raftdemo
       EXPECT_EQ(response_b.summary().request_id(), "coalesce-create");
       EXPECT_EQ(response_a.summary().log_index(), response_b.summary().log_index());
       EXPECT_GT(response_a.summary().log_index(), 0U);
+
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCommitObjectRequest("coalesce-commit", bucket,
+                                  "object/coalesce", "obj-coalesce"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
+      ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << commit_response.summary().message();
+
+      raftdemo::test::MetadataRecoveryExpectation expectation;
+      expectation.bucket = bucket;
+      expectation.objects = {{
+          "object/coalesce",
+          "obj-coalesce",
+          2U,
+          false,
+      }};
+      expectation.visible_keys = {"object/coalesce"};
+      expectation.expected_request_count = 3U;
+      expectation.expected_tombstone_count = 0U;
+      expectation.expected_last_applied_index = commit_response.summary().log_index();
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+          cluster.Nodes(), expectation, 10s));
+
+      const auto head_response =
+          HeadViaLeader(cluster.Nodes(), configs, {}, bucket, "object/coalesce", 5s);
+      ASSERT_EQ(head_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << head_response.summary().message();
+      ASSERT_TRUE(head_response.found());
+      EXPECT_EQ(head_response.object().object_id(), "obj-coalesce");
+
+      const auto list_response =
+          ListViaLeader(cluster.Nodes(), configs, {}, bucket, "object/", 5s);
+      ASSERT_EQ(list_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << list_response.summary().message();
+      ASSERT_EQ(list_response.objects_size(), 1);
+      EXPECT_EQ(list_response.objects(0).object_key(), "object/coalesce");
+    }
+
+    TEST_F(MetadataFailoverTest,
+           ConcurrentConflictingCreateObjectRequestsReturnConflictAndKeepCommittedStateConsistent)
+    {
+      const std::string bucket = "fingerprint-concurrent-bucket";
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      const std::string leader_address = configs[leader_index].address;
+
+      const auto bucket_response = InvokeWriteViaCurrentLeader<
+          raft::CreateBucketRequest, raft::CreateBucketResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateBucketRequest("fingerprint-concurrent-bucket-create", bucket),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateBucketRequest &request,
+             raft::CreateBucketResponse *response)
+          {
+            return stub->CreateBucket(context, request, response);
+          });
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      auto request_a = MakeCreateObjectRequest(
+          "fingerprint-concurrent-create", bucket, "object/conflict", "obj-conflict");
+      auto request_b = request_a;
+      request_b.set_size(2048);
+      request_b.set_etag("etag-conflict-overwrite");
+
+      raft::CreateObjectResponse response_a;
+      raft::CreateObjectResponse response_b;
+      std::thread thread_a([&]()
+                           {
+                             auto stub = MakeMetadataStub(leader_address);
+                             grpc::ClientContext context;
+                             EXPECT_TRUE(stub->CreateObject(&context, request_a, &response_a).ok());
+                           });
+      std::thread thread_b([&]()
+                           {
+                             auto stub = MakeMetadataStub(leader_address);
+                             grpc::ClientContext context;
+                             EXPECT_TRUE(stub->CreateObject(&context, request_b, &response_b).ok());
+                           });
+      thread_a.join();
+      thread_b.join();
+
+      int ok_count = 0;
+      int conflict_count = 0;
+      for (const auto *response : {&response_a, &response_b})
+      {
+        if (response->summary().code() == raft::METADATA_STATUS_CODE_OK)
+        {
+          ++ok_count;
+          continue;
+        }
+        if (response->summary().code() == raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT)
+        {
+          ++conflict_count;
+          continue;
+        }
+        FAIL() << "unexpected create response code=" << response->summary().code()
+               << " message=" << response->summary().message();
+      }
+      EXPECT_EQ(ok_count, 1);
+      EXPECT_EQ(conflict_count, 1);
+
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCommitObjectRequest("fingerprint-concurrent-commit", bucket,
+                                  "object/conflict", "obj-conflict"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
+      ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << commit_response.summary().message();
+
+      raftdemo::test::MetadataRecoveryExpectation expectation;
+      expectation.bucket = bucket;
+      expectation.objects = {{
+          "object/conflict",
+          "obj-conflict",
+          2U,
+          false,
+      }};
+      expectation.visible_keys = {"object/conflict"};
+      expectation.expected_request_count = 3U;
+      expectation.expected_tombstone_count = 0U;
+      expectation.expected_last_applied_index = commit_response.summary().log_index();
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+          cluster.Nodes(), expectation, 10s));
+
+      const auto head_response =
+          HeadViaLeader(cluster.Nodes(), configs, {}, bucket, "object/conflict", 5s);
+      ASSERT_EQ(head_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << head_response.summary().message();
+      ASSERT_TRUE(head_response.found());
+      EXPECT_EQ(head_response.object().object_id(), "obj-conflict");
+
+      const auto list_response =
+          ListViaLeader(cluster.Nodes(), configs, {}, bucket, "object/", 5s);
+      ASSERT_EQ(list_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << list_response.summary().message();
+      ASSERT_EQ(list_response.objects_size(), 1);
+      EXPECT_EQ(list_response.objects(0).object_key(), "object/conflict");
     }
 
     TEST_F(MetadataFailoverTest, DifferentFingerprintForSameRequestIdReturnsIdempotencyConflict)

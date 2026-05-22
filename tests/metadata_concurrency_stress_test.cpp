@@ -354,6 +354,22 @@ namespace raftdemo
         EXPECT_NE(result.status, ProposeStatus::kOk)
             << "isolated leader should not commit while majority is down";
       }
+
+      const auto *state_machine = leader->GetMetadataStateMachineV2();
+      ASSERT_NE(state_machine, nullptr);
+      EXPECT_EQ(state_machine->RequestCount(), 1U);
+      EXPECT_GE(state_machine->LastAppliedIndex(), bucket_result.log_index);
+
+      const auto listed = state_machine->ListObjects(
+          {.bucket = "stress-overload-bucket",
+           .prefix = "objects/",
+           .limit = std::nullopt,
+           .continuation_token = ""});
+      ASSERT_TRUE(listed.result.Ok()) << listed.result.summary.message;
+      EXPECT_TRUE(listed.records.empty());
+      EXPECT_FALSE(state_machine->FindObject("stress-overload-bucket",
+                                             "objects/overflow")
+                       .has_value());
     }
 
     TEST(MetadataConcurrencyStressTest,
@@ -512,12 +528,109 @@ namespace raftdemo
           cluster.Nodes(), bucket, object_key, object_id, 2U,
           commit_log_index, 10s));
 
-      for (const auto &node : cluster.Nodes())
+      raftdemo::test::MetadataRecoveryExpectation expectation;
+      expectation.bucket = bucket;
+      expectation.objects = {{
+          object_key,
+          object_id,
+          2U,
+          false,
+      }};
+      expectation.visible_keys = {object_key};
+      expectation.expected_request_count = 3U;
+      expectation.expected_tombstone_count = 0U;
+      expectation.expected_last_applied_index = commit_log_index;
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+          cluster.Nodes(), expectation, 10s));
+    }
+
+    TEST(MetadataConcurrencyStressTest,
+         ConcurrentDuplicateDeleteRequestsShareOneLogEntryAndKeepDeletionFactsConsistent)
+    {
+      ClusterRunner cluster(PickBasePort(), 1200ms);
+      cluster.Start();
+
+      auto leader = cluster.WaitForLeader(5s);
+      ASSERT_NE(leader, nullptr);
+
+      const std::string bucket = "stress-delete-bucket";
+      const std::string object_key = "objects/deleted";
+      const std::string object_id = "obj-deleted";
+
+      ProposeResult bucket_result;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+          cluster.Nodes(),
+          raftdemo::test::MakeCreateBucketCommand(
+              bucket, "stress-delete-create-bucket"),
+          5s, &bucket_result));
+      ASSERT_EQ(bucket_result.status, ProposeStatus::kOk) << bucket_result.message;
+
+      ProposeResult create_result;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+          cluster.Nodes(),
+          raftdemo::test::MakeCreateObjectCommand(
+              bucket, object_key, object_id, "stress-delete-create"),
+          5s, &create_result));
+      ASSERT_EQ(create_result.status, ProposeStatus::kOk) << create_result.message;
+
+      ProposeResult commit_result;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+          cluster.Nodes(),
+          raftdemo::test::MakeCommitObjectCommand(
+              bucket, object_key, object_id, "stress-delete-commit"),
+          5s, &commit_result));
+      ASSERT_EQ(commit_result.status, ProposeStatus::kOk) << commit_result.message;
+
+      const std::string delete_payload = SerializeMetadataCommand(
+          raftdemo::test::MakeDeleteObjectCommand(
+              bucket, object_key, object_id, "stress-delete-request"));
+
+      constexpr int kConcurrency = 6;
+      std::atomic<bool> start{false};
+      std::vector<ProposeResult> delete_results(kConcurrency);
+      std::vector<std::thread> delete_threads;
+      delete_threads.reserve(kConcurrency);
+      for (int i = 0; i < kConcurrency; ++i)
       {
-        const auto *state_machine = node->GetMetadataStateMachineV2();
-        ASSERT_NE(state_machine, nullptr);
-        EXPECT_EQ(state_machine->RequestCount(), 3U);
+        delete_threads.emplace_back(
+            [&, i]()
+            {
+              while (!start.load(std::memory_order_acquire))
+              {
+              }
+              delete_results[static_cast<std::size_t>(i)] =
+                  leader->ProposeMetadata(delete_payload);
+            });
       }
+
+      start.store(true, std::memory_order_release);
+      for (auto &thread : delete_threads)
+      {
+        thread.join();
+      }
+
+      const std::uint64_t delete_log_index = delete_results.front().log_index;
+      for (const auto &result : delete_results)
+      {
+        ASSERT_EQ(result.status, ProposeStatus::kOk)
+            << ProposeStatusName(result.status) << ": " << result.message;
+        EXPECT_EQ(result.log_index, delete_log_index);
+      }
+
+      raftdemo::test::MetadataRecoveryExpectation expectation;
+      expectation.bucket = bucket;
+      expectation.objects = {{
+          object_key,
+          object_id,
+          2U,
+          true,
+      }};
+      expectation.visible_keys = {};
+      expectation.expected_request_count = 4U;
+      expectation.expected_tombstone_count = 1U;
+      expectation.expected_last_applied_index = delete_log_index;
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+          cluster.Nodes(), expectation, 10s));
     }
 
   } // namespace
