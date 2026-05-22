@@ -102,7 +102,7 @@
 - [x] T023 [US2] 更新 `proto/raft.proto`，把当前 record-centric `CreateMetadataRecord` / `CommitMetadataRecord` / `DeleteMetadataRecord` / `HeadMetadataRecord` / `ListMetadataRecords` 升级为 bucket/object V2 RPC
 - [x] T024 [US2] 更新 `modules/raft/service/metadata_service_impl.h`、`modules/raft/service/metadata_service_impl.cpp`，让 MetadataService 按 bucket/object 语义提案 `MetadataCommand` 并返回显式冲突/重放结果
 - [x] T025 [US2] 扩展 `apps/raft_metadata_client.cpp`，实现 `create-bucket`、`delete-bucket`、`create-object`、`commit-object`、`abort-object`、`delete-object`、`head-object`、`list-objects`
-- [ ] T026 [US2] 更新 `tests/metadata_client_scenario_test.cpp` 与 `tests/CMakeLists.txt`，将 client scenario 从 V1 record 流程切换为 bucket/object 主路径
+- [x] T026 [US2] 更新 `tests/metadata_client_scenario_test.cpp` 与 `tests/CMakeLists.txt`，将 client scenario 从 V1 record 流程切换为 bucket/object 主路径
 - [ ] T027 [US2] 运行 US2 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T027-us2-lifecycle-validation.md`
 
 **Checkpoint**: metadata-only 主路径已经具备正式的 bucket/object 生命周期能力，可替代旧 KV demo 的业务闭环

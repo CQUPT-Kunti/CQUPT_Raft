@@ -10,10 +10,11 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo
 {
@@ -233,6 +234,11 @@ namespace raftdemo
         return false;
       }
 
+      const std::vector<std::shared_ptr<RaftNode>> &Nodes() const
+      {
+        return nodes_;
+      }
+
     private:
       fs::path root_;
       snapshotConfig snapshot_config_;
@@ -248,21 +254,39 @@ namespace raftdemo
       auto leader = cluster.WaitForLeader(5s);
       ASSERT_NE(leader, nullptr);
 
-      Command cmd;
-      cmd.type = CommandType::kSet;
-      cmd.key = "x";
-      cmd.value = "1";
+      const ProposeResult bucket_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateBucketCommand("replication-bucket",
+                                                          "replication-bucket-create-1"));
+      ASSERT_EQ(bucket_result.status, ProposeStatus::kOk) << bucket_result.message;
 
-      const ProposeResult result = leader->Propose(cmd);
-      ASSERT_EQ(result.status, ProposeStatus::kOk) << result.message;
-      ASSERT_GT(result.log_index, 0u);
+      const ProposeResult create_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateObjectCommand("replication-bucket",
+                                                          "logs/object-a",
+                                                          "obj-repl-a",
+                                                          "replication-object-create-1"));
+      ASSERT_EQ(create_result.status, ProposeStatus::kOk) << create_result.message;
 
-      const std::string index = std::to_string(result.log_index);
+      const ProposeResult commit_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCommitObjectCommand("replication-bucket",
+                                                          "logs/object-a",
+                                                          "obj-repl-a",
+                                                          "replication-object-commit-1"));
+      ASSERT_EQ(commit_result.status, ProposeStatus::kOk) << commit_result.message;
+      ASSERT_GT(commit_result.log_index, 0u);
+
+      const std::string index = std::to_string(commit_result.log_index);
       ASSERT_TRUE(cluster.WaitUntilAll({"last_log_index=" + index,
                                         "commit_index=" + index,
                                         "last_applied=" + index},
                                        5s));
-      ASSERT_TRUE(cluster.WaitUntilAll({"kv={x=1}"}, 5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+          cluster.Nodes(),
+          "replication-bucket",
+          "logs/object-a",
+          "obj-repl-a",
+          2,
+          commit_result.log_index,
+          5s));
     }
 
     TEST(RaftLogReplicationTest, MultipleSequentialEntriesStayConsistentAcrossCluster)
@@ -273,28 +297,67 @@ namespace raftdemo
       auto leader = cluster.WaitForLeader(5s);
       ASSERT_NE(leader, nullptr);
 
-      auto propose_set = [&](const std::string &key, const std::string &value)
-      {
-        Command cmd;
-        cmd.type = CommandType::kSet;
-        cmd.key = key;
-        cmd.value = value;
-        return leader->Propose(cmd);
-      };
-
-      const ProposeResult r1 = propose_set("x", "1");
+      const ProposeResult r1 = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateBucketCommand("replication-bucket-b",
+                                                          "replication-bucket-create-2"));
       ASSERT_EQ(r1.status, ProposeStatus::kOk) << r1.message;
-      const ProposeResult r2 = propose_set("y", "2");
+
+      const ProposeResult r2 = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateObjectCommand("replication-bucket-b",
+                                                          "logs/object-a",
+                                                          "obj-repl-b-a",
+                                                          "replication-object-create-2"));
       ASSERT_EQ(r2.status, ProposeStatus::kOk) << r2.message;
-      const ProposeResult r3 = propose_set("x", "100");
+
+      const ProposeResult r3 = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCommitObjectCommand("replication-bucket-b",
+                                                          "logs/object-a",
+                                                          "obj-repl-b-a",
+                                                          "replication-object-commit-2"));
       ASSERT_EQ(r3.status, ProposeStatus::kOk) << r3.message;
 
-      const std::string index = std::to_string(r3.log_index);
+      const ProposeResult r4 = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateObjectCommand("replication-bucket-b",
+                                                          "logs/object-b",
+                                                          "obj-repl-b-b",
+                                                          "replication-object-create-3"));
+      ASSERT_EQ(r4.status, ProposeStatus::kOk) << r4.message;
+
+      const ProposeResult r5 = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCommitObjectCommand("replication-bucket-b",
+                                                          "logs/object-b",
+                                                          "obj-repl-b-b",
+                                                          "replication-object-commit-3"));
+      ASSERT_EQ(r5.status, ProposeStatus::kOk) << r5.message;
+
+      const std::string index = std::to_string(r5.log_index);
       ASSERT_TRUE(cluster.WaitUntilAll({"last_log_index=" + index,
                                         "commit_index=" + index,
                                         "last_applied=" + index},
                                        5s));
-      ASSERT_TRUE(cluster.WaitUntilAll({"kv={x=100, y=2}"}, 5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+          cluster.Nodes(),
+          "replication-bucket-b",
+          "logs/object-a",
+          "obj-repl-b-a",
+          2,
+          r5.log_index,
+          5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+          cluster.Nodes(),
+          "replication-bucket-b",
+          "logs/object-b",
+          "obj-repl-b-b",
+          2,
+          r5.log_index,
+          5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllListObjectsMatch(
+          cluster.Nodes(),
+          "replication-bucket-b",
+          "logs/",
+          {"logs/object-a", "logs/object-b"},
+          r5.log_index,
+          5s));
     }
 
   } // namespace

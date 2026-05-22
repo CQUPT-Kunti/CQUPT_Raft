@@ -10,10 +10,11 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo
 {
@@ -233,6 +234,11 @@ namespace raftdemo
         return false;
       }
 
+      const std::vector<std::shared_ptr<RaftNode>> &Nodes() const
+      {
+        return nodes_;
+      }
+
     private:
       fs::path root_;
       snapshotConfig snapshot_config_;
@@ -248,12 +254,23 @@ namespace raftdemo
       auto leader = cluster.WaitForLeader(5s);
       ASSERT_NE(leader, nullptr);
 
-      Command cmd;
-      cmd.type = CommandType::kSet;
-      cmd.key = "apply_key";
-      cmd.value = "apply_value";
+      const ProposeResult bucket_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateBucketCommand("commit-apply-bucket",
+                                                          "commit-apply-bucket-create-1"));
+      ASSERT_EQ(bucket_result.status, ProposeStatus::kOk) << bucket_result.message;
 
-      const ProposeResult result = leader->Propose(cmd);
+      const ProposeResult create_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateObjectCommand("commit-apply-bucket",
+                                                          "logs/apply-object",
+                                                          "obj-apply-1",
+                                                          "commit-apply-object-create-1"));
+      ASSERT_EQ(create_result.status, ProposeStatus::kOk) << create_result.message;
+
+      const ProposeResult result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCommitObjectCommand("commit-apply-bucket",
+                                                          "logs/apply-object",
+                                                          "obj-apply-1",
+                                                          "commit-apply-object-commit-1"));
       ASSERT_EQ(result.status, ProposeStatus::kOk) << result.message;
       ASSERT_GT(result.log_index, 0u);
 
@@ -261,8 +278,15 @@ namespace raftdemo
       ASSERT_TRUE(cluster.WaitUntilAll(
           {"last_log_index=" + index,
            "commit_index=" + index,
-           "last_applied=" + index,
-           "kv={apply_key=apply_value}"},
+           "last_applied=" + index},
+          5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+          cluster.Nodes(),
+          "commit-apply-bucket",
+          "logs/apply-object",
+          "obj-apply-1",
+          2,
+          result.log_index,
           5s));
     }
 
@@ -274,17 +298,38 @@ namespace raftdemo
       auto leader = cluster.WaitForLeader(5s);
       ASSERT_NE(leader, nullptr);
 
-      Command set_cmd;
-      set_cmd.type = CommandType::kSet;
-      set_cmd.key = "x";
-      set_cmd.value = "1";
-      const ProposeResult set_result = leader->Propose(set_cmd);
-      ASSERT_EQ(set_result.status, ProposeStatus::kOk) << set_result.message;
+      const ProposeResult bucket_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateBucketCommand("commit-delete-bucket",
+                                                          "commit-delete-bucket-create-1"));
+      ASSERT_EQ(bucket_result.status, ProposeStatus::kOk) << bucket_result.message;
 
-      Command del_cmd;
-      del_cmd.type = CommandType::kDelete;
-      del_cmd.key = "x";
-      const ProposeResult del_result = leader->Propose(del_cmd);
+      const ProposeResult create_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCreateObjectCommand("commit-delete-bucket",
+                                                          "logs/delete-object",
+                                                          "obj-delete-1",
+                                                          "commit-delete-object-create-1"));
+      ASSERT_EQ(create_result.status, ProposeStatus::kOk) << create_result.message;
+
+      const ProposeResult commit_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeCommitObjectCommand("commit-delete-bucket",
+                                                          "logs/delete-object",
+                                                          "obj-delete-1",
+                                                          "commit-delete-object-commit-1"));
+      ASSERT_EQ(commit_result.status, ProposeStatus::kOk) << commit_result.message;
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+          cluster.Nodes(),
+          "commit-delete-bucket",
+          "logs/delete-object",
+          "obj-delete-1",
+          2,
+          commit_result.log_index,
+          5s));
+
+      const ProposeResult del_result = raftdemo::test::ProposeMetadataCommand(
+          leader, raftdemo::test::MakeDeleteObjectCommand("commit-delete-bucket",
+                                                          "logs/delete-object",
+                                                          "obj-delete-1",
+                                                          "commit-delete-object-delete-1"));
       ASSERT_EQ(del_result.status, ProposeStatus::kOk) << del_result.message;
 
       const std::string index = std::to_string(del_result.log_index);
@@ -292,7 +337,13 @@ namespace raftdemo
                                         "commit_index=" + index,
                                         "last_applied=" + index},
                                        5s));
-      ASSERT_TRUE(cluster.WaitUntilAll({"kv={}"}, 5s));
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+          cluster.Nodes(),
+          "commit-delete-bucket",
+          "logs/delete-object",
+          "obj-delete-1",
+          del_result.log_index,
+          5s));
     }
 
   } // namespace
