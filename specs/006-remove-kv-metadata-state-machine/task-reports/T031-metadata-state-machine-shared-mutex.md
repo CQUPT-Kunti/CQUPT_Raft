@@ -110,8 +110,27 @@
 - 否
 - 本次只处理 `MetadataStateMachine` 内部 shared_mutex 并发模型与并发测试
 
+
+## T031 追加注意：delete 后同名重建与旧 lifecycle 防护
+
+- 本次 `CreateObject` 会在重新创建同名对象时清理旧 `tombstones_`，该行为用于支持对象被 `DeleteObject` 后使用新的 `request_id` 开启新的同名 object lifecycle。
+- 该行为可以接受，但必须以“旧 request_id / 旧 lifecycle 不能复活或污染新对象”为前提。
+- 后续任务需要确认系统仍保留足够的旧生命周期事实，例如 `request_table`、`request_fingerprints_`、`object_epoch` / 等价 lifecycle 标识，或其他能够区分旧对象生命周期与新对象生命周期的机制。
+- 正确语义应为：
+  - `delete old object -> recreate same bucket/object with new request_id -> commit new object` 后，新对象应保持可见。
+  - 旧 `CreateObject` / `CommitObject` / `DeleteObject` 的 `request_id` 重试只能返回幂等重放或冲突结果，不能重新 apply。
+  - 旧请求不能覆盖新对象的 manifest、checksum、chunk refs、object state 或 visible index。
+  - 清理旧 tombstone 不等于删除旧 request/lifecycle 的去重与冲突事实。
+- 建议在后续 US3 / US4 测试中补充反向用例：
+  1. `CreateObject(c1)` -> `CommitObject(m1)` -> `DeleteObject(d1)`；
+  2. `CreateObject(c2)` -> `CommitObject(m2)` 重建同名对象；
+  3. 再次重放旧 `c1` / `m1` / `d1`；
+  4. 断言新对象仍可见且 metadata 未被旧请求覆盖，旧请求返回 replay/conflict，而不是形成新的成功 apply。
+- 风险归属：这不是 T031 阻塞项，但必须在后续 T032/T035 或恢复相关 T043 前被测试锁定，避免 delete/recreate 场景在 leader switch、restart recovery 或 follower catch-up 后出现 stale retry resurrect / stale retry overwrite 问题。
+
 ## 剩余风险
 
+- `CreateObject` 清理旧 tombstone 后，必须在后续任务中继续验证旧 `request_id` / 旧 lifecycle 重放不会复活或污染同名新对象；详见上一节追加注意。
 - `last_applied_term_` 仍只能写成当前实现事实 `0`；真实 term 传播不在 T031 范围内。
 - proposal admission / bounded queue / timeout / no-double-apply 的节点级并发防护仍属于 T032。
 - 本次没有改 `metadata_state_machine_test.cpp` 的旧断言；如果后续需要把 `object_index` 语义从“内部对象入口”进一步收紧成“仅 committed 可见索引”，应在后续任务中连同对应单测一起调整。

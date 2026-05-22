@@ -123,7 +123,7 @@
 
 ### Implementation for User Story 3
 
-- [ ] T031 [US3] 将 `modules/raft/state_machine/metadata_state_machine.h`、`modules/raft/state_machine/metadata_state_machine.cpp` 升级为 `shared_mutex` 并发模型，保证 apply 单写、Head/List 并发读、request/object/tombstone 原子更新
+- [x] T031 [US3] 将 `modules/raft/state_machine/metadata_state_machine.h`、`modules/raft/state_machine/metadata_state_machine.cpp` 升级为 `shared_mutex` 并发模型，保证 apply 单写、Head/List 并发读、request/object/tombstone 原子更新
 - [ ] T032 [US3] 在 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp`、`modules/raft/common/propose.h` 中补齐 metadata proposal admission、bounded queue/backpressure、timeout handling、no-double-apply 防护
 - [ ] T033 [US3] 更新 `modules/raft/common/metadata_result.h`、`proto/raft.proto`、`modules/raft/service/metadata_service_impl.cpp`、`apps/raft_metadata_client.cpp`，为 overload、timeout、retry、idempotency conflict 提供稳定对外语义
 - [ ] T034 [US3] 将 `tests/raft_integration_test.cpp`、`tests/metadata_failover_test.cpp`、`tests/metadata_main_path_test.cpp` 的集群断言全部改为 metadata 读路径与 metadata 状态一致性断言
