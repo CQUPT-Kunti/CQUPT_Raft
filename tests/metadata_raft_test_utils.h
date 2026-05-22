@@ -14,6 +14,19 @@
 
 namespace raftdemo::test
 {
+    inline bool IsExcludedNode(const std::size_t index,
+                               const std::vector<std::size_t> &excluded)
+    {
+        for (const std::size_t excluded_index : excluded)
+        {
+            if (index == excluded_index)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     inline MetadataCommand MakeCreateBucketCommand(const std::string &bucket,
                                                    const std::string &request_id,
                                                    const std::uint64_t create_time = 1710000000)
@@ -142,14 +155,21 @@ namespace raftdemo::test
         const std::string &object_id,
         const std::size_t expected_chunk_count,
         const std::uint64_t expected_last_applied_index,
-        const std::chrono::milliseconds timeout)
+        const std::chrono::milliseconds timeout,
+        const std::vector<std::size_t> &excluded = {})
     {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline)
         {
             bool ok = true;
-            for (const auto &node : nodes)
+            for (std::size_t i = 0; i < nodes.size(); ++i)
             {
+                if (IsExcludedNode(i, excluded))
+                {
+                    continue;
+                }
+
+                const auto &node = nodes[i];
                 if (!node)
                 {
                     continue;
@@ -218,14 +238,21 @@ namespace raftdemo::test
         const std::string &object_key,
         const std::string &object_id,
         const std::uint64_t expected_last_applied_index,
-        const std::chrono::milliseconds timeout)
+        const std::chrono::milliseconds timeout,
+        const std::vector<std::size_t> &excluded = {})
     {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline)
         {
             bool ok = true;
-            for (const auto &node : nodes)
+            for (std::size_t i = 0; i < nodes.size(); ++i)
             {
+                if (IsExcludedNode(i, excluded))
+                {
+                    continue;
+                }
+
+                const auto &node = nodes[i];
                 if (!node)
                 {
                     continue;
@@ -305,14 +332,21 @@ namespace raftdemo::test
         const std::string &prefix,
         const std::vector<std::string> &expected_keys,
         const std::uint64_t expected_last_applied_index,
-        const std::chrono::milliseconds timeout)
+        const std::chrono::milliseconds timeout,
+        const std::vector<std::size_t> &excluded = {})
     {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline)
         {
             bool ok = true;
-            for (const auto &node : nodes)
+            for (std::size_t i = 0; i < nodes.size(); ++i)
             {
+                if (IsExcludedNode(i, excluded))
+                {
+                    continue;
+                }
+
+                const auto &node = nodes[i];
                 if (!node)
                 {
                     continue;

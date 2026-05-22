@@ -12,10 +12,11 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -112,21 +113,6 @@ std::string ProposeStatusName(ProposeStatus status) {
       return "Timeout";
   }
   return "Unknown";
-}
-
-Command SetCommand(const std::string& key, const std::string& value) {
-  Command command;
-  command.type = CommandType::kSet;
-  command.key = key;
-  command.value = value;
-  return command;
-}
-
-Command DeleteCommand(const std::string& key) {
-  Command command;
-  command.type = CommandType::kDelete;
-  command.key = key;
-  return command;
 }
 
 int PickBasePort(const std::string& test_name) {
@@ -322,63 +308,6 @@ std::size_t PickFollowerIndex(const std::vector<std::shared_ptr<RaftNode>>& node
   return nodes.size();
 }
 
-bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                       const std::string& key,
-                       const std::string& expected_value,
-                       std::chrono::milliseconds timeout,
-                       const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_match = true;
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-
-    if (all_match) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                         const std::string& key,
-                         std::chrono::milliseconds timeout,
-                         const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_missing = true;
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (nodes[i]->DebugGetValue(key, &value)) {
-        all_missing = false;
-        break;
-      }
-    }
-
-    if (all_missing) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
 bool WaitForOrderedCommitApplyAtLeast(const std::vector<std::shared_ptr<RaftNode>>& nodes,
                                       std::uint64_t minimum_index,
                                       std::chrono::milliseconds timeout,
@@ -426,7 +355,7 @@ bool WaitForOrderedCommitApplyAtLeast(const std::vector<std::shared_ptr<RaftNode
 }
 
 bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const Command& command,
+                      const MetadataCommand& command,
                       std::chrono::milliseconds timeout,
                       ProposeResult* final_result,
                       const std::vector<std::size_t>& excluded = {}) {
@@ -440,7 +369,8 @@ bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
       continue;
     }
 
-    last_result = leader->Propose(command);
+    last_result =
+        leader->ProposeMetadata(SerializeMetadataCommand(command));
     if (last_result.Ok()) {
       if (final_result != nullptr) {
         *final_result = last_result;
@@ -463,19 +393,99 @@ bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
   return false;
 }
 
-void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                     const std::string& prefix,
-                     int count,
-                     const std::vector<std::size_t>& excluded = {}) {
+std::string BucketName(const std::string& prefix) {
+  return "t017-" + prefix + "-bucket";
+}
+
+std::string ObjectIdFor(const std::string& object_key) {
+  return "obj-" + object_key;
+}
+
+bool ProposeCreateBucketWithRetry(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const std::string& bucket,
+    std::chrono::milliseconds timeout,
+    ProposeResult* final_result,
+    const std::vector<std::size_t>& excluded = {}) {
+  return ProposeWithRetry(
+      nodes,
+      raftdemo::test::MakeCreateBucketCommand(bucket, "bucket:" + bucket),
+      timeout,
+      final_result,
+      excluded);
+}
+
+bool ProposeCommittedObjectWithRetry(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const std::string& bucket,
+    const std::string& object_key,
+    std::chrono::milliseconds timeout,
+    ProposeResult* final_result,
+    const std::vector<std::size_t>& excluded = {}) {
+  ProposeResult create_result;
+  const std::string object_id = ObjectIdFor(object_key);
+  if (!ProposeWithRetry(
+          nodes,
+          raftdemo::test::MakeCreateObjectCommand(
+              bucket, object_key, object_id,
+              "create:" + bucket + ":" + object_key),
+          timeout,
+          &create_result,
+          excluded)) {
+    if (final_result != nullptr) {
+      *final_result = create_result;
+    }
+    return false;
+  }
+
+  ProposeResult commit_result;
+  const bool ok = ProposeWithRetry(
+      nodes,
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, object_key, object_id,
+          "commit:" + bucket + ":" + object_key),
+      timeout,
+      &commit_result,
+      excluded);
+  if (final_result != nullptr) {
+    *final_result = commit_result;
+  }
+  return ok;
+}
+
+bool ProposeDeleteObjectWithRetry(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const std::string& bucket,
+    const std::string& object_key,
+    std::chrono::milliseconds timeout,
+    ProposeResult* final_result,
+    const std::vector<std::size_t>& excluded = {}) {
+  return ProposeWithRetry(
+      nodes,
+      raftdemo::test::MakeDeleteObjectCommand(
+          bucket, object_key, ObjectIdFor(object_key),
+          "delete:" + bucket + ":" + object_key),
+      timeout,
+      final_result,
+      excluded);
+}
+
+void WriteManyCommittedObjects(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const std::string& bucket,
+    const std::string& prefix,
+    int count,
+    const std::vector<std::size_t>& excluded = {}) {
   ProposeResult result;
   for (int i = 0; i < count; ++i) {
     SCOPED_TRACE(prefix + " write " + std::to_string(i));
-    ASSERT_TRUE(ProposeWithRetry(nodes,
-                                 SetCommand(prefix + "_" + std::to_string(i),
-                                            "value_" + std::to_string(i)),
-                                 std::chrono::seconds(10),
-                                 &result,
-                                 excluded))
+    const std::string object_key = prefix + "_" + std::to_string(i);
+    ASSERT_TRUE(ProposeCommittedObjectWithRetry(nodes,
+                                                bucket,
+                                                object_key,
+                                                std::chrono::seconds(10),
+                                                &result,
+                                                excluded))
         << "write failed, status=" << ProposeStatusName(result.status)
         << ", message=" << result.message;
   }
@@ -528,25 +538,33 @@ TEST_F(RaftLeaderSwitchOrderingTest,
 
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no initial leader elected";
+  const std::string bucket = BucketName("committed-state-survives-switch");
 
   const std::size_t old_leader_index = FindNodeIndex(cluster.Nodes(), leader);
   ASSERT_LT(old_leader_index, cluster.Nodes().size()) << "failed to locate old leader";
 
   ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("stable_before_switch", "v1"),
+  ASSERT_TRUE(ProposeCreateBucketWithRetry(cluster.Nodes(), bucket,
+                               std::chrono::seconds(10), &result))
+      << "create bucket failed, status=" << ProposeStatusName(result.status)
+      << ", message=" << result.message;
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "stable_before_switch",
                                std::chrono::seconds(10), &result))
       << "stable_before_switch failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("switch_anchor", "kept"),
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "switch_anchor",
                                std::chrono::seconds(10), &result))
       << "switch_anchor failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "stable_before_switch", "v1",
-                                std::chrono::seconds(10)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "stable_before_switch",
+      ObjectIdFor("stable_before_switch"), 2, result.log_index,
+      std::chrono::seconds(10)))
       << "cluster did not apply committed state before leader switch";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "switch_anchor", "kept",
-                                std::chrono::seconds(10)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "switch_anchor", ObjectIdFor("switch_anchor"),
+      2, result.log_index, std::chrono::seconds(10)))
       << "cluster did not apply switch anchor before leader switch";
 
   std::string ordering_failure;
@@ -562,20 +580,24 @@ TEST_F(RaftLeaderSwitchOrderingTest,
                                         excluded_old_leader);
   ASSERT_NE(new_leader, nullptr) << "no replacement leader elected";
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "stable_before_switch", "v1",
-                                std::chrono::seconds(10), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "stable_before_switch",
+      ObjectIdFor("stable_before_switch"), 2, result.log_index,
+      std::chrono::seconds(10), excluded_old_leader))
       << "surviving quorum lost committed value after leader switch";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "switch_anchor", "kept",
-                                std::chrono::seconds(10), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "switch_anchor", ObjectIdFor("switch_anchor"),
+      2, result.log_index, std::chrono::seconds(10), excluded_old_leader))
       << "surviving quorum lost committed anchor after leader switch";
 
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_switch", "v2"),
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "after_switch",
                                std::chrono::seconds(10), &result, excluded_old_leader))
       << "after_switch failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_switch", "v2",
-                                std::chrono::seconds(10), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "after_switch", ObjectIdFor("after_switch"),
+      2, result.log_index, std::chrono::seconds(10), excluded_old_leader))
       << "surviving quorum did not advance new committed log after leader switch";
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), result.log_index,
                                                std::chrono::seconds(10),
@@ -585,15 +607,24 @@ TEST_F(RaftLeaderSwitchOrderingTest,
 
   cluster.RestartNode(old_leader_index);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "stable_before_switch", "v1",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "stable_before_switch",
+      ObjectIdFor("stable_before_switch"), 2, result.log_index,
+      std::chrono::seconds(20)))
       << "restarted old leader did not preserve prior committed state";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "switch_anchor", "kept",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "switch_anchor", ObjectIdFor("switch_anchor"),
+      2, result.log_index, std::chrono::seconds(20)))
       << "restarted old leader did not preserve switch anchor";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_switch", "v2",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "after_switch", ObjectIdFor("after_switch"),
+      2, result.log_index, std::chrono::seconds(20)))
       << "restarted old leader did not catch up to post-switch committed log";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllListObjectsMatch(
+      cluster.Nodes(), bucket, "",
+      {"after_switch", "stable_before_switch", "switch_anchor"},
+      result.log_index, std::chrono::seconds(20)))
+      << "cluster object_index did not converge after leader switch recovery";
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), result.log_index,
                                                std::chrono::seconds(20),
                                                &ordering_failure))
@@ -607,6 +638,7 @@ TEST_F(RaftLeaderSwitchOrderingTest,
 
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no initial leader elected";
+  const std::string bucket = BucketName("lagging-follower-mixed-switch");
 
   const std::size_t old_leader_index = FindNodeIndex(cluster.Nodes(), leader);
   ASSERT_LT(old_leader_index, cluster.Nodes().size()) << "failed to locate old leader";
@@ -616,24 +648,29 @@ TEST_F(RaftLeaderSwitchOrderingTest,
   cluster.StopNode(lagging_follower);
 
   const std::vector<std::size_t> excluded_lagging{lagging_follower};
-  WriteManyValues(cluster.Nodes(), "mixed_gap", 32, excluded_lagging);
-
   ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("mixed_ordering", "phase_1"),
-                               std::chrono::seconds(10), &result, excluded_lagging))
-      << "mixed_ordering phase_1 failed, status=" << ProposeStatusName(result.status)
+  ASSERT_TRUE(ProposeCreateBucketWithRetry(cluster.Nodes(), bucket,
+                                           std::chrono::seconds(10), &result,
+                                           excluded_lagging))
+      << "create bucket failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("mixed_ordering", "phase_2"),
-                               std::chrono::seconds(10), &result, excluded_lagging))
-      << "mixed_ordering phase_2 failed, status=" << ProposeStatusName(result.status)
+  WriteManyCommittedObjects(cluster.Nodes(), bucket, "mixed_gap", 32, excluded_lagging);
+
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "mixed_ordering",
+                                              std::chrono::seconds(10), &result,
+                                              excluded_lagging))
+      << "mixed_ordering commit failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("mixed_ordering"),
-                               std::chrono::seconds(10), &result, excluded_lagging))
+  ASSERT_TRUE(ProposeDeleteObjectWithRetry(cluster.Nodes(), bucket, "mixed_ordering",
+                                           std::chrono::seconds(10), &result,
+                                           excluded_lagging))
       << "mixed_ordering delete failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "mixed_ordering",
-                                  std::chrono::seconds(10), excluded_lagging))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+      cluster.Nodes(), bucket, "mixed_ordering",
+      ObjectIdFor("mixed_ordering"), result.log_index,
+      std::chrono::seconds(10), excluded_lagging))
       << "surviving quorum did not preserve committed delete before leader switch";
 
   std::string ordering_failure;
@@ -653,23 +690,27 @@ TEST_F(RaftLeaderSwitchOrderingTest,
   ASSERT_NE(new_leader, nullptr)
       << "no replacement leader elected with restarted lagging follower";
 
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("mixed_after_switch", "committed"),
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "mixed_after_switch",
                                std::chrono::seconds(12), &result, excluded_old_leader))
       << "mixed_after_switch failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("mixed_tail", "final"),
+  ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "mixed_tail",
                                std::chrono::seconds(12), &result, excluded_old_leader))
       << "mixed_tail failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "mixed_after_switch", "committed",
-                                std::chrono::seconds(20), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_after_switch",
+      ObjectIdFor("mixed_after_switch"), 2, result.log_index,
+      std::chrono::seconds(20), excluded_old_leader))
       << "surviving quorum did not converge on post-switch committed value";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "mixed_tail", "final",
-                                std::chrono::seconds(20), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_tail", ObjectIdFor("mixed_tail"),
+      2, result.log_index, std::chrono::seconds(20), excluded_old_leader))
       << "surviving quorum did not converge on final committed value";
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "mixed_ordering",
-                                  std::chrono::seconds(20), excluded_old_leader))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+      cluster.Nodes(), bucket, "mixed_ordering", ObjectIdFor("mixed_ordering"),
+      result.log_index, std::chrono::seconds(20), excluded_old_leader))
       << "surviving quorum lost committed delete while lagging follower caught up";
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), result.log_index,
                                                std::chrono::seconds(20),
@@ -679,18 +720,36 @@ TEST_F(RaftLeaderSwitchOrderingTest,
 
   cluster.RestartNode(old_leader_index);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "mixed_gap_31", "value_31",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_gap_31", ObjectIdFor("mixed_gap_31"),
+      2, result.log_index, std::chrono::seconds(20)))
       << "cluster did not preserve pre-switch committed log after full recovery";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "mixed_after_switch", "committed",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_after_switch",
+      ObjectIdFor("mixed_after_switch"), 2, result.log_index,
+      std::chrono::seconds(20)))
       << "restarted old leader did not catch up to post-switch committed value";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "mixed_tail", "final",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_tail", ObjectIdFor("mixed_tail"),
+      2, result.log_index, std::chrono::seconds(20)))
       << "restarted old leader did not catch up to final committed value";
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "mixed_ordering",
-                                  std::chrono::seconds(20)))
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+      cluster.Nodes(), bucket, "mixed_ordering", ObjectIdFor("mixed_ordering"),
+      result.log_index, std::chrono::seconds(20)))
       << "cluster did not preserve delete ordering after lagging follower catch-up";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllListObjectsMatch(
+      cluster.Nodes(), bucket, "mixed_",
+      {"mixed_after_switch", "mixed_gap_0", "mixed_gap_1", "mixed_gap_10",
+       "mixed_gap_11", "mixed_gap_12", "mixed_gap_13", "mixed_gap_14",
+       "mixed_gap_15", "mixed_gap_16", "mixed_gap_17", "mixed_gap_18",
+       "mixed_gap_19", "mixed_gap_2", "mixed_gap_20", "mixed_gap_21",
+       "mixed_gap_22", "mixed_gap_23", "mixed_gap_24", "mixed_gap_25",
+       "mixed_gap_26", "mixed_gap_27", "mixed_gap_28", "mixed_gap_29",
+       "mixed_gap_3", "mixed_gap_30", "mixed_gap_31", "mixed_gap_4",
+       "mixed_gap_5", "mixed_gap_6", "mixed_gap_7", "mixed_gap_8",
+       "mixed_gap_9", "mixed_tail"},
+      result.log_index, std::chrono::seconds(20)))
+      << "cluster object_index did not converge after lagging follower catch-up";
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), result.log_index,
                                                std::chrono::seconds(20),
                                                &ordering_failure))
