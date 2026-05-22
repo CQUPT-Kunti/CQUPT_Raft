@@ -166,6 +166,68 @@ namespace raftdemo::test
         return leader->ProposeMetadata(SerializeMetadataCommand(command));
     }
 
+    inline bool ProposeMetadataCommandWithRetry(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const MetadataCommand &command,
+        const std::chrono::milliseconds timeout,
+        ProposeResult *final_result = nullptr,
+        const std::vector<std::size_t> &excluded = {})
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        ProposeResult last_result;
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            for (std::size_t i = 0; i < nodes.size(); ++i)
+            {
+                if (IsExcludedNode(i, excluded))
+                {
+                    continue;
+                }
+
+                const auto &node = nodes[i];
+                if (node == nullptr)
+                {
+                    continue;
+                }
+
+                if (node->Describe().find("role=Leader") == std::string::npos)
+                {
+                    continue;
+                }
+
+                last_result = ProposeMetadataCommand(node, command);
+                if (last_result.Ok())
+                {
+                    if (final_result != nullptr)
+                    {
+                        *final_result = last_result;
+                    }
+                    return true;
+                }
+
+                if (last_result.status == ProposeStatus::kInvalidCommand ||
+                    last_result.status == ProposeStatus::kApplyFailed ||
+                    last_result.status == ProposeStatus::kCommitFailed)
+                {
+                    if (final_result != nullptr)
+                    {
+                        *final_result = last_result;
+                    }
+                    return false;
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (final_result != nullptr)
+        {
+            *final_result = last_result;
+        }
+        return false;
+    }
+
     inline bool WaitUntilAllCommittedObject(
         const std::vector<std::shared_ptr<RaftNode>> &nodes,
         const std::string &bucket,
