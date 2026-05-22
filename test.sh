@@ -5,7 +5,7 @@ set -Eeuo pipefail
 #
 # test.sh section map:
 #   Platform-neutral base regression groups:
-#     unit snapshot-storage kv-service segment-basic election replication
+#     unit snapshot-storage segment-basic election replication
 #     integration snapshot-catchup snapshot-restart replicator
 #   Shared restart / durability regression:
 #     persistence
@@ -49,7 +49,6 @@ Usage:
 Platform-neutral base regression groups:
   unit               Basic unit tests for commands, scheduler, and thread pool
   snapshot-storage   Snapshot storage reliability coverage
-  kv-service         KV service redirect and read/write behavior
   segment-basic      Focused segment storage persistence cases
   election           Leader election and split-brain related checks
   replication        Log replication and commit/apply progression
@@ -145,7 +144,7 @@ log_section() {
 print_group_catalog() {
   cat <<'EOF'
 Platform-neutral base regression groups:
-  unit snapshot-storage kv-service segment-basic election replication
+  unit snapshot-storage segment-basic election replication
   integration snapshot-catchup snapshot-restart replicator
 
 Shared restart / durability regression:
@@ -177,7 +176,7 @@ print_group_classification() {
   local group="$1"
 
   case "${group}" in
-    unit|snapshot-storage|kv-service|segment-basic|election|replication|integration|snapshot-catchup|snapshot-restart|replicator)
+    unit|snapshot-storage|segment-basic|election|replication|integration|snapshot-catchup|snapshot-restart|replicator)
       echo "Section: platform-neutral base regression."
       ;;
     persistence)
@@ -323,9 +322,6 @@ run_group_by_name() {
     snapshot-storage)
       run_ctest_group "snapshot-storage" "^SnapshotStorageReliabilityTest\."
       ;;
-    kv-service)
-      run_ctest_group "kv-service" "^RaftKvServiceTest\."
-      ;;
     segment-basic)
       run_ctest_group "segment-basic" "^RaftSegmentStorageTest\.(WritesMultipleSegmentFilesUnderBuildDirectory|AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave)$"
       ;;
@@ -362,7 +358,6 @@ run_group_by_name() {
     all)
       run_group_by_name unit
       run_group_by_name snapshot-storage
-      run_group_by_name kv-service
       run_group_by_name segment-basic
       run_group_by_name election
       run_group_by_name replication

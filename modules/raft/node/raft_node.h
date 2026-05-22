@@ -30,7 +30,6 @@ namespace raftdemo
 {
 
   class RaftServiceImpl;
-  class KvServiceImpl;
   class MetadataServiceImpl;
   class Replicator;
   class MetadataStateMachine;
@@ -170,8 +169,6 @@ namespace raftdemo
 
     friend class Replicator;
     friend class RaftServiceImpl;
-    friend class KvServiceImpl;
-
     void InitServer();
     void InitClients();
     Replicator *GetOrCreateReplicatorLocked(const PeerConfig &peer);
@@ -278,7 +275,6 @@ namespace raftdemo
     std::atomic<bool> running_{false};
 
     std::unique_ptr<RaftServiceImpl> service_;
-    std::unique_ptr<KvServiceImpl> kv_service_;
     std::unique_ptr<MetadataServiceImpl> metadata_service_;
     std::unique_ptr<grpc::Server> server_;
 

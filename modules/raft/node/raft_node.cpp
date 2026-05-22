@@ -16,7 +16,6 @@
 #include <vector>
 
 #include "raft/runtime/logging.h"
-#include "raft/service/kv_service_impl.h"
 #include "raft/service/metadata_service_impl.h"
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
@@ -407,13 +406,11 @@ namespace raftdemo
   void RaftNode::InitServer()
   {
     service_ = std::make_unique<RaftServiceImpl>(*this);
-    kv_service_ = std::make_unique<KvServiceImpl>(*this);
     metadata_service_ = std::make_unique<MetadataServiceImpl>(*this);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(config_.address, grpc::InsecureServerCredentials());
     builder.RegisterService(service_.get());
-    builder.RegisterService(kv_service_.get());
     builder.RegisterService(metadata_service_.get());
     server_ = builder.BuildAndStart();
     if (!server_)

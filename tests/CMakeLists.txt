@@ -209,11 +209,6 @@ add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp
   "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_thread_pool test_thread_pool.cpp
   "platform-neutral;platform-neutral-fallback")
-add_raft_gtest(test_kv_service test_kv_service.cpp
-  "platform-neutral")
-target_link_libraries(test_kv_service
-  PRIVATE
-    kv_proto)
 
 # =========================
 # Platform-neutral baseline:

@@ -84,12 +84,10 @@ set(PROTO_FILES
   ${PROTO_DIR}/common.proto
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
-  ${PROTO_DIR}/kv.proto
 )
 set(GRPC_PROTO_FILES
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
-  ${PROTO_DIR}/kv.proto
 )
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(PROJECT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/modules)
@@ -108,23 +106,19 @@ set(PROTO_SRCS
   ${GENERATED_DIR}/common.pb.cc
   ${GENERATED_DIR}/raft.pb.cc
   ${GENERATED_DIR}/metadata.pb.cc
-  ${GENERATED_DIR}/kv.pb.cc
 )
 set(PROTO_HDRS
   ${GENERATED_DIR}/common.pb.h
   ${GENERATED_DIR}/raft.pb.h
   ${GENERATED_DIR}/metadata.pb.h
-  ${GENERATED_DIR}/kv.pb.h
 )
 set(GRPC_SRCS
   ${GENERATED_DIR}/raft.grpc.pb.cc
   ${GENERATED_DIR}/metadata.grpc.pb.cc
-  ${GENERATED_DIR}/kv.grpc.pb.cc
 )
 set(GRPC_HDRS
   ${GENERATED_DIR}/raft.grpc.pb.h
   ${GENERATED_DIR}/metadata.grpc.pb.h
-  ${GENERATED_DIR}/kv.grpc.pb.h
 )
 
 add_custom_command(
@@ -208,30 +202,10 @@ target_link_libraries(metadata_proto
     gRPC::grpc++
 )
 
-add_library(kv_proto
-  ${GENERATED_DIR}/kv.pb.cc
-  ${GENERATED_DIR}/kv.pb.h
-  ${GENERATED_DIR}/kv.grpc.pb.cc
-  ${GENERATED_DIR}/kv.grpc.pb.h
-)
-
-target_include_directories(kv_proto
-  PUBLIC
-    ${GENERATED_DIR}
-)
-
-target_link_libraries(kv_proto
-  PUBLIC
-    common_proto
-    protobuf::libprotobuf
-    gRPC::grpc++
-)
-
 if(WIN32)
   target_link_libraries(common_proto PUBLIC Ws2_32)
   target_link_libraries(raft_proto PUBLIC Ws2_32)
   target_link_libraries(metadata_proto PUBLIC Ws2_32)
-  target_link_libraries(kv_proto PUBLIC Ws2_32)
 endif()
 
 add_library(raft_core
@@ -241,7 +215,6 @@ add_library(raft_core
   modules/raft/common/metadata_command.cpp
   modules/raft/node/raft_node.cpp
   modules/raft/service/raft_service_impl.cpp
-  modules/raft/service/kv_service_impl.cpp
   modules/raft/service/metadata_service_impl.cpp
   modules/raft/state_machine/state_machine.cpp
   modules/raft/state_machine/metadata_state_machine.cpp
@@ -262,7 +235,6 @@ target_link_libraries(raft_core
     raft_proto
   PRIVATE
     metadata_proto
-    kv_proto
     Threads::Threads
 )
 
@@ -273,15 +245,6 @@ add_executable(raft_demo
 target_link_libraries(raft_demo
   PRIVATE
     raft_core
-)
-
-add_executable(raft_kv_client
-  apps/raft_kv_client.cpp
-)
-
-target_link_libraries(raft_kv_client
-  PRIVATE
-    kv_proto
 )
 
 add_executable(raft_metadata_client

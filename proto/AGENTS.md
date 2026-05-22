@@ -7,19 +7,16 @@
 - `raft.proto`
 - `metadata.proto`
 - `common.proto`
-- `kv.proto`（过渡期保留，用于承载尚未删除的 KV RPC）
 
 ## Responsibilities
 
 - 定义 `RaftService`
 - 定义 `MetadataService`
 - 定义共享 request/response/message/enum
-- 仅在过渡期于 `kv.proto` 中定义 `KvService`
 - 维护生成 target 边界：
   - `common_proto`
   - `raft_proto`
   - `metadata_proto`
-  - `kv_proto`
 - `metadata.proto` 当前主路径负责 bucket/object 生命周期 RPC：
   - `CreateBucket` / `DeleteBucket`
   - `CreateObject` / `CommitObject` / `AbortObject` / `DeleteObject`
@@ -46,14 +43,12 @@
   - `raft.proto` 只承载共识 RPC 与 Raft 消息
   - `metadata.proto` 只承载 metadata 业务 RPC，不能复用 KV RPC / KV message
   - `common.proto` 只承载可复用公共消息
-  - `kv.proto` 只承载遗留 KV RPC，避免重新混回 `raft.proto`
 - 优先维持 target 边界清晰：
-  - `raft_proto` 不应依赖 KV/metadata 生成代码
-  - `metadata_proto` / `kv_proto` 通过 `common_proto` 复用公共消息
+  - `raft_proto` 不应依赖 metadata 生成代码
+  - `metadata_proto` 通过 `common_proto` 复用公共消息
 
 ## Relevant Tests
 
-- `tests/test_kv_service.cpp`
 - `tests/metadata_failover_test.cpp`
 - `tests/metadata_client_scenario_test.cpp`
 - `tests/raft_integration_test.cpp`
@@ -64,7 +59,7 @@
 - message 字段编号
 - 状态码枚举
 - 跨 proto import 与生成顺序
-- Raft RPC、metadata RPC、遗留 KV RPC 的边界串扰
+- Raft RPC 与 metadata RPC 的边界串扰
 
 ## Context Hints
 
