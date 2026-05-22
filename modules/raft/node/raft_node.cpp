@@ -29,7 +29,11 @@ namespace raftdemo
   class CompositeKvMetadataStateMachine final : public IStateMachine
   {
   public:
-    ApplyResult Apply(std::uint64_t index, const std::string &command_data) override;
+    using IStateMachine::Apply;
+
+    ApplyResult Apply(std::uint64_t index,
+                      std::uint64_t term,
+                      const std::string &command_data) override;
     SnapshotResult SaveSnapshot(const std::string &file_path) const override;
     SnapshotResult LoadSnapshot(const std::string &file_path) override;
 
@@ -125,15 +129,16 @@ namespace raftdemo
   } // namespace
 
   ApplyResult CompositeKvMetadataStateMachine::Apply(std::uint64_t index,
+                                                     std::uint64_t term,
                                                      const std::string &command_data)
   {
     Command command;
     if (Command::Deserialize(command_data, &command) &&
         command.type == CommandType::kMetadata)
     {
-      return metadata_.Apply(index, command_data);
+      return metadata_.Apply(index, term, command_data);
     }
-    return kv_.Apply(index, command_data);
+    return kv_.Apply(index, term, command_data);
   }
 
   SnapshotResult CompositeKvMetadataStateMachine::SaveSnapshot(const std::string &file_path) const
@@ -2716,6 +2721,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
     while (true)
     {
       std::uint64_t apply_index = 0;
+      std::uint64_t apply_term = 0;
       std::string command_data;
       IStateMachine *state_machine = nullptr;
 
@@ -2760,6 +2766,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         }
 
         command_data = record->command;
+        apply_term = record->term;
         state_machine = state_machine_.get();
       }
 
@@ -2768,7 +2775,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         return {false, "state machine is null"};
       }
 
-      ApplyResult result = state_machine->Apply(apply_index, command_data);
+      ApplyResult result = state_machine->Apply(apply_index, apply_term, command_data);
       if (!result.Ok)
       {
         Log(NodeTag(config_.node_id),

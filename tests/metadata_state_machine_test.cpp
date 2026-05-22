@@ -17,6 +17,7 @@ namespace raftdemo
 
 namespace
 {
+    using raftdemo::test::ApplyMetadataCommand;
     using raftdemo::test::MakeAbortObjectCommand;
     using raftdemo::test::MakeCommitObjectCommand;
     using raftdemo::test::MakeCreateBucketCommand;
@@ -83,15 +84,15 @@ TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitResults)
 TEST(MetadataStateMachineTest, CreateBucketApplyCreatesBucketAndUpdatesApplyPosition)
 {
     raftdemo::MetadataStateMachine machine;
+    constexpr std::uint64_t kAppliedTerm = 3;
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        7, raftdemo::SerializeMetadataCommand(
-               MakeCreateBucketCommand("bucket-a", "create-bucket-1")));
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 7, MakeCreateBucketCommand("bucket-a", "create-bucket-1"), kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 7U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.BucketCount(), 1U);
     EXPECT_EQ(machine.RequestCount(), 1U);
 
@@ -105,20 +106,19 @@ TEST(MetadataStateMachineTest, CreateBucketApplyCreatesBucketAndUpdatesApplyPosi
 TEST(MetadataStateMachineTest, DeleteBucketApplyMarksBucketDeletedAndUpdatesApplyPosition)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           10,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-b", "create-bucket-2")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 10,
+                    MakeCreateBucketCommand("bucket-b", "create-bucket-2"), 4)
                     .Ok);
+    constexpr std::uint64_t kAppliedTerm = 5;
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        11, raftdemo::SerializeMetadataCommand(
-                MakeDeleteBucketCommand("bucket-b", "delete-bucket-1")));
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 11, MakeDeleteBucketCommand("bucket-b", "delete-bucket-1"), kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 11U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.BucketCount(), 1U);
     EXPECT_EQ(machine.RequestCount(), 2U);
 
@@ -193,20 +193,21 @@ TEST(MetadataStateMachineTest, EmptyRequestIdReturnsExplicitErrorAndIsNotRecorde
 TEST(MetadataStateMachineTest, CreateObjectApplyCreatesPendingRecordAndIndexEntry)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           30,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-d", "create-bucket-5")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 30,
+                    MakeCreateBucketCommand("bucket-d", "create-bucket-5"), 6)
                     .Ok);
+    constexpr std::uint64_t kAppliedTerm = 7;
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        31, raftdemo::SerializeMetadataCommand(
-                MakeCreateObjectCommand("bucket-d", "object/a", "obj-1", "create-object-1")));
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 31,
+        MakeCreateObjectCommand("bucket-d", "object/a", "obj-1", "create-object-1"),
+        kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 31U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.ObjectCount(), 1U);
     EXPECT_EQ(machine.RequestCount(), 2U);
 
@@ -279,26 +280,27 @@ TEST(MetadataStateMachineTest, CreateObjectApplyRejectsMissingOrDeletedBucketAnd
 TEST(MetadataStateMachineTest, CommitObjectApplyPromotesPendingObjectAndPersistsMetadata)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           60,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-g", "create-bucket-8")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 60,
+                    MakeCreateBucketCommand("bucket-g", "create-bucket-8"), 8)
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           61,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-g", "object/a", "obj-6",
-                                                       "create-object-6")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 61,
+                    MakeCreateObjectCommand("bucket-g", "object/a", "obj-6",
+                                            "create-object-6"),
+                    8)
                     .Ok);
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        62, raftdemo::SerializeMetadataCommand(
-                MakeCommitObjectCommand("bucket-g", "object/a", "obj-6", "commit-object-1")));
+    constexpr std::uint64_t kAppliedTerm = 9;
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 62,
+        MakeCommitObjectCommand("bucket-g", "object/a", "obj-6", "commit-object-1"),
+        kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 62U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.ObjectCount(), 1U);
     EXPECT_EQ(machine.RequestCount(), 3U);
 
@@ -415,26 +417,27 @@ TEST(MetadataStateMachineTest, CommitObjectApplyRejectsMissingBucketObjectIdAndS
 TEST(MetadataStateMachineTest, AbortObjectApplyMarksPendingObjectDeletedAndHidesIt)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           110,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-l", "create-bucket-13")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 110,
+                    MakeCreateBucketCommand("bucket-l", "create-bucket-13"), 10)
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           111,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-l", "object/a", "obj-13",
-                                                       "create-object-9")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 111,
+                    MakeCreateObjectCommand("bucket-l", "object/a", "obj-13",
+                                            "create-object-9"),
+                    10)
                     .Ok);
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        112, raftdemo::SerializeMetadataCommand(
-                 MakeAbortObjectCommand("bucket-l", "object/a", "obj-13", "abort-object-1")));
+    constexpr std::uint64_t kAppliedTerm = 11;
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 112,
+        MakeAbortObjectCommand("bucket-l", "object/a", "obj-13", "abort-object-1"),
+        kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 112U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.RequestCount(), 3U);
     EXPECT_EQ(machine.TombstoneCount(), 1U);
 
@@ -578,32 +581,33 @@ TEST(MetadataStateMachineTest, AbortObjectApplyRejectsMissingBucketObjectIdAndSt
 TEST(MetadataStateMachineTest, DeleteObjectApplyMarksCommittedObjectDeletedAndHidesIt)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           170,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-r", "create-bucket-19")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 170,
+                    MakeCreateBucketCommand("bucket-r", "create-bucket-19"), 12)
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           171,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-r", "object/a", "obj-21",
-                                                       "create-object-13")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 171,
+                    MakeCreateObjectCommand("bucket-r", "object/a", "obj-21",
+                                            "create-object-13"),
+                    12)
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           172,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCommitObjectCommand("bucket-r", "object/a", "obj-21",
-                                                       "commit-object-9")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 172,
+                    MakeCommitObjectCommand("bucket-r", "object/a", "obj-21",
+                                            "commit-object-9"),
+                    12)
                     .Ok);
 
-    const raftdemo::ApplyResult apply = machine.Apply(
-        173, raftdemo::SerializeMetadataCommand(
-                 MakeDeleteObjectCommand("bucket-r", "object/a", "obj-21", "delete-object-1")));
+    constexpr std::uint64_t kAppliedTerm = 13;
+    const raftdemo::ApplyResult apply = ApplyMetadataCommand(
+        machine, 173,
+        MakeDeleteObjectCommand("bucket-r", "object/a", "obj-21", "delete-object-1"),
+        kAppliedTerm);
 
     EXPECT_TRUE(apply.Ok);
     EXPECT_EQ(apply.message, "ok");
     EXPECT_EQ(machine.LastAppliedIndex(), 173U);
-    EXPECT_EQ(machine.LastAppliedTerm(), 0U);
+    EXPECT_EQ(machine.LastAppliedTerm(), kAppliedTerm);
     EXPECT_EQ(machine.RequestCount(), 4U);
     EXPECT_EQ(machine.TombstoneCount(), 1U);
 
@@ -748,4 +752,71 @@ TEST(MetadataStateMachineTest, DeleteObjectApplyRejectsMissingBucketObjectIdAndS
     EXPECT_FALSE(already_deleted.Ok);
     EXPECT_EQ(already_deleted.message, "state conflict: object already deleted");
     EXPECT_EQ(deleted_machine.LastAppliedIndex(), 223U);
+}
+
+TEST(MetadataStateMachineTest, DuplicateRequestReplayDoesNotAdvanceAppliedTerm)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 300,
+                    MakeCreateBucketCommand("bucket-term-replay", "term-replay-bucket"), 21)
+                    .Ok);
+
+    const auto create = MakeCreateObjectCommand(
+        "bucket-term-replay", "object/a", "obj-term-replay", "term-replay-create");
+    const auto first_apply = ApplyMetadataCommand(machine, 301, create, 22);
+    ASSERT_TRUE(first_apply.Ok) << first_apply.message;
+    EXPECT_EQ(machine.LastAppliedIndex(), 301U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 22U);
+
+    const auto replay_apply = ApplyMetadataCommand(machine, 999, create, 99);
+    EXPECT_TRUE(replay_apply.Ok);
+    EXPECT_EQ(replay_apply.message, "idempotent replay");
+    EXPECT_EQ(machine.LastAppliedIndex(), 301U);
+    EXPECT_EQ(machine.LastAppliedTerm(), 22U);
+}
+
+TEST(MetadataStateMachineTest, SaveSnapshotAndLoadSnapshotPreserveAppliedTerm)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 320,
+                    MakeCreateBucketCommand("bucket-snapshot-term", "snapshot-term-bucket"), 31)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 321,
+                    MakeCreateObjectCommand("bucket-snapshot-term", "object/live",
+                                            "obj-snapshot-term", "snapshot-term-create"),
+                    32)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine, 322,
+                    MakeCommitObjectCommand("bucket-snapshot-term", "object/live",
+                                            "obj-snapshot-term", "snapshot-term-commit"),
+                    33)
+                    .Ok);
+
+    const std::filesystem::path snapshot_path =
+        MakeSnapshotPath("metadata-applied-term-preserved.snapshot");
+    std::error_code ec;
+    std::filesystem::remove(snapshot_path, ec);
+
+    const auto save_result = machine.SaveSnapshot(snapshot_path.string());
+    ASSERT_EQ(save_result.status, raftdemo::SnapshotStatus::kOk) << save_result.message;
+
+    raftdemo::MetadataStateMachine restored;
+    const auto load_result = restored.LoadSnapshot(snapshot_path.string());
+    ASSERT_EQ(load_result.status, raftdemo::SnapshotStatus::kOk) << load_result.message;
+
+    EXPECT_EQ(restored.LastAppliedIndex(), 322U);
+    EXPECT_EQ(restored.LastAppliedTerm(), 33U);
+    EXPECT_EQ(restored.RequestCount(), 3U);
+    EXPECT_EQ(restored.TombstoneCount(), 0U);
+
+    const auto head = restored.HeadObject(
+        {.bucket = "bucket-snapshot-term", .object_key = "object/live"});
+    ASSERT_TRUE(head.result.Ok()) << head.result.summary.message;
+    ASSERT_TRUE(head.record.has_value());
+    EXPECT_EQ(head.record->object_id, "obj-snapshot-term");
+    EXPECT_TRUE(head.record->IsCommitted());
 }

@@ -290,6 +290,7 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
       .expected_request_count = 42U,
       .expected_tombstone_count = 1U,
       .expected_last_applied_index = result.log_index,
+      .expected_min_last_applied_term = result.term,
   };
   ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
       cluster.Nodes(), expected_before_restart, std::chrono::seconds(15)))
@@ -309,7 +310,7 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
     ASSERT_NE(state_machine, nullptr);
     EXPECT_EQ(state_machine->RequestCount(), 42U);
     EXPECT_EQ(state_machine->TombstoneCount(), 1U);
-    EXPECT_EQ(state_machine->LastAppliedTerm(), 0U);
+    EXPECT_GE(state_machine->LastAppliedTerm(), result.term);
     EXPECT_GE(state_machine->LastAppliedIndex(), expected_before_restart.expected_last_applied_index);
   }
 
@@ -336,6 +337,7 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
             expected_after_restart.visible_keys.end());
   expected_after_restart.expected_request_count = 44U;
   expected_after_restart.expected_last_applied_index = result.log_index;
+  expected_after_restart.expected_min_last_applied_term = result.term;
 
   ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
       cluster.Nodes(), expected_after_restart, std::chrono::seconds(20)))

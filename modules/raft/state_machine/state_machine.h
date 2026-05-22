@@ -13,7 +13,10 @@ namespace raftdemo
     class KvStateMachine final : public IStateMachine
     {
     public:
+        using IStateMachine::Apply;
+
         ApplyResult Apply(std::uint64_t index,
+                          std::uint64_t term,
                           const std::string &command_data) override;
 
         SnapshotResult SaveSnapshot(const std::string &file_path) const override;

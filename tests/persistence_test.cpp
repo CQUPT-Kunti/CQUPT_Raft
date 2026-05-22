@@ -576,6 +576,7 @@ namespace raftdemo
           .expected_request_count = 6U,
           .expected_tombstone_count = 1U,
           .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
       };
 
       ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
@@ -689,6 +690,7 @@ namespace raftdemo
           .expected_request_count = 8U,
           .expected_tombstone_count = 1U,
           .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
       };
       ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
                       alive_nodes, expected_state, 10s))
@@ -722,7 +724,7 @@ namespace raftdemo
           restarted_follower->GetMetadataStateMachineV2();
       ASSERT_NE(restarted_state_machine, nullptr);
       EXPECT_EQ(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
-      EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), 0U);
+      EXPECT_GE(restarted_state_machine->LastAppliedTerm(), delete_result.term);
       EXPECT_EQ(restarted_state_machine->RequestCount(), 8U);
       EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
 
@@ -785,6 +787,7 @@ namespace raftdemo
           .expected_request_count = 6U,
           .expected_tombstone_count = 1U,
           .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
       };
       ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
                       {node}, expected_state, 6s))
@@ -798,7 +801,7 @@ namespace raftdemo
       const MetadataStateMachine *before_state_machine = node->GetMetadataStateMachineV2();
       ASSERT_NE(before_state_machine, nullptr);
       EXPECT_EQ(before_state_machine->LastAppliedIndex(), delete_result.log_index);
-      EXPECT_EQ(before_state_machine->LastAppliedTerm(), 0U);
+      EXPECT_EQ(before_state_machine->LastAppliedTerm(), delete_result.term);
 
       node->Stop();
       if (worker.joinable())
@@ -825,7 +828,7 @@ namespace raftdemo
       EXPECT_EQ(after_status.last_applied, before_status.last_applied) << after_description;
       EXPECT_EQ(after_voted_for, before_voted_for) << after_description;
       EXPECT_EQ(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
-      EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), 0U);
+      EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), delete_result.term);
 
       const fs::path probe_dir = scoped_dir.path() / "metadata_recovery_probe";
       std::error_code ec;
@@ -843,7 +846,7 @@ namespace raftdemo
       EXPECT_EQ(replay_probe.RequestCount(), 6U);
       EXPECT_EQ(replay_probe.TombstoneCount(), 1U);
       EXPECT_EQ(replay_probe.LastAppliedIndex(), delete_result.log_index);
-      EXPECT_EQ(replay_probe.LastAppliedTerm(), 0U);
+      EXPECT_EQ(replay_probe.LastAppliedTerm(), delete_result.term);
 
       const ApplyResult delete_replay = replay_probe.Apply(
           delete_result.log_index + 1,

@@ -77,6 +77,7 @@ namespace raftdemo
     }
 
     ApplyResult KvStateMachine::Apply(std::uint64_t /*index*/,
+                                      std::uint64_t /*term*/,
                                       const std::string &command_data)
     {
         if (command_data == kInternalNoOpCommand)

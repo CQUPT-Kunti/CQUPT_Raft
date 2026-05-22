@@ -671,6 +671,7 @@ namespace raftdemo
                 .expected_request_count = 54U,
                 .expected_tombstone_count = 1U,
                 .expected_last_applied_index = result.log_index,
+                .expected_min_last_applied_term = result.term,
             };
             ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
                 cluster.nodes, expected_before_restart, 8s));
@@ -702,7 +703,7 @@ namespace raftdemo
                 ASSERT_NE(state_machine, nullptr);
                 EXPECT_EQ(state_machine->RequestCount(), 54U);
                 EXPECT_EQ(state_machine->TombstoneCount(), 1U);
-                EXPECT_EQ(state_machine->LastAppliedTerm(), 0U);
+                EXPECT_GE(state_machine->LastAppliedTerm(), result.term);
                 EXPECT_GE(state_machine->LastAppliedIndex(), expected_before_restart.expected_last_applied_index);
             }
 
@@ -730,6 +731,7 @@ namespace raftdemo
                       expected_after_restart.visible_keys.end());
             expected_after_restart.expected_request_count = 56U;
             expected_after_restart.expected_last_applied_index = after_restart_result.log_index;
+            expected_after_restart.expected_min_last_applied_term = after_restart_result.term;
 
             ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
                 restarted.nodes, expected_after_restart, 8s));

@@ -1084,6 +1084,7 @@ namespace raftdemo
     } // namespace
 
     ApplyResult MetadataStateMachine::Apply(std::uint64_t index,
+                                            std::uint64_t term,
                                             const std::string &command_data)
     {
         if (index == 0)
@@ -1094,7 +1095,7 @@ namespace raftdemo
         {
             std::unique_lock<std::shared_mutex> lk(mu_);
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
         if (command_data.empty())
@@ -1155,7 +1156,7 @@ namespace raftdemo
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -1193,7 +1194,7 @@ namespace raftdemo
                 MakeAppliedRequestRecord(command, it->second.bucket, "ok", index);
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -1229,7 +1230,7 @@ namespace raftdemo
             requests_[command.request_id].object_key = record.object_key;
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -1295,7 +1296,7 @@ namespace raftdemo
             requests_[command.request_id].object_key = record.object_key;
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -1369,7 +1370,7 @@ namespace raftdemo
             requests_[command.request_id].object_key = record.object_key;
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -1443,7 +1444,7 @@ namespace raftdemo
             requests_[command.request_id].object_key = record.object_key;
             request_fingerprints_[command.request_id] = fingerprint;
             last_applied_index_ = index;
-            last_applied_term_ = 0;
+            last_applied_term_ = term;
             return {true, "ok"};
         }
 
@@ -2082,6 +2083,7 @@ namespace raftdemo
     }
 
     ApplyResult StrongConsistencyMetadataStateMachine::Apply(std::uint64_t index,
+                                                             std::uint64_t /*term*/,
                                                              const std::string &command_data)
     {
         MetadataCommand command;

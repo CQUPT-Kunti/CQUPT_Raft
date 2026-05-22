@@ -31,6 +31,7 @@ namespace raftdemo::test
         std::size_t expected_request_count{0};
         std::size_t expected_tombstone_count{0};
         std::uint64_t expected_last_applied_index{0};
+        std::optional<std::uint64_t> expected_min_last_applied_term;
     };
 
     inline bool IsExcludedNode(const std::size_t index,
@@ -405,6 +406,14 @@ namespace raftdemo::test
                 if (state_machine->RequestCount() != expectation.expected_request_count ||
                     state_machine->TombstoneCount() != expectation.expected_tombstone_count ||
                     state_machine->LastAppliedIndex() < expectation.expected_last_applied_index)
+                {
+                    ok = false;
+                    break;
+                }
+
+                if (expectation.expected_min_last_applied_term.has_value() &&
+                    state_machine->LastAppliedTerm() <
+                        *expectation.expected_min_last_applied_term)
                 {
                     ok = false;
                     break;

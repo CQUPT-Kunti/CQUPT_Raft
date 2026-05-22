@@ -20,9 +20,10 @@ namespace raftdemo::test
 {
     inline ApplyResult ApplyMetadataCommand(MetadataStateMachine &machine,
                                             const std::uint64_t index,
-                                            const MetadataCommand &command)
+                                            const MetadataCommand &command,
+                                            const std::uint64_t term = 0)
     {
-        return machine.Apply(index, raftdemo::SerializeMetadataCommand(command));
+        return machine.Apply(index, term, raftdemo::SerializeMetadataCommand(command));
     }
 
     inline MetadataCommand MakeCreateBucketCommand(const std::string &bucket,

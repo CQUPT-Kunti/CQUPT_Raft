@@ -771,6 +771,7 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
       .expected_request_count = 44U,
       .expected_tombstone_count = 1U,
       .expected_last_applied_index = result.log_index,
+      .expected_min_last_applied_term = result.term,
   };
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
@@ -798,7 +799,7 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
   ASSERT_NE(restarted_state_machine, nullptr);
   EXPECT_EQ(restarted_state_machine->RequestCount(), 44U);
   EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
-  EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), 0U);
+  EXPECT_GE(restarted_state_machine->LastAppliedTerm(), result.term);
 
   ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
       cluster.Nodes(),
@@ -821,6 +822,7 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
   std::sort(expected_after_tail.visible_keys.begin(), expected_after_tail.visible_keys.end());
   expected_after_tail.expected_request_count = 46U;
   expected_after_tail.expected_last_applied_index = result.log_index;
+  expected_after_tail.expected_min_last_applied_term = result.term;
 
   ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
       cluster.Nodes(), expected_after_tail, std::chrono::seconds(15)))

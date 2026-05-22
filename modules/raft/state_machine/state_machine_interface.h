@@ -39,7 +39,14 @@ namespace raftdemo
         virtual ~IStateMachine() = default;
 
         virtual ApplyResult Apply(std::uint64_t index,
+                                  std::uint64_t term,
                                   const std::string &command_data) = 0;
+
+        virtual ApplyResult Apply(std::uint64_t index,
+                                  const std::string &command_data)
+        {
+            return Apply(index, 0, command_data);
+        }
 
         virtual SnapshotResult SaveSnapshot(const std::string &file_path) const = 0;
         virtual SnapshotResult LoadSnapshot(const std::string &file_path) = 0;
