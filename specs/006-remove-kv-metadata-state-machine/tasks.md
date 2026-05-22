@@ -127,7 +127,7 @@
 - [x] T032 [US3] 在 `modules/raft/node/raft_node.h`、`modules/raft/node/raft_node.cpp`、`modules/raft/common/propose.h` 中补齐 metadata proposal admission、bounded queue/backpressure、timeout handling、no-double-apply 防护
 - [x] T033 [US3] 更新 `modules/raft/common/metadata_result.h`、`proto/raft.proto`、`modules/raft/service/metadata_service_impl.cpp`、`apps/raft_metadata_client.cpp`，为 overload、timeout、retry、idempotency conflict 提供稳定对外语义
 - [x] T034 [US3] 将 `tests/raft_integration_test.cpp`、`tests/metadata_failover_test.cpp`、`tests/metadata_main_path_test.cpp` 的集群断言全部改为 metadata 读路径与 metadata 状态一致性断言
-- [ ] T035 [US3] 运行 US3 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T035-us3-concurrency-validation.md`
+- [x] T035 [US3] 运行 US3 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T035-us3-concurrency-validation.md`
 
 **Checkpoint**: metadata-only 主路径已经满足并发、幂等、leader switch 和 read/write 分离要求
 

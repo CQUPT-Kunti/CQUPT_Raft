@@ -86,9 +86,17 @@ namespace raftdemo
     fs::path MakeTestRoot()
     {
       std::random_device rd;
+#ifdef _WIN32
+      // Keep Windows stress-test roots short so log staging paths stay below
+      // common path-length limits during multi-node runs.
+      return fs::temp_directory_path() / "rq_mcs" /
+             ("mcs_" + std::to_string(NowForPath()) + "_" +
+              std::to_string(rd()));
+#else
       return TestBinaryDir() / "raft_test_data" / "metadata_concurrency_stress" /
              (SafeTestName() + "_" + std::to_string(NowForPath()) + "_" +
               std::to_string(rd()));
+#endif
     }
 
     int PickBasePort()
