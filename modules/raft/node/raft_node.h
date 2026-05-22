@@ -167,6 +167,21 @@ namespace raftdemo
       std::uint64_t max_latency_us{0};
     };
 
+    struct MetadataProposalTracker
+    {
+      std::mutex mu;
+      std::condition_variable cv;
+      std::string fingerprint;
+      bool completed{false};
+      ProposeResult result;
+    };
+
+    struct CompletedMetadataProposal
+    {
+      std::string fingerprint;
+      ProposeResult result;
+    };
+
     friend class Replicator;
     friend class RaftServiceImpl;
     void InitServer();
@@ -220,8 +235,25 @@ namespace raftdemo
     bool ValidateValueUnlocked(const std::string &value, std::string *reason) const;
     std::uint64_t AppendLocalLogUnlocked(const std::string &command_data);
     ReplicationOutcome ReplicateLogEntryToMajority(std::uint64_t log_index);
+    ReplicationOutcome ReplicateLogEntryToMajority(
+        std::uint64_t log_index,
+        std::chrono::steady_clock::time_point deadline);
     void AdvanceCommitIndexUnlocked();
     ApplyResult ApplyCommittedEntries();
+    void ExecuteMetadataProposal(
+        const std::string &request_id,
+        const std::string &metadata_command_data,
+        std::shared_ptr<MetadataProposalTracker> tracker);
+    bool WaitForMetadataProposalTracker(
+        const std::shared_ptr<MetadataProposalTracker> &tracker,
+        std::chrono::steady_clock::time_point deadline,
+        ProposeResult *result) const;
+    void CompleteMetadataProposal(
+        const std::string &request_id,
+        const std::shared_ptr<MetadataProposalTracker> &tracker,
+        const std::string &fingerprint,
+        const ProposeResult &result);
+    void PruneCompletedMetadataProposalsLocked();
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
     std::string AddressForNodeLocked(int node_id) const;
@@ -279,6 +311,11 @@ namespace raftdemo
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
+    std::unordered_map<std::string, std::shared_ptr<MetadataProposalTracker>>
+        metadata_inflight_proposals_;
+    std::unordered_map<std::string, CompletedMetadataProposal>
+        metadata_completed_proposals_;
+    std::vector<std::string> metadata_completed_proposal_order_;
     std::unique_ptr<IStateMachine> state_machine_;
     std::unique_ptr<IRaftStorage> storage_;
     std::unique_ptr<ISnapshotStorage> snapshot_storage_;

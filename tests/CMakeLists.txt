@@ -178,6 +178,8 @@ add_raft_gtest(test_metadata_failover metadata_failover_test.cpp
 target_link_libraries(test_metadata_failover
   PRIVATE
     metadata_proto)
+add_raft_gtest(test_metadata_concurrency_stress metadata_concurrency_stress_test.cpp
+  "platform-neutral")
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
   add_executable(test_metadata_client_scenario
     metadata_client_scenario_test.cpp
