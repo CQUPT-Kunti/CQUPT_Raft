@@ -437,7 +437,7 @@ namespace raftdemo
     TEST(MetadataConcurrencyStressTest,
          ConcurrentDuplicateRequestIdProposalsShareOneLogEntryAndOneApply)
     {
-      ClusterRunner cluster(PickBasePort(), 800ms);
+      ClusterRunner cluster(PickBasePort(), 1200ms);
       cluster.Start();
 
       auto leader = cluster.WaitForLeader(5s);

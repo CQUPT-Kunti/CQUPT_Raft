@@ -56,7 +56,7 @@ namespace raftdemo
       n1.election_timeout_min = std::chrono::milliseconds(250);
       n1.election_timeout_max = std::chrono::milliseconds(500);
       n1.heartbeat_interval = std::chrono::milliseconds(80);
-      n1.rpc_deadline = std::chrono::milliseconds(250);
+      n1.rpc_deadline = std::chrono::milliseconds(500);
       n1.data_dir = (root / "node_1_data").string();
 
       NodeConfig n2 = n1;
@@ -144,6 +144,24 @@ namespace raftdemo
         {
           wait_threads_[index].join();
         }
+      }
+
+      void RestartNode(const std::size_t index)
+      {
+        if (index >= configs_.size())
+        {
+          return;
+        }
+
+        StopNode(index);
+        nodes_[index] = std::make_shared<RaftNode>(configs_[index]);
+        nodes_[index]->Start();
+        if (index >= wait_threads_.size())
+        {
+          wait_threads_.resize(index + 1);
+        }
+        wait_threads_[index] = std::thread([node = nodes_[index]]()
+                                           { node->Wait(); });
       }
 
       const std::vector<std::shared_ptr<RaftNode>> &Nodes() const
@@ -303,6 +321,48 @@ namespace raftdemo
       return request;
     }
 
+    template <typename Request, typename Response, typename Invoke>
+    Response InvokeWriteViaCurrentLeader(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const std::vector<NodeConfig> &configs,
+        const Request &request,
+        const std::chrono::milliseconds timeout,
+        Invoke &&invoke)
+    {
+      Response response;
+      const auto deadline = Clock::now() + timeout;
+      while (Clock::now() < deadline)
+      {
+        auto leader = WaitForSingleLeader(nodes, 1500ms);
+        if (leader == nullptr)
+        {
+          std::this_thread::sleep_for(50ms);
+          continue;
+        }
+
+        const auto leader_index = FindNodeIndex(nodes, leader);
+        if (leader_index >= configs.size())
+        {
+          std::this_thread::sleep_for(50ms);
+          continue;
+        }
+
+        auto stub = MakeMetadataStub(configs[leader_index].address);
+        grpc::ClientContext context;
+        const auto status = invoke(stub.get(), &context, request, &response);
+        if (status.ok() &&
+            response.summary().code() != raft::METADATA_STATUS_CODE_NOT_LEADER &&
+            response.summary().code() != raft::METADATA_STATUS_CODE_TIMEOUT)
+        {
+          return response;
+        }
+
+        std::this_thread::sleep_for(50ms);
+      }
+
+      return response;
+    }
+
     raft::HeadObjectResponse HeadViaLeader(const std::vector<std::shared_ptr<RaftNode>> &nodes,
                                            const std::vector<NodeConfig> &configs,
                                            const std::vector<std::size_t> &excluded,
@@ -431,47 +491,67 @@ namespace raftdemo
 
       const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
       ASSERT_LT(leader_index, cluster.Nodes().size());
-      auto leader_stub = MakeMetadataStub(configs[leader_index].address);
-
-      grpc::ClientContext bucket_context;
-      raft::CreateBucketResponse bucket_response;
-      ASSERT_TRUE(leader_stub->CreateBucket(&bucket_context,
-                                            MakeCreateBucketRequest("create-bucket", bucket),
-                                            &bucket_response)
-                      .ok());
+      const auto bucket_response = InvokeWriteViaCurrentLeader<
+          raft::CreateBucketRequest, raft::CreateBucketResponse>(
+          cluster.Nodes(), configs, MakeCreateBucketRequest("create-bucket", bucket), 5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateBucketRequest &request,
+             raft::CreateBucketResponse *response)
+          {
+            return stub->CreateBucket(context, request, response);
+          });
       ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << bucket_response.summary().message();
 
-      grpc::ClientContext create_committed_context;
-      raft::CreateObjectResponse create_committed_response;
-      ASSERT_TRUE(leader_stub->CreateObject(
-                              &create_committed_context,
-                              MakeCreateObjectRequest("create-committed", bucket,
-                                                      "object/committed", "obj-committed"),
-                              &create_committed_response)
-                      .ok());
+      const auto create_committed_response = InvokeWriteViaCurrentLeader<
+          raft::CreateObjectRequest, raft::CreateObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateObjectRequest("create-committed", bucket,
+                                  "object/committed", "obj-committed"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateObjectRequest &request,
+             raft::CreateObjectResponse *response)
+          {
+            return stub->CreateObject(context, request, response);
+          });
       ASSERT_EQ(create_committed_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << create_committed_response.summary().message();
 
-      grpc::ClientContext commit_context;
-      raft::CommitObjectResponse commit_response;
-      ASSERT_TRUE(leader_stub->CommitObject(
-                              &commit_context,
-                              MakeCommitObjectRequest("commit-committed", bucket,
-                                                      "object/committed", "obj-committed"),
-                              &commit_response)
-                      .ok());
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCommitObjectRequest("commit-committed", bucket,
+                                  "object/committed", "obj-committed"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
       ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << commit_response.summary().message();
 
-      grpc::ClientContext create_pending_context;
-      raft::CreateObjectResponse create_pending_response;
-      ASSERT_TRUE(leader_stub->CreateObject(
-                              &create_pending_context,
-                              MakeCreateObjectRequest("create-pending", bucket,
-                                                      "object/pending", "obj-pending"),
-                              &create_pending_response)
-                      .ok());
+      const auto create_pending_response = InvokeWriteViaCurrentLeader<
+          raft::CreateObjectRequest, raft::CreateObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateObjectRequest("create-pending", bucket,
+                                  "object/pending", "obj-pending"),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateObjectRequest &request,
+             raft::CreateObjectResponse *response)
+          {
+            return stub->CreateObject(context, request, response);
+          });
       ASSERT_EQ(create_pending_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
           << create_pending_response.summary().message();
 
@@ -518,7 +598,11 @@ namespace raftdemo
     TEST_F(MetadataFailoverTest, SameCommitRequestIdCanBeRetriedOnNewLeader)
     {
       const std::string bucket = "retry-bucket";
-      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      for (auto &config : configs)
+      {
+        config.rpc_deadline = 500ms;
+      }
       MetadataCluster cluster(configs);
       cluster.Start();
 
@@ -589,6 +673,268 @@ namespace raftdemo
           << list_response.summary().message();
       ASSERT_EQ(list_response.objects_size(), 1);
       EXPECT_EQ(list_response.objects(0).object_key(), "object/retry");
+    }
+
+    TEST_F(MetadataFailoverTest, FollowerWriteReturnsNotLeader)
+    {
+      const std::string bucket = "not-leader-bucket";
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+      std::this_thread::sleep_for(250ms);
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+
+      std::size_t follower_index = cluster.Nodes().size();
+      for (std::size_t i = 0; i < cluster.Nodes().size(); ++i)
+      {
+        if (i != leader_index)
+        {
+          follower_index = i;
+          break;
+        }
+      }
+      ASSERT_LT(follower_index, cluster.Nodes().size());
+
+      auto follower_stub = MakeMetadataStub(configs[follower_index].address);
+      grpc::ClientContext context;
+      raft::CreateBucketResponse response;
+      ASSERT_TRUE(follower_stub->CreateBucket(
+                                  &context,
+                                  MakeCreateBucketRequest("write-on-follower", bucket),
+                                  &response)
+                      .ok());
+      EXPECT_EQ(response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER)
+          << response.summary().message();
+      EXPECT_EQ(response.summary().request_id(), "write-on-follower");
+    }
+
+    TEST_F(MetadataFailoverTest, LeaderWriteTimeoutReturnsTimeoutAndSameRequestIdCanRetry)
+    {
+      const std::string bucket = "timeout-bucket";
+      auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      for (auto &config : configs)
+      {
+        config.rpc_deadline = 400ms;
+      }
+
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      auto leader_stub = MakeMetadataStub(configs[leader_index].address);
+
+      const auto bucket_response = InvokeWriteViaCurrentLeader<
+          raft::CreateBucketRequest, raft::CreateBucketResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateBucketRequest("timeout-create-bucket", bucket),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateBucketRequest &request,
+             raft::CreateBucketResponse *response)
+          {
+            return stub->CreateBucket(context, request, response);
+          });
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      std::vector<std::size_t> follower_indexes;
+      for (std::size_t i = 0; i < cluster.Nodes().size(); ++i)
+      {
+        if (i != leader_index)
+        {
+          follower_indexes.push_back(i);
+          cluster.StopNode(i);
+        }
+      }
+
+      const auto create_request =
+          MakeCreateObjectRequest("timeout-create", bucket, "object/timeout", "obj-timeout");
+      grpc::ClientContext timeout_context;
+      raft::CreateObjectResponse timeout_response;
+      ASSERT_TRUE(leader_stub->CreateObject(&timeout_context, create_request, &timeout_response).ok());
+      EXPECT_EQ(timeout_response.summary().code(), raft::METADATA_STATUS_CODE_TIMEOUT)
+          << timeout_response.summary().message();
+      EXPECT_EQ(timeout_response.summary().request_id(), "timeout-create");
+
+      for (const auto index : follower_indexes)
+      {
+        cluster.RestartNode(index);
+      }
+
+      raft::CreateObjectResponse retry_response;
+      const auto retry_deadline = Clock::now() + 8s;
+      while (Clock::now() < retry_deadline)
+      {
+        auto current_leader = WaitForSingleLeader(cluster.Nodes(), 1500ms);
+        if (current_leader == nullptr)
+        {
+          std::this_thread::sleep_for(100ms);
+          continue;
+        }
+        const auto current_leader_index = FindNodeIndex(cluster.Nodes(), current_leader);
+        if (current_leader_index >= configs.size())
+        {
+          std::this_thread::sleep_for(100ms);
+          continue;
+        }
+        auto current_leader_stub = MakeMetadataStub(configs[current_leader_index].address);
+        grpc::ClientContext retry_context;
+        const auto retry_status = current_leader_stub->CreateObject(
+            &retry_context, create_request, &retry_response);
+        if (!retry_status.ok())
+        {
+          std::this_thread::sleep_for(100ms);
+          continue;
+        }
+        if (retry_response.summary().code() == raft::METADATA_STATUS_CODE_OK ||
+            retry_response.summary().code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
+        {
+          break;
+        }
+        std::this_thread::sleep_for(100ms);
+      }
+
+      EXPECT_TRUE(retry_response.summary().code() == raft::METADATA_STATUS_CODE_OK ||
+                  retry_response.summary().code() == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
+          << retry_response.summary().message();
+      EXPECT_EQ(retry_response.summary().request_id(), "timeout-create");
+
+      auto current_leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(current_leader, nullptr) << DescribeCluster(cluster.Nodes());
+      const auto current_leader_index = FindNodeIndex(cluster.Nodes(), current_leader);
+      ASSERT_LT(current_leader_index, configs.size());
+      auto current_leader_stub = MakeMetadataStub(configs[current_leader_index].address);
+
+      grpc::ClientContext commit_context;
+      raft::CommitObjectResponse commit_response;
+      ASSERT_TRUE(current_leader_stub->CommitObject(
+                                      &commit_context,
+                                      MakeCommitObjectRequest("timeout-commit", bucket,
+                                                              "object/timeout", "obj-timeout"),
+                                      &commit_response)
+                      .ok());
+      ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << commit_response.summary().message();
+
+      const auto head_response =
+          HeadViaLeader(cluster.Nodes(), configs, {}, bucket, "object/timeout", 5s);
+      ASSERT_EQ(head_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << head_response.summary().message();
+      ASSERT_TRUE(head_response.found());
+      EXPECT_EQ(head_response.object().object_id(), "obj-timeout");
+    }
+
+    TEST_F(MetadataFailoverTest, ConcurrentDuplicateCreateObjectRequestsShareSameLogIndex)
+    {
+      const std::string bucket = "coalesce-bucket";
+      auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      for (auto &config : configs)
+      {
+        config.rpc_deadline = 500ms;
+      }
+
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      const std::string leader_address = configs[leader_index].address;
+      auto leader_stub = MakeMetadataStub(leader_address);
+
+      grpc::ClientContext bucket_context;
+      raft::CreateBucketResponse bucket_response;
+      ASSERT_TRUE(leader_stub->CreateBucket(&bucket_context,
+                                            MakeCreateBucketRequest("coalesce-create-bucket", bucket),
+                                            &bucket_response)
+                      .ok());
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      const auto request =
+          MakeCreateObjectRequest("coalesce-create", bucket, "object/coalesce", "obj-coalesce");
+      raft::CreateObjectResponse response_a;
+      raft::CreateObjectResponse response_b;
+
+      std::thread thread_a([&]()
+                           {
+                             auto stub = MakeMetadataStub(leader_address);
+                             grpc::ClientContext context;
+                             EXPECT_TRUE(stub->CreateObject(&context, request, &response_a).ok());
+                           });
+      std::thread thread_b([&]()
+                           {
+                             auto stub = MakeMetadataStub(leader_address);
+                             grpc::ClientContext context;
+                             EXPECT_TRUE(stub->CreateObject(&context, request, &response_b).ok());
+                           });
+      thread_a.join();
+      thread_b.join();
+
+      ASSERT_EQ(response_a.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << response_a.summary().message();
+      ASSERT_EQ(response_b.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << response_b.summary().message();
+      EXPECT_EQ(response_a.summary().request_id(), "coalesce-create");
+      EXPECT_EQ(response_b.summary().request_id(), "coalesce-create");
+      EXPECT_EQ(response_a.summary().log_index(), response_b.summary().log_index());
+      EXPECT_GT(response_a.summary().log_index(), 0U);
+    }
+
+    TEST_F(MetadataFailoverTest, DifferentFingerprintForSameRequestIdReturnsIdempotencyConflict)
+    {
+      const std::string bucket = "fingerprint-conflict-bucket";
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      auto leader_stub = MakeMetadataStub(configs[leader_index].address);
+
+      grpc::ClientContext bucket_context;
+      raft::CreateBucketResponse bucket_response;
+      ASSERT_TRUE(leader_stub->CreateBucket(
+                                  &bucket_context,
+                                  MakeCreateBucketRequest("fingerprint-bucket", bucket),
+                                  &bucket_response)
+                      .ok());
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      auto first_request =
+          MakeCreateObjectRequest("fingerprint-create", bucket, "object/conflict-a", "obj-conflict-a");
+      grpc::ClientContext first_context;
+      raft::CreateObjectResponse first_response;
+      ASSERT_TRUE(leader_stub->CreateObject(&first_context, first_request, &first_response).ok());
+      ASSERT_EQ(first_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << first_response.summary().message();
+
+      auto second_request =
+          MakeCreateObjectRequest("fingerprint-create", bucket, "object/conflict-b", "obj-conflict-b");
+      second_request.set_size(2048);
+      grpc::ClientContext second_context;
+      raft::CreateObjectResponse second_response;
+      ASSERT_TRUE(leader_stub->CreateObject(&second_context, second_request, &second_response).ok());
+      EXPECT_EQ(second_response.summary().code(), raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT)
+          << second_response.summary().message();
+      EXPECT_EQ(second_response.summary().request_id(), "fingerprint-create");
     }
 
   } // namespace

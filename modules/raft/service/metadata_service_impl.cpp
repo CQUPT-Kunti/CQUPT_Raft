@@ -63,6 +63,11 @@ namespace raftdemo
       }
     }
 
+    bool MessageStartsWith(const std::string &message, const std::string &prefix)
+    {
+      return message.rfind(prefix, 0) == 0;
+    }
+
     raft::MetadataObjectState ToProtoObjectState(const ObjectState state)
     {
       switch (state)
@@ -78,45 +83,48 @@ namespace raftdemo
       }
     }
 
-    MetadataStatusCode ToMetadataStatusCode(const ProposeResult &result)
+    raft::MetadataStatusCode ToWriteProtoStatusCode(const ProposeResult &result)
     {
       switch (result.status)
       {
       case ProposeStatus::kOk:
-        if (result.message == "idempotent replay")
+        if (MessageStartsWith(result.message, "idempotent replay"))
         {
-          return MetadataStatusCode::kIdempotentReplay;
+          return raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY;
         }
-        return MetadataStatusCode::kOk;
+        return raft::METADATA_STATUS_CODE_OK;
       case ProposeStatus::kNotLeader:
-        return MetadataStatusCode::kNotLeader;
+        return raft::METADATA_STATUS_CODE_NOT_LEADER;
       case ProposeStatus::kInvalidCommand:
-        return MetadataStatusCode::kInvalidArgument;
+        return raft::METADATA_STATUS_CODE_INVALID_ARGUMENT;
       case ProposeStatus::kTimeout:
-        return MetadataStatusCode::kTimeout;
-      case ProposeStatus::kApplyFailed:
-        if (result.message.rfind("invalid metadata command:", 0) == 0)
-        {
-          return MetadataStatusCode::kInvalidArgument;
-        }
-        if (result.message.rfind("not found:", 0) == 0)
-        {
-          return MetadataStatusCode::kNotFound;
-        }
-        if (result.message.rfind("state conflict:", 0) == 0)
-        {
-          return MetadataStatusCode::kStateConflict;
-        }
-        if (result.message.rfind("idempotency conflict:", 0) == 0)
-        {
-          return MetadataStatusCode::kIdempotencyConflict;
-        }
-        return MetadataStatusCode::kInternalError;
+        return raft::METADATA_STATUS_CODE_TIMEOUT;
+      case ProposeStatus::kOverloaded:
+        return raft::METADATA_STATUS_CODE_OVERLOADED;
       case ProposeStatus::kNodeStopping:
+        return raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
+      case ProposeStatus::kApplyFailed:
+        if (MessageStartsWith(result.message, "invalid metadata command:"))
+        {
+          return raft::METADATA_STATUS_CODE_INVALID_ARGUMENT;
+        }
+        if (MessageStartsWith(result.message, "not found:"))
+        {
+          return raft::METADATA_STATUS_CODE_NOT_FOUND;
+        }
+        if (MessageStartsWith(result.message, "state conflict:"))
+        {
+          return raft::METADATA_STATUS_CODE_STATE_CONFLICT;
+        }
+        if (MessageStartsWith(result.message, "idempotency conflict:"))
+        {
+          return raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT;
+        }
+        return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
       case ProposeStatus::kReplicationFailed:
       case ProposeStatus::kCommitFailed:
       default:
-        return MetadataStatusCode::kInternalError;
+        return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
       }
     }
 
@@ -184,7 +192,7 @@ namespace raftdemo
     }
 
     void FillSummary(const NodeStatusSnapshot &status,
-                     MetadataStatusCode code,
+                     raft::MetadataStatusCode code,
                      const std::string &message,
                      const std::string &request_id,
                      const std::string &bucket,
@@ -199,7 +207,7 @@ namespace raftdemo
       {
         return;
       }
-      out->set_code(ToProtoStatusCode(code));
+      out->set_code(code);
       out->set_message(message);
       out->set_request_id(request_id);
       out->set_bucket(bucket);
@@ -212,6 +220,31 @@ namespace raftdemo
       FillLeaderHint(status, out->mutable_leader_hint());
     }
 
+    void FillSummary(const NodeStatusSnapshot &status,
+                     MetadataStatusCode code,
+                     const std::string &message,
+                     const std::string &request_id,
+                     const std::string &bucket,
+                     const std::string &object_key,
+                     const std::string &object_id,
+                     const std::optional<ObjectState> state,
+                     const std::optional<std::uint64_t> log_index,
+                     const std::optional<std::uint64_t> term,
+                     raft::MetadataResponseSummary *out)
+    {
+      FillSummary(status,
+                  ToProtoStatusCode(code),
+                  message,
+                  request_id,
+                  bucket,
+                  object_key,
+                  object_id,
+                  state,
+                  log_index,
+                  term,
+                  out);
+    }
+
     void FillWriteSummary(const NodeStatusSnapshot &status,
                           const ProposeResult &result,
                           const std::string &request_id,
@@ -222,7 +255,7 @@ namespace raftdemo
                           raft::MetadataResponseSummary *out)
     {
       FillSummary(status,
-                  ToMetadataStatusCode(result),
+                  ToWriteProtoStatusCode(result),
                   result.message,
                   request_id,
                   bucket,
@@ -489,8 +522,9 @@ namespace raftdemo
                      std::nullopt,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)
@@ -539,8 +573,9 @@ namespace raftdemo
                      std::nullopt,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)
@@ -589,8 +624,9 @@ namespace raftdemo
                      ObjectState::PENDING,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)
@@ -640,8 +676,9 @@ namespace raftdemo
                      ObjectState::COMMITTED,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)
@@ -691,8 +728,9 @@ namespace raftdemo
                      ObjectState::DELETED,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)
@@ -742,8 +780,9 @@ namespace raftdemo
                      ObjectState::DELETED,
                      response->mutable_summary());
 
-    if (const MetadataStatusCode code = ToMetadataStatusCode(result);
-        code == MetadataStatusCode::kOk || code == MetadataStatusCode::kIdempotentReplay)
+    if (const raft::MetadataStatusCode code = ToWriteProtoStatusCode(result);
+        code == raft::METADATA_STATUS_CODE_OK ||
+        code == raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
     {
       if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
           metadata_state_machine != nullptr)

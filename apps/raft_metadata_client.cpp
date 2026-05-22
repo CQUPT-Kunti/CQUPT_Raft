@@ -64,6 +64,10 @@ namespace
       return "STATE_CONFLICT";
     case raft::METADATA_STATUS_CODE_TIMEOUT:
       return "TIMEOUT";
+    case raft::METADATA_STATUS_CODE_OVERLOADED:
+      return "OVERLOADED";
+    case raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE:
+      return "SERVICE_UNAVAILABLE";
     case raft::METADATA_STATUS_CODE_INTERNAL_ERROR:
       return "INTERNAL_ERROR";
     case raft::METADATA_STATUS_CODE_UNSPECIFIED:
@@ -91,7 +95,9 @@ namespace
   bool NeedsRetry(const raft::MetadataStatusCode code)
   {
     return code == raft::METADATA_STATUS_CODE_NOT_LEADER ||
-           code == raft::METADATA_STATUS_CODE_TIMEOUT;
+           code == raft::METADATA_STATUS_CODE_TIMEOUT ||
+           code == raft::METADATA_STATUS_CODE_OVERLOADED ||
+           code == raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
   }
 
   std::uint64_t ParsePositiveInt(const std::string &value, const char *name)
@@ -416,6 +422,7 @@ namespace
               << " target_address=" << target_address
               << " code=" << MetadataStatusCodeToString(summary.code())
               << " status=" << MetadataStatusCodeToString(summary.code())
+              << " retryable=" << (NeedsRetry(summary.code()) ? "true" : "false")
               << " message=\"" << summary.message() << "\""
               << " request_id=" << summary.request_id()
               << " bucket=" << summary.bucket()

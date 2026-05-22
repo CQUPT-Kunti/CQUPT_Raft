@@ -177,6 +177,15 @@ namespace
       leader_address_ = std::move(leader_address);
     }
 
+    void ForceWriteResponse(const std::string &request_id,
+                            const raft::MetadataStatusCode code,
+                            std::string message)
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      forced_write_responses_[request_id] =
+          ForcedWriteResponse{code, std::move(message)};
+    }
+
     struct Snapshot
     {
       bool bucket_exists = false;
@@ -222,6 +231,12 @@ namespace
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++create_bucket_calls_;
+
+      if (MaybeServeForcedWriteResponse(
+              request->request_id(), request->bucket(), "", "", response))
+      {
+        return grpc::Status::OK;
+      }
 
       const std::string fingerprint = CreateBucketFingerprint(*request);
       auto replay = create_bucket_replays_.find(request->request_id());
@@ -301,6 +316,12 @@ namespace
                               raft::DeleteBucketResponse *response) override
     {
       std::lock_guard<std::mutex> lock(mu_);
+      if (MaybeServeForcedWriteResponse(
+              request->request_id(), request->bucket(), "", "", response))
+      {
+        return grpc::Status::OK;
+      }
+
       auto bucket_it = buckets_.find(request->bucket());
       if (bucket_it == buckets_.end())
       {
@@ -336,6 +357,15 @@ namespace
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++create_object_calls_;
+
+      if (MaybeServeForcedWriteResponse(request->request_id(),
+                                        request->bucket(),
+                                        request->object_key(),
+                                        request->object_id(),
+                                        response))
+      {
+        return grpc::Status::OK;
+      }
 
       const std::string fingerprint = CreateObjectFingerprint(*request);
       auto replay = create_object_replays_.find(request->request_id());
@@ -440,6 +470,15 @@ namespace
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++commit_object_calls_;
+
+      if (MaybeServeForcedWriteResponse(request->request_id(),
+                                        request->bucket(),
+                                        request->object_key(),
+                                        request->object_id(),
+                                        response))
+      {
+        return grpc::Status::OK;
+      }
 
       const std::string fingerprint = CommitObjectFingerprint(*request);
       auto replay = commit_object_replays_.find(request->request_id());
@@ -551,6 +590,15 @@ namespace
                              raft::AbortObjectResponse *response) override
     {
       std::lock_guard<std::mutex> lock(mu_);
+      if (MaybeServeForcedWriteResponse(request->request_id(),
+                                        request->bucket(),
+                                        request->object_key(),
+                                        request->object_id(),
+                                        response))
+      {
+        return grpc::Status::OK;
+      }
+
       const std::string key = ObjectIdentity(request->bucket(), request->object_key());
       auto object_it = objects_.find(key);
       if (object_it == objects_.end())
@@ -587,6 +635,15 @@ namespace
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++delete_object_calls_;
+
+      if (MaybeServeForcedWriteResponse(request->request_id(),
+                                        request->bucket(),
+                                        request->object_key(),
+                                        request->object_id(),
+                                        response))
+      {
+        return grpc::Status::OK;
+      }
 
       const std::string fingerprint = DeleteObjectFingerprint(*request);
       auto replay = delete_object_replays_.find(request->request_id());
@@ -783,6 +840,37 @@ namespace
     }
 
   private:
+    struct ForcedWriteResponse
+    {
+      raft::MetadataStatusCode code;
+      std::string message;
+    };
+
+    template <typename Response>
+    bool MaybeServeForcedWriteResponse(const std::string &request_id,
+                                       const std::string &bucket,
+                                       const std::string &object_key,
+                                       const std::string &object_id,
+                                       Response *response)
+    {
+      const auto it = forced_write_responses_.find(request_id);
+      if (it == forced_write_responses_.end())
+      {
+        return false;
+      }
+
+      response->mutable_summary()->CopyFrom(
+          MakeSummary(it->second.code,
+                      it->second.message,
+                      request_id,
+                      bucket,
+                      object_key,
+                      object_id,
+                      raft::METADATA_OBJECT_STATE_UNSPECIFIED,
+                      CurrentLogIndex()));
+      return true;
+    }
+
     static std::string CreateBucketFingerprint(const raft::CreateBucketRequest &request)
     {
       return request.request_id() + "|" + request.bucket() + "|" +
@@ -861,6 +949,7 @@ namespace
     std::uint64_t next_log_index_ = 1;
     std::map<std::string, raft::BucketRecord> buckets_;
     std::map<std::string, raft::ObjectRecord> objects_;
+    std::map<std::string, ForcedWriteResponse> forced_write_responses_;
     std::map<std::string, ReplayEntry<raft::CreateBucketResponse>> create_bucket_replays_;
     std::map<std::string, ReplayEntry<raft::CreateObjectResponse>> create_object_replays_;
     std::map<std::string, ReplayEntry<raft::CommitObjectResponse>> commit_object_replays_;
@@ -1102,6 +1191,76 @@ TEST_F(MetadataClientScenarioTest, DuplicateRequestIdDoesNotCreateDuplicateVisib
   ASSERT_TRUE(snapshot.object.has_value());
   EXPECT_EQ(snapshot.object->state(), raft::METADATA_OBJECT_STATE_COMMITTED);
   EXPECT_EQ(snapshot.object_count, 1U);
+}
+
+TEST_F(MetadataClientScenarioTest, ClientShowsRetryableAdmissionStatuses)
+{
+  server_.service().ForceWriteResponse(
+      "req-not-leader", raft::METADATA_STATUS_CODE_NOT_LEADER,
+      "node is not the leader");
+  server_.service().ForceWriteResponse(
+      "req-timeout", raft::METADATA_STATUS_CODE_TIMEOUT,
+      "timed out waiting for metadata proposal completion");
+  server_.service().ForceWriteResponse(
+      "req-overloaded", raft::METADATA_STATUS_CODE_OVERLOADED,
+      "metadata proposal admission rejected: in-flight limit reached");
+  server_.service().ForceWriteResponse(
+      "req-stopped", raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE,
+      "node is stopping");
+
+  for (const auto &[request_id, expected_status] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"req-not-leader", "NOT_LEADER"},
+           {"req-timeout", "TIMEOUT"},
+           {"req-overloaded", "OVERLOADED"},
+           {"req-stopped", "SERVICE_UNAVAILABLE"}})
+  {
+    const ClientRunResult result = RunClient(
+        {server_.address(), "create-bucket",
+         "--request-id", request_id,
+         "--bucket", kBucket},
+        "retryable_" + request_id);
+
+    ASSERT_NE(result.exit_code, 0);
+    EXPECT_TRUE(Contains(result.output, "status=" + expected_status)) << result.output;
+    EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
+    EXPECT_TRUE(Contains(result.output, "request_id=" + request_id)) << result.output;
+  }
+}
+
+TEST_F(MetadataClientScenarioTest, ClientShowsIdempotencyConflictAsNonRetryable)
+{
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-bucket",
+                 "--request-id", "req-conflict-bucket",
+                 "--bucket", kBucket},
+                "conflict_bucket")
+                .exit_code,
+            0);
+
+  ASSERT_EQ(RunClient(
+                {server_.address(), "create-object",
+                 "--request-id", "req-conflict-create",
+                 "--bucket", kBucket,
+                 "--object-key", "scenario/object-conflict-a",
+                 "--object-id", "obj-conflict-a",
+                 "--size", "16"},
+                "conflict_create_first")
+                .exit_code,
+            0);
+
+  const ClientRunResult result = RunClient(
+      {server_.address(), "create-object",
+       "--request-id", "req-conflict-create",
+       "--bucket", kBucket,
+       "--object-key", "scenario/object-conflict-b",
+       "--object-id", "obj-conflict-b",
+       "--size", "32"},
+      "conflict_create_second");
+
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=IDEMPOTENCY_CONFLICT")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=false")) << result.output;
 }
 
 TEST_F(MetadataClientScenarioTest, ChunkLayoutAndCustomEtagAreExposed)
