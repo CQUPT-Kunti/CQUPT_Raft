@@ -119,7 +119,7 @@
 
 - [x] T028 [P] [US3] 新增 `tests/metadata_state_machine_concurrency_test.cpp`，覆盖 `shared_mutex` 读写分离、duplicate request_id 并发、Head/List 不读到半更新状态
 - [x] T029 [P] [US3] 新增 `tests/metadata_concurrency_stress_test.cpp`，覆盖多客户端并发 create/commit/delete/head/list、bounded queue、timeout、backpressure 行为
-- [ ] T030 [P] [US3] 将 `tests/test_t017_leader_switch_ordering.cpp`、`tests/test_raft_commit_apply.cpp`、`tests/test_raft_log_replication.cpp` 从 KV 断言迁移为 metadata ordered-apply / leader-switch 断言
+- [x] T030 [P] [US3] 将 `tests/test_t017_leader_switch_ordering.cpp`、`tests/test_raft_commit_apply.cpp`、`tests/test_raft_log_replication.cpp` 从 KV 断言迁移为 metadata ordered-apply / leader-switch 断言
 
 ### Implementation for User Story 3
 

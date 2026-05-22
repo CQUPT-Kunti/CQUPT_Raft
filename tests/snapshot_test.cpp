@@ -14,9 +14,12 @@
 
 #include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/runtime/logging.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo
 {
@@ -598,31 +601,79 @@ namespace raftdemo
             auto stable_leader = WaitForStableLeader(cluster.nodes, 6s);
             ASSERT_TRUE(stable_leader.has_value())
                 << "leader not stable in phase-1, cluster=" << DescribeCluster(cluster.nodes);
-            auto leader = stable_leader->leader;
 
             LogClusterState("phase-1 leader elected", cluster.nodes);
 
+            const std::string bucket = "snapshot-recovery-bucket";
+            ProposeResult result;
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.nodes,
+                raftdemo::test::MakeCreateBucketCommand(
+                    bucket, "snapshot-recovery-create-bucket-1"),
+                10s,
+                &result));
+
+            std::vector<raftdemo::test::ExpectedRecoveredMetadataObject> expected_objects;
+            std::vector<std::string> visible_keys;
             for (int i = 0; i < 25; ++i)
             {
-                const auto key = "k" + std::to_string(i);
-                const auto value = "v" + std::to_string(i);
-                ProposeResult result;
-                std::string propose_diagnostics;
-                ASSERT_TRUE(ProposeWithStableLeaderRetry(cluster.nodes,
-                                                        MakeSet(key, value),
-                                                        10s,
-                                                        &result,
-                                                        &propose_diagnostics))
-                    << "propose failed at i=" << i
-                    << ", status=" << static_cast<int>(result.status)
-                    << ", message=" << result.message
-                    << ", diagnostics=" << propose_diagnostics;
+                const std::string suffix = (i < 10 ? "0" : "") + std::to_string(i);
+                const std::string key = "k" + suffix;
+                const std::string object_id = "obj-" + key;
+                ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                    cluster.nodes,
+                    raftdemo::test::MakeCreateObjectCommand(
+                        bucket, key, object_id,
+                        "snapshot-recovery-create-" + suffix),
+                    10s,
+                    &result));
+                ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                    cluster.nodes,
+                    raftdemo::test::MakeCommitObjectCommand(
+                        bucket, key, object_id,
+                        "snapshot-recovery-commit-" + suffix),
+                    10s,
+                    &result));
+                expected_objects.push_back({key, object_id, 2U, false});
+                visible_keys.push_back(key);
             }
 
-            std::string replication_diagnostics;
-            ASSERT_TRUE(WaitForValueOnAllNodes(cluster.nodes, "k24", "v24", 8s, &replication_diagnostics))
-                << "replicated values did not reach all nodes in phase-1, diagnostics="
-                << replication_diagnostics;
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.nodes,
+                raftdemo::test::MakeCreateObjectCommand(
+                    bucket, "deleted_anchor", "obj-deleted-anchor",
+                    "snapshot-recovery-create-deleted-anchor"),
+                10s,
+                &result));
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.nodes,
+                raftdemo::test::MakeCommitObjectCommand(
+                    bucket, "deleted_anchor", "obj-deleted-anchor",
+                    "snapshot-recovery-commit-deleted-anchor"),
+                10s,
+                &result));
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.nodes,
+                raftdemo::test::MakeDeleteObjectCommand(
+                    bucket, "deleted_anchor", "obj-deleted-anchor",
+                    "snapshot-recovery-delete-deleted-anchor"),
+                10s,
+                &result));
+
+            expected_objects.push_back(
+                {"deleted_anchor", "obj-deleted-anchor", 0U, true});
+            std::sort(visible_keys.begin(), visible_keys.end());
+
+            const raftdemo::test::MetadataRecoveryExpectation expected_before_restart{
+                .bucket = bucket,
+                .objects = expected_objects,
+                .visible_keys = visible_keys,
+                .expected_request_count = 54U,
+                .expected_tombstone_count = 1U,
+                .expected_last_applied_index = result.log_index,
+            };
+            ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                cluster.nodes, expected_before_restart, 8s));
 
             std::string snapshot_diagnostics;
             ASSERT_TRUE(WaitForSnapshots(snapshot_configs, 10s, &snapshot_diagnostics))
@@ -640,37 +691,48 @@ namespace raftdemo
             auto restarted_stable_leader = WaitForStableLeader(restarted.nodes, 6s);
             ASSERT_TRUE(restarted_stable_leader.has_value())
                 << "leader not stable after restart, cluster=" << DescribeCluster(restarted.nodes);
-            auto restarted_leader = restarted_stable_leader->leader;
 
             LogClusterState("phase-2 after restart before new propose", restarted.nodes);
 
-            std::string restore_k0_diagnostics;
-            ASSERT_TRUE(WaitForValueOnAllNodes(restarted.nodes, "k0", "v0", 8s, &restore_k0_diagnostics))
-                << "k0 was not restored on all nodes, diagnostics=" << restore_k0_diagnostics;
-            std::string restore_k24_diagnostics;
-            ASSERT_TRUE(WaitForValueOnAllNodes(restarted.nodes, "k24", "v24", 8s, &restore_k24_diagnostics))
-                << "k24 was not restored on all nodes, diagnostics=" << restore_k24_diagnostics;
+            ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                restarted.nodes, expected_before_restart, 8s));
+            for (const auto &node : restarted.nodes)
+            {
+                const MetadataStateMachine *state_machine = node->GetMetadataStateMachineV2();
+                ASSERT_NE(state_machine, nullptr);
+                EXPECT_EQ(state_machine->RequestCount(), 54U);
+                EXPECT_EQ(state_machine->TombstoneCount(), 1U);
+                EXPECT_EQ(state_machine->LastAppliedTerm(), 0U);
+                EXPECT_GE(state_machine->LastAppliedIndex(), expected_before_restart.expected_last_applied_index);
+            }
 
             ProposeResult after_restart_result;
-            std::string after_restart_propose_diagnostics;
-            ASSERT_TRUE(ProposeWithStableLeaderRetry(restarted.nodes,
-                                                    MakeSet("after_restart", "ok"),
-                                                    10s,
-                                                    &after_restart_result,
-                                                    &after_restart_propose_diagnostics))
-                << "post-restart propose failed, status="
-                << static_cast<int>(after_restart_result.status)
-                << ", message=" << after_restart_result.message
-                << ", diagnostics=" << after_restart_propose_diagnostics;
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                restarted.nodes,
+                raftdemo::test::MakeCreateObjectCommand(
+                    bucket, "after_restart", "obj-after-restart",
+                    "snapshot-recovery-create-after-restart"),
+                10s,
+                &after_restart_result));
+            ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                restarted.nodes,
+                raftdemo::test::MakeCommitObjectCommand(
+                    bucket, "after_restart", "obj-after-restart",
+                    "snapshot-recovery-commit-after-restart"),
+                10s,
+                &after_restart_result));
 
-            std::string post_restart_replication_diagnostics;
-            ASSERT_TRUE(WaitForValueOnAllNodes(restarted.nodes,
-                                               "after_restart",
-                                               "ok",
-                                               8s,
-                                               &post_restart_replication_diagnostics))
-                << "post-restart writes did not replicate to all nodes, diagnostics="
-                << post_restart_replication_diagnostics;
+            auto expected_after_restart = expected_before_restart;
+            expected_after_restart.objects.push_back(
+                {"after_restart", "obj-after-restart", 2U, false});
+            expected_after_restart.visible_keys.push_back("after_restart");
+            std::sort(expected_after_restart.visible_keys.begin(),
+                      expected_after_restart.visible_keys.end());
+            expected_after_restart.expected_request_count = 56U;
+            expected_after_restart.expected_last_applied_index = after_restart_result.log_index;
+
+            ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                restarted.nodes, expected_after_restart, 8s));
 
             LogClusterState("phase-2 after recovery and new propose", restarted.nodes);
             LogSnapshotFiles(snapshot_configs);

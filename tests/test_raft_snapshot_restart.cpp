@@ -18,9 +18,12 @@
 
 #include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/storage/snapshot_storage.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -1162,7 +1165,38 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected";
 
-  WriteManyValues(cluster.Nodes(), "snapshot_base", 36);
+  const std::string bucket = "snapshot-plus-tail-bucket";
+  ProposeResult result;
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateBucketCommand(
+          bucket, "snapshot-plus-tail-create-bucket-1"),
+      std::chrono::seconds(10),
+      &result));
+
+  std::vector<raftdemo::test::ExpectedRecoveredMetadataObject> expected_objects;
+  std::vector<std::string> visible_keys;
+  for (int i = 0; i < 18; ++i) {
+    const std::string suffix = (i < 10 ? "0" : "") + std::to_string(i);
+    const std::string key = "snapshot_base_" + suffix;
+    const std::string object_id = "obj-" + key;
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCreateObjectCommand(
+            bucket, key, object_id,
+            "snapshot-plus-tail-create-base-" + suffix),
+        std::chrono::seconds(10),
+        &result));
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCommitObjectCommand(
+            bucket, key, object_id,
+            "snapshot-plus-tail-commit-base-" + suffix),
+        std::chrono::seconds(10),
+        &result));
+    expected_objects.push_back({key, object_id, 2U, false});
+    visible_keys.push_back(key);
+  }
 
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader after snapshot_base writes";
@@ -1175,11 +1209,58 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
       << "leader did not create baseline snapshot, describe="
       << cluster.Nodes()[leader_index]->Describe();
 
-  WriteManyValues(cluster.Nodes(), "tail_log", 5);
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "tail_only", "obj-tail-only",
+          "snapshot-plus-tail-create-tail-only"),
+      std::chrono::seconds(10),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "tail_only", "obj-tail-only",
+          "snapshot-plus-tail-commit-tail-only"),
+      std::chrono::seconds(10),
+      &result));
+  expected_objects.push_back({"tail_only", "obj-tail-only", 2U, false});
+  visible_keys.push_back("tail_only");
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_log_4", "value_4",
-                                std::chrono::seconds(15)))
-      << "cluster did not apply post-snapshot tail logs";
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "tail_delete", "obj-tail-delete",
+          "snapshot-plus-tail-create-tail-delete"),
+      std::chrono::seconds(10),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "tail_delete", "obj-tail-delete",
+          "snapshot-plus-tail-commit-tail-delete"),
+      std::chrono::seconds(10),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "tail_delete", "obj-tail-delete",
+          "snapshot-plus-tail-delete-tail-delete"),
+      std::chrono::seconds(10),
+      &result));
+  expected_objects.push_back({"tail_delete", "obj-tail-delete", 0U, true});
+
+  std::sort(visible_keys.begin(), visible_keys.end());
+  const raftdemo::test::MetadataRecoveryExpectation expected_before_restart{
+      .bucket = bucket,
+      .objects = expected_objects,
+      .visible_keys = visible_keys,
+      .expected_request_count = 42U,
+      .expected_tombstone_count = 1U,
+      .expected_last_applied_index = result.log_index,
+  };
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expected_before_restart, std::chrono::seconds(15)))
+      << "cluster did not apply post-snapshot metadata tail logs";
 
   cluster.StopAll();
   cluster.Start();
@@ -1187,23 +1268,45 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(10));
   ASSERT_NE(leader, nullptr) << "no leader after restarting snapshot + tail log cluster";
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "snapshot_base_35", "value_35",
-                                std::chrono::seconds(20)))
-      << "snapshot-covered data was not restored after restart";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expected_before_restart, std::chrono::seconds(20)))
+      << "metadata snapshot-covered state plus tail logs were not restored after restart";
+  for (const auto& node : cluster.Nodes()) {
+    const MetadataStateMachine* state_machine = node->GetMetadataStateMachineV2();
+    ASSERT_NE(state_machine, nullptr);
+    EXPECT_EQ(state_machine->RequestCount(), 42U);
+    EXPECT_EQ(state_machine->TombstoneCount(), 1U);
+    EXPECT_EQ(state_machine->LastAppliedTerm(), 0U);
+    EXPECT_GE(state_machine->LastAppliedIndex(), expected_before_restart.expected_last_applied_index);
+  }
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_log_4", "value_4",
-                                std::chrono::seconds(20)))
-      << "post-snapshot log data was not restored after restart";
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "after_tail_restart", "obj-after-tail-restart",
+          "snapshot-plus-tail-create-after-restart"),
+      std::chrono::seconds(15),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "after_tail_restart", "obj-after-tail-restart",
+          "snapshot-plus-tail-commit-after-restart"),
+      std::chrono::seconds(15),
+      &result));
 
-  ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_tail_restart", "ok"),
-                               std::chrono::seconds(15), &result))
-      << "write after snapshot + tail restart failed, status="
-      << ProposeStatusName(result.status) << ", message=" << result.message;
+  auto expected_after_restart = expected_before_restart;
+  expected_after_restart.objects.push_back(
+      {"after_tail_restart", "obj-after-tail-restart", 2U, false});
+  expected_after_restart.visible_keys.push_back("after_tail_restart");
+  std::sort(expected_after_restart.visible_keys.begin(),
+            expected_after_restart.visible_keys.end());
+  expected_after_restart.expected_request_count = 44U;
+  expected_after_restart.expected_last_applied_index = result.log_index;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_tail_restart", "ok",
-                                std::chrono::seconds(20)))
-      << "cluster did not continue after restoring snapshot + tail logs";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expected_after_restart, std::chrono::seconds(20)))
+      << "cluster did not continue after restoring metadata snapshot + tail logs";
 }
 
 TEST_F(RaftSnapshotRecoveryTest,

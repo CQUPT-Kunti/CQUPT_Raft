@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -14,8 +15,11 @@
 
 #include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -697,7 +701,77 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "install_first", 40, excluded);
+  const std::string bucket = "snapshot-then-logs-bucket";
+  ProposeResult result;
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateBucketCommand(
+          bucket, "snapshot-then-logs-create-bucket-1"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+
+  std::vector<raftdemo::test::ExpectedRecoveredMetadataObject> expected_objects;
+  std::vector<std::string> visible_keys;
+  for (int i = 0; i < 20; ++i) {
+    const std::string suffix = (i < 10 ? "0" : "") + std::to_string(i);
+    const std::string key = "install_first_" + suffix;
+    const std::string object_id = "obj-" + key;
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCreateObjectCommand(
+            bucket, key, object_id,
+            "snapshot-then-logs-create-" + suffix),
+        std::chrono::seconds(10),
+        &result,
+        excluded));
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCommitObjectCommand(
+            bucket, key, object_id,
+            "snapshot-then-logs-commit-" + suffix),
+        std::chrono::seconds(10),
+        &result,
+        excluded));
+    expected_objects.push_back({key, object_id, 2U, false});
+    visible_keys.push_back(key);
+  }
+
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-create-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-commit-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-delete-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+
+  expected_objects.push_back({"deleted_anchor", "obj-deleted-anchor", 0U, true});
+  std::sort(visible_keys.begin(), visible_keys.end());
+  const raftdemo::test::MetadataRecoveryExpectation expected_after_install{
+      .bucket = bucket,
+      .objects = expected_objects,
+      .visible_keys = visible_keys,
+      .expected_request_count = 44U,
+      .expected_tombstone_count = 1U,
+      .expected_last_applied_index = result.log_index,
+  };
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
                                       "last_snapshot_index", 6,
@@ -707,10 +781,10 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "install_first_39", "value_39",
-                                 std::chrono::seconds(30)))
-      << "restarted follower did not catch up to snapshot baseline, describe="
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      {cluster.Nodes()[stopped_follower]}, expected_after_install,
+      std::chrono::seconds(30)))
+      << "restarted follower did not catch up to metadata snapshot baseline, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stopped_follower],
@@ -719,15 +793,38 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
       << "restarted follower did not install snapshot, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
-  ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_snapshot", "ok"),
-                               std::chrono::seconds(10), &result))
-      << "write after snapshot failed, status=" << ProposeStatusName(result.status)
-      << ", message=" << result.message;
+  const MetadataStateMachine* restarted_state_machine =
+      cluster.Nodes()[stopped_follower]->GetMetadataStateMachineV2();
+  ASSERT_NE(restarted_state_machine, nullptr);
+  EXPECT_EQ(restarted_state_machine->RequestCount(), 44U);
+  EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
+  EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), 0U);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_snapshot", "ok",
-                                std::chrono::seconds(15)))
-      << "not all nodes replicated logs after snapshot installation";
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "after_snapshot", "obj-after-snapshot",
+          "snapshot-then-logs-create-after-snapshot"),
+      std::chrono::seconds(10),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "after_snapshot", "obj-after-snapshot",
+          "snapshot-then-logs-commit-after-snapshot"),
+      std::chrono::seconds(10),
+      &result));
+
+  auto expected_after_tail = expected_after_install;
+  expected_after_tail.objects.push_back({"after_snapshot", "obj-after-snapshot", 2U, false});
+  expected_after_tail.visible_keys.push_back("after_snapshot");
+  std::sort(expected_after_tail.visible_keys.begin(), expected_after_tail.visible_keys.end());
+  expected_after_tail.expected_request_count = 46U;
+  expected_after_tail.expected_last_applied_index = result.log_index;
+
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expected_after_tail, std::chrono::seconds(15)))
+      << "not all nodes replicated metadata logs after snapshot installation";
 }
 
 }  // namespace
