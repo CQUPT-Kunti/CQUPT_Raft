@@ -9,9 +9,22 @@
 
 #include "raft/common/metadata_command.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
+
+namespace raftdemo
+{
+    std::string SerializeMetadataCommand(const MetadataCommand &command);
+} // namespace raftdemo
 
 namespace raftdemo::test
 {
+    inline ApplyResult ApplyMetadataCommand(MetadataStateMachine &machine,
+                                            const std::uint64_t index,
+                                            const MetadataCommand &command)
+    {
+        return machine.Apply(index, raftdemo::SerializeMetadataCommand(command));
+    }
+
     inline MetadataCommand MakeCreateBucketCommand(const std::string &bucket,
                                                    const std::string &request_id,
                                                    const std::uint64_t create_time = 1710000000)

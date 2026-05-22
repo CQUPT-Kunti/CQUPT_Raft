@@ -10,13 +10,9 @@
 #include <thread>
 #include <vector>
 
-namespace raftdemo
-{
-    std::string SerializeMetadataCommand(const MetadataCommand &command);
-} // namespace raftdemo
-
 namespace
 {
+    using raftdemo::test::ApplyMetadataCommand;
     using raftdemo::test::MakeAbortObjectCommand;
     using raftdemo::test::MakeCommitObjectCommand;
     using raftdemo::test::MakeCreateBucketCommand;
@@ -24,19 +20,19 @@ namespace
     using raftdemo::test::MakeDeleteObjectCommand;
 } // namespace
 
-TEST(MetadataStateMachineTest, ConcurrentDuplicateRequestIdApplyStaysIdempotent)
+TEST(MetadataStateMachineConcurrencyTest, ConcurrentDuplicateRequestIdApplyStaysIdempotent)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           400,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-concurrent-idem",
-                                                       "concurrent-idem-bucket")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    400,
+                    MakeCreateBucketCommand("bucket-concurrent-idem",
+                                            "concurrent-idem-bucket"))
                     .Ok);
 
-    const std::string create_object = raftdemo::SerializeMetadataCommand(
+    const raftdemo::MetadataCommand create_object_command =
         MakeCreateObjectCommand("bucket-concurrent-idem", "object/a", "obj-concurrent-idem",
-                                "concurrent-idem-object"));
+                                "concurrent-idem-object");
 
     constexpr int kThreadCount = 8;
     std::atomic<bool> start{false};
@@ -53,7 +49,8 @@ TEST(MetadataStateMachineTest, ConcurrentDuplicateRequestIdApplyStaysIdempotent)
                 while (!start.load(std::memory_order_acquire))
                 {
                 }
-                const raftdemo::ApplyResult result = machine.Apply(401, create_object);
+                const raftdemo::ApplyResult result =
+                    ApplyMetadataCommand(machine, 401, create_object_command);
                 oks[static_cast<std::size_t>(i)] = result.Ok ? 1 : 0;
                 messages[static_cast<std::size_t>(i)] = result.message;
             });
@@ -89,66 +86,66 @@ TEST(MetadataStateMachineTest, ConcurrentDuplicateRequestIdApplyStaysIdempotent)
               std::optional<std::string>("obj-concurrent-idem"));
 }
 
-TEST(MetadataStateMachineTest, ConcurrentHeadAndListReadsRemainConsistent)
+TEST(MetadataStateMachineConcurrencyTest, ConcurrentHeadAndListReadsRemainConsistent)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           410,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-concurrent-read",
-                                                       "concurrent-read-bucket")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    410,
+                    MakeCreateBucketCommand("bucket-concurrent-read",
+                                            "concurrent-read-bucket"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           411,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-concurrent-read", "logs/a",
-                                                       "obj-read-a", "concurrent-read-create-a")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    411,
+                    MakeCreateObjectCommand("bucket-concurrent-read", "logs/a",
+                                            "obj-read-a", "concurrent-read-create-a"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           412,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCommitObjectCommand("bucket-concurrent-read", "logs/a",
-                                                       "obj-read-a", "concurrent-read-commit-a")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    412,
+                    MakeCommitObjectCommand("bucket-concurrent-read", "logs/a",
+                                            "obj-read-a", "concurrent-read-commit-a"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           413,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-concurrent-read", "logs/b",
-                                                       "obj-read-b", "concurrent-read-create-b")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    413,
+                    MakeCreateObjectCommand("bucket-concurrent-read", "logs/b",
+                                            "obj-read-b", "concurrent-read-create-b"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           414,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCommitObjectCommand("bucket-concurrent-read", "logs/b",
-                                                       "obj-read-b", "concurrent-read-commit-b")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    414,
+                    MakeCommitObjectCommand("bucket-concurrent-read", "logs/b",
+                                            "obj-read-b", "concurrent-read-commit-b"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           415,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-concurrent-read", "logs/pending",
-                                                       "obj-read-pending",
-                                                       "concurrent-read-create-pending")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    415,
+                    MakeCreateObjectCommand("bucket-concurrent-read", "logs/pending",
+                                            "obj-read-pending",
+                                            "concurrent-read-create-pending"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           416,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateObjectCommand("bucket-concurrent-read", "logs/deleted",
-                                                       "obj-read-deleted",
-                                                       "concurrent-read-create-deleted")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    416,
+                    MakeCreateObjectCommand("bucket-concurrent-read", "logs/deleted",
+                                            "obj-read-deleted",
+                                            "concurrent-read-create-deleted"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           417,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCommitObjectCommand("bucket-concurrent-read", "logs/deleted",
-                                                       "obj-read-deleted",
-                                                       "concurrent-read-commit-deleted")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    417,
+                    MakeCommitObjectCommand("bucket-concurrent-read", "logs/deleted",
+                                            "obj-read-deleted",
+                                            "concurrent-read-commit-deleted"))
                     .Ok);
-    EXPECT_TRUE(machine.Apply(
-                           418,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeDeleteObjectCommand("bucket-concurrent-read", "logs/deleted",
-                                                       "obj-read-deleted",
-                                                       "concurrent-read-delete-deleted")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    418,
+                    MakeDeleteObjectCommand("bucket-concurrent-read", "logs/deleted",
+                                            "obj-read-deleted",
+                                            "concurrent-read-delete-deleted"))
                     .Ok);
 
     std::atomic<int> violations{0};
@@ -228,14 +225,14 @@ TEST(MetadataStateMachineTest, ConcurrentHeadAndListReadsRemainConsistent)
     EXPECT_EQ(violations.load(), 0);
 }
 
-TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistency)
+TEST(MetadataStateMachineConcurrencyTest, ConcurrentApplyAndQueryPreserveMetadataConsistency)
 {
     raftdemo::MetadataStateMachine machine;
-    EXPECT_TRUE(machine.Apply(
-                           430,
-                           raftdemo::SerializeMetadataCommand(
-                               MakeCreateBucketCommand("bucket-concurrent-mixed",
-                                                       "concurrent-mixed-bucket")))
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    430,
+                    MakeCreateBucketCommand("bucket-concurrent-mixed",
+                                            "concurrent-mixed-bucket"))
                     .Ok);
 
     std::atomic<bool> start{false};
@@ -249,78 +246,78 @@ TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistenc
             {
             }
 
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      431,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/live",
-                                                 "obj-mixed-live",
-                                                 "concurrent-mixed-create-live")))
+                     MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/live",
+                                             "obj-mixed-live",
+                                             "concurrent-mixed-create-live"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      432,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeCommitObjectCommand("bucket-concurrent-mixed", "obj/live",
-                                                 "obj-mixed-live",
-                                                 "concurrent-mixed-commit-live")))
+                     MakeCommitObjectCommand("bucket-concurrent-mixed", "obj/live",
+                                             "obj-mixed-live",
+                                             "concurrent-mixed-commit-live"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      433,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/delete",
-                                                 "obj-mixed-delete",
-                                                 "concurrent-mixed-create-delete")))
+                     MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/delete",
+                                             "obj-mixed-delete",
+                                             "concurrent-mixed-create-delete"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      434,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeCommitObjectCommand("bucket-concurrent-mixed", "obj/delete",
-                                                 "obj-mixed-delete",
-                                                 "concurrent-mixed-commit-delete")))
+                     MakeCommitObjectCommand("bucket-concurrent-mixed", "obj/delete",
+                                             "obj-mixed-delete",
+                                             "concurrent-mixed-commit-delete"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      435,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeDeleteObjectCommand("bucket-concurrent-mixed", "obj/delete",
-                                                 "obj-mixed-delete",
-                                                 "concurrent-mixed-delete-delete")))
+                     MakeDeleteObjectCommand("bucket-concurrent-mixed", "obj/delete",
+                                             "obj-mixed-delete",
+                                             "concurrent-mixed-delete-delete"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      436,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/abort",
-                                                 "obj-mixed-abort",
-                                                 "concurrent-mixed-create-abort")))
+                     MakeCreateObjectCommand("bucket-concurrent-mixed", "obj/abort",
+                                             "obj-mixed-abort",
+                                             "concurrent-mixed-create-abort"))
                      .Ok)
             {
                 ++violations;
             }
             std::this_thread::yield();
-            if (!machine.Apply(
+            if (!ApplyMetadataCommand(
+                     machine,
                      437,
-                     raftdemo::SerializeMetadataCommand(
-                         MakeAbortObjectCommand("bucket-concurrent-mixed", "obj/abort",
-                                                "obj-mixed-abort",
-                                                "concurrent-mixed-abort-abort")))
+                     MakeAbortObjectCommand("bucket-concurrent-mixed", "obj/abort",
+                                            "obj-mixed-abort",
+                                            "concurrent-mixed-abort-abort"))
                      .Ok)
             {
                 ++violations;
@@ -423,4 +420,69 @@ TEST(MetadataStateMachineTest, ConcurrentApplyAndQueryPreserveMetadataConsistenc
     ASSERT_EQ(listed.result.code, raftdemo::MetadataStatusCode::kOk);
     ASSERT_EQ(listed.records.size(), 1U);
     EXPECT_EQ(listed.records[0].object_key, "obj/live");
+}
+
+TEST(MetadataStateMachineConcurrencyTest,
+     DeleteThenRecreateClearsStaleTombstoneAndKeepsVisibleIndexConsistent)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    450,
+                    MakeCreateBucketCommand("bucket-recreate", "recreate-bucket"))
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    451,
+                    MakeCreateObjectCommand("bucket-recreate", "logs/recreated",
+                                            "obj-recreated-v1", "recreate-create-v1"))
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    452,
+                    MakeCommitObjectCommand("bucket-recreate", "logs/recreated",
+                                            "obj-recreated-v1", "recreate-commit-v1"))
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    453,
+                    MakeDeleteObjectCommand("bucket-recreate", "logs/recreated",
+                                            "obj-recreated-v1", "recreate-delete-v1"))
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    454,
+                    MakeCreateObjectCommand("bucket-recreate", "logs/recreated",
+                                            "obj-recreated-v2", "recreate-create-v2"))
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    455,
+                    MakeCommitObjectCommand("bucket-recreate", "logs/recreated",
+                                            "obj-recreated-v2", "recreate-commit-v2"))
+                    .Ok);
+
+    const auto head = machine.HeadObject(
+        {.bucket = "bucket-recreate", .object_key = "logs/recreated"});
+    ASSERT_EQ(head.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_TRUE(head.record.has_value());
+    EXPECT_EQ(head.record->object_id, "obj-recreated-v2");
+    EXPECT_TRUE(head.record->IsCommitted());
+
+    const auto listed =
+        machine.ListObjects({.bucket = "bucket-recreate", .prefix = "logs/"});
+    ASSERT_EQ(listed.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_EQ(listed.records.size(), 1U);
+    EXPECT_EQ(listed.records[0].object_id, "obj-recreated-v2");
+
+    const auto indexed =
+        machine.FindIndexedObjectId("bucket-recreate", "logs/recreated");
+    ASSERT_TRUE(indexed.has_value());
+    EXPECT_EQ(*indexed, "obj-recreated-v2");
+
+    const auto chunks = machine.FindChunkRefs("bucket-recreate", "logs/recreated");
+    ASSERT_TRUE(chunks.has_value());
+    EXPECT_EQ(chunks->size(), 2U);
+    EXPECT_EQ(machine.TombstoneCount(), 0U);
+    EXPECT_EQ(machine.LastAppliedIndex(), 455U);
 }

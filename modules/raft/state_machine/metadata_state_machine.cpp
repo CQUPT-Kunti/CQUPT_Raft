@@ -1221,6 +1221,8 @@ namespace raftdemo
             ObjectRecord record = payload;
             record.state = ObjectState::PENDING;
             objects_[object_identity] = record;
+            tombstones_.erase(object_identity);
+            chunk_ref_index_.erase(object_identity);
             object_index_[object_identity] = {record.object_id};
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
@@ -1286,6 +1288,7 @@ namespace raftdemo
                 }
             }
 
+            object_index_[object_identity] = {record.object_id};
             chunk_ref_index_[object_identity] = record.chunks;
             requests_[command.request_id] =
                 MakeAppliedRequestRecord(command, record.bucket, "ok", index);
@@ -1812,8 +1815,6 @@ namespace raftdemo
 
         {
             std::unique_lock<std::shared_mutex> lk(mu_);
-            last_applied_index_ = last_applied_index;
-            last_applied_term_ = last_applied_term;
             buckets_ = std::move(new_buckets);
             objects_ = std::move(new_objects);
             object_index_ = std::move(new_object_index);
@@ -1821,6 +1822,8 @@ namespace raftdemo
             requests_ = std::move(new_requests);
             request_fingerprints_ = std::move(new_request_fingerprints);
             tombstones_ = std::move(new_tombstones);
+            last_applied_index_ = last_applied_index;
+            last_applied_term_ = last_applied_term;
         }
 
         return {SnapshotStatus::kOk, "ok"};
