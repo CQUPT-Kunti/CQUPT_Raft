@@ -148,7 +148,7 @@
 ### Implementation for User Story 4
 
 - [x] T039 [US4] 升级 `modules/raft/state_machine/metadata_state_machine.cpp` 的 snapshot 数据文件格式为 V2，纳入 `last_applied_index`、`last_applied_term`、buckets、objects、object_index、chunk_refs、request_table、tombstones
-- [ ] T040 [US4] 更新 `modules/raft/node/raft_node.cpp` 的 snapshot worker、startup load、post-snapshot replay 逻辑，确保 `LoadSnapshot + Replay` 只回放 `index > last_applied_index`
+- [x] T040 [US4] 更新 `modules/raft/node/raft_node.cpp` 的 snapshot worker、startup load、post-snapshot replay 逻辑，确保 `LoadSnapshot + Replay` 只回放 `index > last_applied_index`
 - [ ] T041 [US4] 保持 `modules/raft/storage/snapshot_storage.h`、`modules/raft/storage/snapshot_storage.cpp` 的 staging publish / checksum / fsync / FlushFileBuffers 语义不减弱，同时补齐 metadata-only 边界诊断
 - [ ] T042 [US4] 将 `tests/test_raft_split_brain.cpp`、`tests/test_raft_snapshot_diagnosis.cpp`、`tests/persistence_more_test.cpp`、`tests/test_raft_replicator_behavior.cpp`、`tests/test_raft_segment_storage.cpp` 的 KV 断言全部替换为 metadata 状态或 metadata 查询断言
 - [ ] T043 [US4] 运行 US4 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T043-us4-recovery-validation.md`

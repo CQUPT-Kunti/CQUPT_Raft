@@ -49,6 +49,11 @@ namespace raftdemo
 
   namespace
   {
+    struct SnapshotAppliedBoundary
+    {
+      std::uint64_t index{0};
+      std::uint64_t term{0};
+    };
 
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
     constexpr const char *kSnapshotMarkerCommand = "snapshot";
@@ -124,6 +129,39 @@ namespace raftdemo
         values.emplace(Trim(line.substr(0, pos)), Trim(line.substr(pos + 1)));
       }
       return values;
+    }
+
+    std::optional<SnapshotAppliedBoundary> ResolveLoadedSnapshotAppliedBoundary(
+        const IStateMachine &state_machine,
+        const std::uint64_t expected_index,
+        const std::uint64_t expected_term,
+        std::string *reason)
+    {
+      if (const auto *metadata_state_machine =
+              dynamic_cast<const MetadataStateMachine *>(&state_machine);
+          metadata_state_machine != nullptr)
+      {
+        const SnapshotAppliedBoundary boundary{
+            metadata_state_machine->LastAppliedIndex(),
+            metadata_state_machine->LastAppliedTerm()};
+        if (boundary.index != expected_index || boundary.term != expected_term)
+        {
+          if (reason != nullptr)
+          {
+            std::ostringstream oss;
+            oss << "metadata snapshot boundary mismatch, expected_index="
+                << expected_index
+                << ", expected_term=" << expected_term
+                << ", restored_index=" << boundary.index
+                << ", restored_term=" << boundary.term;
+            *reason = oss.str();
+          }
+          return std::nullopt;
+        }
+        return boundary;
+      }
+
+      return SnapshotAppliedBoundary{expected_index, expected_term};
     }
 
   } // namespace
@@ -1698,6 +1736,18 @@ void RaftNode::SendHeartbeats()
         return;
       }
 
+      std::string boundary_error;
+      const auto boundary = ResolveLoadedSnapshotAppliedBoundary(
+          *state_machine_,
+          request.last_included_index(),
+          request.last_included_term(),
+          &boundary_error);
+      if (!boundary.has_value())
+      {
+        response->set_message("load installed snapshot boundary check failed: " + boundary_error);
+        return;
+      }
+
       std::lock_guard<std::mutex> lk(mu_);
       if (request.term() < current_term_)
       {
@@ -1706,9 +1756,9 @@ void RaftNode::SendHeartbeats()
         return;
       }
 
-      CompactLogPrefixLocked(request.last_included_index(), request.last_included_term());
-      commit_index_ = std::max<std::uint64_t>(commit_index_, request.last_included_index());
-      last_applied_ = std::max<std::uint64_t>(last_applied_, request.last_included_index());
+      CompactLogPrefixLocked(boundary->index, boundary->term);
+      commit_index_ = std::max<std::uint64_t>(commit_index_, boundary->index);
+      last_applied_ = boundary->index;
 
       std::string persist_error;
       if (!PersistStateLocked(&persist_error))
@@ -2899,11 +2949,26 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         continue;
       }
 
+      std::string boundary_error;
+      const auto boundary = ResolveLoadedSnapshotAppliedBoundary(
+          *state_machine_,
+          meta.last_included_index,
+          meta.last_included_term,
+          &boundary_error);
+      if (!boundary.has_value())
+      {
+        Log(NodeTag(config_.node_id), "skip invalid snapshot ", meta.snapshot_path,
+            ", index=", meta.last_included_index,
+            ", term=", meta.last_included_term,
+            ", reason=", boundary_error);
+        continue;
+      }
+
       {
         std::lock_guard<std::mutex> lk(mu_);
-        CompactLogPrefixLocked(meta.last_included_index, meta.last_included_term);
-        commit_index_ = std::max<std::uint64_t>(commit_index_, meta.last_included_index);
-        last_applied_ = meta.last_included_index;
+        CompactLogPrefixLocked(boundary->index, boundary->term);
+        commit_index_ = std::max<std::uint64_t>(commit_index_, boundary->index);
+        last_applied_ = boundary->index;
 
         std::string persist_error;
         if (!PersistStateLocked(&persist_error))
@@ -2917,7 +2982,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
       }
 
       Log(NodeTag(config_.node_id), "loaded snapshot from ", meta.snapshot_path,
-          ", index=", meta.last_included_index, ", term=", meta.last_included_term,
+          ", index=", boundary->index, ", term=", boundary->term,
           ", commit_index=", commit_index_, ", last_applied=", last_applied_,
           ", last_snapshot_index=", last_snapshot_index_,
           ", last_snapshot_term=", last_snapshot_term_,
