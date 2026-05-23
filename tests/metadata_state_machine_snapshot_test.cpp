@@ -7,7 +7,9 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 namespace raftdemo
 {
@@ -16,6 +18,7 @@ namespace raftdemo
 
 namespace
 {
+    using raftdemo::test::ApplyMetadataCommand;
     using raftdemo::test::MakeAbortObjectCommand;
     using raftdemo::test::MakeCommitObjectCommand;
     using raftdemo::test::MakeCreateBucketCommand;
@@ -24,6 +27,45 @@ namespace
     using raftdemo::test::MakeDeleteObjectCommand;
     using raftdemo::test::MakeSnapshotPath;
     using raftdemo::test::WritePod;
+
+    constexpr std::uint32_t kMetadataStateMachineSnapshotMagicV2 = 0x4D445332U; // "MDS2"
+    constexpr std::uint32_t kMetadataStateMachineSnapshotVersionV2 = 2U;
+
+    template <typename T>
+    T ReadPodOrFail(std::ifstream &in)
+    {
+        T value{};
+        in.read(reinterpret_cast<char *>(&value), sizeof(T));
+        EXPECT_TRUE(static_cast<bool>(in));
+        return value;
+    }
+
+    std::vector<char> ReadBinaryFile(const std::filesystem::path &path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        EXPECT_TRUE(in.is_open()) << path.string();
+        return std::vector<char>(std::istreambuf_iterator<char>(in),
+                                 std::istreambuf_iterator<char>());
+    }
+
+    void WriteBinaryFile(const std::filesystem::path &path,
+                         const std::vector<char> &bytes)
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open()) << path.string();
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.flush();
+        ASSERT_TRUE(static_cast<bool>(out)) << path.string();
+    }
+
+    std::size_t FindByteSequence(const std::vector<char> &bytes,
+                                 const std::string &needle)
+    {
+        const auto begin = std::search(bytes.begin(), bytes.end(),
+                                       needle.begin(), needle.end());
+        EXPECT_NE(begin, bytes.end()) << "needle not found: " << needle;
+        return static_cast<std::size_t>(std::distance(bytes.begin(), begin));
+    }
 } // namespace
 
 TEST(MetadataStateMachineTest, SnapshotRoundTripRestoresStateIndexesAndIdempotency)
@@ -293,6 +335,221 @@ TEST(MetadataStateMachineTest, SnapshotLoadThenReplayRestoresFinalStateAndBounda
     EXPECT_EQ(all_listed.records[1].object_key, "replay-committed");
 }
 
+TEST(MetadataStateMachineTest, SaveSnapshotWritesExplicitV2HeaderAndCounts)
+{
+    raftdemo::MetadataStateMachine machine;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    430,
+                    MakeCreateBucketCommand("bucket-v2-header", "v2-header-bucket"),
+                    41)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    431,
+                    MakeCreateObjectCommand("bucket-v2-header",
+                                            "object/live",
+                                            "obj-v2-live",
+                                            "v2-header-create-live"),
+                    42)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    432,
+                    MakeCommitObjectCommand("bucket-v2-header",
+                                            "object/live",
+                                            "obj-v2-live",
+                                            "v2-header-commit-live"),
+                    43)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    433,
+                    MakeCreateObjectCommand("bucket-v2-header",
+                                            "object/deleted",
+                                            "obj-v2-deleted",
+                                            "v2-header-create-deleted"),
+                    44)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    434,
+                    MakeCommitObjectCommand("bucket-v2-header",
+                                            "object/deleted",
+                                            "obj-v2-deleted",
+                                            "v2-header-commit-deleted"),
+                    45)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    machine,
+                    435,
+                    MakeDeleteObjectCommand("bucket-v2-header",
+                                            "object/deleted",
+                                            "obj-v2-deleted",
+                                            "v2-header-delete-deleted"),
+                    46)
+                    .Ok);
+
+    const std::filesystem::path snapshot_path =
+        MakeSnapshotPath("metadata-v2-header.snapshot");
+    std::error_code ec;
+    std::filesystem::remove(snapshot_path, ec);
+    ASSERT_EQ(machine.SaveSnapshot(snapshot_path.string()).status,
+              raftdemo::SnapshotStatus::kOk);
+
+    std::ifstream in(snapshot_path, std::ios::binary);
+    ASSERT_TRUE(in.is_open()) << snapshot_path.string();
+
+    const auto magic = ReadPodOrFail<std::uint32_t>(in);
+    const auto version = ReadPodOrFail<std::uint32_t>(in);
+    const auto last_applied_index = ReadPodOrFail<std::uint64_t>(in);
+    const auto last_applied_term = ReadPodOrFail<std::uint64_t>(in);
+    const auto bucket_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto object_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto object_index_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto chunk_ref_index_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto request_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto request_fingerprint_count = ReadPodOrFail<std::uint64_t>(in);
+    const auto tombstone_count = ReadPodOrFail<std::uint64_t>(in);
+
+    EXPECT_EQ(magic, kMetadataStateMachineSnapshotMagicV2);
+    EXPECT_EQ(version, kMetadataStateMachineSnapshotVersionV2);
+    EXPECT_EQ(last_applied_index, 435U);
+    EXPECT_EQ(last_applied_term, 46U);
+    EXPECT_EQ(bucket_count, 1U);
+    EXPECT_EQ(object_count, 2U);
+    EXPECT_EQ(object_index_count, 1U);
+    EXPECT_EQ(chunk_ref_index_count, 1U);
+    EXPECT_EQ(request_count, 6U);
+    EXPECT_EQ(request_fingerprint_count, 6U);
+    EXPECT_EQ(tombstone_count, 1U);
+}
+
+TEST(MetadataStateMachineTest, LoadSnapshotRejectsUnsupportedVersionAndPreservesExistingState)
+{
+    raftdemo::MetadataStateMachine source;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    source, 440,
+                    MakeCreateBucketCommand("bucket-v2-version", "v2-version-bucket"), 51)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    source, 441,
+                    MakeCreateObjectCommand("bucket-v2-version",
+                                            "object/live",
+                                            "obj-v2-version",
+                                            "v2-version-create"),
+                    52)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    source, 442,
+                    MakeCommitObjectCommand("bucket-v2-version",
+                                            "object/live",
+                                            "obj-v2-version",
+                                            "v2-version-commit"),
+                    53)
+                    .Ok);
+
+    const std::filesystem::path snapshot_path =
+        MakeSnapshotPath("metadata-v2-version-mismatch.snapshot");
+    std::error_code ec;
+    std::filesystem::remove(snapshot_path, ec);
+    ASSERT_EQ(source.SaveSnapshot(snapshot_path.string()).status,
+              raftdemo::SnapshotStatus::kOk);
+
+    {
+        std::fstream io(snapshot_path, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(io.is_open());
+        io.seekp(sizeof(std::uint32_t));
+        const std::uint32_t unsupported_version = 999U;
+        io.write(reinterpret_cast<const char *>(&unsupported_version),
+                 sizeof(unsupported_version));
+        io.flush();
+        ASSERT_TRUE(static_cast<bool>(io));
+    }
+
+    raftdemo::MetadataStateMachine restored;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    restored, 11,
+                    MakeCreateBucketCommand("bucket-preserved", "preserved-bucket"), 7)
+                    .Ok);
+
+    const auto load = restored.LoadSnapshot(snapshot_path.string());
+    EXPECT_EQ(load.status, raftdemo::SnapshotStatus::kVersionMismatch);
+    EXPECT_EQ(load.message, "unsupported metadata state machine snapshot version");
+
+    EXPECT_EQ(restored.LastAppliedIndex(), 11U);
+    EXPECT_EQ(restored.LastAppliedTerm(), 7U);
+    EXPECT_EQ(restored.RequestCount(), 1U);
+    EXPECT_TRUE(restored.FindBucket("bucket-preserved").has_value());
+    EXPECT_FALSE(restored.FindBucket("bucket-v2-version").has_value());
+}
+
+TEST(MetadataStateMachineTest, LoadSnapshotRejectsTruncatedOrInconsistentStateWithoutPollutingMemory)
+{
+    raftdemo::MetadataStateMachine source;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    source, 450,
+                    MakeCreateBucketCommand("bucket-v2-corrupt", "v2-corrupt-bucket"), 61)
+                    .Ok);
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    source, 451,
+                    MakeCreateObjectCommand("bucket-v2-corrupt",
+                                            "object/pending",
+                                            "obj-v2-pending",
+                                            "v2-corrupt-create"),
+                    62)
+                    .Ok);
+
+    const std::filesystem::path snapshot_path =
+        MakeSnapshotPath("metadata-v2-corrupt.snapshot");
+    std::error_code ec;
+    std::filesystem::remove(snapshot_path, ec);
+    ASSERT_EQ(source.SaveSnapshot(snapshot_path.string()).status,
+              raftdemo::SnapshotStatus::kOk);
+
+    const std::vector<char> bytes = ReadBinaryFile(snapshot_path);
+    ASSERT_GT(bytes.size(), 8U);
+
+    const std::filesystem::path truncated_path =
+        MakeSnapshotPath("metadata-v2-corrupt-truncated.snapshot");
+    std::vector<char> truncated(bytes.begin(), bytes.end() - 1);
+    WriteBinaryFile(truncated_path, truncated);
+
+    raftdemo::MetadataStateMachine restored;
+    EXPECT_TRUE(ApplyMetadataCommand(
+                    restored, 21,
+                    MakeCreateBucketCommand("bucket-safety", "safety-bucket"), 8)
+                    .Ok);
+
+    const auto truncated_load = restored.LoadSnapshot(truncated_path.string());
+    EXPECT_EQ(truncated_load.status, raftdemo::SnapshotStatus::kCorruptedData);
+    EXPECT_EQ(truncated_load.message,
+              "failed to read metadata state machine request fingerprint");
+
+    EXPECT_EQ(restored.LastAppliedIndex(), 21U);
+    EXPECT_EQ(restored.LastAppliedTerm(), 8U);
+    EXPECT_TRUE(restored.FindBucket("bucket-safety").has_value());
+    EXPECT_FALSE(restored.FindBucket("bucket-v2-corrupt").has_value());
+
+    const std::filesystem::path inconsistent_path =
+        MakeSnapshotPath("metadata-v2-corrupt-inconsistent.snapshot");
+    std::vector<char> inconsistent = bytes;
+    const std::string object_identity = std::string("bucket-v2-corrupt") + "\n" + "object/pending";
+    const std::size_t identity_offset = FindByteSequence(inconsistent, object_identity);
+    inconsistent[identity_offset] = 'B';
+    WriteBinaryFile(inconsistent_path, inconsistent);
+
+    const auto inconsistent_load = restored.LoadSnapshot(inconsistent_path.string());
+    EXPECT_EQ(inconsistent_load.status, raftdemo::SnapshotStatus::kCorruptedData);
+    EXPECT_EQ(inconsistent_load.message,
+              "invalid metadata state machine snapshot state: live object is missing object index entry");
+
+    EXPECT_EQ(restored.LastAppliedIndex(), 21U);
+    EXPECT_EQ(restored.LastAppliedTerm(), 8U);
+    EXPECT_TRUE(restored.FindBucket("bucket-safety").has_value());
+    EXPECT_FALSE(restored.FindBucket("bucket-v2-corrupt").has_value());
+}
+
 TEST(MetadataStateMachineTest, LoadSnapshotRejectsCorruptedDataAndPreservesState)
 {
     raftdemo::MetadataStateMachine machine;
@@ -322,7 +579,7 @@ TEST(MetadataStateMachineTest, LoadSnapshotRejectsCorruptedDataAndPreservesState
     const std::filesystem::path snapshot_path = MakeSnapshotPath("metadata-corrupt.snapshot");
     std::ofstream out(snapshot_path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(out.is_open());
-    const std::uint32_t magic = 0x4D445331U;
+    const std::uint32_t magic = kMetadataStateMachineSnapshotMagicV2;
     WritePod(out, magic);
     out.flush();
     out.close();
@@ -352,7 +609,7 @@ TEST(MetadataStateMachineTest, LoadSnapshotRejectsUnknownVersionAndPreservesStat
     const std::filesystem::path snapshot_path = MakeSnapshotPath("metadata-version.snapshot");
     std::ofstream out(snapshot_path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(out.is_open());
-    const std::uint32_t magic = 0x4D445331U;
+    const std::uint32_t magic = kMetadataStateMachineSnapshotMagicV2;
     const std::uint32_t version = 99U;
     const std::uint64_t zero = 0U;
     WritePod(out, magic);

@@ -16,7 +16,8 @@ namespace raftdemo
     namespace
     {
         constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
-        constexpr std::uint32_t kMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
+        constexpr std::uint32_t kStrongConsistencyMetadataSnapshotMagic = 0x4D445331U; // "MDS1"
+        constexpr std::uint32_t kMetadataStateMachineSnapshotMagic = 0x4D445332U;      // "MDS2"
         constexpr std::uint32_t kStrongConsistencyMetadataSnapshotVersion = 1U;
         constexpr std::uint32_t kMetadataStateMachineSnapshotVersion = 2U;
         ApplyResult MakeApplyFailure(const std::string &message)
@@ -916,6 +917,7 @@ namespace raftdemo
         }
 
         bool ValidateLoadedMetadataState(
+            const std::uint64_t last_applied_index,
             const std::unordered_map<std::string, BucketRecord> &buckets,
             const std::unordered_map<std::string, ObjectRecord> &objects,
             const std::unordered_map<std::string, std::vector<std::string>> &object_index,
@@ -939,6 +941,10 @@ namespace raftdemo
                 if (request_id.empty() || record.request_id != request_id)
                 {
                     return set_error("invalid request table entry");
+                }
+                if (record.applied_index == 0 || record.applied_index > last_applied_index)
+                {
+                    return set_error("request table applied index is out of range");
                 }
                 const auto fingerprint_it = request_fingerprints.find(request_id);
                 if (fingerprint_it == request_fingerprints.end() ||
@@ -975,6 +981,12 @@ namespace raftdemo
                 {
                     return set_error("object references missing bucket");
                 }
+                const auto bucket_it = buckets.find(record.bucket);
+                if (bucket_it != buckets.end() && bucket_it->second.deleted &&
+                    !record.IsDeleted())
+                {
+                    return set_error("deleted bucket still contains active object");
+                }
 
                 const auto index_it = object_index.find(identity);
                 if (record.IsDeleted())
@@ -999,6 +1011,10 @@ namespace raftdemo
                 if (index_it == object_index.end() || index_it->second.empty())
                 {
                     return set_error("live object is missing object index entry");
+                }
+                if (index_it->second.size() != 1U)
+                {
+                    return set_error("live object has ambiguous object index entry");
                 }
                 if (std::find(index_it->second.begin(), index_it->second.end(), record.object_id) ==
                     index_it->second.end())
@@ -1072,6 +1088,11 @@ namespace raftdemo
                 if (!object_it->second.IsDeleted())
                 {
                     return set_error("tombstone references non-deleted object");
+                }
+                if (tombstone.deleted_at_log_index == 0 ||
+                    tombstone.deleted_at_log_index > last_applied_index)
+                {
+                    return set_error("tombstone deleted_at_log_index is out of range");
                 }
                 if (tombstone.object_key != object_it->second.object_key)
                 {
@@ -1521,7 +1542,7 @@ namespace raftdemo
                         "open temp metadata state machine snapshot file failed: " + temp_path.string()};
             }
 
-            if (!WritePod(out, kMetadataSnapshotMagic) ||
+            if (!WritePod(out, kMetadataStateMachineSnapshotMagic) ||
                 !WritePod(out, kMetadataStateMachineSnapshotVersion) ||
                 !WritePod(out, last_applied_index) ||
                 !WritePod(out, last_applied_term) ||
@@ -1672,7 +1693,7 @@ namespace raftdemo
             return {SnapshotStatus::kCorruptedData,
                     "failed to read metadata state machine snapshot header"};
         }
-        if (magic != kMetadataSnapshotMagic)
+        if (magic != kMetadataStateMachineSnapshotMagic)
         {
             return {SnapshotStatus::kCorruptedData,
                     "invalid metadata state machine snapshot magic"};
@@ -1801,7 +1822,8 @@ namespace raftdemo
         }
 
         std::string validation_error;
-        if (!ValidateLoadedMetadataState(new_buckets,
+        if (!ValidateLoadedMetadataState(last_applied_index,
+                                         new_buckets,
                                          new_objects,
                                          new_object_index,
                                          new_chunk_ref_index,
@@ -2286,7 +2308,7 @@ namespace raftdemo
                         "open temp metadata snapshot file failed: " + temp_path.string()};
             }
 
-            const std::uint32_t magic = kMetadataSnapshotMagic;
+            const std::uint32_t magic = kStrongConsistencyMetadataSnapshotMagic;
             const std::uint32_t version = kStrongConsistencyMetadataSnapshotVersion;
             const std::uint64_t record_count = static_cast<std::uint64_t>(records.size());
             const std::uint64_t tombstone_count = static_cast<std::uint64_t>(tombstones.size());
@@ -2389,7 +2411,7 @@ namespace raftdemo
             return {SnapshotStatus::kCorruptedData, "failed to read metadata snapshot header"};
         }
 
-        if (magic != kMetadataSnapshotMagic)
+        if (magic != kStrongConsistencyMetadataSnapshotMagic)
         {
             return {SnapshotStatus::kCorruptedData, "invalid metadata snapshot magic"};
         }
