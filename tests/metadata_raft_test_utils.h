@@ -116,6 +116,70 @@ namespace raftdemo::test
         return false;
     }
 
+    inline bool ProposeCreateBucketWithRetry(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const std::string &bucket,
+        const std::string &request_id,
+        const std::chrono::milliseconds timeout,
+        ProposeResult *final_result = nullptr,
+        const std::vector<std::size_t> &excluded = {})
+    {
+        return ProposeMetadataCommandWithRetry(
+            nodes,
+            MakeCreateBucketCommand(bucket, request_id),
+            timeout,
+            final_result,
+            excluded);
+    }
+
+    inline bool ProposeCreateCommitObjectWithRetry(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        const std::string &create_request_id,
+        const std::string &commit_request_id,
+        const std::chrono::milliseconds timeout,
+        ProposeResult *final_result = nullptr,
+        const std::vector<std::size_t> &excluded = {})
+    {
+        ProposeResult create_result;
+        if (!ProposeMetadataCommandWithRetry(
+                nodes,
+                MakeCreateObjectCommand(bucket, object_key, object_id, create_request_id),
+                timeout,
+                &create_result,
+                excluded))
+        {
+            if (final_result != nullptr)
+            {
+                *final_result = create_result;
+            }
+            return false;
+        }
+
+        ProposeResult commit_result;
+        if (!ProposeMetadataCommandWithRetry(
+                nodes,
+                MakeCommitObjectCommand(bucket, object_key, object_id, commit_request_id),
+                timeout,
+                &commit_result,
+                excluded))
+        {
+            if (final_result != nullptr)
+            {
+                *final_result = commit_result;
+            }
+            return false;
+        }
+
+        if (final_result != nullptr)
+        {
+            *final_result = commit_result;
+        }
+        return true;
+    }
+
     inline bool WaitUntilAllCommittedObject(
         const std::vector<std::shared_ptr<RaftNode>> &nodes,
         const std::string &bucket,
