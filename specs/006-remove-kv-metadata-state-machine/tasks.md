@@ -141,8 +141,8 @@
 
 ### Tests for User Story 4
 
-- [ ] T036 [P] [US4] 扩展 `tests/metadata_snapshot_test.cpp`，覆盖 snapshot V2 头、`last_applied_index`/`term`、bucket/object/index/request/tombstone 恢复与 checksum 校验
-- [ ] T037 [P] [US4] 将 `tests/snapshot_test.cpp`、`tests/persistence_test.cpp`、`tests/test_raft_snapshot_catchup.cpp`、`tests/test_raft_snapshot_restart.cpp` 从 KV 断言迁移为 metadata snapshot/save/load/replay/catch-up 断言
+- [x] T036 [P] [US4] 扩展 `tests/metadata_snapshot_test.cpp`，覆盖 snapshot V2 头、`last_applied_index`/`term`、bucket/object/index/request/tombstone 恢复与 checksum 校验
+- [x] T037 [P] [US4] 将 `tests/snapshot_test.cpp`、`tests/persistence_test.cpp`、`tests/test_raft_snapshot_catchup.cpp`、`tests/test_raft_snapshot_restart.cpp` 从 KV 断言迁移为 metadata snapshot/save/load/replay/catch-up 断言
 - [ ] T038 [P] [US4] 新增 `tests/metadata_recovery_stress_test.cpp`，覆盖并发 apply/query 期间 snapshot、并发写入后的 restart recovery、catch-up 后元数据一致性
 
 ### Implementation for User Story 4
