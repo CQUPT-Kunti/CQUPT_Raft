@@ -99,6 +99,28 @@ function(add_raft_gtest_sources target_name test_labels)
   )
 endfunction()
 
+set(NO_KV_SURFACE_AUDIT_SCRIPT
+  "${CMAKE_CURRENT_SOURCE_DIR}/no_kv_surface_audit.cmake")
+if (EXISTS "${NO_KV_SURFACE_AUDIT_SCRIPT}")
+  add_custom_target(no_kv_surface_audit
+    COMMAND ${CMAKE_COMMAND}
+      -DRAFT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+      -P "${NO_KV_SURFACE_AUDIT_SCRIPT}"
+    COMMENT "Running no-KV surface audit"
+    VERBATIM
+  )
+
+  add_test(NAME NoKvSurfaceAudit
+    COMMAND ${CMAKE_COMMAND}
+      -DRAFT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+      -P "${NO_KV_SURFACE_AUDIT_SCRIPT}"
+  )
+  set_tests_properties(NoKvSurfaceAudit PROPERTIES
+    LABELS "platform-neutral;platform-neutral-fallback;no-kv-audit")
+else()
+  message(STATUS "Skip no_kv_surface_audit: no_kv_surface_audit.cmake not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic unit tests

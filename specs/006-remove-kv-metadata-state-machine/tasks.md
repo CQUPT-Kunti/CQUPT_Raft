@@ -167,7 +167,7 @@
 - [x] T047 [P] 删除 `apps/raft_kv_client.cpp` 并从 `CMakeLists.txt` 中移除 `raft_kv_client` target
 - [x] T048 [P] 从 `proto/raft.proto` 中彻底移除 `KvService`、`KvStatusCode`、`Put/Get/Delete` 相关 message/RPC，并确保 `raft_proto` 的唯一业务 RPC 面是 metadata-only
 - [x] T049 [P] 清理 `docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md`、`docs/PERSISTENCE_DURABILITY_CONTRACT.md`、`tests/README.md`、`README.md` 中的 KV 主路径描述，改为 metadata-only 主路径描述
-- [ ] T050 在 `tests/no_kv_surface_audit.cmake`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1` 中接入最终 no-KV 审计，确保主构建/主 CTest 路径检测到残留 KV 符号、KV target 或 KV regression-only path 时直接失败
+- [X] T050 在 `tests/no_kv_surface_audit.cmake`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1` 中接入最终 no-KV 审计，确保主构建/主 CTest 路径检测到残留 KV 符号、KV target 或 KV regression-only path 时直接失败
 - [ ] T051 运行 Linux 全量 configure/build/CTest 并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T051-linux-final-validation.md`
 - [ ] T052 运行 Windows 全量 configure/build/CTest 并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T052-windows-final-validation.md`
 - [ ] T053 汇总 KV 删除完成度、回归迁移完成度、并发/恢复/跨平台风险余项，并记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T053-kv-removal-summary.md`

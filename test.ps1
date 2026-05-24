@@ -42,6 +42,10 @@ Windows full managed CTest sweep:
   - Test preset: windows-release-managed-tests
   - Use: .\test.ps1 -Managed
 
+No-KV surface audit:
+  - Build target: no_kv_surface_audit
+  - The wrapper runs this audit after the normal Windows test entry.
+
 Notes:
   - This wrapper does not call Bash.
   - Default behavior (.\\test.ps1 / .\\test.ps1 -All) stays on the conservative Windows platform-neutral fallback flow.
@@ -99,6 +103,7 @@ Write-Host "Linux primary entry remains: ./test.sh"
 Write-Host "PowerShell fallback presets: $script:ConfigurePreset / $script:BuildPreset / $script:TestPreset"
 Write-Host "CTest fallback subset: CommandTest / KvStateMachineTest / TimerSchedulerTest / ThreadPoolTest"
 Write-Host "Explicit full managed preset: $script:ManagedTestPreset"
+Write-Host "No-KV audit target: no_kv_surface_audit"
 
 Push-Location $projectRoot
 try {
@@ -117,6 +122,11 @@ try {
             -StepName "Running Windows full managed CTest preset" `
             -FilePath "ctest" `
             -ArgumentList @("--preset", $script:ManagedTestPreset)
+
+        Invoke-CheckedCommand `
+            -StepName "Running no-KV surface audit target" `
+            -FilePath "cmake" `
+            -ArgumentList @("--build", "--preset", $script:BuildPreset, "--target", "no_kv_surface_audit")
 
         Write-Host ""
         Write-Host "Windows full managed CTest sweep completed successfully."
@@ -142,6 +152,11 @@ try {
             -StepName "Running Windows platform-neutral CTest preset" `
             -FilePath "ctest" `
             -ArgumentList @("--preset", $script:TestPreset)
+
+        Invoke-CheckedCommand `
+            -StepName "Running no-KV surface audit target" `
+            -FilePath "cmake" `
+            -ArgumentList @("--build", "--preset", $script:BuildPreset, "--target", "no_kv_surface_audit")
     }
 
     Write-Host ""

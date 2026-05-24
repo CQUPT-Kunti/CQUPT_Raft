@@ -9,6 +9,8 @@ set -Eeuo pipefail
 #     integration snapshot-catchup snapshot-restart replicator
 #   Shared restart / durability regression:
 #     persistence
+#   No-KV surface audit:
+#     no-kv
 #   Linux-specific / Linux-primary focus groups:
 #     snapshot-recovery diagnosis segment-cluster
 #   Linux Bash primary sweep:
@@ -56,6 +58,7 @@ Platform-neutral base regression groups:
   snapshot-catchup   Lagging follower catch-up and snapshot handoff
   snapshot-restart   Restart after compacted snapshot scenarios
   replicator         Single follower replication and catch-up behavior
+  no-kv              Audit retired KV service/client/proto/doc surfaces
 
 Shared restart / durability regression:
   persistence        Restart recovery and hard-state/log trusted-state checks
@@ -69,7 +72,7 @@ Linux-specific / Linux-primary focus groups:
 
 Linux Bash primary sweep:
   all                Runs platform-neutral base regression groups first,
-                     then persistence, then Linux-specific / Linux-primary
+                     then no-kv, then persistence, then Linux-specific / Linux-primary
                      focus groups, followed by a final full-suite check.
 
 --keep-data:
@@ -152,11 +155,16 @@ Shared restart / durability regression:
   Recovery logic is platform-neutral; Linux-specific durability interpretation
   remains documented separately.
 
+No-KV surface audit:
+  no-kv
+  Enforces retired KV service/client/proto/doc surfaces stay removed while
+  tolerating the documented legacy blockers.
+
 Linux-specific / Linux-primary focus groups:
   snapshot-recovery diagnosis segment-cluster
 
 Linux Bash primary sweep:
-  all = platform-neutral base regression groups + persistence +
+  all = platform-neutral base regression groups + no-kv + persistence +
         Linux-specific / Linux-primary focus groups + final full-suite check
 
 --keep-data:
@@ -179,6 +187,9 @@ print_group_classification() {
     unit|snapshot-storage|segment-basic|election|replication|integration|snapshot-catchup|snapshot-restart|replicator)
       echo "Section: platform-neutral base regression."
       ;;
+    no-kv)
+      echo "Section: no-KV surface audit."
+      ;;
     persistence)
       echo "Section: shared restart / durability regression."
       echo "Note: recovery logic is platform-neutral; Linux-specific durability interpretation remains separate."
@@ -188,7 +199,7 @@ print_group_classification() {
       ;;
     all)
       echo "Section: Linux Bash primary sweep."
-      echo "Order: platform-neutral base regression -> persistence -> Linux-specific / Linux-primary focus groups -> final full-suite check."
+      echo "Order: no-kv -> platform-neutral base regression -> persistence -> Linux-specific / Linux-primary focus groups -> final full-suite check."
       ;;
   esac
 }
@@ -214,6 +225,10 @@ print_group_guidance() {
     replicator)
       echo "Purpose: single follower replication state machine and catch-up behavior."
       echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data when diagnosing replication state drift."
+      ;;
+    no-kv)
+      echo "Purpose: fail fast when retired KV service/client/proto/doc surfaces reappear."
+      echo "Hint: this audit tolerates the documented legacy Command/KvStateMachine blockers and reports them separately."
       ;;
     segment-cluster)
       echo "Purpose: clustered segment / snapshot stress path."
@@ -250,6 +265,12 @@ print_failure_rerun_hint() {
       echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group replicator --keep-data"
       echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftReplicatorBehaviorTest\\.'"
       echo "  - Failure focus: follower replication state machine and catch-up behavior."
+      ;;
+    no-kv)
+      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group no-kv"
+      echo "  - CTest fallback: ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^NoKvSurfaceAudit$'"
+      echo "  - Build target fallback: cmake --build \"${BUILD_DIR}\" --target no_kv_surface_audit"
+      echo "  - Failure focus: retired KV service/client/proto/doc surfaces unexpectedly reappeared."
       ;;
     segment-cluster)
       echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group segment-cluster --keep-data"
@@ -352,10 +373,14 @@ run_group_by_name() {
     replicator)
       run_ctest_group "replicator" "^RaftReplicatorBehaviorTest\."
       ;;
+    no-kv)
+      run_ctest_group "no-kv" "^NoKvSurfaceAudit$"
+      ;;
     segment-cluster)
       run_ctest_group "segment-cluster" "^RaftSegmentStorageTest\.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory$"
       ;;
     all)
+      run_group_by_name no-kv
       run_group_by_name unit
       run_group_by_name snapshot-storage
       run_group_by_name segment-basic
