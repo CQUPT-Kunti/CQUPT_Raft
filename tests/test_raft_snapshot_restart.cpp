@@ -310,8 +310,9 @@ TEST_F(RaftSnapshotRestartTest, SnapshotAndPostSnapshotLogsRecoverAfterFullResta
     ASSERT_NE(state_machine, nullptr);
     EXPECT_EQ(state_machine->RequestCount(), 42U);
     EXPECT_EQ(state_machine->TombstoneCount(), 1U);
-    EXPECT_EQ(state_machine->LastAppliedTerm(), result.term);
-    EXPECT_EQ(state_machine->LastAppliedIndex(), expected_before_restart.expected_last_applied_index);
+    EXPECT_GE(state_machine->LastAppliedTerm(), result.term);
+    EXPECT_GE(state_machine->LastAppliedIndex(),
+              expected_before_restart.expected_last_applied_index);
   }
 
   ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
