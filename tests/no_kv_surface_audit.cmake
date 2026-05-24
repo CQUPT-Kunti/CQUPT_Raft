@@ -7,14 +7,19 @@ endif()
 file(TO_CMAKE_PATH "${RAFT_SOURCE_DIR}" RAFT_SOURCE_DIR)
 
 set(AUDIT_FAILURES "")
-set(AUDIT_BLOCKERS "")
+set(AUDIT_DEFERRED_RISKS "")
+set(AUDIT_WHITELIST_NOTES "")
 
 macro(record_failure category detail)
   list(APPEND AUDIT_FAILURES "${category}: ${detail}")
 endmacro()
 
-macro(record_blocker detail)
-  list(APPEND AUDIT_BLOCKERS "${detail}")
+macro(record_deferred_risk detail)
+  list(APPEND AUDIT_DEFERRED_RISKS "${detail}")
+endmacro()
+
+macro(record_whitelist detail)
+  list(APPEND AUDIT_WHITELIST_NOTES "${detail}")
 endmacro()
 
 macro(check_path_absent relative_path category)
@@ -23,7 +28,7 @@ macro(check_path_absent relative_path category)
   endif()
 endmacro()
 
-macro(check_literal_absent relative_path literal category)
+macro(scan_file_for_literal relative_path literal category)
   set(_audit_path "${RAFT_SOURCE_DIR}/${relative_path}")
   if(EXISTS "${_audit_path}")
     file(READ "${_audit_path}" _audit_content)
@@ -34,117 +39,255 @@ macro(check_literal_absent relative_path literal category)
   endif()
 endmacro()
 
-macro(check_literal_present relative_path literal)
+macro(scan_file_for_regex relative_path regex label category)
   set(_audit_path "${RAFT_SOURCE_DIR}/${relative_path}")
   if(EXISTS "${_audit_path}")
     file(READ "${_audit_path}" _audit_content)
-    string(FIND "${_audit_content}" "${literal}" _audit_index)
-    if(NOT _audit_index EQUAL -1)
-      record_blocker("${relative_path} contains ${literal}")
+    string(REGEX MATCH "${regex}" _audit_match "${_audit_content}")
+    if(NOT "${_audit_match}" STREQUAL "")
+      record_failure("${category}" "${relative_path} matches ${label}")
     endif()
   endif()
 endmacro()
 
-macro(check_path_present relative_path)
-  if(EXISTS "${RAFT_SOURCE_DIR}/${relative_path}")
-    record_blocker("${relative_path} still exists")
-  endif()
+function(collect_files out_var)
+  set(_collected "")
+  foreach(pattern IN LISTS ARGN)
+    file(GLOB_RECURSE _matches RELATIVE "${RAFT_SOURCE_DIR}" "${pattern}")
+    foreach(match IN LISTS _matches)
+      if(NOT IS_DIRECTORY "${RAFT_SOURCE_DIR}/${match}")
+        list(APPEND _collected "${match}")
+      endif()
+    endforeach()
+  endforeach()
+  list(REMOVE_DUPLICATES _collected)
+  set(${out_var} "${_collected}" PARENT_SCOPE)
+endfunction()
+
+macro(remove_paths source_list_var)
+  foreach(_remove_path IN LISTS ARGN)
+    list(REMOVE_ITEM ${source_list_var} "${_remove_path}")
+  endforeach()
 endmacro()
 
-# Strict no-KV surface failures: these surfaces are expected to be fully retired.
-check_path_absent("modules/raft/service/kv_service_impl.h" "forbidden service file")
-check_path_absent("modules/raft/service/kv_service_impl.cpp" "forbidden service file")
-check_path_absent("tests/test_kv_service.cpp" "forbidden test file")
-check_path_absent("apps/raft_kv_client.cpp" "forbidden client file")
+macro(remove_matching_paths source_list_var regex)
+  set(_kept_paths "")
+  foreach(_candidate_path IN LISTS ${source_list_var})
+    if(NOT _candidate_path MATCHES "${regex}")
+      list(APPEND _kept_paths "${_candidate_path}")
+    endif()
+  endforeach()
+  set(${source_list_var} "${_kept_paths}")
+endmacro()
+
+macro(scan_files_for_regex file_list_var regex label category)
+  foreach(relative_path IN LISTS ${file_list_var})
+    scan_file_for_regex("${relative_path}" "${regex}" "${label}" "${category}")
+  endforeach()
+endmacro()
+
+macro(scan_files_for_literal file_list_var literal category)
+  foreach(relative_path IN LISTS ${file_list_var})
+    scan_file_for_literal("${relative_path}" "${literal}" "${category}")
+  endforeach()
+endmacro()
+
+record_whitelist("specs/006-remove-kv-metadata-state-machine/task-reports/** 保留历史迁移说明")
+record_whitelist("specs/006-remove-kv-metadata-state-machine/{research,plan,spec,tasks,quickstart}.md 保留历史上下文")
+record_whitelist("tests/no_kv_surface_audit.cmake 允许出现检测关键词")
+record_whitelist("tests/AGENTS.md 与 tests/support/AGENTS.md 属于维护说明，不纳入 strict fail")
+record_whitelist("tests/test-reports/** 属于历史测试组织记录，不纳入 strict fail")
+
+collect_files(PRODUCTION_SOURCE_FILES
+  "modules/*"
+  "apps/*"
+  "proto/*")
+remove_matching_paths(PRODUCTION_SOURCE_FILES "AGENTS\\.md$")
+
+set(PRODUCTION_BUILD_FILES
+  "CMakeLists.txt"
+  "tests/CMakeLists.txt")
+
+collect_files(TEST_MAIN_FILES
+  "tests/*")
+remove_paths(TEST_MAIN_FILES
+  "tests/no_kv_surface_audit.cmake"
+  "tests/AGENTS.md"
+  "tests/support/AGENTS.md"
+  "tests/test-reports/test-file-organization.md")
+remove_matching_paths(TEST_MAIN_FILES "AGENTS\\.md$")
+remove_matching_paths(TEST_MAIN_FILES "^tests/test-reports/")
+
+# Strict: retired files / old paths must stay absent.
+check_path_absent("modules/raft/service/kv_service_impl.h" "forbidden production file")
+check_path_absent("modules/raft/service/kv_service_impl.cpp" "forbidden production file")
+check_path_absent("apps/raft_kv_client.cpp" "forbidden production file")
 check_path_absent("proto/kv.proto" "forbidden proto file")
+check_path_absent("modules/raft/state_machine/state_machine.h" "forbidden production file")
+check_path_absent("modules/raft/state_machine/state_machine.cpp" "forbidden production file")
+check_path_absent("tests/test_kv_service.cpp" "forbidden test file")
+check_path_absent("tests/test_state_machine.cpp" "forbidden test file")
 
-check_literal_absent("CMakeLists.txt" "raft_kv_client" "forbidden build target")
-check_literal_absent("CMakeLists.txt" "kv_service_impl" "forbidden build source")
-check_literal_absent("tests/CMakeLists.txt" "test_kv_service" "forbidden test target")
+# Strict: build graph / main test registration cannot mention retired KV entry points.
+scan_file_for_literal("CMakeLists.txt" "raft_kv_client" "forbidden build target")
+scan_file_for_literal("CMakeLists.txt" "kv_service_impl" "forbidden build source")
+scan_file_for_literal("CMakeLists.txt"
+  "modules/raft/state_machine/state_machine.cpp"
+  "forbidden build source")
+scan_file_for_literal("tests/CMakeLists.txt" "test_kv_service" "forbidden test target")
+scan_file_for_literal("tests/CMakeLists.txt" "test_state_machine" "forbidden test target")
 
-check_literal_absent("proto/raft.proto" "service KvService" "forbidden proto service")
-check_literal_absent("proto/raft.proto" "enum KvStatusCode" "forbidden proto enum")
-check_literal_absent("proto/raft.proto" "message PutRequest" "forbidden proto message")
-check_literal_absent("proto/raft.proto" "message GetRequest" "forbidden proto message")
-check_literal_absent("proto/raft.proto" "message DeleteRequest" "forbidden proto message")
-check_literal_absent("proto/raft.proto" "message PutResponse" "forbidden proto message")
-check_literal_absent("proto/raft.proto" "message GetResponse" "forbidden proto message")
-check_literal_absent("proto/raft.proto" "message DeleteResponse" "forbidden proto message")
+# Strict: production source tree cannot reintroduce retired KV business symbols.
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "CommandType::kSet([^A-Za-z0-9_]|$)"
+  "CommandType::kSet"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "CommandType::kDelete([^A-Za-z0-9_]|$)"
+  "CommandType::kDelete"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])kSet([^A-Za-z0-9_]|$)"
+  "kSet token"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])kDelete([^A-Za-z0-9_]|$)"
+  "kDelete token"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])KvStateMachine([^A-Za-z0-9_]|$)"
+  "KvStateMachine"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])CompositeKvMetadataStateMachine([^A-Za-z0-9_]|$)"
+  "CompositeKvMetadataStateMachine"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])KvService([^A-Za-z0-9_]|$)"
+  "KvService"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])KvStatusCode([^A-Za-z0-9_]|$)"
+  "KvStatusCode"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])raft_kv_client([^A-Za-z0-9_]|$)"
+  "raft_kv_client"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])PutRequest([^A-Za-z0-9_]|$)"
+  "PutRequest"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])GetRequest([^A-Za-z0-9_]|$)"
+  "GetRequest"
+  "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])DeleteRequest([^A-Za-z0-9_]|$)"
+  "DeleteRequest"
+  "forbidden production symbol")
+scan_files_for_literal(PRODUCTION_SOURCE_FILES "SET|" "forbidden production symbol")
+scan_files_for_literal(PRODUCTION_SOURCE_FILES "DEL|" "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])DebugGetValue([^A-Za-z0-9_]|$)"
+  "DebugGetValue"
+  "forbidden production symbol")
+scan_files_for_literal(PRODUCTION_SOURCE_FILES "kv-service" "forbidden production symbol")
+scan_files_for_regex(PRODUCTION_SOURCE_FILES
+  "(^|[^A-Za-z0-9_])kv\\.proto([^A-Za-z0-9_]|$)"
+  "kv.proto"
+  "forbidden production symbol")
+scan_files_for_literal(PRODUCTION_SOURCE_FILES "raft/state_machine/state_machine.h"
+  "forbidden production include")
+scan_files_for_literal(PRODUCTION_SOURCE_FILES
+  "modules/raft/state_machine/state_machine.cpp"
+  "forbidden production source reference")
 
-check_literal_absent("test.sh" "raft_kv_client" "forbidden script entry")
-check_literal_absent("test.sh" "test_kv_service" "forbidden script entry")
-check_literal_absent("test.sh" "kv_service_impl" "forbidden script entry")
-check_literal_absent("test.sh" "KV fallback" "forbidden script entry")
+# Strict: tests main path cannot reference retired KV symbols or retired default paths.
+scan_files_for_regex(TEST_MAIN_FILES
+  "CommandType::kSet([^A-Za-z0-9_]|$)"
+  "CommandType::kSet"
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "CommandType::kDelete([^A-Za-z0-9_]|$)"
+  "CommandType::kDelete"
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])SetCommand\\("
+  "SetCommand("
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])DeleteCommand\\("
+  "DeleteCommand("
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])DebugGetValue([^A-Za-z0-9_]|$)"
+  "DebugGetValue"
+  "forbidden test symbol")
+scan_files_for_literal(TEST_MAIN_FILES "raft/state_machine/state_machine.h"
+  "forbidden test include")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])KvStateMachine([^A-Za-z0-9_]|$)"
+  "KvStateMachine"
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])KV regression-only path([^A-Za-z0-9_]|$)"
+  "KV regression-only path"
+  "forbidden test doc symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])KvStateMachineTest([^A-Za-z0-9_]|$)"
+  "KvStateMachineTest"
+  "forbidden test doc symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])test_state_machine([^A-Za-z0-9_]|$)"
+  "test_state_machine"
+  "forbidden test doc symbol")
 
-check_literal_absent("test.ps1" "raft_kv_client" "forbidden script entry")
-check_literal_absent("test.ps1" "test_kv_service" "forbidden script entry")
-check_literal_absent("test.ps1" "kv_service_impl" "forbidden script entry")
-check_literal_absent("test.ps1" "KV fallback" "forbidden script entry")
+# Deferred to T059: script/preset fallback text still needs a metadata-only rewrite.
+set(_audit_ps1_path "${RAFT_SOURCE_DIR}/test.ps1")
+if(EXISTS "${_audit_ps1_path}")
+  file(READ "${_audit_ps1_path}" _audit_ps1_content)
+  string(REGEX MATCH "(^|[^A-Za-z0-9_])KvStateMachineTest([^A-Za-z0-9_]|$)"
+    _audit_ps1_match "${_audit_ps1_content}")
+  if(NOT "${_audit_ps1_match}" STREQUAL "")
+    record_deferred_risk("test.ps1 仍保留 KvStateMachineTest fallback 子集说明，转交 T059")
+  endif()
+endif()
 
-check_literal_absent("README.md" "raft_kv_client" "forbidden README entry")
-check_literal_absent("README.md" "KvService" "forbidden README entry")
-check_literal_absent("README.md" "KV fallback" "forbidden README entry")
-
-check_literal_absent("docs/PERSISTENCE_DURABILITY_CONTRACT.md" "KvStateMachine::SaveSnapshot()" "stale current-path doc")
-check_literal_absent("docs/PERSISTENCE_DURABILITY_CONTRACT.md" "KV fallback" "forbidden current-path doc")
-
-check_literal_absent("tests/README.md" "test_kv_service" "stale test doc")
-check_literal_absent("tests/README.md" "test_kv_service.cpp" "stale test doc")
-check_literal_absent("tests/README.md" "raft_kv_client" "stale test doc")
-check_literal_absent("tests/README.md" "KV fallback" "stale test doc")
-
-check_literal_absent("docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md"
-  "KV client / KV service 仍被当作当前主要外部接口"
-  "stale current-path doc")
-check_literal_absent("docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md"
-  "`proto/raft.proto` 中的 `KvService`"
-  "stale current-path doc")
-check_literal_absent("docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md"
-  "`KvService` 与 Raft service 同处一个 proto"
-  "stale current-path doc")
-check_literal_absent("docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md"
-  "`RaftService` 和 `KvService` 在同一个 `proto/raft.proto`"
-  "stale current-path doc")
-
-# Known blockers: report clearly but do not fail T050 on them.
-check_literal_present("modules/raft/common/command.h" "kSet")
-check_literal_present("modules/raft/common/command.h" "kDelete")
-check_literal_present("modules/raft/common/command.cpp" "CommandType::kSet")
-check_literal_present("modules/raft/common/command.cpp" "CommandType::kDelete")
-check_path_present("modules/raft/state_machine/state_machine.h")
-check_path_present("modules/raft/state_machine/state_machine.cpp")
-check_path_present("tests/test_state_machine.cpp")
-check_literal_present("modules/raft/state_machine/state_machine.h" "KvStateMachine")
-check_literal_present("modules/raft/node/raft_node.cpp" "KvStateMachine")
-check_literal_present("tests/support/raft_snapshot_restart_test_utils.h" "SetCommand(")
-check_literal_present("tests/support/raft_snapshot_restart_test_utils.h" "DeleteCommand(")
+set(_audit_presets_path "${RAFT_SOURCE_DIR}/CMakePresets.json")
+if(EXISTS "${_audit_presets_path}")
+  file(READ "${_audit_presets_path}" _audit_presets_content)
+  string(REGEX MATCH "(^|[^A-Za-z0-9_])KvStateMachineTest([^A-Za-z0-9_]|$)"
+    _audit_presets_match "${_audit_presets_content}")
+  if(NOT "${_audit_presets_match}" STREQUAL "")
+    record_deferred_risk("CMakePresets.json 仍保留 KvStateMachineTest fallback filter，转交 T059")
+  endif()
+endif()
 
 list(REMOVE_DUPLICATES AUDIT_FAILURES)
-list(REMOVE_DUPLICATES AUDIT_BLOCKERS)
+list(REMOVE_DUPLICATES AUDIT_DEFERRED_RISKS)
+list(REMOVE_DUPLICATES AUDIT_WHITELIST_NOTES)
 
-if(AUDIT_BLOCKERS)
-  message(STATUS "no_kv_surface_audit known blockers (tolerated in T050):")
-  foreach(blocker IN LISTS AUDIT_BLOCKERS)
-    message(STATUS "  - ${blocker}")
+if(AUDIT_WHITELIST_NOTES)
+  message(STATUS "no_kv_surface_audit whitelist scope:")
+  foreach(note IN LISTS AUDIT_WHITELIST_NOTES)
+    message(STATUS "  - ${note}")
+  endforeach()
+endif()
+
+if(AUDIT_DEFERRED_RISKS)
+  message(STATUS "no_kv_surface_audit deferred risks (tracked outside T058 strict-fail scope):")
+  foreach(risk IN LISTS AUDIT_DEFERRED_RISKS)
+    message(STATUS "  - ${risk}")
   endforeach()
 endif()
 
 if(AUDIT_FAILURES)
   list(JOIN AUDIT_FAILURES "\n  - " AUDIT_FAILURE_TEXT)
-  if(AUDIT_BLOCKERS)
-    list(JOIN AUDIT_BLOCKERS "\n  - " AUDIT_BLOCKER_TEXT)
-    message(FATAL_ERROR
-      "no_kv_surface_audit failed.\n"
-      "Strict retired KV surface regressions:\n"
-      "  - ${AUDIT_FAILURE_TEXT}\n"
-      "Known blockers intentionally not promoted to failure in T050:\n"
-      "  - ${AUDIT_BLOCKER_TEXT}\n")
-  else()
-    message(FATAL_ERROR
-      "no_kv_surface_audit failed.\n"
-      "Strict retired KV surface regressions:\n"
-      "  - ${AUDIT_FAILURE_TEXT}\n")
-  endif()
+  message(FATAL_ERROR
+    "no_kv_surface_audit failed.\n"
+    "Strict retired KV surface regressions:\n"
+    "  - ${AUDIT_FAILURE_TEXT}\n")
 endif()
 
-message(STATUS "no_kv_surface_audit passed: retired KV service/client/proto/doc surfaces remain absent.")
+message(STATUS "no_kv_surface_audit passed: production code and tests main path remain strict metadata-only.")

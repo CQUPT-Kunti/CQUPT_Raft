@@ -88,3 +88,17 @@
   - 后续若需要提升并发，应先单独验证 snapshot/recovery 组的端口隔离和 leader 稳定性。
 - 当前是否阻塞：
   - 不阻塞 `T057` 验收；当前更像运行环境并发干扰，不是测试语义或 metadata-only 迁移回归。
+
+## T058 追加注意：strict no-KV audit 已收口主代码与主测试路径，脚本 / preset 仍转交 T059
+
+- 来源任务：T058
+- 注意点：
+  - 本轮 `NoKvSurfaceAudit` 已升级为 strict fail：生产代码、主构建图、`tests/` 主测试路径出现旧 KV 残留会直接失败。
+  - 但 `test.ps1` 与 `CMakePresets.json` 仍保留 `KvStateMachineTest` fallback 子集说明 / filter；按任务边界未在 T058 中修改，只作为 deferred risk 输出。
+- 可能影响：
+  - 如果后续只看 `NoKvSurfaceAudit PASS` 而忽略 deferred risk，可能误以为所有 no-KV 入口都已统一为 metadata-only。
+- 建议处理：
+  - `T059` 继续收口 `test.sh`、`test.ps1`、`CMakePresets.json` 的 no-KV / fallback 入口。
+  - 复验时应同时看 audit PASS 和 deferred risk 是否清零。
+- 当前是否阻塞：
+  - 不阻塞 `T058` 验收；会直接影响 `T059` 的最终入口一致性收口。
