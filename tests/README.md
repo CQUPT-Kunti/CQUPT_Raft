@@ -24,7 +24,6 @@ macOS 当前不在本 feature 验证范围内。
 - `test_state_machine`
 - `test_min_heap_timer`
 - `test_thread_pool`
-- `test_kv_service`
 - `test_raft_election`
 - `test_raft_log_replication`
 - `test_raft_commit_apply`
@@ -48,7 +47,6 @@ macOS 当前不在本 feature 验证范围内。
 - `test_state_machine.cpp`
 - `test_min_heap_timer.cpp`
 - `test_thread_pool.cpp`
-- `test_kv_service.cpp`
 - `test_raft_election.cpp`
 - `test_raft_log_replication.cpp`
 - `test_raft_commit_apply.cpp`
@@ -74,7 +72,6 @@ macOS 当前不在本 feature 验证范围内。
 - `test_state_machine`
 - `test_min_heap_timer`
 - `test_thread_pool`
-- `test_kv_service`
 - `test_raft_election`
 - `test_raft_log_replication`
 - `test_raft_commit_apply`
@@ -172,7 +169,6 @@ macOS 当前不在本 feature 验证范围内。
 
 以下受管回归当前都不属于 Windows platform-neutral fallback：
 
-- `test_kv_service`
 - `test_raft_election`
 - `test_raft_log_replication`
 - `test_raft_commit_apply`
