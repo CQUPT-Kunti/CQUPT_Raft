@@ -116,13 +116,10 @@ namespace raftdemo
     std::string Describe() const;
     ProposeResult Propose(const Command &command);
     ProposeResult ProposeMetadata(const std::string &metadata_command_data);
-    bool DebugGetValue(const std::string &key, std::string *value) const;
     MetadataStateMachine *GetMetadataStateMachineV2();
     const MetadataStateMachine *GetMetadataStateMachineV2() const;
     StrongConsistencyMetadataStateMachine *GetMetadataStateMachine();
     const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
-    bool ValidateKey(const std::string &key, std::string *reason) const;
-    bool ValidateValue(const std::string &value, std::string *reason) const;
     NodeStatusSnapshot GetStatusSnapshot() const;
     NodeMetricsSnapshot GetMetricsSnapshot() const;
     bool IsRunning() const;
@@ -150,12 +147,6 @@ namespace raftdemo
       kRequestVote,
       kAppendEntries,
       kInstallSnapshot,
-      kKvPut,
-      kKvDelete,
-      kKvGet,
-      kKvStatus,
-      kKvHealth,
-      kKvMetrics,
     };
 
     struct RpcMetricState
@@ -231,8 +222,6 @@ namespace raftdemo
     static const char *RoleName(Role role);
 
     bool ValidateCommandUnlocked(const Command &command, std::string *reason) const;
-    bool ValidateKeyUnlocked(const std::string &key, std::string *reason) const;
-    bool ValidateValueUnlocked(const std::string &value, std::string *reason) const;
     std::uint64_t AppendLocalLogUnlocked(const std::string &command_data);
     ReplicationOutcome ReplicateLogEntryToMajority(std::uint64_t log_index);
     ReplicationOutcome ReplicateLogEntryToMajority(

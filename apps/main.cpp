@@ -54,7 +54,7 @@ namespace raftdemo
                 throw std::runtime_error("failed to open config file: " + path.string());
             }
 
-            std::map<std::string, std::string> kv;
+            std::map<std::string, std::string> config_values;
             std::string line;
             while (std::getline(in, line))
             {
@@ -82,53 +82,53 @@ namespace raftdemo
                 {
                     throw std::runtime_error("bad config line, empty key");
                 }
-                kv[key] = value;
+                config_values[key] = value;
             }
-            return kv;
+            return config_values;
         }
 
-        int GetInt(const std::map<std::string, std::string> &kv,
+        int GetInt(const std::map<std::string, std::string> &config_values,
                    const std::string &key,
                    int default_value)
         {
-            auto it = kv.find(key);
-            if (it == kv.end())
+            auto it = config_values.find(key);
+            if (it == config_values.end())
             {
                 return default_value;
             }
             return std::stoi(it->second);
         }
 
-        std::string GetString(const std::map<std::string, std::string> &kv,
+        std::string GetString(const std::map<std::string, std::string> &config_values,
                               const std::string &key,
                               const std::string &default_value)
         {
-            auto it = kv.find(key);
-            if (it == kv.end())
+            auto it = config_values.find(key);
+            if (it == config_values.end())
             {
                 return default_value;
             }
             return it->second;
         }
 
-        bool GetBool(const std::map<std::string, std::string> &kv,
+        bool GetBool(const std::map<std::string, std::string> &config_values,
                      const std::string &key,
                      bool default_value)
         {
-            auto it = kv.find(key);
-            if (it == kv.end())
+            auto it = config_values.find(key);
+            if (it == config_values.end())
             {
                 return default_value;
             }
             return ParseBool(it->second);
         }
 
-        std::map<int, std::string> LoadMembers(const std::map<std::string, std::string> &kv)
+        std::map<int, std::string> LoadMembers(const std::map<std::string, std::string> &config_values)
         {
             std::map<int, std::string> members;
             constexpr const char *prefix = "node.";
 
-            for (const auto &[key, value] : kv)
+            for (const auto &[key, value] : config_values)
             {
                 if (key.rfind(prefix, 0) != 0)
                 {
@@ -158,12 +158,12 @@ namespace raftdemo
             return members;
         }
 
-        NodeConfig BuildNodeConfig(const std::map<std::string, std::string> &kv,
+        NodeConfig BuildNodeConfig(const std::map<std::string, std::string> &config_values,
                                    int override_node_id,
                                    const std::filesystem::path &config_path)
         {
-            const auto members = LoadMembers(kv);
-            const int node_id = override_node_id > 0 ? override_node_id : GetInt(kv, "node_id", 1);
+            const auto members = LoadMembers(config_values);
+            const int node_id = override_node_id > 0 ? override_node_id : GetInt(config_values, "node_id", 1);
 
             auto self = members.find(node_id);
             if (self == members.end())
@@ -187,32 +187,28 @@ namespace raftdemo
             }
 
             config.election_timeout_min =
-                std::chrono::milliseconds(GetInt(kv, "election_timeout_min_ms", 800));
+                std::chrono::milliseconds(GetInt(config_values, "election_timeout_min_ms", 800));
             config.election_timeout_max =
-                std::chrono::milliseconds(GetInt(kv, "election_timeout_max_ms", 1600));
+                std::chrono::milliseconds(GetInt(config_values, "election_timeout_max_ms", 1600));
             config.heartbeat_interval =
-                std::chrono::milliseconds(GetInt(kv, "heartbeat_interval_ms", 150));
+                std::chrono::milliseconds(GetInt(config_values, "heartbeat_interval_ms", 150));
             config.rpc_deadline =
-                std::chrono::milliseconds(GetInt(kv, "rpc_deadline_ms", 500));
+                std::chrono::milliseconds(GetInt(config_values, "rpc_deadline_ms", 500));
 
-            config.kv_limits.max_key_bytes =
-                static_cast<std::size_t>(GetInt(kv, "kv_max_key_bytes", 256));
-            config.kv_limits.max_value_bytes =
-                static_cast<std::size_t>(GetInt(kv, "kv_max_value_bytes", 64 * 1024));
-            config.kv_limits.max_command_bytes =
-                static_cast<std::size_t>(GetInt(kv, "kv_max_command_bytes", 1024 * 1024));
+            config.proposal_limits.max_command_bytes =
+                static_cast<std::size_t>(GetInt(config_values, "proposal_max_command_bytes", 1024 * 1024));
 
             const std::filesystem::path config_dir =
                 config_path.has_parent_path() ? config_path.parent_path() : std::filesystem::current_path();
 
             const std::filesystem::path data_root =
-                GetString(kv, "data_root", (config_dir / "raft_data").string());
+                GetString(config_values, "data_root", (config_dir / "raft_data").string());
 
             config.data_dir = (data_root / ("node_" + std::to_string(node_id))).string();
             return config;
         }
 
-        snapshotConfig BuildSnapshotConfig(const std::map<std::string, std::string> &kv,
+        snapshotConfig BuildSnapshotConfig(const std::map<std::string, std::string> &config_values,
                                            int node_id,
                                            const std::filesystem::path &config_path)
         {
@@ -220,18 +216,18 @@ namespace raftdemo
                 config_path.has_parent_path() ? config_path.parent_path() : std::filesystem::current_path();
 
             const std::filesystem::path snapshot_root =
-                GetString(kv, "snapshot_root", (config_dir / "raft_snapshots").string());
+                GetString(config_values, "snapshot_root", (config_dir / "raft_snapshots").string());
 
             snapshotConfig config;
-            config.enabled = GetBool(kv, "snapshot_enabled", true);
+            config.enabled = GetBool(config_values, "snapshot_enabled", true);
             config.snapshot_dir = (snapshot_root / ("node_" + std::to_string(node_id))).string();
-            config.log_threshold = static_cast<std::uint64_t>(GetInt(kv, "snapshot_log_threshold", 30));
+            config.log_threshold = static_cast<std::uint64_t>(GetInt(config_values, "snapshot_log_threshold", 30));
             config.snapshot_interval =
-                std::chrono::milliseconds(GetInt(kv, "snapshot_interval_ms", 600000));
+                std::chrono::milliseconds(GetInt(config_values, "snapshot_interval_ms", 600000));
             config.max_snapshot_count =
-                static_cast<std::size_t>(GetInt(kv, "snapshot_max_count", 5));
-            config.load_on_startup = GetBool(kv, "snapshot_load_on_startup", true);
-            config.file_prefix = GetString(kv, "snapshot_file_prefix", "snapshot");
+                static_cast<std::size_t>(GetInt(config_values, "snapshot_max_count", 5));
+            config.load_on_startup = GetBool(config_values, "snapshot_load_on_startup", true);
+            config.file_prefix = GetString(config_values, "snapshot_file_prefix", "snapshot");
             return config;
         }
 
@@ -261,9 +257,9 @@ namespace raftdemo
             }
 
             Log("raft-node-main", "data_dir=", node_config.data_dir);
-            Log("raft-node-main", "kv_max_key_bytes=", node_config.kv_limits.max_key_bytes,
-                ", kv_max_value_bytes=", node_config.kv_limits.max_value_bytes,
-                ", kv_max_command_bytes=", node_config.kv_limits.max_command_bytes);
+            Log("raft-node-main",
+                "proposal_max_command_bytes=",
+                node_config.proposal_limits.max_command_bytes);
             Log("raft-node-main", "snapshot_enabled=", snapshot_config.enabled ? "true" : "false");
             Log("raft-node-main", "snapshot_dir=", snapshot_config.snapshot_dir);
         }
@@ -293,17 +289,17 @@ int main(int argc, char **argv)
             node_id_override = std::stoi(argv[2]);
         }
 
-        const auto kv = LoadKeyValueConfig(config_path);
-        const std::string log_level_text = GetString(kv, "log_level", "info");
+        const auto config_values = LoadKeyValueConfig(config_path);
+        const std::string log_level_text = GetString(config_values, "log_level", "info");
         LogLevel log_level = LogLevel::kInfo;
         if (!TryParseLogLevel(log_level_text, &log_level))
         {
             throw std::runtime_error("invalid log_level: " + log_level_text);
         }
         SetGlobalLogLevel(log_level);
-        NodeConfig node_config = BuildNodeConfig(kv, node_id_override, config_path);
+        NodeConfig node_config = BuildNodeConfig(config_values, node_id_override, config_path);
         snapshotConfig snapshot_config =
-            BuildSnapshotConfig(kv, node_config.node_id, config_path);
+            BuildSnapshotConfig(config_values, node_config.node_id, config_path);
 
         PrintConfigSummary(config_path, node_config, snapshot_config);
 
@@ -311,7 +307,7 @@ int main(int argc, char **argv)
         node->Start();
 
         const auto print_interval =
-            std::chrono::milliseconds(GetInt(kv, "describe_interval_ms", 5000));
+            std::chrono::milliseconds(GetInt(config_values, "describe_interval_ms", 5000));
 
         while (!g_stop.load())
         {

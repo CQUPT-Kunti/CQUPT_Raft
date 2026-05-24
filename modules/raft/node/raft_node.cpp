@@ -21,32 +21,10 @@
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
 #include "raft/state_machine/metadata_state_machine.h"
-#include "raft/state_machine/state_machine.h"
 #include "raft/storage/snapshot_storage.h"
 
 namespace raftdemo
 {
-  class CompositeKvMetadataStateMachine final : public IStateMachine
-  {
-  public:
-    using IStateMachine::Apply;
-
-    ApplyResult Apply(std::uint64_t index,
-                      std::uint64_t term,
-                      const std::string &command_data) override;
-    SnapshotResult SaveSnapshot(const std::string &file_path) const override;
-    SnapshotResult LoadSnapshot(const std::string &file_path) override;
-
-    bool GetValue(const std::string &key, std::string *value) const;
-    std::string DebugString() const;
-    StrongConsistencyMetadataStateMachine *MetadataStateMachine();
-    const StrongConsistencyMetadataStateMachine *MetadataStateMachine() const;
-
-  private:
-    KvStateMachine kv_;
-    StrongConsistencyMetadataStateMachine metadata_;
-  };
-
   namespace
   {
     struct SnapshotAppliedBoundary
@@ -166,49 +144,6 @@ namespace raftdemo
 
   } // namespace
 
-  ApplyResult CompositeKvMetadataStateMachine::Apply(std::uint64_t index,
-                                                     std::uint64_t term,
-                                                     const std::string &command_data)
-  {
-    Command command;
-    if (Command::Deserialize(command_data, &command) &&
-        command.type == CommandType::kMetadata)
-    {
-      return metadata_.Apply(index, term, command_data);
-    }
-    return kv_.Apply(index, term, command_data);
-  }
-
-  SnapshotResult CompositeKvMetadataStateMachine::SaveSnapshot(const std::string &file_path) const
-  {
-    return kv_.SaveSnapshot(file_path);
-  }
-
-  SnapshotResult CompositeKvMetadataStateMachine::LoadSnapshot(const std::string &file_path)
-  {
-    return kv_.LoadSnapshot(file_path);
-  }
-
-  bool CompositeKvMetadataStateMachine::GetValue(const std::string &key, std::string *value) const
-  {
-    return kv_.Get(key, value);
-  }
-
-  std::string CompositeKvMetadataStateMachine::DebugString() const
-  {
-    return kv_.DebugString();
-  }
-
-  StrongConsistencyMetadataStateMachine *CompositeKvMetadataStateMachine::MetadataStateMachine()
-  {
-    return &metadata_;
-  }
-
-  const StrongConsistencyMetadataStateMachine *CompositeKvMetadataStateMachine::MetadataStateMachine() const
-  {
-    return &metadata_;
-  }
-
   RaftNode::RaftNode(NodeConfig config)
       : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<MetadataStateMachine>())
   {
@@ -266,7 +201,7 @@ namespace raftdemo
       // snapshot + committed log replay, so do NOT restore runtime last_applied_
       // to persistent_state.last_applied here. If we did, startup would think
       // those entries were already applied and would skip replay, leaving an
-      // empty KV state after a pure-log restart.
+      // empty metadata state after a pure-log restart.
       commit_index_ = std::max<std::uint64_t>(persistent_state.commit_index,
                                              persistent_state.last_applied);
       last_applied_ = 0;
@@ -515,18 +450,6 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return running_.load();
   }
 
-  bool RaftNode::ValidateKey(const std::string &key, std::string *reason) const
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    return ValidateKeyUnlocked(key, reason);
-  }
-
-  bool RaftNode::ValidateValue(const std::string &value, std::string *reason) const
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    return ValidateValueUnlocked(value, reason);
-  }
-
   NodeStatusSnapshot RaftNode::GetStatusSnapshot() const
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -623,36 +546,7 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       oss << "]";
     }
 
-    if (const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-        kv_sm != nullptr)
-    {
-      oss << ", kv=" << kv_sm->DebugString();
-    }
-    else if (const auto *composite_sm =
-                 dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
-             composite_sm != nullptr)
-    {
-      oss << ", kv=" << composite_sm->DebugString();
-    }
-
     return oss.str();
-  }
-
-  bool RaftNode::DebugGetValue(const std::string &key, std::string *value) const
-  {
-    if (const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-        kv_sm != nullptr)
-    {
-      return kv_sm->Get(key, value);
-    }
-
-    const auto *composite_sm =
-        dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
-    if (composite_sm == nullptr)
-    {
-      return false;
-    }
-    return composite_sm->GetValue(key, value);
   }
 
   MetadataStateMachine *RaftNode::GetMetadataStateMachineV2()
@@ -1807,18 +1701,6 @@ void RaftNode::SendHeartbeats()
       return "append_entries";
     case RpcKind::kInstallSnapshot:
       return "install_snapshot";
-    case RpcKind::kKvPut:
-      return "kv_put";
-    case RpcKind::kKvDelete:
-      return "kv_delete";
-    case RpcKind::kKvGet:
-      return "kv_get";
-    case RpcKind::kKvStatus:
-      return "kv_status";
-    case RpcKind::kKvHealth:
-      return "kv_health";
-    case RpcKind::kKvMetrics:
-      return "kv_metrics";
     }
     return "unknown";
   }
@@ -1826,17 +1708,11 @@ void RaftNode::SendHeartbeats()
   std::vector<RaftNode::RpcMetricState> RaftNode::BuildRpcMetricStateTemplate()
   {
     std::vector<RpcMetricState> metrics;
-    metrics.reserve(9);
+    metrics.reserve(3);
     for (const RpcKind kind : {
              RpcKind::kRequestVote,
              RpcKind::kAppendEntries,
              RpcKind::kInstallSnapshot,
-             RpcKind::kKvPut,
-             RpcKind::kKvDelete,
-             RpcKind::kKvGet,
-             RpcKind::kKvStatus,
-             RpcKind::kKvHealth,
-             RpcKind::kKvMetrics,
          })
     {
       metrics.push_back(RpcMetricState{RpcKindName(kind), 0, 0, 0, 0});
@@ -2435,38 +2311,12 @@ void RaftNode::SendHeartbeats()
 
   StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine()
   {
-    if (auto *metadata_sm =
-            dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
-        metadata_sm != nullptr)
-    {
-      return metadata_sm;
-    }
-
-    auto *composite_sm =
-        dynamic_cast<CompositeKvMetadataStateMachine *>(state_machine_.get());
-    if (composite_sm == nullptr)
-    {
-      return nullptr;
-    }
-    return composite_sm->MetadataStateMachine();
+    return dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
   }
 
   const StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine() const
   {
-    if (const auto *metadata_sm =
-            dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
-        metadata_sm != nullptr)
-    {
-      return metadata_sm;
-    }
-
-    const auto *composite_sm =
-        dynamic_cast<const CompositeKvMetadataStateMachine *>(state_machine_.get());
-    if (composite_sm == nullptr)
-    {
-      return nullptr;
-    }
-    return composite_sm->MetadataStateMachine();
+    return dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
   }
 
   bool RaftNode::ValidateCommandUnlocked(const Command &command, std::string *reason) const
@@ -2480,17 +2330,6 @@ void RaftNode::SendHeartbeats()
       return false;
     }
 
-    if ((command.type == CommandType::kSet || command.type == CommandType::kDelete) &&
-        !ValidateKeyUnlocked(command.key, reason))
-    {
-      return false;
-    }
-
-    if (command.type == CommandType::kSet && !ValidateValueUnlocked(command.value, reason))
-    {
-      return false;
-    }
-
     const std::string serialized = command.Serialize();
     if (serialized.empty())
     {
@@ -2500,61 +2339,11 @@ void RaftNode::SendHeartbeats()
       }
       return false;
     }
-    if (serialized.size() > config_.kv_limits.max_command_bytes)
+    if (serialized.size() > config_.proposal_limits.max_command_bytes)
     {
       if (reason != nullptr)
       {
         *reason = "command size exceeds limit";
-      }
-      return false;
-    }
-    return true;
-  }
-
-  bool RaftNode::ValidateKeyUnlocked(const std::string &key, std::string *reason) const
-  {
-    if (key.empty())
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key must not be empty";
-      }
-      return false;
-    }
-    if (key.find('|') != std::string::npos)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key must not contain '|'";
-      }
-      return false;
-    }
-    if (key.size() > config_.kv_limits.max_key_bytes)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key size exceeds limit";
-      }
-      return false;
-    }
-    return true;
-  }
-
-  bool RaftNode::ValidateValueUnlocked(const std::string &value, std::string *reason) const
-  {
-    if (value.find('|') != std::string::npos)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "value must not contain '|'";
-      }
-      return false;
-    }
-    if (value.size() > config_.kv_limits.max_value_bytes)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "value size exceeds limit";
       }
       return false;
     }

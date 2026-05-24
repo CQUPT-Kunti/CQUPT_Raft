@@ -216,7 +216,6 @@ add_library(raft_core
   modules/raft/node/raft_node.cpp
   modules/raft/service/raft_service_impl.cpp
   modules/raft/service/metadata_service_impl.cpp
-  modules/raft/state_machine/state_machine.cpp
   modules/raft/state_machine/metadata_state_machine.cpp
   modules/raft/storage/raft_storage.cpp
   modules/raft/storage/snapshot_storage.cpp

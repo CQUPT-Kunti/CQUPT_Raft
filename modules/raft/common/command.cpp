@@ -1,6 +1,5 @@
 #include "raft/common/command.h"
 
-#include <cstddef>
 #include <stdexcept>
 #include <sstream>
 #include <vector>
@@ -29,10 +28,6 @@ namespace raftdemo
     {
         switch (type)
         {
-        case CommandType::kSet:
-            return !key.empty();
-        case CommandType::kDelete:
-            return !key.empty();
         case CommandType::kMetadata:
             return !metadata_payload.empty();
         case CommandType::kUnknown:
@@ -41,20 +36,10 @@ namespace raftdemo
         }
     }
 
-    // 这里自定义协议
     std::string Command::Serialize() const
     {
-        // 简单协议
-        // Set    -> "SET|key|value"
-        // Delete -> "DEL|key|"
-        // Meta   -> "META|payload_size|payload"
-
         switch (type)
         {
-        case CommandType::kSet:
-            return "SET|" + key + "|" + value;
-        case CommandType::kDelete:
-            return "DEL|" + key + "|";
         case CommandType::kMetadata:
             return "META|" + std::to_string(metadata_payload.size()) + "|" + metadata_payload;
         case CommandType::kUnknown:
@@ -76,33 +61,9 @@ namespace raftdemo
             return false;
         }
 
-        out->key.clear();
-        out->value.clear();
         out->metadata_payload.clear();
 
-        if (parts[0] == "SET")
-        {
-            if (parts.size() < 3)
-            {
-                return false;
-            }
-            out->type = CommandType::kSet;
-            out->key = parts[1];
-            out->value = parts[2];
-            return out->IsValid();
-        }
-        else if (parts[0] == "DEL")
-        {
-            if (parts.size() < 2)
-            {
-                return false;
-            }
-            out->type = CommandType::kDelete;
-            out->key = parts[1];
-            out->value.clear();
-            return out->IsValid();
-        }
-        else if (data.rfind("META|", 0) == 0)
+        if (data.rfind("META|", 0) == 0)
         {
             const std::size_t size_pos = data.find('|', 5);
             if (size_pos == std::string::npos)

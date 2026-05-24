@@ -49,3 +49,28 @@
   - `T059` 需要恢复或重建 `test.sh` 的分组分发能力，并显式把 `no-kv` 组收敛为 direct `NoKvSurfaceAudit` 与必要 metadata-only smoke。
 - 当前是否阻塞：
   - 不阻塞 `T055` 静态审计结论，但会直接影响 `T058/T059` 的设计边界与最终收口可信度。
+
+## T056 追加注意：生产 KV 符号删除后旧测试编译链路待 T057 收口
+
+- 来源任务：T056
+- 注意点：
+  - 本轮已从生产代码中删除 `CommandType::kSet/kDelete`、`KvStateMachine`、`state_machine.h/.cpp`、`DebugGetValue()`、`KvRequestLimits/kv_limits` 等 KV 残留。
+  - 当前 `tests/` 仍保留大量对这些旧生产符号的直接引用，包括：
+    - `tests/test_command.cpp`
+    - `tests/test_state_machine.cpp`
+    - `tests/snapshot_test.cpp`
+    - `tests/persistence_test.cpp`
+    - `tests/test_raft_snapshot_recovery.cpp`
+    - `tests/test_raft_snapshot_restart.cpp`
+    - `tests/test_raft_snapshot_catchup.cpp`
+    - `tests/test_raft_election.cpp`
+    - `tests/test_raft_commit_apply.cpp`
+    - `tests/raft_integration_test.cpp`
+    - `tests/metadata_state_machine_test.cpp`
+- 可能影响：
+  - 生产主路径 `raft_demo` / `raft_metadata_client` / `NoKvSurfaceAudit` 已可构建并执行，但旧测试目标在重新构建时，预期会因为缺失 `kSet/kDelete`、`DebugGetValue()`、`state_machine.h` 等符号而失败。
+- 建议处理：
+  - `T057` 需要统一迁移或退役上述测试与 helper，不能在多个测试文件里零散兼容旧符号。
+  - `T058` 需要在 `T057` 完成后把 `tests/test_state_machine.cpp`、`SetCommand/DeleteCommand` helper 等 tolerated blocker 升格为 strict fail。
+- 当前是否阻塞：
+  - 不阻塞 `T056` 生产代码清理完成，但会直接影响后续测试全量构建，必须由 `T057` 收口。
