@@ -33,3 +33,19 @@
   - 断言结果仍由持久化 `request_table` 给出一致 replay/conflict，不依赖节点内存缓存。
 - 当前是否阻塞：
   - 不阻塞 T032，但必须在恢复验收阶段验证。
+
+## T055 追加注意：no-KV 审计与脚本入口存在覆盖盲区
+
+- 来源任务：T055
+- 注意点：
+  - 当前 [test.sh](/home/yangjilei/Code/C++/CQUPT_Raft/test.sh:1) 已是 `T051` Linux 全量验证脚本，不再提供 `--group` 分发；`./test.sh --group no-kv` 实际不会成为轻量 no-KV 审计入口。
+  - 当前 [test.ps1](/home/yangjilei/Code/C++/CQUPT_Raft/test.ps1:37) 与 [CMakePresets.json](/home/yangjilei/Code/C++/CQUPT_Raft/CMakePresets.json:89) 仍保留 `CommandTest / KvStateMachineTest / TimerSchedulerTest / ThreadPoolTest` 的 Windows conservative fallback 子集表述。
+  - 当前 [tests/no_kv_surface_audit.cmake](/home/yangjilei/Code/C++/CQUPT_Raft/tests/no_kv_surface_audit.cmake:110) 仅把 `CommandType::kSet/kDelete`、`KvStateMachine`、`test_state_machine.cpp`、`SetCommand/DeleteCommand` helper 记为 tolerated blocker，并未提升为 strict fail；同时未覆盖 `CMakePresets.json`。
+- 可能影响：
+  - `T058` 若只强化 `tests/no_kv_surface_audit.cmake` 而不扩展到 preset / script 文案与入口，可能出现“审计 PASS，但 Windows fallback 和脚本入口仍宣传 KV residual”的假阴性。
+  - `T059` 若只修 `test.sh --group no-kv` 的命令分发，而不同时收口 `test.ps1` / `CMakePresets.json` 的 fallback 子集，最终 no-KV 主验证入口仍不一致。
+- 建议处理：
+  - `T058` 需要把 `CMakePresets.json`、`test.ps1` 中 `KvStateMachineTest` fallback 文案与 target/filter 一并纳入审计范围。
+  - `T059` 需要恢复或重建 `test.sh` 的分组分发能力，并显式把 `no-kv` 组收敛为 direct `NoKvSurfaceAudit` 与必要 metadata-only smoke。
+- 当前是否阻塞：
+  - 不阻塞 `T055` 静态审计结论，但会直接影响 `T058/T059` 的设计边界与最终收口可信度。
