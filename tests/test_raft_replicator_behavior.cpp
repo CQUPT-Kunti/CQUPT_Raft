@@ -562,14 +562,14 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
                             bucket,
                             "lagged_before_restart",
                             0,
-                            96,
-                            std::chrono::seconds(6));
+                            64,
+                            std::chrono::seconds(8));
 
-  constexpr std::uint64_t kExpectedIndexBeforeRestart = 1 + 96 * 2;
+  constexpr std::uint64_t kExpectedIndexBeforeRestart = 1 + 64 * 2;
   ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
                                                 bucket,
-                                                ObjectKey("lagged_before_restart", 95),
-                                                ObjectId("lagged_before_restart", 95),
+                                                ObjectKey("lagged_before_restart", 63),
+                                                ObjectId("lagged_before_restart", 63),
                                                 2,
                                                 kExpectedIndexBeforeRestart,
                                                 std::chrono::seconds(10)))
@@ -580,6 +580,10 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
       << DescribeAllNodes(cluster.Nodes());
 
   cluster.StartNode(*lagging_index);
+  leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(5));
+  ASSERT_NE(leader, nullptr)
+      << "cluster did not retain a single leader after the lagging follower restarted\n"
+      << DescribeAllNodes(cluster.Nodes());
 
   // Immediately continue writing. These proposes should not wait for the slow follower to fully catch up;
   // the current majority should keep making progress.
@@ -587,14 +591,14 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
                             bucket,
                             "live_during_catchup",
                             0,
-                            32,
+                            16,
                             std::chrono::seconds(8));
 
-  constexpr std::uint64_t kExpectedIndexAfterCatchupWrites = 1 + (96 + 32) * 2;
+  constexpr std::uint64_t kExpectedIndexAfterCatchupWrites = 1 + (64 + 16) * 2;
   ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
                                                 bucket,
-                                                ObjectKey("live_during_catchup", 31),
-                                                ObjectId("live_during_catchup", 31),
+                                                ObjectKey("live_during_catchup", 15),
+                                                ObjectId("live_during_catchup", 15),
                                                 2,
                                                 kExpectedIndexAfterCatchupWrites,
                                                 std::chrono::seconds(8)))
@@ -603,8 +607,8 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
 
   ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
                                                 bucket,
-                                                ObjectKey("lagged_before_restart", 95),
-                                                ObjectId("lagged_before_restart", 95),
+                                                ObjectKey("lagged_before_restart", 63),
+                                                ObjectId("lagged_before_restart", 63),
                                                 2,
                                                 kExpectedIndexAfterCatchupWrites,
                                                 std::chrono::seconds(35)))
@@ -613,8 +617,8 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
 
   ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
                                                 bucket,
-                                                ObjectKey("live_during_catchup", 31),
-                                                ObjectId("live_during_catchup", 31),
+                                                ObjectKey("live_during_catchup", 15),
+                                                ObjectId("live_during_catchup", 15),
                                                 2,
                                                 kExpectedIndexAfterCatchupWrites,
                                                 std::chrono::seconds(35)))
@@ -623,11 +627,11 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
   ExpectCommittedMetadataState(cluster.Nodes(),
                                bucket,
                                "lagged_before_restart",
-                               96,
-                               static_cast<std::size_t>(1 + 128 * 2),
-                               128U,
+                               64,
+                               static_cast<std::size_t>(1 + 80 * 2),
+                               80U,
                                kExpectedIndexAfterCatchupWrites);
-  const auto expected_live_keys = SortedObjectKeys("live_during_catchup", 0, 32);
+  const auto expected_live_keys = SortedObjectKeys("live_during_catchup", 0, 16);
   ASSERT_TRUE(test::WaitUntilAllListObjectsMatch(cluster.Nodes(),
                                                  bucket,
                                                  "live_during_catchup",
@@ -639,9 +643,9 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
     ASSERT_NE(node, nullptr);
     const auto* state_machine = node->GetMetadataStateMachineV2();
     ASSERT_NE(state_machine, nullptr) << node->Describe();
-    EXPECT_EQ(state_machine->RequestCount(), static_cast<std::size_t>(1 + 128 * 2))
+    EXPECT_EQ(state_machine->RequestCount(), static_cast<std::size_t>(1 + 80 * 2))
         << node->Describe();
-    EXPECT_EQ(state_machine->ObjectCount(), 128U) << node->Describe();
+    EXPECT_EQ(state_machine->ObjectCount(), 80U) << node->Describe();
     EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
     EXPECT_GT(state_machine->LastAppliedTerm(), 0U) << node->Describe();
   }

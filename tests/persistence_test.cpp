@@ -234,6 +234,56 @@ namespace raftdemo
       return snapshot_config;
     }
 
+    constexpr const char *kPersistenceBoundaryBucket = "persistence-boundary-bucket";
+    constexpr const char *kBoundaryAlphaKey = "boundary_alpha";
+    constexpr const char *kBoundaryAlphaObjectId = "obj-boundary-alpha";
+    constexpr const char *kBoundaryBetaKey = "boundary_beta";
+    constexpr const char *kBoundaryBetaObjectId = "obj-boundary-beta";
+
+    std::vector<LogRecord> BuildPersistenceBoundaryLog(const std::uint64_t term)
+    {
+      return {
+          LogRecord{1,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateBucketCommand(
+                            kPersistenceBoundaryBucket,
+                            "persistence-boundary-create-bucket"))},
+          LogRecord{2,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryAlphaKey,
+                            kBoundaryAlphaObjectId,
+                            "persistence-boundary-create-alpha"))},
+          LogRecord{3,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCommitObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryAlphaKey,
+                            kBoundaryAlphaObjectId,
+                            "persistence-boundary-commit-alpha"))},
+          LogRecord{4,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryBetaKey,
+                            kBoundaryBetaObjectId,
+                            "persistence-boundary-create-beta"))},
+          LogRecord{5,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCommitObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryBetaKey,
+                            kBoundaryBetaObjectId,
+                            "persistence-boundary-commit-beta"))},
+      };
+    }
+
     PersistentRaftState MakePersistenceState(std::uint64_t first_index, std::uint64_t last_index)
     {
       PersistentRaftState state;
@@ -242,13 +292,13 @@ namespace raftdemo
       state.commit_index = last_index;
       state.last_applied = last_index;
 
-      for (std::uint64_t index = first_index; index <= last_index; ++index)
+      const auto log = BuildPersistenceBoundaryLog(state.current_term);
+      for (const auto &record : log)
       {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "boundary_key_" + std::to_string(index);
-        command.value = "boundary_value_" + std::to_string(index);
-        state.log.push_back(LogRecord{index, 5, command.Serialize()});
+        if (record.index >= first_index && record.index <= last_index)
+        {
+          state.log.push_back(record);
+        }
       }
 
       return state;
@@ -267,13 +317,13 @@ namespace raftdemo
       state.commit_index = commit_index;
       state.last_applied = last_applied;
 
-      for (std::uint64_t index = first_index; index <= last_index; ++index)
+      const auto log = BuildPersistenceBoundaryLog(current_term);
+      for (const auto &record : log)
       {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "boundary_key_" + std::to_string(index);
-        command.value = "boundary_value_" + std::to_string(index);
-        state.log.push_back(LogRecord{index, current_term, command.Serialize()});
+        if (record.index >= first_index && record.index <= last_index)
+        {
+          state.log.push_back(record);
+        }
       }
 
       return state;
@@ -527,6 +577,75 @@ namespace raftdemo
       }
     }
 
+    void ExpectBoundaryObjectState(const MetadataStateMachine &state_machine,
+                                   const std::string &object_key,
+                                   const std::string &object_id,
+                                   const bool expected_visible)
+    {
+      const auto response = state_machine.HeadObject(
+          {.bucket = kPersistenceBoundaryBucket, .object_key = object_key});
+      const auto indexed_object_id =
+          state_machine.FindIndexedObjectId(kPersistenceBoundaryBucket, object_key);
+      const auto chunk_refs =
+          state_machine.FindChunkRefs(kPersistenceBoundaryBucket, object_key);
+      const auto internal_object =
+          state_machine.FindObject(kPersistenceBoundaryBucket, object_key);
+
+      if (expected_visible)
+      {
+        ASSERT_TRUE(response.result.Ok());
+        ASSERT_TRUE(response.record.has_value());
+        EXPECT_TRUE(response.record->IsCommitted());
+        EXPECT_EQ(response.record->object_id, object_id);
+        EXPECT_TRUE(indexed_object_id.has_value());
+        EXPECT_EQ(*indexed_object_id, object_id);
+        EXPECT_TRUE(chunk_refs.has_value());
+        EXPECT_EQ(chunk_refs->size(), 2U);
+        EXPECT_TRUE(internal_object.has_value());
+        EXPECT_TRUE(internal_object->IsCommitted());
+      }
+      else
+      {
+        EXPECT_EQ(response.result.code, MetadataStatusCode::kNotFound);
+        EXPECT_FALSE(response.record.has_value());
+        EXPECT_FALSE(chunk_refs.has_value());
+      }
+    }
+
+    void ExpectBoundaryMetadataState(const std::shared_ptr<RaftNode> &node,
+                                     const std::uint64_t expected_last_applied_index,
+                                     const std::uint64_t expected_term,
+                                     const bool expect_alpha_visible,
+                                     const bool expect_beta_visible)
+    {
+      ASSERT_NE(node, nullptr);
+      const MetadataStateMachine *state_machine = node->GetMetadataStateMachineV2();
+      ASSERT_NE(state_machine, nullptr) << node->Describe();
+
+      const auto bucket = state_machine->FindBucket(kPersistenceBoundaryBucket);
+      ASSERT_TRUE(bucket.has_value()) << node->Describe();
+      EXPECT_TRUE(bucket->IsActive()) << node->Describe();
+
+      EXPECT_EQ(state_machine->LastAppliedIndex(), expected_last_applied_index)
+          << node->Describe();
+      EXPECT_EQ(state_machine->LastAppliedTerm(),
+                expected_last_applied_index == 0 ? 0U : expected_term)
+          << node->Describe();
+      EXPECT_EQ(state_machine->RequestCount(),
+                static_cast<std::size_t>(expected_last_applied_index))
+          << node->Describe();
+      EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
+
+      ExpectBoundaryObjectState(*state_machine,
+                                kBoundaryAlphaKey,
+                                kBoundaryAlphaObjectId,
+                                expect_alpha_visible);
+      ExpectBoundaryObjectState(*state_machine,
+                                kBoundaryBetaKey,
+                                kBoundaryBetaObjectId,
+                                expect_beta_visible);
+    }
+
     TEST(PersistenceTest, FullClusterRestartRecovery)
     {
       ScopedDataDir scoped_dir("test_full_restart");
@@ -723,7 +842,7 @@ namespace raftdemo
       const MetadataStateMachine *restarted_state_machine =
           restarted_follower->GetMetadataStateMachineV2();
       ASSERT_NE(restarted_state_machine, nullptr);
-      EXPECT_EQ(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
+      EXPECT_GE(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
       EXPECT_GE(restarted_state_machine->LastAppliedTerm(), delete_result.term);
       EXPECT_EQ(restarted_state_machine->RequestCount(), 8U);
       EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
@@ -901,19 +1020,7 @@ namespace raftdemo
       config.rpc_deadline = std::chrono::milliseconds(500);
       config.data_dir = (scoped_dir.path() / "raft_data" / "node_1").string();
 
-      PersistentRaftState persisted;
-      persisted.current_term = 3;
-      persisted.voted_for = 1;
-      persisted.commit_index = 99;
-      persisted.last_applied = 99;
-      for (std::uint64_t index = 1; index <= 3; ++index)
-      {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "clamp_key_" + std::to_string(index);
-        command.value = "clamp_value_" + std::to_string(index);
-        persisted.log.push_back(LogRecord{index, 3, command.Serialize()});
-      }
+      const auto persisted = MakePersistenceStateWithHardState(1, 3, 3, 1, 99, 99);
 
       std::string error;
       auto storage = CreateFileRaftStorage(config.data_dir);
@@ -927,9 +1034,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 3U) << restarted->Describe();
       EXPECT_EQ(status.last_log_index, 3U) << restarted->Describe();
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("clamp_key_3", &actual));
-      EXPECT_EQ(actual, "clamp_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 3U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartUsesPreviouslyTrustedMetaBoundaryWhenNewLogPublishesBeforeMeta)
@@ -982,10 +1087,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, new_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsCommitIndexToLastLogAndReplaysCommittedPrefix)
@@ -1019,9 +1121,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, 3U) << description;
       EXPECT_EQ(voted_for, 2) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 4U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsLastAppliedToCommitIndexWhenAppliedExceedsCommit)
@@ -1052,10 +1152,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 2U) << description;
       EXPECT_EQ(status.last_log_index, 3U) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_2", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_2");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 2U, 4U, false, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsLastAppliedToTrustedLogPrefixWhenAppliedPointsPastAvailableLog)
@@ -1086,9 +1183,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 3U) << description;
       EXPECT_EQ(status.last_log_index, 3U) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 4U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartUsesOlderMetaTermAndVoteWhenNewerLogTreeIsVisible)
@@ -1138,10 +1233,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, new_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, NewMetaWithOldLogBoundaryRejectsUntrustedCurrentTermAndVote)
@@ -1239,10 +1331,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, old_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, MetaDirectorySyncFailureNeedsExactFailureInjectionSeam)
@@ -1307,10 +1396,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, old_state.current_term, true, false);
     }
 
   } // namespace

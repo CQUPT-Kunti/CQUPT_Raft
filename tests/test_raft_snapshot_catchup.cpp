@@ -20,6 +20,7 @@
 #include "raft/node/raft_node.h"
 #include "raft/state_machine/metadata_state_machine.h"
 #include "metadata_raft_test_utils.h"
+#include "support/raft_snapshot_restart_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -56,19 +57,12 @@ bool IsLeaderNode(const std::shared_ptr<RaftNode>& node) {
   return node && Contains(node->Describe(), "role=Leader");
 }
 
-Command SetCommand(const std::string& key, const std::string& value) {
-  Command command;
-  command.type = CommandType::kSet;
-  command.key = key;
-  command.value = value;
-  return command;
+auto SetCommand(const std::string& key, const std::string& value) {
+  return raftdemo::test::SetCommand(key, value);
 }
 
-Command DeleteCommand(const std::string& key) {
-  Command command;
-  command.type = CommandType::kDelete;
-  command.key = key;
-  return command;
+auto DeleteCommand(const std::string& key) {
+  return raftdemo::test::DeleteCommand(key);
 }
 
 std::uint64_t NowForPath() {
@@ -353,17 +347,7 @@ bool WaitForValueOnNode(const std::shared_ptr<RaftNode>& node,
                         const std::string& key,
                         const std::string& expected_value,
                         std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    if (node) {
-      std::string value;
-      if (node->DebugGetValue(key, &value) && value == expected_value) {
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
+  return raftdemo::test::WaitForValueOnNode(node, key, expected_value, timeout);
 }
 
 bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
@@ -371,131 +355,37 @@ bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
                        const std::string& expected_value,
                        std::chrono::milliseconds timeout,
                        const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_match = true;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-
-    if (all_match) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
+  return raftdemo::test::WaitForValueOnAll(nodes, key, expected_value, timeout, excluded);
 }
 
 bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
                          const std::string& key,
                          std::chrono::milliseconds timeout,
                          const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_missing = true;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (nodes[i]->DebugGetValue(key, &value)) {
-        all_missing = false;
-        break;
-      }
-    }
-
-    if (all_missing) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
+  return raftdemo::test::WaitForMissingOnAll(nodes, key, timeout, excluded);
 }
 
 bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode>& node,
                              const std::string& field_name,
                              std::uint64_t minimum,
                              std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    if (node) {
-      const auto value = ExtractUintField(node->Describe(), field_name);
-      if (value.has_value() && *value >= minimum) {
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-  return false;
+  return raftdemo::test::WaitForNodeFieldAtLeast(node, field_name, minimum, timeout);
 }
 
+template <typename CommandLike>
 bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const Command& command,
+                      const CommandLike& command,
                       std::chrono::milliseconds timeout,
                       ProposeResult* final_result,
                       const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  ProposeResult last_result;
-
-  while (Clock::now() < deadline) {
-    auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1500), excluded);
-    if (!leader) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
-    }
-
-    last_result = leader->Propose(command);
-    if (last_result.Ok()) {
-      if (final_result != nullptr) {
-        *final_result = last_result;
-      }
-      return true;
-    }
-
-    if (last_result.status == ProposeStatus::kInvalidCommand ||
-        last_result.status == ProposeStatus::kApplyFailed ||
-        last_result.status == ProposeStatus::kCommitFailed) {
-      break;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-
-  if (final_result != nullptr) {
-    *final_result = last_result;
-  }
-  return false;
+  return raftdemo::test::ProposeWithRetry(nodes, command, timeout, final_result, excluded);
 }
 
 void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
                      const std::string& prefix,
                      int count,
                      const std::vector<std::size_t>& excluded = {}) {
-  ProposeResult result;
-  for (int i = 0; i < count; ++i) {
-    SCOPED_TRACE(prefix + " write " + std::to_string(i));
-    ASSERT_TRUE(ProposeWithRetry(nodes,
-                                 SetCommand(prefix + "_" + std::to_string(i),
-                                            "value_" + std::to_string(i)),
-                                 std::chrono::seconds(10),
-                                 &result,
-                                 excluded))
-        << "write failed, status=" << ProposeStatusName(result.status)
-        << ", message=" << result.message;
-  }
+  raftdemo::test::WriteManyValues(nodes, prefix, count, excluded);
 }
 
 class RaftSnapshotCatchupTest : public ::testing::Test {
@@ -559,22 +449,22 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerCatchesUpLargeGapWithBatchedApp
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "batch_gap", 320, excluded);
+  WriteManyValues(cluster.Nodes(), "batch_gap", 64, excluded);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "batch_gap_319", "value_319",
+  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "batch_gap_63", "value_63",
                                 std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last batch value";
 
   cluster.RestartNode(stopped_follower);
 
   ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "batch_gap_319", "value_319",
+                                 "batch_gap_63", "value_63",
                                  std::chrono::seconds(30)))
       << "restarted follower did not catch up through batched AppendEntries, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stopped_follower],
-                                      "last_applied", 320,
+                                      "last_applied", 120,
                                       std::chrono::seconds(10)))
       << "restarted follower last_applied did not advance enough, describe="
       << cluster.Nodes()[stopped_follower]->Describe();

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -21,13 +22,17 @@
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/storage/snapshot_storage.h"
+#include "support/metadata_test_utils.h"
 
 namespace raftdemo::test
 {
     using Clock = std::chrono::steady_clock;
     inline constexpr const char *kSnapshotStorageFailpointEnv =
         "RAFT_TEST_SNAPSHOT_STORAGE_FAILPOINT";
+    inline constexpr const char *kSyntheticMetadataBucket =
+        "__raft_test_metadata_bridge_bucket__";
 
     inline std::string ProposeStatusName(const ProposeStatus status)
     {
@@ -100,21 +105,371 @@ namespace raftdemo::test
         return oss.str();
     }
 
-    inline Command SetCommand(const std::string &key, const std::string &value)
+    struct SyntheticMetadataCommand
     {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = key;
-        command.value = value;
-        return command;
+        enum class Operation
+        {
+            kSet,
+            kDelete,
+        };
+
+        Operation operation{Operation::kSet};
+        std::string key;
+        std::string value;
+    };
+
+    inline SyntheticMetadataCommand SetCommand(const std::string &key, const std::string &value)
+    {
+        return SyntheticMetadataCommand{
+            .operation = SyntheticMetadataCommand::Operation::kSet,
+            .key = key,
+            .value = value,
+        };
     }
 
-    inline Command DeleteCommand(const std::string &key)
+    inline SyntheticMetadataCommand DeleteCommand(const std::string &key)
     {
-        Command command;
-        command.type = CommandType::kDelete;
-        command.key = key;
-        return command;
+        return SyntheticMetadataCommand{
+            .operation = SyntheticMetadataCommand::Operation::kDelete,
+            .key = key,
+            .value = "",
+        };
+    }
+
+    inline std::string HexEncode(std::string_view value)
+    {
+        static constexpr char kHexDigits[] = "0123456789abcdef";
+        std::string encoded;
+        encoded.reserve(value.size() * 2);
+        for (const unsigned char ch : value)
+        {
+            encoded.push_back(kHexDigits[(ch >> 4U) & 0x0FU]);
+            encoded.push_back(kHexDigits[ch & 0x0FU]);
+        }
+        return encoded;
+    }
+
+    inline bool HexDecode(std::string_view encoded, std::string *value)
+    {
+        if (value == nullptr || encoded.size() % 2 != 0)
+        {
+            return false;
+        }
+
+        auto decode_nibble = [](const char ch) -> int
+        {
+            if (ch >= '0' && ch <= '9')
+            {
+                return ch - '0';
+            }
+            if (ch >= 'a' && ch <= 'f')
+            {
+                return 10 + ch - 'a';
+            }
+            if (ch >= 'A' && ch <= 'F')
+            {
+                return 10 + ch - 'A';
+            }
+            return -1;
+        };
+
+        std::string decoded;
+        decoded.reserve(encoded.size() / 2);
+        for (std::size_t index = 0; index < encoded.size(); index += 2)
+        {
+            const int high = decode_nibble(encoded[index]);
+            const int low = decode_nibble(encoded[index + 1]);
+            if (high < 0 || low < 0)
+            {
+                return false;
+            }
+            decoded.push_back(static_cast<char>((high << 4U) | low));
+        }
+
+        *value = std::move(decoded);
+        return true;
+    }
+
+    inline std::string SyntheticObjectIdForValue(const std::string &key,
+                                                 const std::string &value)
+    {
+        return "kvbridge:" + HexEncode(key) + ":" + HexEncode(value);
+    }
+
+    inline bool DecodeSyntheticObjectId(const std::string &object_id,
+                                        std::string *key,
+                                        std::string *value)
+    {
+        constexpr std::string_view kPrefix = "kvbridge:";
+        if (!object_id.starts_with(kPrefix))
+        {
+            return false;
+        }
+
+        const std::size_t separator =
+            object_id.find(':', static_cast<std::size_t>(kPrefix.size()));
+        if (separator == std::string::npos)
+        {
+            return false;
+        }
+
+        return HexDecode(std::string_view(object_id).substr(kPrefix.size(),
+                                                            separator - kPrefix.size()),
+                         key) &&
+               HexDecode(std::string_view(object_id).substr(separator + 1U), value);
+    }
+
+    inline std::string SyntheticRequestId(const std::string &phase,
+                                          const std::string &key,
+                                          const std::string &value = "")
+    {
+        return "kvbridge:" + phase + ":" + HexEncode(key) + ":" + HexEncode(value);
+    }
+
+    inline const MetadataStateMachine *GetMetadataStateMachine(
+        const std::shared_ptr<RaftNode> &node)
+    {
+        return node == nullptr ? nullptr : node->GetMetadataStateMachineV2();
+    }
+
+    inline ProposeResult ProposeMetadataBridgeCommand(const std::shared_ptr<RaftNode> &leader,
+                                                      const MetadataCommand &command)
+    {
+        return leader->ProposeMetadata(raftdemo::SerializeMetadataCommand(command));
+    }
+
+    inline bool EnsureSyntheticBucket(const std::shared_ptr<RaftNode> &leader,
+                                      ProposeResult *last_result)
+    {
+        const MetadataStateMachine *state_machine = GetMetadataStateMachine(leader);
+        if (state_machine == nullptr)
+        {
+            if (last_result != nullptr)
+            {
+                last_result->status = ProposeStatus::kApplyFailed;
+                last_result->message = "metadata state machine unavailable";
+            }
+            return false;
+        }
+
+        const auto bucket = state_machine->FindBucket(kSyntheticMetadataBucket);
+        if (bucket.has_value() && bucket->IsActive())
+        {
+            return true;
+        }
+
+        const ProposeResult result = ProposeMetadataBridgeCommand(
+            leader,
+            MakeCreateBucketCommand(kSyntheticMetadataBucket,
+                                    SyntheticRequestId("bucket", kSyntheticMetadataBucket)));
+        if (last_result != nullptr)
+        {
+            *last_result = result;
+        }
+        return result.Ok();
+    }
+
+    inline bool SyntheticStateMatchesValue(const MetadataStateMachine &state_machine,
+                                           const std::string &key,
+                                           const std::string &expected_value)
+    {
+        const auto response = state_machine.HeadObject(
+            {.bucket = kSyntheticMetadataBucket, .object_key = key});
+        if (!response.result.Ok() || !response.record.has_value() ||
+            !response.record->IsCommitted())
+        {
+            return false;
+        }
+
+        const auto indexed_object_id =
+            state_machine.FindIndexedObjectId(kSyntheticMetadataBucket, key);
+        const auto chunks = state_machine.FindChunkRefs(kSyntheticMetadataBucket, key);
+        if (!indexed_object_id.has_value() || *indexed_object_id != response.record->object_id ||
+            !chunks.has_value() || chunks->empty())
+        {
+            return false;
+        }
+
+        std::string decoded_key;
+        std::string decoded_value;
+        return DecodeSyntheticObjectId(response.record->object_id,
+                                       &decoded_key,
+                                       &decoded_value) &&
+               decoded_key == key &&
+               decoded_value == expected_value;
+    }
+
+    inline bool SyntheticStateMatchesMissing(const MetadataStateMachine &state_machine,
+                                             const std::string &key)
+    {
+        const auto response = state_machine.HeadObject(
+            {.bucket = kSyntheticMetadataBucket, .object_key = key});
+        if (response.result.code != MetadataStatusCode::kNotFound ||
+            response.record.has_value())
+        {
+            return false;
+        }
+
+        if (state_machine.FindIndexedObjectId(kSyntheticMetadataBucket, key).has_value() ||
+            state_machine.FindChunkRefs(kSyntheticMetadataBucket, key).has_value())
+        {
+            return false;
+        }
+
+        const auto object = state_machine.FindObject(kSyntheticMetadataBucket, key);
+        return !object.has_value() || object->IsDeleted();
+    }
+
+    inline bool ApplySyntheticMetadataCommand(const std::shared_ptr<RaftNode> &leader,
+                                              const SyntheticMetadataCommand &command,
+                                              ProposeResult *last_result)
+    {
+        if (!EnsureSyntheticBucket(leader, last_result))
+        {
+            return false;
+        }
+
+        const MetadataStateMachine *state_machine = GetMetadataStateMachine(leader);
+        if (state_machine == nullptr)
+        {
+            if (last_result != nullptr)
+            {
+                last_result->status = ProposeStatus::kApplyFailed;
+                last_result->message = "metadata state machine unavailable";
+            }
+            return false;
+        }
+
+        const std::string desired_object_id =
+            SyntheticObjectIdForValue(command.key, command.value);
+        const auto indexed_object_id =
+            state_machine->FindIndexedObjectId(kSyntheticMetadataBucket, command.key);
+        const auto current_object =
+            state_machine->FindObject(kSyntheticMetadataBucket, command.key);
+
+        if (command.operation == SyntheticMetadataCommand::Operation::kDelete)
+        {
+            if (!indexed_object_id.has_value())
+            {
+                if (last_result != nullptr)
+                {
+                    last_result->status = ProposeStatus::kOk;
+                    last_result->term = state_machine->LastAppliedTerm();
+                    last_result->log_index = state_machine->LastAppliedIndex();
+                    last_result->message = "already missing";
+                }
+                return true;
+            }
+
+            const ProposeResult result = ProposeMetadataBridgeCommand(
+                leader,
+                MakeDeleteObjectCommand(kSyntheticMetadataBucket,
+                                        command.key,
+                                        *indexed_object_id,
+                                        SyntheticRequestId("delete",
+                                                           command.key,
+                                                           *indexed_object_id)));
+            if (last_result != nullptr)
+            {
+                *last_result = result;
+            }
+            return result.Ok();
+        }
+
+        if (SyntheticStateMatchesValue(*state_machine, command.key, command.value))
+        {
+            if (last_result != nullptr)
+            {
+                last_result->status = ProposeStatus::kOk;
+                last_result->term = state_machine->LastAppliedTerm();
+                last_result->log_index = state_machine->LastAppliedIndex();
+                last_result->message = "already committed";
+            }
+            return true;
+        }
+
+        if (indexed_object_id.has_value() && *indexed_object_id != desired_object_id)
+        {
+            const ProposeResult delete_result = ProposeMetadataBridgeCommand(
+                leader,
+                MakeDeleteObjectCommand(kSyntheticMetadataBucket,
+                                        command.key,
+                                        *indexed_object_id,
+                                        SyntheticRequestId("replace-delete",
+                                                           command.key,
+                                                           *indexed_object_id)));
+            if (last_result != nullptr)
+            {
+                *last_result = delete_result;
+            }
+            if (!delete_result.Ok())
+            {
+                return false;
+            }
+        }
+
+        state_machine = GetMetadataStateMachine(leader);
+        if (state_machine == nullptr)
+        {
+            if (last_result != nullptr)
+            {
+                last_result->status = ProposeStatus::kApplyFailed;
+                last_result->message = "metadata state machine unavailable after delete";
+            }
+            return false;
+        }
+
+        const auto refreshed_object =
+            state_machine->FindObject(kSyntheticMetadataBucket, command.key);
+        const bool needs_create =
+            !refreshed_object.has_value() || refreshed_object->object_id != desired_object_id;
+        if (needs_create)
+        {
+            const ProposeResult create_result = ProposeMetadataBridgeCommand(
+                leader,
+                MakeCreateObjectCommand(kSyntheticMetadataBucket,
+                                        command.key,
+                                        desired_object_id,
+                                        SyntheticRequestId("create",
+                                                           command.key,
+                                                           command.value)));
+            if (last_result != nullptr)
+            {
+                *last_result = create_result;
+            }
+            if (!create_result.Ok())
+            {
+                return false;
+            }
+        }
+
+        state_machine = GetMetadataStateMachine(leader);
+        if (state_machine != nullptr &&
+            SyntheticStateMatchesValue(*state_machine, command.key, command.value))
+        {
+            if (last_result != nullptr)
+            {
+                last_result->status = ProposeStatus::kOk;
+                last_result->term = state_machine->LastAppliedTerm();
+                last_result->log_index = state_machine->LastAppliedIndex();
+                last_result->message = "committed";
+            }
+            return true;
+        }
+
+        const ProposeResult commit_result = ProposeMetadataBridgeCommand(
+            leader,
+            MakeCommitObjectCommand(kSyntheticMetadataBucket,
+                                    command.key,
+                                    desired_object_id,
+                                    SyntheticRequestId("commit",
+                                                       command.key,
+                                                       command.value)));
+        if (last_result != nullptr)
+        {
+            *last_result = commit_result;
+        }
+        return commit_result.Ok();
     }
 
     inline std::uint64_t NowForPath()
@@ -695,26 +1050,21 @@ namespace raftdemo::test
         {
             if (node)
             {
-                std::string value;
-                if (node->DebugGetValue(key, &value) && value == expected_value)
+                const MetadataStateMachine *state_machine = GetMetadataStateMachine(node);
+                if (state_machine != nullptr &&
+                    SyntheticStateMatchesValue(*state_machine, key, expected_value))
                 {
                     if (diagnostics != nullptr)
                     {
-                        *diagnostics = "value observed, key=" + key + ", value=" + value +
+                        *diagnostics = "value observed, key=" + key + ", value=" + expected_value +
                                        ", describe=" + node->Describe();
                     }
                     return true;
                 }
-                if (node->DebugGetValue(key, &value))
-                {
-                    saw_value = true;
-                    last_value = value;
-                }
-                else
-                {
-                    saw_value = false;
-                    last_value.clear();
-                }
+                saw_value = state_machine != nullptr &&
+                            state_machine->FindIndexedObjectId(kSyntheticMetadataBucket, key)
+                                .has_value();
+                last_value = saw_value ? "<present-but-unexpected>" : "<missing>";
                 last_describe = node->Describe();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -750,26 +1100,21 @@ namespace raftdemo::test
                     continue;
                 }
 
-                std::string value;
                 if (cluster_values.tellp() > 0)
                 {
                     cluster_values << " | ";
                 }
                 cluster_values << "node[" << i << "]=";
-                if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value)
+                const MetadataStateMachine *state_machine = GetMetadataStateMachine(nodes[i]);
+                if (state_machine == nullptr ||
+                    !SyntheticStateMatchesValue(*state_machine, key, expected_value))
                 {
-                    if (nodes[i]->DebugGetValue(key, &value))
-                    {
-                        cluster_values << value;
-                    }
-                    else
-                    {
-                        cluster_values << "<missing>";
-                    }
+                    cluster_values << (state_machine == nullptr ? "<no-metadata-sm>"
+                                                                : "<missing-or-unexpected>");
                     all_match = false;
                     break;
                 }
-                cluster_values << value;
+                cluster_values << expected_value;
             }
 
             last_cluster_state = cluster_values.str();
@@ -817,15 +1162,16 @@ namespace raftdemo::test
                     continue;
                 }
 
-                std::string value;
                 if (cluster_values.tellp() > 0)
                 {
                     cluster_values << " | ";
                 }
                 cluster_values << "node[" << i << "]=";
-                if (nodes[i]->DebugGetValue(key, &value))
+                const MetadataStateMachine *state_machine = GetMetadataStateMachine(nodes[i]);
+                if (state_machine == nullptr ||
+                    !SyntheticStateMatchesMissing(*state_machine, key))
                 {
-                    cluster_values << value;
+                    cluster_values << (state_machine == nullptr ? "<no-metadata-sm>" : "<present>");
                     all_missing = false;
                     break;
                 }
@@ -973,7 +1319,7 @@ namespace raftdemo::test
     }
 
     inline bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                 const Command &command,
+                                 const SyntheticMetadataCommand &command,
                                  const std::chrono::milliseconds timeout,
                                  ProposeResult *final_result,
                                  const std::vector<std::size_t> &excluded = {},
@@ -985,26 +1331,33 @@ namespace raftdemo::test
         std::string last_leader_describe = "none";
         std::string last_cluster_state = DescribeCluster(nodes, excluded);
         int attempts = 0;
-        int no_stable_leader_rounds = 0;
+        int no_leader_rounds = 0;
 
         while (Clock::now() < deadline)
         {
-            auto stable_leader =
-                WaitForStableLeader(nodes, std::chrono::milliseconds(1500), excluded);
-            if (!stable_leader.has_value())
+            auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(500), excluded);
+            if (leader == nullptr)
             {
-                ++no_stable_leader_rounds;
+                ++no_leader_rounds;
                 last_cluster_state = DescribeCluster(nodes, excluded);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
 
             ++attempts;
-            last_leader_index = stable_leader->leader_index;
-            last_leader_describe = stable_leader->leader->Describe();
+            last_leader_index = FindNodeIndex(nodes, leader);
+            last_leader_describe = leader->Describe();
             last_cluster_state = DescribeCluster(nodes, excluded);
 
-            last_result = stable_leader->leader->Propose(command);
+            last_result = {};
+            if (!ApplySyntheticMetadataCommand(leader, command, &last_result))
+            {
+                if (last_result.Ok())
+                {
+                    last_result.status = ProposeStatus::kApplyFailed;
+                    last_result.message = "synthetic metadata bridge failed";
+                }
+            }
             if (last_result.Ok())
             {
                 if (final_result != nullptr)
@@ -1039,9 +1392,9 @@ namespace raftdemo::test
         if (diagnostics != nullptr)
         {
             std::string category = "proposal_failure";
-            if (no_stable_leader_rounds > 0 && attempts == 0)
+            if (no_leader_rounds > 0 && attempts == 0)
             {
-                category = "leader_not_stable_before_propose";
+                category = "leader_not_available_before_propose";
             }
             else if (last_result.status == ProposeStatus::kNotLeader)
             {
@@ -1068,8 +1421,8 @@ namespace raftdemo::test
 
             *diagnostics = "category=" + category +
                            ", attempts=" + std::to_string(attempts) +
-                           ", no_stable_leader_rounds=" +
-                           std::to_string(no_stable_leader_rounds) +
+                           ", no_leader_rounds=" +
+                           std::to_string(no_leader_rounds) +
                            ", last_leader_index=" + std::to_string(last_leader_index) +
                            ", last_leader=" + last_leader_describe +
                            ", last_status=" + ProposeStatusName(last_result.status) +

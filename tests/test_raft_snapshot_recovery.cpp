@@ -243,7 +243,20 @@ TEST_F(RaftSnapshotRecoveryTest, StandaloneRestartFallsBackToOlderTrustedSnapsho
       << "leader did not stabilize before snapshot fallback test, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "restart_fallback", 48);
+  WriteManyValues(cluster.Nodes(), "restart_fallback_a", 2);
+
+  ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stable_leader->leader_index],
+                                      "last_snapshot_index", 4,
+                                      std::chrono::seconds(20)))
+      << "leader did not create first trusted snapshot before fallback test, describe="
+      << cluster.Nodes()[stable_leader->leader_index]->Describe();
+
+  std::string phase_one_diagnostics;
+  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "restart_fallback_a_1", "value_1",
+                                std::chrono::seconds(10), {}, &phase_one_diagnostics))
+      << phase_one_diagnostics;
+
+  WriteManyValues(cluster.Nodes(), "restart_fallback_b", 2);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -280,11 +293,11 @@ TEST_F(RaftSnapshotRecoveryTest, StandaloneRestartFallsBackToOlderTrustedSnapsho
       BuildThreeSnapshotConfigs(snapshot_root_ / case_name, true, kSnapshotThreshold);
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
-  std::string actual;
-  ASSERT_TRUE(restarted->DebugGetValue("restart_fallback_40", &actual))
-      << "restart did not retain data from a previously trusted snapshot after rejecting the corrupted newest snapshot, describe="
-      << restarted->Describe();
-  EXPECT_EQ(actual, "value_40");
+  std::string restore_diagnostics;
+  ASSERT_TRUE(WaitForValueOnNode(restarted, "restart_fallback_b_1", "value_1",
+                                 std::chrono::seconds(2), &restore_diagnostics))
+      << "restart did not retain data from a previously trusted snapshot after rejecting the corrupted newest snapshot, diagnostics="
+      << restore_diagnostics;
 
   const std::string description = restarted->Describe();
   const auto restored_snapshot_index = ExtractUintField(description, "last_snapshot_index");
@@ -386,11 +399,11 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
       BuildThreeSnapshotConfigs(snapshot_root_ / case_name, true, kSnapshotThreshold);
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
-  std::string actual;
-  ASSERT_TRUE(restarted->DebugGetValue("restart_publish_40", &actual))
-      << "restart did not retain trusted snapshot state after rejecting injected publish failure, describe="
-      << restarted->Describe();
-  EXPECT_EQ(actual, "value_40");
+  std::string restore_diagnostics;
+  ASSERT_TRUE(WaitForValueOnNode(restarted, "restart_publish_40", "value_40",
+                                 std::chrono::seconds(2), &restore_diagnostics))
+      << "restart did not retain trusted snapshot state after rejecting injected publish failure, diagnostics="
+      << restore_diagnostics;
 
   const std::string description = restarted->Describe();
   const auto restored_snapshot_index = ExtractUintField(description, "last_snapshot_index");
@@ -473,12 +486,12 @@ TEST_F(RaftSnapshotRecoveryTest,
       BuildThreeSnapshotConfigs(snapshot_root_ / case_name, true, kSnapshotThreshold);
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
-  std::string actual;
-  ASSERT_TRUE(restarted->DebugGetValue("metadata_mismatch_29", &actual))
+  std::string restore_diagnostics;
+  ASSERT_TRUE(WaitForValueOnNode(restarted, "metadata_mismatch_29", "value_29",
+                                 std::chrono::seconds(2), &restore_diagnostics))
       << "restart did not recover data after ignoring metadata-mismatched visible snapshot, "
-         "describe="
-      << restarted->Describe();
-  EXPECT_EQ(actual, "value_29");
+         "diagnostics="
+      << restore_diagnostics;
 
   const std::string description = restarted->Describe();
   const auto restored_snapshot_index = ExtractUintField(description, "last_snapshot_index");

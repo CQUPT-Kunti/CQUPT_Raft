@@ -114,9 +114,9 @@ namespace raftdemo
       }
 
       std::random_device rd;
-      const int jitter = static_cast<int>(rd() % 1000);
-      const auto tick = static_cast<int>(Clock::now().time_since_epoch().count() % 1000);
-      return 35000 + jitter + tick;
+      const int jitter = static_cast<int>(rd() % 12000);
+      const auto tick = static_cast<int>(Clock::now().time_since_epoch().count() % 4000);
+      return 42000 + jitter + tick;
     }
 
     std::filesystem::path TestBinaryDir()

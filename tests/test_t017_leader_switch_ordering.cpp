@@ -685,10 +685,24 @@ TEST_F(RaftLeaderSwitchOrderingTest,
 
   cluster.RestartNode(lagging_follower);
 
-  auto new_leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(12),
+  auto new_leader = WaitForSingleLeader(cluster.Nodes(),
+                                        std::chrono::seconds(12),
                                         excluded_old_leader);
   ASSERT_NE(new_leader, nullptr)
-      << "no replacement leader elected with restarted lagging follower";
+      << "no stable replacement leader elected with restarted lagging follower";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+      cluster.Nodes(), bucket, "mixed_gap_31", ObjectIdFor("mixed_gap_31"),
+      2, result.log_index, std::chrono::seconds(20), excluded_old_leader))
+      << "restarted lagging follower did not catch up to pre-switch committed gap";
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+      cluster.Nodes(), bucket, "mixed_ordering", ObjectIdFor("mixed_ordering"),
+      result.log_index, std::chrono::seconds(20), excluded_old_leader))
+      << "restarted lagging follower did not catch up to committed delete before new writes";
+  ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), result.log_index,
+                                               std::chrono::seconds(20),
+                                               &ordering_failure,
+                                               excluded_old_leader))
+      << ordering_failure;
 
   ASSERT_TRUE(ProposeCommittedObjectWithRetry(cluster.Nodes(), bucket, "mixed_after_switch",
                                std::chrono::seconds(12), &result, excluded_old_leader))
