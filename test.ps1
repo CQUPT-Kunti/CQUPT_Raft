@@ -34,7 +34,7 @@ Windows platform-neutral fallback:
   - Configure preset: windows
   - Build preset: windows-release
   - Test preset: windows-release-tests
-    (current subset: CommandTest / KvStateMachineTest / TimerSchedulerTest / ThreadPoolTest)
+    (current subset: CommandTest / MetadataStateMachineTest / TimerSchedulerTest / ThreadPoolTest)
 
 Windows full managed CTest sweep:
   - Configure preset: windows
@@ -52,6 +52,7 @@ Notes:
   - The conservative fallback is not the full cross-platform semantic test bucket.
   - Full managed CTest sweep must be requested explicitly with -Managed.
   - The current Windows preset implementation uses a conservative test-name subset that corresponds to the documented platform-neutral fallback intent.
+  - Snapshot / recovery / restart 类验证建议在 Windows 上也保持低并发复验。
   - Linux-specific groups and Linux Bash-first retained-artifact flows remain in ./test.sh.
 "@ | Write-Host
 }
@@ -101,9 +102,10 @@ Write-Host "Windows platform-neutral fallback validation"
 Write-Host "Project root: $projectRoot"
 Write-Host "Linux primary entry remains: ./test.sh"
 Write-Host "PowerShell fallback presets: $script:ConfigurePreset / $script:BuildPreset / $script:TestPreset"
-Write-Host "CTest fallback subset: CommandTest / KvStateMachineTest / TimerSchedulerTest / ThreadPoolTest"
+Write-Host "CTest fallback subset: CommandTest / MetadataStateMachineTest / TimerSchedulerTest / ThreadPoolTest"
 Write-Host "Explicit full managed preset: $script:ManagedTestPreset"
 Write-Host "No-KV audit target: no_kv_surface_audit"
+Write-Host "Recovery / snapshot restart validation should be rerun with low parallelism."
 
 Push-Location $projectRoot
 try {
