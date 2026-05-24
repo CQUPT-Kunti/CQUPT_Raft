@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $OutDir = "tmp"
-$LogFile = Join-Path $OutDir "t017-windows-metadata-state-machine-test.log"
+$LogFile = Join-Path $OutDir "t034-windows-metadata-read-admission.log"
 
 if (-not (Test-Path $OutDir)) {
     New-Item -ItemType Directory -Path $OutDir | Out-Null
@@ -37,7 +37,7 @@ function Run-Cmd {
 Start-Transcript -Path $LogFile -Force
 
 try {
-    Write-Host "==== T017 Windows MetadataStateMachine Validation ===="
+    Write-Host "==== T034 Windows Metadata Read Admission Validation ===="
     Write-Host "time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Write-Host "repo: $(Get-Location)"
     Write-Host "cmake: $CMakeExe"
@@ -45,34 +45,34 @@ try {
     Write-Host "log: $LogFile"
 
     Write-Host ""
-    Write-Host "==== Git status ===="
-    Run-Cmd "git" @("status", "--short")
-
-    Write-Host ""
     Write-Host "==== Configure ===="
     Run-Cmd $CMakeExe @("--preset", "windows")
 
     Write-Host ""
-    Write-Host "==== Build test_metadata_state_machine ===="
+    Write-Host "==== Build T034 affected targets ===="
     Run-Cmd $CMakeExe @(
         "--build", "--preset", "windows-debug",
-        "--target", "test_metadata_state_machine"
+        "--target",
+        "raft_metadata_client",
+        "test_metadata_client_scenario",
+        "test_metadata_failover",
+        "test_metadata_state_machine"
     )
 
     Write-Host ""
-    Write-Host "==== Run MetadataStateMachineTest ===="
+    Write-Host "==== Run T034 related tests ===="
     $env:CTEST_PARALLEL_LEVEL = "1"
     Run-Cmd $CTestExe @(
         "--test-dir", "build/windows",
         "-C", "Debug",
         "--output-on-failure",
-        "-R", "^MetadataStateMachineTest\."
+        "-R", "(MetadataClientScenarioTest|MetadataFailoverTest|MetadataStateMachineTest)"
     )
 
     Write-Host ""
     Write-Host "==== Result ===="
-    Write-Host "T017 Windows MetadataStateMachine validation PASS"
-    Write-Host "Only related target/test was run; full CTest was not run."
+    Write-Host "T034 Windows metadata read admission validation PASS"
+    Write-Host "Only T034 related targets/tests were run; full CTest was not run."
     Write-Host "log saved to: $LogFile"
 }
 finally {
