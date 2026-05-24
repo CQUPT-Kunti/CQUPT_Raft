@@ -151,7 +151,7 @@
 - [x] T040 [US4] 更新 `modules/raft/node/raft_node.cpp` 的 snapshot worker、startup load、post-snapshot replay 逻辑，确保 `LoadSnapshot + Replay` 只回放 `index > last_applied_index`
 - [x] T041 [US4] 保持 `modules/raft/storage/snapshot_storage.h`、`modules/raft/storage/snapshot_storage.cpp` 的 staging publish / checksum / fsync / FlushFileBuffers 语义不减弱，同时补齐 metadata-only 边界诊断
 - [x] T042 [US4] 将 `tests/test_raft_split_brain.cpp`、`tests/test_raft_snapshot_diagnosis.cpp`、`tests/persistence_more_test.cpp`、`tests/test_raft_replicator_behavior.cpp`、`tests/test_raft_segment_storage.cpp` 的 KV 断言全部替换为 metadata 状态或 metadata 查询断言
-- [ ] T043 [US4] 运行 US4 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T043-us4-recovery-validation.md`
+- [x] T043 [US4] 运行 US4 相关 Linux/Windows 构建与 CTest 验证，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T043-us4-recovery-validation.md`
 
 **Checkpoint**: 所有高价值 Raft 恢复/追赶/重启能力都已迁移到 metadata-only 主路径
 
@@ -161,7 +161,7 @@
 
 **Purpose**: 彻底删除 KV 残留、补齐 no-KV 审计与跨平台最终验收
 
-- [ ] T044 [P] 从 `modules/raft/common/command.h`、`modules/raft/common/command.cpp`、`tests/test_command.cpp` 中删除 KV `SET/DEL` 命令路径，只保留 metadata-only 业务载荷与 Raft 内部必需标记
+- [x] T044 [P] 从 `modules/raft/common/command.h`、`modules/raft/common/command.cpp`、`tests/test_command.cpp` 中删除 KV `SET/DEL` 命令路径，只保留 metadata-only 业务载荷与 Raft 内部必需标记
 - [ ] T045 [P] 删除 `modules/raft/state_machine/state_machine.h`、`modules/raft/state_machine/state_machine.cpp`，并退役 `tests/test_state_machine.cpp`
 - [ ] T046 [P] 删除 `modules/raft/service/kv_service_impl.h`、`modules/raft/service/kv_service_impl.cpp`，并退役 `tests/test_kv_service.cpp`
 - [ ] T047 [P] 删除 `apps/raft_kv_client.cpp` 并从 `CMakeLists.txt` 中移除 `raft_kv_client` target
