@@ -36,7 +36,7 @@
 
 ### 仍停留在 demo / happy path 的能力
 
-- KV client / KV service 仍被当作当前主要外部接口
+- `raft_metadata_client` / `MetadataService` 是当前主要外部接口
 - cluster membership 仍是静态配置
 - transport 仍强依赖 gRPC，同进程内没有抽象 transport boundary
 - durability 语义更接近“ofstream flush + rename 成功路径”，不是严格 power-loss 级别 durability
@@ -67,7 +67,7 @@ KV 在当前项目中不是最终产品雏形，而是：
 ### 哪些模块是 app / demo / service 层
 
 - `apps/main.cpp`
-- `apps/raft_kv_client.cpp`
+- `apps/raft_metadata_client.cpp`
 - `modules/raft/service`
 - `proto/raft.proto` 中的 `KvService`
 - `KvStateMachine` 的 KV 语义部分
@@ -379,7 +379,6 @@ KV 在当前项目中不是最终产品雏形，而是：
 - `Command` 的 `SET|...` / `DEL|...`
 - `KvService`
 - `KvStateMachine`
-- `raft_kv_client`
 - KV request limits
 - `DebugGetValue()` 和围绕 KV 的 status 验证逻辑
 
@@ -596,7 +595,7 @@ KV 在当前项目中不是最终产品雏形，而是：
 
 #### target structure
 
-- `raft_proto` / `raft_core` / `raft_demo` / `raft_kv_client`
+- `raft_proto` / `metadata_proto` / `raft_core` / `raft_demo` / `raft_metadata_client`
 - 对当前阶段够用
 
 #### include structure

@@ -162,9 +162,9 @@
 **Purpose**: 彻底删除 KV 残留、补齐 no-KV 审计与跨平台最终验收
 
 - [x] T044 [P] 从 `modules/raft/common/command.h`、`modules/raft/common/command.cpp`、`tests/test_command.cpp` 中删除 KV `SET/DEL` 命令路径，只保留 metadata-only 业务载荷与 Raft 内部必需标记
-- [ ] T045 [P] 删除 `modules/raft/state_machine/state_machine.h`、`modules/raft/state_machine/state_machine.cpp`，并退役 `tests/test_state_machine.cpp`
+- [x] T045 [P] 删除 `modules/raft/state_machine/state_machine.h`、`modules/raft/state_machine/state_machine.cpp`，并退役 `tests/test_state_machine.cpp`
 - [x] T046 [P] 删除 `modules/raft/service/kv_service_impl.h`、`modules/raft/service/kv_service_impl.cpp`，并退役 `tests/test_kv_service.cpp`
-- [ ] T047 [P] 删除 `apps/raft_kv_client.cpp` 并从 `CMakeLists.txt` 中移除 `raft_kv_client` target
+- [x] T047 [P] 删除 `apps/raft_kv_client.cpp` 并从 `CMakeLists.txt` 中移除 `raft_kv_client` target
 - [ ] T048 [P] 从 `proto/raft.proto` 中彻底移除 `KvService`、`KvStatusCode`、`Put/Get/Delete` 相关 message/RPC，并确保 `raft_proto` 的唯一业务 RPC 面是 metadata-only
 - [ ] T049 [P] 清理 `docs/CURRENT_INDUSTRIALIZATION_ANALYSIS.md`、`docs/PERSISTENCE_DURABILITY_CONTRACT.md`、`tests/README.md`、`README.md` 中的 KV 主路径描述，改为 metadata-only 主路径描述
 - [ ] T050 在 `tests/no_kv_surface_audit.cmake`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1` 中接入最终 no-KV 审计，确保主构建/主 CTest 路径检测到残留 KV 符号、KV target 或 KV regression-only path 时直接失败
