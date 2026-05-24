@@ -21,7 +21,6 @@ macOS 当前不在本 feature 验证范围内。
 属于当前文档化的 GTest / CTest 回归入口：
 
 - `test_command`
-- `test_state_machine`
 - `test_min_heap_timer`
 - `test_thread_pool`
 - `test_raft_election`
@@ -44,7 +43,6 @@ macOS 当前不在本 feature 验证范围内。
 对应参与受管 GTest / CTest 的测试源文件是：
 
 - `test_command.cpp`
-- `test_state_machine.cpp`
 - `test_min_heap_timer.cpp`
 - `test_thread_pool.cpp`
 - `test_raft_election.cpp`
@@ -69,7 +67,6 @@ macOS 当前不在本 feature 验证范围内。
 主要表示跨平台逻辑回归语义。当前受管测试里，以下目标可以进入这一层解释：
 
 - `test_command`
-- `test_state_machine`
 - `test_min_heap_timer`
 - `test_thread_pool`
 - `test_raft_election`
@@ -133,14 +130,12 @@ macOS 当前不在本 feature 验证范围内。
 当前默认只覆盖保守 baseline：
 
 - `CommandTest`
-- `KvStateMachineTest`
 - `TimerSchedulerTest`
 - `ThreadPoolTest`
 
 也就是说，Windows fallback 当前只对应这些受管目标：
 
 - `test_command`
-- `test_state_machine`
 - `test_min_heap_timer`
 - `test_thread_pool`
 

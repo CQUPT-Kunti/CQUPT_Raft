@@ -246,8 +246,6 @@ else()
   message(STATUS "Skip test_metadata_client_scenario: metadata_client_scenario_test.cpp not found")
 endif()
 
-add_raft_gtest(test_state_machine test_state_machine.cpp
-  "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp
   "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_thread_pool test_thread_pool.cpp

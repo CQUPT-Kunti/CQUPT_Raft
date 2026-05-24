@@ -12,7 +12,6 @@
 #include <utility>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
 #include "raft/common/metadata_command.h"
 #include "raft/runtime/logging.h"
@@ -324,56 +323,6 @@ namespace raftdemo
             return nullptr;
         }
 
-        bool WaitForValueOnAllNodes(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                    const std::string &key,
-                                    const std::string &expected_value,
-                                    std::chrono::milliseconds timeout,
-                                    std::string *diagnostics = nullptr)
-        {
-            const auto deadline = std::chrono::steady_clock::now() + timeout;
-            std::string last_values;
-            while (std::chrono::steady_clock::now() < deadline)
-            {
-                bool ok = true;
-                std::ostringstream values;
-                for (const auto &node : nodes)
-                {
-                    std::string value;
-                    if (values.tellp() > 0)
-                    {
-                        values << " | ";
-                    }
-                    if (!node->DebugGetValue(key, &value) || value != expected_value)
-                    {
-                        values << "<missing-or-mismatch>";
-                        ok = false;
-                        break;
-                    }
-                    values << value;
-                }
-                last_values = values.str();
-                if (ok)
-                {
-                    if (diagnostics != nullptr)
-                    {
-                        *diagnostics = "value observed on all nodes, key=" + key +
-                                       ", expected=" + expected_value +
-                                       ", cluster=" + DescribeCluster(nodes);
-                    }
-                    return true;
-                }
-                std::this_thread::sleep_for(100ms);
-            }
-            if (diagnostics != nullptr)
-            {
-                *diagnostics = "value not observed on all nodes, key=" + key +
-                               ", expected=" + expected_value +
-                               ", cluster_values=" + last_values +
-                               ", cluster=" + DescribeCluster(nodes);
-            }
-            return false;
-        }
-
         bool HasDirectorySnapshot(const snapshotConfig &cfg)
         {
             std::error_code ec;
@@ -535,15 +484,6 @@ namespace raftdemo
                                ", cluster=" + last_cluster_state;
             }
             return false;
-        }
-
-        Command MakeSet(const std::string &key, const std::string &value)
-        {
-            Command cmd;
-            cmd.type = CommandType::kSet;
-            cmd.key = key;
-            cmd.value = value;
-            return cmd;
         }
 
         void LogClusterState(const std::string &title,

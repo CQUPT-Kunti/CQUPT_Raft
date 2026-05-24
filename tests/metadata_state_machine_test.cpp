@@ -53,9 +53,8 @@ TEST(MetadataStateMachineTest, RaftNodeDefaultStateMachineWiringUsesMetadataStat
 
     EXPECT_NE(node.GetMetadataStateMachineV2(), nullptr);
     EXPECT_EQ(node.GetMetadataStateMachine(), nullptr);
-
-    std::string value;
-    EXPECT_FALSE(node.DebugGetValue("legacy-kv-key", &value));
+    EXPECT_EQ(node.GetMetadataStateMachineV2()->LastAppliedIndex(), 0U);
+    EXPECT_EQ(node.GetMetadataStateMachineV2()->LastAppliedTerm(), 0U);
 }
 
 TEST(MetadataStateMachineTest, SkeletonApplyAndSnapshotReturnExplicitResults)

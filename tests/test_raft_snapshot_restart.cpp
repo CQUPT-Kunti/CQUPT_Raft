@@ -16,15 +16,15 @@ using raftdemo::test::FindNodeIndex;
 using raftdemo::test::PickFollowerIndex;
 using raftdemo::test::ProposeStatusName;
 using raftdemo::test::ProposeWithRetry;
-using raftdemo::test::SetCommand;
 using raftdemo::test::SnapshotRestartTestBase;
 using raftdemo::test::TestCluster;
 using raftdemo::test::WaitForNodeFieldAtLeast;
+using raftdemo::test::WaitForSyntheticObjectOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnNode;
 using raftdemo::test::WaitForSingleLeader;
 using raftdemo::test::WaitForStableLeader;
-using raftdemo::test::WaitForValueOnAll;
-using raftdemo::test::WaitForValueOnNode;
-using raftdemo::test::WriteManyValues;
+using raftdemo::test::WriteSyntheticObject;
+using raftdemo::test::WriteSyntheticObjects;
 
 class RaftSnapshotRestartTest : public SnapshotRestartTestBase {};
 
@@ -43,7 +43,7 @@ TEST_F(RaftSnapshotRestartTest, FollowerKeepsStateAfterInstallSnapshotAndRestart
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "install_restart", 48, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "install_restart", 48, excluded);
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
                                       "last_snapshot_index", 6,
@@ -53,9 +53,9 @@ TEST_F(RaftSnapshotRestartTest, FollowerKeepsStateAfterInstallSnapshotAndRestart
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "install_restart_47", "value_47",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "install_restart_47", "value_47",
+                                           std::chrono::seconds(30)))
       << "follower did not catch up by InstallSnapshot, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
@@ -67,9 +67,9 @@ TEST_F(RaftSnapshotRestartTest, FollowerKeepsStateAfterInstallSnapshotAndRestart
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "install_restart_47", "value_47",
-                                 std::chrono::seconds(15)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "install_restart_47", "value_47",
+                                           std::chrono::seconds(15)))
       << "follower lost snapshot state after restart, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
@@ -90,7 +90,7 @@ TEST_F(RaftSnapshotRestartTest, LeaderKeepsCompactedSnapshotStateAfterRestart) {
       << DescribeCluster(cluster.Nodes());
   auto leader = stable_leader->leader;
 
-  WriteManyValues(cluster.Nodes(), "leader_restart", 32);
+  WriteSyntheticObjects(cluster.Nodes(), "leader_restart", 32);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -116,10 +116,10 @@ TEST_F(RaftSnapshotRestartTest, LeaderKeepsCompactedSnapshotStateAfterRestart) {
       << DescribeCluster(cluster.Nodes());
 
   std::string restore_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[leader_index],
-                                 "leader_restart_31", "value_31",
-                                 std::chrono::seconds(15),
-                                 &restore_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[leader_index],
+                                           "leader_restart_31", "value_31",
+                                           std::chrono::seconds(15),
+                                           &restore_diagnostics))
       << "restarted leader node did not reload snapshot/log state, diagnostics="
       << restore_diagnostics << ", cluster=" << DescribeCluster(cluster.Nodes());
 
@@ -134,15 +134,17 @@ TEST_F(RaftSnapshotRestartTest, LeaderKeepsCompactedSnapshotStateAfterRestart) {
 
   ProposeResult result;
   std::string propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_leader_restart", "ok"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("after_leader_restart", "ok"),
                                std::chrono::seconds(15), &result, {}, &propose_diagnostics))
       << "write after leader restart failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message
       << ", diagnostics=" << propose_diagnostics;
 
   std::string replication_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_leader_restart", "ok",
-                                std::chrono::seconds(20), {}, &replication_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "after_leader_restart", "ok",
+                                          std::chrono::seconds(20), {},
+                                          &replication_diagnostics))
       << "cluster did not continue replication after compacted leader restart, diagnostics="
       << replication_diagnostics;
 }
@@ -154,10 +156,10 @@ TEST_F(RaftSnapshotRestartTest, FullClusterRestartsAfterSnapshotAndContinuesWrit
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected";
 
-  WriteManyValues(cluster.Nodes(), "full_restart", 40);
+  WriteSyntheticObjects(cluster.Nodes(), "full_restart", 40);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "full_restart_39", "value_39",
-                                std::chrono::seconds(15)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "full_restart_39", "value_39",
+                                          std::chrono::seconds(15)))
       << "cluster did not apply baseline data before restart";
 
   bool any_snapshot = false;
@@ -176,18 +178,19 @@ TEST_F(RaftSnapshotRestartTest, FullClusterRestartsAfterSnapshotAndContinuesWrit
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(10));
   ASSERT_NE(leader, nullptr) << "no leader elected after full restart";
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "full_restart_39", "value_39",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "full_restart_39", "value_39",
+                                          std::chrono::seconds(20)))
       << "cluster lost snapshot/log state after full restart";
 
   ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_full_restart", "ok"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("after_full_restart", "ok"),
                                std::chrono::seconds(15), &result))
       << "write after full restart failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_full_restart", "ok",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "after_full_restart", "ok",
+                                          std::chrono::seconds(20)))
       << "cluster did not replicate after full restart";
 }
 

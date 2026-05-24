@@ -13,7 +13,6 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
 #include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
@@ -55,14 +54,6 @@ bool Contains(const std::string& text, const std::string& needle) {
 
 bool IsLeaderNode(const std::shared_ptr<RaftNode>& node) {
   return node && Contains(node->Describe(), "role=Leader");
-}
-
-auto SetCommand(const std::string& key, const std::string& value) {
-  return raftdemo::test::SetCommand(key, value);
-}
-
-auto DeleteCommand(const std::string& key) {
-  return raftdemo::test::DeleteCommand(key);
 }
 
 std::uint64_t NowForPath() {
@@ -286,107 +277,17 @@ class TestCluster {
   std::vector<std::thread> wait_threads_;
 };
 
-bool IsExcluded(std::size_t index, const std::vector<std::size_t>& excluded) {
-  for (std::size_t excluded_index : excluded) {
-    if (index == excluded_index) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::shared_ptr<RaftNode> WaitForSingleLeader(
-    const std::vector<std::shared_ptr<RaftNode>>& nodes,
-    std::chrono::milliseconds timeout,
-    const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    std::shared_ptr<RaftNode> leader;
-    int leader_count = 0;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-      if (IsLeaderNode(nodes[i])) {
-        leader = nodes[i];
-        ++leader_count;
-      }
-    }
-
-    if (leader_count == 1) {
-      return leader;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return nullptr;
-}
-
-std::size_t FindNodeIndex(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                          const std::shared_ptr<RaftNode>& target) {
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    if (nodes[i] == target) {
-      return i;
-    }
-  }
-  return nodes.size();
-}
-
-std::size_t PickFollowerIndex(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                              const std::shared_ptr<RaftNode>& leader) {
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    if (nodes[i] && nodes[i] != leader) {
-      return i;
-    }
-  }
-  return nodes.size();
-}
-
-bool WaitForValueOnNode(const std::shared_ptr<RaftNode>& node,
-                        const std::string& key,
-                        const std::string& expected_value,
-                        std::chrono::milliseconds timeout) {
-  return raftdemo::test::WaitForValueOnNode(node, key, expected_value, timeout);
-}
-
-bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                       const std::string& key,
-                       const std::string& expected_value,
-                       std::chrono::milliseconds timeout,
-                       const std::vector<std::size_t>& excluded = {}) {
-  return raftdemo::test::WaitForValueOnAll(nodes, key, expected_value, timeout, excluded);
-}
-
-bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                         const std::string& key,
-                         std::chrono::milliseconds timeout,
-                         const std::vector<std::size_t>& excluded = {}) {
-  return raftdemo::test::WaitForMissingOnAll(nodes, key, timeout, excluded);
-}
-
-bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode>& node,
-                             const std::string& field_name,
-                             std::uint64_t minimum,
-                             std::chrono::milliseconds timeout) {
-  return raftdemo::test::WaitForNodeFieldAtLeast(node, field_name, minimum, timeout);
-}
-
-template <typename CommandLike>
-bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const CommandLike& command,
-                      std::chrono::milliseconds timeout,
-                      ProposeResult* final_result,
-                      const std::vector<std::size_t>& excluded = {}) {
-  return raftdemo::test::ProposeWithRetry(nodes, command, timeout, final_result, excluded);
-}
-
-void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                     const std::string& prefix,
-                     int count,
-                     const std::vector<std::size_t>& excluded = {}) {
-  raftdemo::test::WriteManyValues(nodes, prefix, count, excluded);
-}
+using raftdemo::test::DeleteSyntheticObject;
+using raftdemo::test::FindNodeIndex;
+using raftdemo::test::PickFollowerIndex;
+using raftdemo::test::ProposeWithRetry;
+using raftdemo::test::WaitForNodeFieldAtLeast;
+using raftdemo::test::WaitForSingleLeader;
+using raftdemo::test::WaitForSyntheticObjectMissingOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnNode;
+using raftdemo::test::WriteSyntheticObject;
+using raftdemo::test::WriteSyntheticObjects;
 
 class RaftSnapshotCatchupTest : public ::testing::Test {
  protected:
@@ -449,17 +350,17 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerCatchesUpLargeGapWithBatchedApp
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "batch_gap", 64, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "batch_gap", 64, excluded);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "batch_gap_63", "value_63",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "batch_gap_63", "value_63",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last batch value";
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "batch_gap_63", "value_63",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "batch_gap_63", "value_63",
+                                           std::chrono::seconds(30)))
       << "restarted follower did not catch up through batched AppendEntries, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
@@ -483,48 +384,52 @@ TEST_F(RaftSnapshotCatchupTest,
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "live_gap", 96, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "live_gap", 96, excluded);
 
   ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_ordering", "phase_1"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_ordering", "phase_1"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering phase_1 failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_ordering", "phase_2"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_ordering", "phase_2"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering phase_2 failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("live_ordering"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               DeleteSyntheticObject("live_ordering"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering delete failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_tail", "committed"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_tail", "committed"),
                                std::chrono::seconds(10), &result, excluded))
       << "live tail write failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_gap_95", "value_95",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_gap_95", "value_95",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last live gap value";
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "live_ordering",
-                                  std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "live_ordering",
+                                                 std::chrono::seconds(10), excluded))
       << "surviving majority did not preserve committed delete ordering";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_tail", "committed",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_tail", "committed",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply tail value after delete";
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "live_gap_95", "value_95",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "live_gap_95", "value_95",
+                                           std::chrono::seconds(30)))
       << "lagging follower did not replay live log gap, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "live_ordering",
-                                  std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "live_ordering",
+                                                 std::chrono::seconds(20)))
       << "cluster did not preserve committed delete ordering after live log catch-up";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_tail", "committed",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_tail", "committed",
+                                          std::chrono::seconds(20)))
       << "cluster did not converge on committed tail value after live log catch-up";
 
   const auto follower_snapshot_index =
@@ -549,10 +454,10 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerInstallsSnapshotWhenLeaderCompa
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "snapshot_gap", 48, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "snapshot_gap", 48, excluded);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "snapshot_gap_47", "value_47",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "snapshot_gap_47", "value_47",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last snapshot_gap value";
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
@@ -563,9 +468,9 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerInstallsSnapshotWhenLeaderCompa
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "snapshot_gap_47", "value_47",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "snapshot_gap_47", "value_47",
+                                           std::chrono::seconds(30)))
       << "restarted follower did not install snapshot and catch up, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 

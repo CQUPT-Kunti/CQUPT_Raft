@@ -13,6 +13,7 @@
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "support/metadata_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -293,9 +294,10 @@ TEST(RaftElectionTest, FollowerRejectsClientProposeAfterLeaderIsElected) {
       << "leader became observable, but follower redirect information was not ready";
 
   Command cmd;
-  cmd.type = CommandType::kSet;
-  cmd.key = "from_follower";
-  cmd.value = "123";
+  cmd.type = CommandType::kMetadata;
+  cmd.metadata_payload = SerializeMetadataCommand(
+      test::MakeCreateBucketCommand("from-follower-bucket",
+                                    "from-follower-create-bucket-1"));
 
   const ProposeResult result = follower->Propose(cmd);
   EXPECT_EQ(result.status, ProposeStatus::kNotLeader);

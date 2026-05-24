@@ -18,7 +18,6 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
@@ -105,32 +104,33 @@ namespace raftdemo::test
         return oss.str();
     }
 
-    struct SyntheticMetadataCommand
+    struct SyntheticMetadataMutation
     {
         enum class Operation
         {
-            kSet,
-            kDelete,
+            kWriteObject,
+            kDeleteObject,
         };
 
-        Operation operation{Operation::kSet};
+        Operation operation{Operation::kWriteObject};
         std::string key;
         std::string value;
     };
 
-    inline SyntheticMetadataCommand SetCommand(const std::string &key, const std::string &value)
+    inline SyntheticMetadataMutation WriteSyntheticObject(const std::string &key,
+                                                          const std::string &value)
     {
-        return SyntheticMetadataCommand{
-            .operation = SyntheticMetadataCommand::Operation::kSet,
+        return SyntheticMetadataMutation{
+            .operation = SyntheticMetadataMutation::Operation::kWriteObject,
             .key = key,
             .value = value,
         };
     }
 
-    inline SyntheticMetadataCommand DeleteCommand(const std::string &key)
+    inline SyntheticMetadataMutation DeleteSyntheticObject(const std::string &key)
     {
-        return SyntheticMetadataCommand{
-            .operation = SyntheticMetadataCommand::Operation::kDelete,
+        return SyntheticMetadataMutation{
+            .operation = SyntheticMetadataMutation::Operation::kDeleteObject,
             .key = key,
             .value = "",
         };
@@ -320,9 +320,9 @@ namespace raftdemo::test
         return !object.has_value() || object->IsDeleted();
     }
 
-    inline bool ApplySyntheticMetadataCommand(const std::shared_ptr<RaftNode> &leader,
-                                              const SyntheticMetadataCommand &command,
-                                              ProposeResult *last_result)
+    inline bool ApplySyntheticMetadataMutation(const std::shared_ptr<RaftNode> &leader,
+                                               const SyntheticMetadataMutation &command,
+                                               ProposeResult *last_result)
     {
         if (!EnsureSyntheticBucket(leader, last_result))
         {
@@ -347,7 +347,7 @@ namespace raftdemo::test
         const auto current_object =
             state_machine->FindObject(kSyntheticMetadataBucket, command.key);
 
-        if (command.operation == SyntheticMetadataCommand::Operation::kDelete)
+        if (command.operation == SyntheticMetadataMutation::Operation::kDeleteObject)
         {
             if (!indexed_object_id.has_value())
             {
@@ -1036,11 +1036,11 @@ namespace raftdemo::test
         return std::nullopt;
     }
 
-    inline bool WaitForValueOnNode(const std::shared_ptr<RaftNode> &node,
-                                   const std::string &key,
-                                   const std::string &expected_value,
-                                   const std::chrono::milliseconds timeout,
-                                   std::string *diagnostics = nullptr)
+    inline bool WaitForSyntheticObjectOnNode(const std::shared_ptr<RaftNode> &node,
+                                             const std::string &key,
+                                             const std::string &expected_value,
+                                             const std::chrono::milliseconds timeout,
+                                             std::string *diagnostics = nullptr)
     {
         const auto deadline = Clock::now() + timeout;
         std::string last_value;
@@ -1079,12 +1079,13 @@ namespace raftdemo::test
         return false;
     }
 
-    inline bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                  const std::string &key,
-                                  const std::string &expected_value,
-                                  const std::chrono::milliseconds timeout,
-                                  const std::vector<std::size_t> &excluded = {},
-                                  std::string *diagnostics = nullptr)
+    inline bool WaitForSyntheticObjectOnAll(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const std::string &key,
+        const std::string &expected_value,
+        const std::chrono::milliseconds timeout,
+        const std::vector<std::size_t> &excluded = {},
+        std::string *diagnostics = nullptr)
     {
         const auto deadline = Clock::now() + timeout;
         std::string last_cluster_state;
@@ -1142,11 +1143,12 @@ namespace raftdemo::test
         return false;
     }
 
-    inline bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                    const std::string &key,
-                                    const std::chrono::milliseconds timeout,
-                                    const std::vector<std::size_t> &excluded = {},
-                                    std::string *diagnostics = nullptr)
+    inline bool WaitForSyntheticObjectMissingOnAll(
+        const std::vector<std::shared_ptr<RaftNode>> &nodes,
+        const std::string &key,
+        const std::chrono::milliseconds timeout,
+        const std::vector<std::size_t> &excluded = {},
+        std::string *diagnostics = nullptr)
     {
         const auto deadline = Clock::now() + timeout;
         std::string last_cluster_state;
@@ -1319,7 +1321,7 @@ namespace raftdemo::test
     }
 
     inline bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                 const SyntheticMetadataCommand &command,
+                                 const SyntheticMetadataMutation &command,
                                  const std::chrono::milliseconds timeout,
                                  ProposeResult *final_result,
                                  const std::vector<std::size_t> &excluded = {},
@@ -1350,7 +1352,7 @@ namespace raftdemo::test
             last_cluster_state = DescribeCluster(nodes, excluded);
 
             last_result = {};
-            if (!ApplySyntheticMetadataCommand(leader, command, &last_result))
+            if (!ApplySyntheticMetadataMutation(leader, command, &last_result))
             {
                 if (last_result.Ok())
                 {
@@ -1432,10 +1434,10 @@ namespace raftdemo::test
         return false;
     }
 
-    inline void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                                const std::string &prefix,
-                                const int count,
-                                const std::vector<std::size_t> &excluded = {})
+    inline void WriteSyntheticObjects(const std::vector<std::shared_ptr<RaftNode>> &nodes,
+                                      const std::string &prefix,
+                                      const int count,
+                                      const std::vector<std::size_t> &excluded = {})
     {
         ProposeResult result;
         for (int i = 0; i < count; ++i)
@@ -1443,8 +1445,8 @@ namespace raftdemo::test
             std::string diagnostics;
             SCOPED_TRACE(prefix + " write " + std::to_string(i));
             ASSERT_TRUE(ProposeWithRetry(nodes,
-                                         SetCommand(prefix + "_" + std::to_string(i),
-                                                    "value_" + std::to_string(i)),
+                                         WriteSyntheticObject(prefix + "_" + std::to_string(i),
+                                                              "value_" + std::to_string(i)),
                                          std::chrono::seconds(10),
                                          &result,
                                          excluded,

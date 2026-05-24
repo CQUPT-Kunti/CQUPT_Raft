@@ -13,7 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
 #include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
@@ -428,78 +427,6 @@ namespace raftdemo
       {
         cluster->Stop();
       }
-    }
-
-    bool ProposeSetToLeader(const std::shared_ptr<RaftNode> &leader,
-                            const std::string &key,
-                            const std::string &value)
-    {
-      if (leader == nullptr)
-      {
-        return false;
-      }
-
-      Command cmd;
-      cmd.type = CommandType::kSet;
-      cmd.key = key;
-      cmd.value = value;
-
-      const ProposeResult result = leader->Propose(cmd);
-      return result.Ok();
-    }
-
-    bool ProposeSetWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                             const std::string &key,
-                             const std::string &value,
-                             std::chrono::milliseconds timeout)
-    {
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
-      while (std::chrono::steady_clock::now() < deadline)
-      {
-        auto leader = WaitForLeader(nodes, 500ms);
-        if (leader != nullptr && ProposeSetToLeader(leader, key, value))
-        {
-          return true;
-        }
-        std::this_thread::sleep_for(100ms);
-      }
-      return false;
-    }
-
-    bool WaitUntilValue(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                        const std::string &key,
-                        const std::string &expected_value,
-                        std::chrono::milliseconds timeout)
-    {
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
-      while (std::chrono::steady_clock::now() < deadline)
-      {
-        bool all_ok = true;
-        for (const auto &node : nodes)
-        {
-          if (node == nullptr)
-          {
-            all_ok = false;
-            break;
-          }
-
-          std::string actual;
-          if (!node->DebugGetValue(key, &actual) || actual != expected_value)
-          {
-            all_ok = false;
-            break;
-          }
-        }
-
-        if (all_ok)
-        {
-          return true;
-        }
-
-        std::this_thread::sleep_for(100ms);
-      }
-
-      return false;
     }
 
     bool ProposeMetadataWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,

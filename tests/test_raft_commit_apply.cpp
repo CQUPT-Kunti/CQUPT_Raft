@@ -290,7 +290,7 @@ namespace raftdemo
           5s));
     }
 
-    TEST(RaftCommitApplyTest, DeleteCommandIsAppliedToAllNodes)
+    TEST(RaftCommitApplyTest, DeleteObjectCommandIsAppliedToAllNodes)
     {
       ClusterRunner cluster(PickBasePort());
       cluster.Start();

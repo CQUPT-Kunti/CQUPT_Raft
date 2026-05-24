@@ -147,7 +147,7 @@ namespace raftdemo
                                std::to_string(rd());
       return std::filesystem::temp_directory_path() / "rq_ri" / name;
 #else
-      const std::string name = "raft_kv_gtest_" + safe_name + "_" +
+      const std::string name = "raft_metadata_gtest_" + safe_name + "_" +
                                std::to_string(NowForPath()) + "_" +
                                std::to_string(rd());
       return TestBinaryDir() / "raft_test_data" / "integration" / name;
@@ -480,7 +480,7 @@ namespace raftdemo
       ASSERT_NE(leader, nullptr) << "no single leader elected within timeout";
     }
 
-    TEST_F(RaftIntegrationTest, ReplicatesSetAndDeleteCommandsToAllNodes)
+    TEST_F(RaftIntegrationTest, ReplicatesCreateCommitAndDeleteMetadataCommandsToAllNodes)
     {
       auto cluster = MakeCluster("replication", "replication");
       cluster.Start();

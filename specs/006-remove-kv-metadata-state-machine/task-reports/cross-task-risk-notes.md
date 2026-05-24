@@ -74,3 +74,17 @@
   - `T058` 需要在 `T057` 完成后把 `tests/test_state_machine.cpp`、`SetCommand/DeleteCommand` helper 等 tolerated blocker 升格为 strict fail。
 - 当前是否阻塞：
   - 不阻塞 `T056` 生产代码清理完成，但会直接影响后续测试全量构建，必须由 `T057` 收口。
+
+## T057 追加注意：snapshot/recovery 验证在高并发 CTest 下存在选举互扰
+
+- 来源任务：T057
+- 注意点：
+  - 本轮 `tests/support/raft_snapshot_restart_test_utils.h` 已迁移为 metadata-only synthetic helper，业务断言保持在 `HeadObject/object_index/chunk_ref_index/request_table/tombstone/last_applied` 相关语义。
+  - 但在一次并行 `ctest` 过滤运行中，`RaftSnapshotRecoveryTest.StandaloneRestartRejectsMetadataMismatchedVisibleSnapshotAndKeepsTrustedBoundary` 与 `RaftSnapshotRecoveryTest.AllPublishedSnapshotsInvalidYieldNoTrustedSnapshot` 出现 leader 长时间不稳定；同样用例在 `CTEST_PARALLEL_LEVEL=1` 串行复跑后通过。
+- 可能影响：
+  - 如果后续 `T058/T059` 把 no-KV 审计或 recovery smoke 重新接入脚本入口时默认放开较高并发，可能把端口/时序互扰误判成 metadata 逻辑回归。
+- 建议处理：
+  - `T059` 校正脚本入口时，recovery/snapshot/catch-up 集合继续保持低并发或显式 `CTEST_PARALLEL_LEVEL=1`。
+  - 后续若需要提升并发，应先单独验证 snapshot/recovery 组的端口隔离和 leader 稳定性。
+- 当前是否阻塞：
+  - 不阻塞 `T057` 验收；当前更像运行环境并发干扰，不是测试语义或 metadata-only 迁移回归。

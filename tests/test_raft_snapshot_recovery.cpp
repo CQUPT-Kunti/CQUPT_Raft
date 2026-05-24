@@ -25,19 +25,19 @@ using raftdemo::test::ListSnapshotDirs;
 using raftdemo::test::PickFollowerIndex;
 using raftdemo::test::ProposeWithRetry;
 using raftdemo::test::ScopedEnvVar;
-using raftdemo::test::SetCommand;
-using raftdemo::test::DeleteCommand;
+using raftdemo::test::DeleteSyntheticObject;
 using raftdemo::test::SnapshotIndexFromDir;
 using raftdemo::test::SnapshotRestartTestBase;
-using raftdemo::test::WaitForMissingOnAll;
+using raftdemo::test::WaitForSyntheticObjectMissingOnAll;
 using raftdemo::test::WaitForNodeFieldAtLeast;
 using raftdemo::test::WaitForOrderedCommitApplyAtLeast;
 using raftdemo::test::WaitForStableLeader;
-using raftdemo::test::WaitForValueOnAll;
-using raftdemo::test::WaitForValueOnNode;
-using raftdemo::test::WriteManyValues;
 using raftdemo::test::ExtractUintField;
+using raftdemo::test::WaitForSyntheticObjectOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnNode;
 using raftdemo::test::WriteTextFile;
+using raftdemo::test::WriteSyntheticObject;
+using raftdemo::test::WriteSyntheticObjects;
 
 class RaftSnapshotRecoveryTest : public SnapshotRestartTestBase {};
 
@@ -53,17 +53,20 @@ TEST_F(RaftSnapshotRecoveryTest,
 
   ProposeResult result;
   std::string propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("snapshot_only", "base"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("snapshot_only", "base"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "snapshot_only baseline write failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("tail_delete", "present"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("tail_delete", "present"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "tail_delete baseline write failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("tail_overwrite", "before"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("tail_overwrite", "before"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "tail_overwrite baseline write failed, diagnostics=" << propose_diagnostics;
 
-  WriteManyValues(cluster.Nodes(), "replay_base", 24);
+  WriteSyntheticObjects(cluster.Nodes(), "replay_base", 24);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -80,30 +83,36 @@ TEST_F(RaftSnapshotRecoveryTest,
       << "leader did not create trusted snapshot before tail replay test, diagnostics="
       << snapshot_diagnostics;
 
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("tail_delete"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteSyntheticObject("tail_delete"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "tail_delete replay failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("tail_overwrite", "after"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("tail_overwrite", "after"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "tail_overwrite replay failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("tail_only", "replayed"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("tail_only", "replayed"),
                                std::chrono::seconds(10), &result, {}, &propose_diagnostics))
       << "tail_only replay failed, diagnostics=" << propose_diagnostics;
 
   const std::uint64_t expected_tail_index = result.log_index;
 
   std::string cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "snapshot_only", "base",
-                                std::chrono::seconds(15), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "snapshot_only", "base",
+                                          std::chrono::seconds(15), {},
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_overwrite", "after",
-                                std::chrono::seconds(15), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "tail_overwrite", "after",
+                                          std::chrono::seconds(15), {},
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_only", "replayed",
-                                std::chrono::seconds(15), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "tail_only", "replayed",
+                                          std::chrono::seconds(15), {},
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "tail_delete",
-                                  std::chrono::seconds(15), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "tail_delete",
+                                                 std::chrono::seconds(15), {},
+                                                 &cluster_diagnostics))
       << cluster_diagnostics;
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), expected_tail_index,
                                                std::chrono::seconds(15),
@@ -118,19 +127,23 @@ TEST_F(RaftSnapshotRecoveryTest,
       << "leader did not stabilize after full restart, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "snapshot_only", "base",
-                                std::chrono::seconds(20), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "snapshot_only", "base",
+                                          std::chrono::seconds(20), {},
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_overwrite", "after",
-                                std::chrono::seconds(20), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "tail_overwrite", "after",
+                                          std::chrono::seconds(20), {},
+                                          &cluster_diagnostics))
       << "snapshot load plus tail replay lost overwrite semantics, diagnostics="
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "tail_only", "replayed",
-                                std::chrono::seconds(20), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "tail_only", "replayed",
+                                          std::chrono::seconds(20), {},
+                                          &cluster_diagnostics))
       << "snapshot load plus tail replay lost tail-only value, diagnostics="
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "tail_delete",
-                                  std::chrono::seconds(20), {}, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "tail_delete",
+                                                 std::chrono::seconds(20), {},
+                                                 &cluster_diagnostics))
       << "snapshot load plus tail replay lost delete semantics, diagnostics="
       << cluster_diagnostics;
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), expected_tail_index,
@@ -158,12 +171,13 @@ TEST_F(RaftSnapshotRecoveryTest,
   const std::vector<std::size_t> excluded{stopped_follower};
   ProposeResult result;
   std::string propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("apply_anchor", "snapshot"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("apply_anchor", "snapshot"),
                                std::chrono::seconds(10), &result, excluded,
                                &propose_diagnostics))
       << "apply_anchor baseline write failed, diagnostics=" << propose_diagnostics;
 
-  WriteManyValues(cluster.Nodes(), "apply_gap", 24, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "apply_gap", 24, excluded);
 
   std::string cluster_diagnostics;
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
@@ -174,30 +188,35 @@ TEST_F(RaftSnapshotRecoveryTest,
       << "leader did not create snapshot before follower restart apply test, diagnostics="
       << cluster_diagnostics;
 
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("apply_view", "before_delete"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("apply_view", "before_delete"),
                                std::chrono::seconds(10), &result, excluded,
                                &propose_diagnostics))
       << "apply_view initial write failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("apply_view"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteSyntheticObject("apply_view"),
                                std::chrono::seconds(10), &result, excluded,
                                &propose_diagnostics))
       << "apply_view delete failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("apply_view", "after_replay"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("apply_view", "after_replay"),
                                std::chrono::seconds(10), &result, excluded,
                                &propose_diagnostics))
       << "apply_view overwrite failed, diagnostics=" << propose_diagnostics;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("apply_tail", "committed"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("apply_tail", "committed"),
                                std::chrono::seconds(10), &result, excluded,
                                &propose_diagnostics))
       << "apply_tail write failed, diagnostics=" << propose_diagnostics;
 
   const std::uint64_t expected_tail_index = result.log_index;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "apply_view", "after_replay",
-                                std::chrono::seconds(15), excluded, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "apply_view", "after_replay",
+                                          std::chrono::seconds(15), excluded,
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "apply_tail", "committed",
-                                std::chrono::seconds(15), excluded, &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "apply_tail", "committed",
+                                          std::chrono::seconds(15), excluded,
+                                          &cluster_diagnostics))
       << cluster_diagnostics;
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), expected_tail_index,
                                                std::chrono::seconds(15),
@@ -207,22 +226,22 @@ TEST_F(RaftSnapshotRecoveryTest,
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "apply_anchor", "snapshot",
-                                 std::chrono::seconds(20),
-                                 &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "apply_anchor", "snapshot",
+                                           std::chrono::seconds(20),
+                                           &cluster_diagnostics))
       << "restarted follower lost snapshot-covered state, diagnostics="
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "apply_view", "after_replay",
-                                 std::chrono::seconds(20),
-                                 &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "apply_view", "after_replay",
+                                           std::chrono::seconds(20),
+                                           &cluster_diagnostics))
       << "restarted follower did not replay committed overwrite after snapshot load, diagnostics="
       << cluster_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "apply_tail", "committed",
-                                 std::chrono::seconds(20),
-                                 &cluster_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "apply_tail", "committed",
+                                           std::chrono::seconds(20),
+                                           &cluster_diagnostics))
       << "restarted follower missed committed tail apply after snapshot load, diagnostics="
       << cluster_diagnostics;
   ASSERT_TRUE(WaitForOrderedCommitApplyAtLeast(cluster.Nodes(), expected_tail_index,
@@ -243,7 +262,7 @@ TEST_F(RaftSnapshotRecoveryTest, StandaloneRestartFallsBackToOlderTrustedSnapsho
       << "leader did not stabilize before snapshot fallback test, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "restart_fallback_a", 2);
+  WriteSyntheticObjects(cluster.Nodes(), "restart_fallback_a", 2);
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stable_leader->leader_index],
                                       "last_snapshot_index", 4,
@@ -252,11 +271,15 @@ TEST_F(RaftSnapshotRecoveryTest, StandaloneRestartFallsBackToOlderTrustedSnapsho
       << cluster.Nodes()[stable_leader->leader_index]->Describe();
 
   std::string phase_one_diagnostics;
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "restart_fallback_a_1", "value_1",
-                                std::chrono::seconds(10), {}, &phase_one_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(),
+                                          "restart_fallback_a_1",
+                                          "value_1",
+                                          std::chrono::seconds(10),
+                                          {},
+                                          &phase_one_diagnostics))
       << phase_one_diagnostics;
 
-  WriteManyValues(cluster.Nodes(), "restart_fallback_b", 2);
+  WriteSyntheticObjects(cluster.Nodes(), "restart_fallback_b", 2);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -294,8 +317,11 @@ TEST_F(RaftSnapshotRecoveryTest, StandaloneRestartFallsBackToOlderTrustedSnapsho
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
   std::string restore_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(restarted, "restart_fallback_b_1", "value_1",
-                                 std::chrono::seconds(2), &restore_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(restarted,
+                                           "restart_fallback_b_1",
+                                           "value_1",
+                                           std::chrono::seconds(2),
+                                           &restore_diagnostics))
       << "restart did not retain data from a previously trusted snapshot after rejecting the corrupted newest snapshot, diagnostics="
       << restore_diagnostics;
 
@@ -318,7 +344,7 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
       << "leader did not stabilize before publish failure test, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "restart_publish", 48);
+  WriteSyntheticObjects(cluster.Nodes(), "restart_publish", 48);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -400,8 +426,11 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
   std::string restore_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(restarted, "restart_publish_40", "value_40",
-                                 std::chrono::seconds(2), &restore_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(restarted,
+                                           "restart_publish_40",
+                                           "value_40",
+                                           std::chrono::seconds(2),
+                                           &restore_diagnostics))
       << "restart did not retain trusted snapshot state after rejecting injected publish failure, diagnostics="
       << restore_diagnostics;
 
@@ -425,7 +454,7 @@ TEST_F(RaftSnapshotRecoveryTest,
       << "leader did not stabilize before metadata mismatch test, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "metadata_mismatch", 30);
+  WriteSyntheticObjects(cluster.Nodes(), "metadata_mismatch", 30);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
@@ -487,8 +516,11 @@ TEST_F(RaftSnapshotRecoveryTest,
   auto restarted = std::make_shared<RaftNode>(configs[leader_index], snapshot_configs[leader_index]);
 
   std::string restore_diagnostics;
-  ASSERT_TRUE(WaitForValueOnNode(restarted, "metadata_mismatch_29", "value_29",
-                                 std::chrono::seconds(2), &restore_diagnostics))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(restarted,
+                                           "metadata_mismatch_29",
+                                           "value_29",
+                                           std::chrono::seconds(2),
+                                           &restore_diagnostics))
       << "restart did not recover data after ignoring metadata-mismatched visible snapshot, "
          "diagnostics="
       << restore_diagnostics;
@@ -514,7 +546,7 @@ TEST_F(RaftSnapshotRecoveryTest, AllPublishedSnapshotsInvalidYieldNoTrustedSnaps
       << "leader did not stabilize before all-invalid snapshot test, cluster="
       << DescribeCluster(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "all_invalid_snapshot", 30);
+  WriteSyntheticObjects(cluster.Nodes(), "all_invalid_snapshot", 30);
 
   stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_TRUE(stable_leader.has_value())
