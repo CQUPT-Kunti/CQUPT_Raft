@@ -175,6 +175,34 @@
 
 ---
 
+## Phase 8: Final KV Residual Cleanup & Test Deduplication
+
+**Purpose**: 在 metadata-only 主路径已完成的前提下，继续收口 KV 物理删除、测试去重与严格 no-KV 审计，避免历史兼容残留长期留在生产与测试主路径
+
+**Guardrails**:
+
+- 本阶段是 `T044/T045` blocked 后的后续收尾，不得把历史 blocker 伪装成已完成。
+- 本阶段每个任务都必须写任务报告，路径位于 `specs/006-remove-kv-metadata-state-machine/task-reports/`。
+- 本阶段每份报告必须至少包含：
+  - Linux 结果
+  - Windows 结果
+  - CTest 结果
+  - KV residual status
+  - 是否降低覆盖
+  - 是否删除生产 KV 残留
+  - 剩余风险
+- 若 `T056/T057` 发现新的阻塞项或删改风险，必须同步更新 `specs/006-remove-kv-metadata-state-machine/task-reports/cross-task-risk-notes.md`，不得伪造成完成。
+
+- [ ] T055 全面审计 `modules/`、`apps/`、`proto/`、`tests/`、`CMakeLists.txt`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1`、`docs/` 中 `kv` / `KV` / `Kv` / `kSet` / `kDelete` / `CommandType::kSet` / `CommandType::kDelete` / `KvStateMachine` / `state_machine.h` / `state_machine.cpp` 等残留，并在 `specs/006-remove-kv-metadata-state-machine/task-reports/T055-kv-residual-audit.md` 中分类为“必须删除的生产残留”“必须迁移或删除的测试残留”“仅允许存在于历史 task report / migration 文档的说明性残留”“no-KV audit 自身允许出现的检测关键词”；本任务只产出审计报告，不修改源码
+- [ ] T056 [P] 基于 `specs/006-remove-kv-metadata-state-machine/task-reports/T055-kv-residual-audit.md` 清理 `modules/raft/common/`、`modules/raft/node/`、`modules/raft/state_machine/`、`modules/raft/service/`、`apps/`、`proto/` 与根级 `CMakeLists.txt` 中的生产 KV 残留，包括 `CommandType::kSet` / `CommandType::kDelete`、旧 KV command codec、`KvStateMachine`、`state_machine.h/.cpp`、dead include、dead log message、旧 KV target/source 残留，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T056-production-kv-residual-cleanup.md`
+- [ ] T057 [P] 基于 `specs/006-remove-kv-metadata-state-machine/task-reports/T055-kv-residual-audit.md` 审计并清理 `tests/`、`tests/support/`、`tests/CMakeLists.txt` 中重复测试文件、重复 case、重复 helper 与旧 KV 语义测试，重点处理 `tests/test_state_machine.cpp`、`tests/support/raft_snapshot_restart_test_utils.h`、snapshot/restart/recovery/catch-up 相关重复 helper、旧 `SetCommand` / `DeleteCommand` 测试，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T057-test-dedup-and-legacy-kv-cleanup.md`
+- [ ] T058 基于 `T055`、`T056`、`T057` 的结果强化 `tests/no_kv_surface_audit.cmake`、`tests/CMakeLists.txt`、`test.sh`、`test.ps1` 的 no-KV 审计策略，让生产代码、测试主路径、CMake target/source、脚本入口中的禁止 KV surface 直接失败，同时允许历史 `task-reports/`、migration 文档与 audit 自身保留检测关键词，并将结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T058-strict-no-kv-surface-audit.md`
+- [ ] T059 基于 `T058` 校正 `test.sh`、`test.ps1` 与相关 no-KV 分组入口，使 `./test.sh --skip-configure --skip-build --group no-kv` 成为真正轻量的 no-KV 审计命令，只执行 direct `NoKvSurfaceAudit` 与必要 metadata-only smoke，不默认展开为过重的全量 CTest，并将 Linux/Windows 复验结果记录到 `specs/006-remove-kv-metadata-state-machine/task-reports/T059-final-no-kv-audit-validation.md`
+
+**Checkpoint**: 完成 `T055–T059` 后，才能重新判断“KV 物理删除是否完成”“no-KV audit 是否可升格为严格 fail gate”“测试主路径是否已完成去重与历史兼容收口”
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
@@ -186,6 +214,7 @@
 - **Phase 5: US3** 依赖 US2；因为并发、背压、leader switch 强化必须作用于最终生命周期模型
 - **Phase 6: US4** 依赖 US3；因为恢复、快照、catch-up 要验证的是最终并发强化后的 metadata-only 主路径
 - **Phase 7: Polish** 依赖所有用户故事完成；此时再做物理删除与跨平台最终验收
+- **Phase 8: Final KV Residual Cleanup & Test Deduplication** 依赖 Phase 7 的主路径收口结果；只在 metadata-only 主路径、KV service/client/proto 退役、Linux/Windows 最终验证口径明确后推进
 
 ### User Story Dependencies
 
@@ -202,6 +231,7 @@
 - `T028`、`T029`、`T030` 可并行
 - `T036`、`T037`、`T038` 可并行
 - `T044`、`T045`、`T046`、`T047`、`T048`、`T049` 可在最终删除窗口内并行，但必须在 `T050` 之前完成
+- `T056`、`T057` 可并行，但都必须在 `T055` 完成后开始；`T058` 依赖 `T056` 与 `T057`，`T059` 依赖 `T058`
 
 ---
 
@@ -250,6 +280,20 @@ T038 tests/metadata_recovery_stress_test.cpp
 
 # 然后串行升级 snapshot V2 与 replay 边界：
 T039 -> T040 -> T041 -> T042 -> T043
+```
+
+## Parallel Example: Phase 8
+
+```bash
+# 先完成残留分类审计：
+T055 specs/006-remove-kv-metadata-state-machine/task-reports/T055-kv-residual-audit.md
+
+# 然后并行推进生产代码残留清理与测试去重：
+T056 modules/raft/common/command.h modules/raft/common/command.cpp modules/raft/node/raft_node.cpp modules/raft/state_machine/state_machine.h modules/raft/state_machine/state_machine.cpp
+T057 tests/test_state_machine.cpp tests/support/raft_snapshot_restart_test_utils.h tests/CMakeLists.txt
+
+# 最后再串行强化 no-KV 审计并收口脚本入口：
+T058 -> T059
 ```
 
 ---
