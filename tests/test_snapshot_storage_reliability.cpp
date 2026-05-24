@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -15,6 +16,8 @@ namespace raftdemo {
 namespace {
 
 constexpr const char* kSnapshotStorageFailpointEnv = "RAFT_TEST_SNAPSHOT_STORAGE_FAILPOINT";
+constexpr std::uint32_t kMetadataSnapshotMagicV2 = 0x4D445332U;         // "MDS2"
+constexpr std::uint32_t kMetadataSnapshotVersionV2 = 2U;
 
 std::string Sanitize(const std::string& name) {
   std::string out;
@@ -76,6 +79,41 @@ std::string JoinIssueReasons(const std::vector<SnapshotValidationIssue>& issues)
     oss << issue.path << ": " << issue.reason << "\n";
   }
   return oss.str();
+}
+
+template <typename T>
+void WritePod(std::ofstream& out, const T& value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+  ASSERT_TRUE(static_cast<bool>(out));
+}
+
+std::filesystem::path WriteMockMetadataSnapshotData(const std::filesystem::path& path,
+                                                    std::uint32_t version,
+                                                    std::uint64_t last_applied_index,
+                                                    std::uint64_t last_applied_term,
+                                                    bool truncate_after_magic = false) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  EXPECT_TRUE(out.is_open()) << path.string();
+  WritePod(out, kMetadataSnapshotMagicV2);
+  if (truncate_after_magic) {
+    out.flush();
+    EXPECT_TRUE(static_cast<bool>(out));
+    return path;
+  }
+  WritePod(out, version);
+  WritePod(out, last_applied_index);
+  WritePod(out, last_applied_term);
+  WritePod(out, static_cast<std::uint64_t>(0));  // bucket_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // object_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // object_index_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // chunk_ref_index_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // request_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // request_fingerprint_count
+  WritePod(out, static_cast<std::uint64_t>(0));  // tombstone_count
+  out.flush();
+  EXPECT_TRUE(static_cast<bool>(out));
+  return path;
 }
 
 std::size_t CountSnapshotDirs(const std::filesystem::path& dir) {
@@ -273,8 +311,8 @@ TEST_F(SnapshotStorageReliabilityTest, ReportsValidationIssuesForSkippedSnapshot
 
   const std::string reasons = JoinIssueReasons(result.validation_issues);
   EXPECT_NE(reasons.find("staging snapshot directory ignored"), std::string::npos) << reasons;
-  EXPECT_NE(reasons.find("open snapshot meta file failed"), std::string::npos) << reasons;
-  EXPECT_NE(reasons.find("snapshot data file missing"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("snapshot publish incomplete: meta file missing"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("snapshot publish incomplete: data file missing"), std::string::npos) << reasons;
   EXPECT_NE(reasons.find("snapshot checksum mismatch"), std::string::npos) << reasons;
 }
 
@@ -313,8 +351,8 @@ TEST_F(SnapshotStorageReliabilityTest, AllInvalidSnapshotsReturnNoTrustedSnapsho
 
   const std::string reasons = JoinIssueReasons(result.validation_issues);
   EXPECT_NE(reasons.find("staging snapshot directory ignored"), std::string::npos) << reasons;
-  EXPECT_NE(reasons.find("open snapshot meta file failed"), std::string::npos) << reasons;
-  EXPECT_NE(reasons.find("snapshot data file missing"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("snapshot publish incomplete: meta file missing"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("snapshot publish incomplete: data file missing"), std::string::npos) << reasons;
   EXPECT_NE(reasons.find("snapshot checksum mismatch"), std::string::npos) << reasons;
 
   SnapshotMeta loaded;
@@ -336,6 +374,61 @@ TEST_F(SnapshotStorageReliabilityTest, SameIndexSameTermSaveIsIdempotent) {
   std::string error;
   ASSERT_TRUE(storage_->ListSnapshots(&snapshots, &error)) << error;
   ASSERT_EQ(snapshots.size(), 1U);
+}
+
+TEST_F(SnapshotStorageReliabilityTest,
+       ReportsMetadataSnapshotBoundaryMismatchWhenDataHeaderDisagreesWithOuterMeta) {
+  const auto input_file = input_dir_ / "metadata_boundary_mismatch.bin";
+  WriteMockMetadataSnapshotData(input_file, kMetadataSnapshotVersionV2, 99, 8);
+
+  SnapshotMeta published;
+  std::string error;
+  ASSERT_TRUE(storage_->SaveSnapshotFile(input_file.string(), 120, 7, &published, &error)) << error;
+
+  SnapshotListResult result;
+  ASSERT_TRUE(storage_->ListSnapshotsWithDiagnostics(&result, &error)) << error;
+  EXPECT_TRUE(result.snapshots.empty());
+
+  const std::string reasons = JoinIssueReasons(result.validation_issues);
+  EXPECT_NE(reasons.find("metadata snapshot boundary mismatch"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("meta_last_included_index=120"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("metadata_last_applied_index=99"), std::string::npos) << reasons;
+}
+
+TEST_F(SnapshotStorageReliabilityTest,
+       ReportsMetadataSnapshotVersionMismatchWhenRecognizedV2DataUsesUnknownVersion) {
+  const auto input_file = input_dir_ / "metadata_version_mismatch.bin";
+  WriteMockMetadataSnapshotData(input_file, 99, 120, 7);
+
+  SnapshotMeta published;
+  std::string error;
+  ASSERT_TRUE(storage_->SaveSnapshotFile(input_file.string(), 120, 7, &published, &error)) << error;
+
+  SnapshotListResult result;
+  ASSERT_TRUE(storage_->ListSnapshotsWithDiagnostics(&result, &error)) << error;
+  EXPECT_TRUE(result.snapshots.empty());
+
+  const std::string reasons = JoinIssueReasons(result.validation_issues);
+  EXPECT_NE(reasons.find("metadata snapshot version mismatch"), std::string::npos) << reasons;
+  EXPECT_NE(reasons.find("actual_version=99"), std::string::npos) << reasons;
+}
+
+TEST_F(SnapshotStorageReliabilityTest,
+       ReportsTruncatedMetadataSnapshotHeaderWhenRecognizedV2DataCannotExposeBoundary) {
+  const auto input_file = input_dir_ / "metadata_truncated_header.bin";
+  WriteMockMetadataSnapshotData(input_file, kMetadataSnapshotVersionV2, 0, 0, true);
+
+  SnapshotMeta published;
+  std::string error;
+  ASSERT_TRUE(storage_->SaveSnapshotFile(input_file.string(), 120, 7, &published, &error)) << error;
+
+  SnapshotListResult result;
+  ASSERT_TRUE(storage_->ListSnapshotsWithDiagnostics(&result, &error)) << error;
+  EXPECT_TRUE(result.snapshots.empty());
+
+  const std::string reasons = JoinIssueReasons(result.validation_issues);
+  EXPECT_NE(reasons.find("metadata snapshot header truncated or unreadable"), std::string::npos)
+      << reasons;
 }
 
 TEST_F(SnapshotStorageReliabilityTest, PrunesOldSnapshotDirectoriesByIndex) {
@@ -447,7 +540,7 @@ TEST_F(SnapshotStorageReliabilityTest, SnapshotDirectorySyncFailureNeedsExactFai
   ASSERT_TRUE(storage_->ListSnapshotsWithDiagnostics(&result, &error)) << error;
   ASSERT_EQ(result.snapshots.size(), 1U);
   EXPECT_EQ(result.snapshots.front().last_included_index, 10U);
-  EXPECT_NE(JoinIssueReasons(result.validation_issues).find("open snapshot meta file failed"),
+  EXPECT_NE(JoinIssueReasons(result.validation_issues).find("snapshot publish incomplete: meta file missing"),
             std::string::npos);
 
   SnapshotMeta loaded;

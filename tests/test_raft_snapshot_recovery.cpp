@@ -378,7 +378,7 @@ TEST_F(RaftSnapshotRecoveryTest, RestartAfterSnapshotPublishFailureNeedsExactFai
 
   SnapshotListResult diagnostics;
   ASSERT_TRUE(storage->ListSnapshotsWithDiagnostics(&diagnostics, &error)) << error;
-  EXPECT_NE(JoinIssueReasons(diagnostics.validation_issues).find("open snapshot meta file failed"),
+  EXPECT_NE(JoinIssueReasons(diagnostics.validation_issues).find("snapshot publish incomplete: meta file missing"),
             std::string::npos);
 
   auto configs = BuildThreeNodeConfigs(data_root_ / case_name, base_port_);

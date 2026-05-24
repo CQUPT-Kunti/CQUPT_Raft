@@ -32,6 +32,8 @@ namespace raftdemo
     constexpr std::uint32_t kMetaVersion = 2U;
     constexpr std::uint32_t kLegacyMetaMagic = 0x53504D31U; // "SPM1"
     constexpr std::uint32_t kLegacyMetaVersion = 1U;
+    constexpr std::uint32_t kMetadataStateMachineSnapshotMagicV2 = 0x4D445332U; // "MDS2"
+    constexpr std::uint32_t kMetadataStateMachineSnapshotVersionV2 = 2U;
     constexpr const char *kSnapshotDataFileName = "data.bin";
     constexpr const char *kSnapshotMetaFileName = "__raft_snapshot_meta";
     constexpr const char *kSnapshotPrefix = "snapshot_";
@@ -570,6 +572,97 @@ namespace raftdemo
       return true;
     }
 
+    bool ValidateMetadataSnapshotBoundaryIfPresent(const std::filesystem::path &data_path,
+                                                   const std::uint64_t expected_index,
+                                                   const std::uint64_t expected_term,
+                                                   std::string *error)
+    {
+      std::ifstream in(data_path, std::ios::binary);
+      if (!in.is_open())
+      {
+        if (error != nullptr)
+        {
+          *error = "open snapshot data file for metadata boundary diagnosis failed: " +
+                   data_path.string();
+        }
+        return false;
+      }
+
+      std::uint32_t magic = 0;
+      if (!ReadPod(in, &magic, nullptr))
+      {
+        // Non-metadata snapshots or extremely small inputs are left to the
+        // state machine layer; SnapshotStorage only adds metadata-specific
+        // diagnostics when the file declares the metadata V2 magic.
+        return true;
+      }
+      if (magic != kMetadataStateMachineSnapshotMagicV2)
+      {
+        return true;
+      }
+
+      std::uint32_t version = 0;
+      std::uint64_t last_applied_index = 0;
+      std::uint64_t last_applied_term = 0;
+      std::uint64_t bucket_count = 0;
+      std::uint64_t object_count = 0;
+      std::uint64_t object_index_count = 0;
+      std::uint64_t chunk_ref_index_count = 0;
+      std::uint64_t request_count = 0;
+      std::uint64_t request_fingerprint_count = 0;
+      std::uint64_t tombstone_count = 0;
+
+      std::string read_error;
+      if (!ReadPod(in, &version, &read_error) ||
+          !ReadPod(in, &last_applied_index, &read_error) ||
+          !ReadPod(in, &last_applied_term, &read_error) ||
+          !ReadPod(in, &bucket_count, &read_error) ||
+          !ReadPod(in, &object_count, &read_error) ||
+          !ReadPod(in, &object_index_count, &read_error) ||
+          !ReadPod(in, &chunk_ref_index_count, &read_error) ||
+          !ReadPod(in, &request_count, &read_error) ||
+          !ReadPod(in, &request_fingerprint_count, &read_error) ||
+          !ReadPod(in, &tombstone_count, &read_error))
+      {
+        if (error != nullptr)
+        {
+          *error = "metadata snapshot header truncated or unreadable: data_path=" +
+                   data_path.string() + ", detail=" + read_error;
+        }
+        return false;
+      }
+
+      if (version != kMetadataStateMachineSnapshotVersionV2)
+      {
+        if (error != nullptr)
+        {
+          std::ostringstream oss;
+          oss << "metadata snapshot version mismatch: data_path=" << data_path.string()
+              << ", expected_version=" << kMetadataStateMachineSnapshotVersionV2
+              << ", actual_version=" << version;
+          *error = oss.str();
+        }
+        return false;
+      }
+
+      if (last_applied_index != expected_index || last_applied_term != expected_term)
+      {
+        if (error != nullptr)
+        {
+          std::ostringstream oss;
+          oss << "metadata snapshot boundary mismatch: data_path=" << data_path.string()
+              << ", meta_last_included_index=" << expected_index
+              << ", meta_last_included_term=" << expected_term
+              << ", metadata_last_applied_index=" << last_applied_index
+              << ", metadata_last_applied_term=" << last_applied_term;
+          *error = oss.str();
+        }
+        return false;
+      }
+
+      return true;
+    }
+
   } // namespace
 
   FileSnapshotStorage::FileSnapshotStorage(std::string snapshot_dir, std::string file_prefix)
@@ -1099,6 +1192,24 @@ namespace raftdemo
     }
 
     const std::filesystem::path meta_path = snapshot_dir / kSnapshotMetaFileName;
+    std::error_code ec;
+    if (!std::filesystem::exists(meta_path, ec))
+    {
+      if (error != nullptr)
+      {
+        *error = "snapshot publish incomplete: meta file missing: " + meta_path.string();
+      }
+      return false;
+    }
+    if (ec)
+    {
+      if (error != nullptr)
+      {
+        *error = "check snapshot meta file failed: " + meta_path.string() + ": " + ec.message();
+      }
+      return false;
+    }
+
     std::ifstream in(meta_path, std::ios::binary);
     if (!in.is_open())
     {
@@ -1125,16 +1236,32 @@ namespace raftdemo
         !ReadPod(in, &checksum, error) ||
         !ReadString(in, &data_file_name, error))
     {
+      if (error != nullptr)
+      {
+        *error = "corrupted snapshot meta header: path=" + meta_path.string() +
+                 ", detail=" + *error;
+      }
       return false;
     }
 
-    if (magic != kMetaMagic || version != kMetaVersion)
+    if (magic != kMetaMagic)
     {
       if (error != nullptr)
       {
         std::ostringstream oss;
-        oss << "invalid snapshot meta header: path=" << meta_path.string()
-            << ", magic=" << magic << ", version=" << version;
+        oss << "snapshot meta magic mismatch: path=" << meta_path.string()
+            << ", expected_magic=" << kMetaMagic << ", actual_magic=" << magic;
+        *error = oss.str();
+      }
+      return false;
+    }
+    if (version != kMetaVersion)
+    {
+      if (error != nullptr)
+      {
+        std::ostringstream oss;
+        oss << "snapshot meta version mismatch: path=" << meta_path.string()
+            << ", expected_version=" << kMetaVersion << ", actual_version=" << version;
         *error = oss.str();
       }
       return false;
@@ -1143,7 +1270,7 @@ namespace raftdemo
     {
       if (error != nullptr)
       {
-        *error = "snapshot data file name is empty: meta_path=" + meta_path.string();
+        *error = "snapshot meta missing data file name: meta_path=" + meta_path.string();
       }
       return false;
     }
@@ -1179,12 +1306,11 @@ namespace raftdemo
     }
 
     const std::filesystem::path data_path = snapshot_dir / data_file_name;
-    std::error_code ec;
     if (!std::filesystem::exists(data_path, ec) || ec)
     {
       if (error != nullptr)
       {
-        *error = "snapshot data file missing: " + data_path.string();
+        *error = "snapshot publish incomplete: data file missing: " + data_path.string();
       }
       return false;
     }
@@ -1203,6 +1329,13 @@ namespace raftdemo
             << ", expected=" << checksum << ", actual=" << actual_checksum;
         *error = oss.str();
       }
+      return false;
+    }
+    if (!ValidateMetadataSnapshotBoundaryIfPresent(data_path,
+                                                   last_included_index,
+                                                   last_included_term,
+                                                   error))
+    {
       return false;
     }
 
