@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
+#include "metadata_raft_test_utils.h"
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
@@ -25,6 +25,8 @@ namespace raftdemo {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using test::ExpectedRecoveredMetadataObject;
+using test::MetadataRecoveryExpectation;
 
 std::string ProposeStatusName(ProposeStatus status) {
   switch (status) {
@@ -56,12 +58,189 @@ bool IsLeaderNode(const std::shared_ptr<RaftNode>& node) {
   return node && Contains(node->Describe(), "role=Leader");
 }
 
-Command SetCommand(const std::string& key, const std::string& value) {
-  Command command;
-  command.type = CommandType::kSet;
-  command.key = key;
-  command.value = value;
-  return command;
+constexpr const char* kDiagnosisBucket = "snapshot-diagnosis-bucket";
+
+std::string ObjectKey(const std::string& prefix, const int index) {
+  return prefix + "_" + std::to_string(index);
+}
+
+std::string ObjectId(const std::string& prefix, const int index) {
+  return prefix + "-object-" + std::to_string(index);
+}
+
+ExpectedRecoveredMetadataObject MakeCommittedObjectExpectation(
+    const std::string& prefix,
+    const int index) {
+  return ExpectedRecoveredMetadataObject{
+      ObjectKey(prefix, index),
+      ObjectId(prefix, index),
+      2,
+      false,
+  };
+}
+
+ExpectedRecoveredMetadataObject MakeDeletedObjectExpectation(
+    const std::string& object_key,
+    const std::string& object_id) {
+  return ExpectedRecoveredMetadataObject{
+      object_key,
+      object_id,
+      0,
+      true,
+  };
+}
+
+MetadataRecoveryExpectation MakeBaseExpectation() {
+  MetadataRecoveryExpectation expectation;
+  expectation.bucket = kDiagnosisBucket;
+  expectation.expected_request_count = 1;
+  expectation.expected_last_applied_index = 1;
+  expectation.expected_min_last_applied_term = 1;
+  return expectation;
+}
+
+void AddCommittedObjects(MetadataRecoveryExpectation* expectation,
+                         const std::string& prefix,
+                         const int count) {
+  ASSERT_NE(expectation, nullptr);
+  for (int i = 0; i < count; ++i) {
+    expectation->objects.push_back(MakeCommittedObjectExpectation(prefix, i));
+    expectation->visible_keys.push_back(ObjectKey(prefix, i));
+  }
+  expectation->expected_request_count += static_cast<std::size_t>(count) * 2;
+  expectation->expected_last_applied_index += static_cast<std::uint64_t>(count) * 2;
+  std::sort(expectation->visible_keys.begin(), expectation->visible_keys.end());
+}
+
+void AddDeletedObject(MetadataRecoveryExpectation* expectation,
+                      const std::string& object_key,
+                      const std::string& object_id) {
+  ASSERT_NE(expectation, nullptr);
+  expectation->objects.push_back(MakeDeletedObjectExpectation(object_key, object_id));
+  expectation->expected_request_count += 3;
+  expectation->expected_tombstone_count += 1;
+  expectation->expected_last_applied_index += 3;
+}
+
+std::string DescribeMetadataOnAllNodes(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const MetadataRecoveryExpectation& expectation) {
+  std::ostringstream oss;
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    oss << "node[" << i << "] ";
+    if (!nodes[i]) {
+      oss << "<not running>\n";
+      continue;
+    }
+
+    oss << nodes[i]->Describe();
+    const MetadataStateMachine* state_machine = nodes[i]->GetMetadataStateMachineV2();
+    if (state_machine == nullptr) {
+      oss << " | metadata_sm=<null>\n";
+      continue;
+    }
+
+    oss << " | requests=" << state_machine->RequestCount()
+        << " tombstones=" << state_machine->TombstoneCount()
+        << " last_applied_index=" << state_machine->LastAppliedIndex()
+        << " last_applied_term=" << state_machine->LastAppliedTerm();
+
+    const auto listed = state_machine->ListObjects(
+        {.bucket = expectation.bucket, .prefix = "", .limit = std::nullopt, .continuation_token = ""});
+    oss << " | visible=";
+    if (!listed.result.Ok()) {
+      oss << "<list-failed:" << static_cast<int>(listed.result.code) << ">";
+    } else {
+      oss << "[";
+      for (std::size_t key_index = 0; key_index < listed.records.size(); ++key_index) {
+        if (key_index > 0) {
+          oss << ",";
+        }
+        oss << listed.records[key_index].object_key;
+      }
+      oss << "]";
+    }
+
+    for (const auto& object : expectation.objects) {
+      const auto response = state_machine->HeadObject(
+          {.bucket = expectation.bucket, .object_key = object.object_key});
+      const auto internal_record =
+          state_machine->FindObject(expectation.bucket, object.object_key);
+      const auto indexed_object_id =
+          state_machine->FindIndexedObjectId(expectation.bucket, object.object_key);
+      const auto chunk_refs =
+          state_machine->FindChunkRefs(expectation.bucket, object.object_key);
+      oss << " | object=" << object.object_key << ":head="
+          << static_cast<int>(response.result.code);
+      if (response.record.has_value()) {
+        oss << "/" << response.record->object_id;
+      }
+      if (internal_record.has_value()) {
+        oss << ",state=" << static_cast<int>(internal_record->state)
+            << ",internal_id=" << internal_record->object_id;
+      } else {
+        oss << ",state=<none>";
+      }
+      oss << ",indexed=";
+      if (indexed_object_id.has_value()) {
+        oss << *indexed_object_id;
+      } else {
+        oss << "<none>";
+      }
+      oss << ",chunks=";
+      if (chunk_refs.has_value()) {
+        oss << chunk_refs->size();
+      } else {
+        oss << "<none>";
+      }
+    }
+    oss << '\n';
+  }
+  return oss.str();
+}
+
+void AssertExactMetadataFacts(const std::shared_ptr<RaftNode>& node,
+                              const MetadataRecoveryExpectation& expectation) {
+  ASSERT_NE(node, nullptr);
+  const MetadataStateMachine* state_machine = node->GetMetadataStateMachineV2();
+  ASSERT_NE(state_machine, nullptr) << node->Describe();
+  EXPECT_EQ(state_machine->RequestCount(), expectation.expected_request_count)
+      << node->Describe();
+  EXPECT_EQ(state_machine->TombstoneCount(), expectation.expected_tombstone_count)
+      << node->Describe();
+  EXPECT_GE(state_machine->LastAppliedIndex(), expectation.expected_last_applied_index)
+      << node->Describe();
+  ASSERT_TRUE(expectation.expected_min_last_applied_term.has_value());
+  EXPECT_GE(state_machine->LastAppliedTerm(),
+            *expectation.expected_min_last_applied_term)
+      << node->Describe();
+  const auto parse_uint_field = [](const std::string& text,
+                                   const std::string& field_name)
+      -> std::optional<std::uint64_t> {
+    const std::string prefix = field_name;
+    const std::size_t begin = text.find(prefix);
+    if (begin == std::string::npos) {
+      return std::nullopt;
+    }
+    std::size_t pos = begin + prefix.size();
+    std::size_t end = pos;
+    while (end < text.size() && text[end] >= '0' && text[end] <= '9') {
+      ++end;
+    }
+    if (end == pos) {
+      return std::nullopt;
+    }
+    try {
+      return static_cast<std::uint64_t>(std::stoull(text.substr(pos, end - pos)));
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+  const auto node_last_applied =
+      parse_uint_field(node->Describe(), "last_applied=");
+  ASSERT_TRUE(node_last_applied.has_value()) << node->Describe();
+  EXPECT_EQ(*node_last_applied, state_machine->LastAppliedIndex())
+      << node->Describe();
 }
 
 std::uint64_t NowForPath() {
@@ -370,27 +549,6 @@ std::string DescribeAllNodes(const std::vector<std::shared_ptr<RaftNode>>& nodes
   return oss.str();
 }
 
-std::string DescribeValueOnAllNodes(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                                    const std::string& key) {
-  std::ostringstream oss;
-  oss << "key='" << key << "' values:\n";
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    oss << "node[" << i << "] ";
-    if (!nodes[i]) {
-      oss << "<not running>\n";
-      continue;
-    }
-    std::string value;
-    if (nodes[i]->DebugGetValue(key, &value)) {
-      oss << "value='" << value << "'";
-    } else {
-      oss << "<missing>";
-    }
-    oss << " | " << nodes[i]->Describe() << '\n';
-  }
-  return oss.str();
-}
-
 bool IsExcluded(std::size_t index, const std::vector<std::size_t>& excluded) {
   for (std::size_t excluded_index : excluded) {
     if (index == excluded_index) {
@@ -438,53 +596,6 @@ std::size_t FindNodeIndex(const std::vector<std::shared_ptr<RaftNode>>& nodes,
   return nodes.size();
 }
 
-bool WaitForValueOnNode(const std::shared_ptr<RaftNode>& node,
-                        const std::string& key,
-                        const std::string& expected_value,
-                        std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    if (node) {
-      std::string value;
-      if (node->DebugGetValue(key, &value) && value == expected_value) {
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                       const std::string& key,
-                       const std::string& expected_value,
-                       std::chrono::milliseconds timeout,
-                       const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_match = true;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-
-    if (all_match) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
 bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode>& node,
                              const std::string& field_name,
                              std::uint64_t minimum,
@@ -503,59 +614,86 @@ bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode>& node,
 }
 
 bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const Command& command,
+                      const MetadataCommand& command,
                       std::chrono::milliseconds timeout,
                       ProposeResult* final_result,
                       const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  ProposeResult last_result;
-
-  while (Clock::now() < deadline) {
-    auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1500), excluded);
-    if (!leader) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
-    }
-
-    last_result = leader->Propose(command);
-    if (last_result.Ok()) {
-      if (final_result != nullptr) {
-        *final_result = last_result;
-      }
-      return true;
-    }
-
-    if (last_result.status == ProposeStatus::kInvalidCommand ||
-        last_result.status == ProposeStatus::kApplyFailed ||
-        last_result.status == ProposeStatus::kCommitFailed) {
-      break;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-
-  if (final_result != nullptr) {
-    *final_result = last_result;
-  }
-  return false;
+  return test::ProposeMetadataCommandWithRetry(
+      nodes,
+      command,
+      timeout,
+      final_result,
+      excluded);
 }
 
-void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                     const std::string& prefix,
-                     int count,
-                     const std::vector<std::size_t>& excluded = {}) {
+void CreateBucketOrFail(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                        const std::string& request_id,
+                        const std::vector<std::size_t>& excluded = {}) {
+  ProposeResult result;
+  ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+      nodes,
+      kDiagnosisBucket,
+      request_id,
+      std::chrono::seconds(10),
+      &result,
+      excluded))
+      << "create bucket failed, status=" << ProposeStatusName(result.status)
+      << ", message=" << result.message;
+}
+
+void WriteManyCommittedObjects(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                               const std::string& prefix,
+                               int count,
+                               const std::vector<std::size_t>& excluded = {}) {
   ProposeResult result;
   for (int i = 0; i < count; ++i) {
     SCOPED_TRACE(prefix + " write " + std::to_string(i));
-    ASSERT_TRUE(ProposeWithRetry(nodes,
-                                 SetCommand(prefix + "_" + std::to_string(i),
-                                            "value_" + std::to_string(i)),
-                                 std::chrono::seconds(10),
-                                 &result,
-                                 excluded))
+    ASSERT_TRUE(test::ProposeCreateCommitObjectWithRetry(
+        nodes,
+        kDiagnosisBucket,
+        ObjectKey(prefix, i),
+        ObjectId(prefix, i),
+        prefix + "-create-request-" + std::to_string(i),
+        prefix + "-commit-request-" + std::to_string(i),
+        std::chrono::seconds(10),
+        &result,
+        excluded))
         << "write failed, status=" << ProposeStatusName(result.status)
         << ", message=" << result.message;
   }
+}
+
+void CreateCommitDeleteObject(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                              const std::string& object_key,
+                              const std::string& object_id,
+                              const std::string& request_prefix,
+                              const std::vector<std::size_t>& excluded = {}) {
+  ProposeResult result;
+  ASSERT_TRUE(test::ProposeCreateCommitObjectWithRetry(
+      nodes,
+      kDiagnosisBucket,
+      object_key,
+      object_id,
+      request_prefix + "-create",
+      request_prefix + "-commit",
+      std::chrono::seconds(10),
+      &result,
+      excluded))
+      << "create+commit before delete failed, status="
+      << ProposeStatusName(result.status) << ", message=" << result.message;
+
+  ASSERT_TRUE(ProposeWithRetry(
+      nodes,
+      test::MakeDeleteObjectCommand(
+          kDiagnosisBucket,
+          object_key,
+          object_id,
+          request_prefix + "-delete"),
+      std::chrono::seconds(10),
+      &result,
+      excluded))
+      << "delete failed, status=" << ProposeStatusName(result.status)
+      << ", message=" << result.message;
 }
 
 class RaftSnapshotDiagnosisTest : public ::testing::Test {
@@ -614,11 +752,21 @@ TEST_F(RaftSnapshotDiagnosisTest, RestartedSingleNodeLoadsSnapshotAndTailLogsWit
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "recovery_base", 30);
+  CreateBucketOrFail(cluster.Nodes(), "recovery-bucket");
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "recovery_base_29", "value_29",
-                                std::chrono::seconds(15)))
-      << DescribeValueOnAllNodes(cluster.Nodes(), "recovery_base_29");
+  MetadataRecoveryExpectation expectation = MakeBaseExpectation();
+  WriteManyCommittedObjects(cluster.Nodes(), "recovery_base", 30);
+  AddCommittedObjects(&expectation, "recovery_base", 30);
+  CreateCommitDeleteObject(
+      cluster.Nodes(),
+      "recovery_deleted",
+      "recovery-deleted-object",
+      "recovery-deleted");
+  AddDeletedObject(&expectation, "recovery_deleted", "recovery-deleted-object");
+
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(15)))
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
 
   const std::size_t target_index = 0;
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[target_index],
@@ -628,30 +776,26 @@ TEST_F(RaftSnapshotDiagnosisTest, RestartedSingleNodeLoadsSnapshotAndTailLogsWit
       << "target node did not create a snapshot before tail logs\n"
       << DescribeAllNodes(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "recovery_tail", 3);
+  WriteManyCommittedObjects(cluster.Nodes(), "recovery_tail", 3);
+  AddCommittedObjects(&expectation, "recovery_tail", 3);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "recovery_tail_2", "value_2",
-                                std::chrono::seconds(15)))
-      << DescribeValueOnAllNodes(cluster.Nodes(), "recovery_tail_2");
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(15)))
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
 
   cluster.StopAll();
   cluster.StartOnly(target_index);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[target_index],
-                                 "recovery_base_29",
-                                 "value_29",
-                                 std::chrono::seconds(3)))
-      << "snapshot-covered value was not restored from local files. "
-      << "Suspect startup snapshot loading path in raft_node.cpp/snapshot_storage.cpp.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "recovery_base_29");
-
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[target_index],
-                                 "recovery_tail_2",
-                                 "value_2",
-                                 std::chrono::seconds(3)))
-      << "post-snapshot tail log was not restored when the node started without peers. "
-      << "Suspect startup log replay/apply path in raft_node.cpp or raft_storage.cpp.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "recovery_tail_2");
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[target_index]},
+      expectation,
+      std::chrono::seconds(3)))
+      << "snapshot-covered metadata or post-snapshot tail metadata was not restored. "
+      << "Suspect startup snapshot loading or replay boundary in raft_node.cpp.\n"
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[target_index]},
+             expectation);
+  AssertExactMetadataFacts(cluster.Nodes()[target_index], expectation);
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[target_index],
                                       "last_snapshot_index",
@@ -669,7 +813,20 @@ TEST_F(RaftSnapshotDiagnosisTest, CompactedClusterReplicatesNewLogAfterRestarted
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "replication_base", 32);
+  CreateBucketOrFail(cluster.Nodes(), "replication-bucket");
+  MetadataRecoveryExpectation expectation = MakeBaseExpectation();
+  WriteManyCommittedObjects(cluster.Nodes(), "replication_base", 32);
+  AddCommittedObjects(&expectation, "replication_base", 32);
+  CreateCommitDeleteObject(
+      cluster.Nodes(),
+      "replication_deleted",
+      "replication-deleted-object",
+      "replication-deleted");
+  AddDeletedObject(&expectation, "replication_deleted", "replication-deleted-object");
+
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(15)))
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
 
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader after writes\n" << DescribeAllNodes(cluster.Nodes());
@@ -685,33 +842,72 @@ TEST_F(RaftSnapshotDiagnosisTest, CompactedClusterReplicatesNewLogAfterRestarted
 
   cluster.RestartNode(restarted_index);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[restarted_index],
-                                 "replication_base_31",
-                                 "value_31",
-                                 std::chrono::seconds(10)))
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[restarted_index]},
+      expectation,
+      std::chrono::seconds(10)))
       << "restarted compacted node failed local recovery. "
       << "Run RestartedSingleNodeLoadsSnapshotAndTailLogsWithoutPeers first; "
       << "suspect raft_node.cpp startup recovery or raft_storage.cpp.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "replication_base_31");
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[restarted_index]},
+             expectation);
+  AssertExactMetadataFacts(cluster.Nodes()[restarted_index], expectation);
 
   ProposeResult result;
   ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
-                               SetCommand("diagnosis_after_restart", "ok"),
+                               test::MakeCreateObjectCommand(
+                                   kDiagnosisBucket,
+                                   "diagnosis_after_restart",
+                                   "diagnosis-after-restart-object",
+                                   "diagnosis-after-restart-create"),
                                std::chrono::seconds(15),
                                &result))
-      << "new write after compacted restart failed, status="
+      << "new object-create after compacted restart failed, status="
       << ProposeStatusName(result.status) << ", message=" << result.message
       << "\n" << DescribeAllNodes(cluster.Nodes());
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               test::MakeCommitObjectCommand(
+                                   kDiagnosisBucket,
+                                   "diagnosis_after_restart",
+                                   "diagnosis-after-restart-object",
+                                   "diagnosis-after-restart-commit"),
+                               std::chrono::seconds(15),
+                               &result))
+      << "new object-commit after compacted restart failed, status="
+      << ProposeStatusName(result.status) << ", message=" << result.message
+      << "\n" << DescribeAllNodes(cluster.Nodes());
+  expectation.objects.push_back(ExpectedRecoveredMetadataObject{
+      "diagnosis_after_restart",
+      "diagnosis-after-restart-object",
+      2,
+      false,
+  });
+  expectation.visible_keys.push_back("diagnosis_after_restart");
+  std::sort(expectation.visible_keys.begin(), expectation.visible_keys.end());
+  expectation.expected_request_count += 2;
+  expectation.expected_last_applied_index += 2;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(),
-                                "diagnosis_after_restart",
-                                "ok",
-                                std::chrono::seconds(20)))
-      << "new committed log did not reach/apply on every node after compacted restart. "
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(20)))
+      << "new committed metadata did not reach/apply on every node after compacted restart. "
       << "If the previous local recovery assertion passed, suspect raft_node.cpp "
       << "replication catch-up path: next_index initialization, compacted-log boundary, "
       << "AppendEntries prev_log_index/term, or InstallSnapshot handoff.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "diagnosis_after_restart");
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
+
+  std::optional<std::uint64_t> applied_term;
+  for (const auto& node : cluster.Nodes()) {
+    AssertExactMetadataFacts(node, expectation);
+    const MetadataStateMachine* state_machine = node->GetMetadataStateMachineV2();
+    ASSERT_NE(state_machine, nullptr);
+    if (!applied_term.has_value()) {
+      applied_term = state_machine->LastAppliedTerm();
+    } else {
+      EXPECT_EQ(state_machine->LastAppliedTerm(), *applied_term)
+          << node->Describe();
+    }
+  }
 }
 
 TEST_F(RaftSnapshotDiagnosisTest,
@@ -724,7 +920,20 @@ TEST_F(RaftSnapshotDiagnosisTest,
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "corrupted_fallback", 45);
+  CreateBucketOrFail(cluster.Nodes(), "corrupted-bucket");
+  MetadataRecoveryExpectation expectation = MakeBaseExpectation();
+  WriteManyCommittedObjects(cluster.Nodes(), "corrupted_fallback", 45);
+  AddCommittedObjects(&expectation, "corrupted_fallback", 45);
+  CreateCommitDeleteObject(
+      cluster.Nodes(),
+      "corrupted_deleted",
+      "corrupted-deleted-object",
+      "corrupted-deleted");
+  AddDeletedObject(&expectation, "corrupted_deleted", "corrupted-deleted-object");
+
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(20)))
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
 
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader after baseline writes\n"
@@ -757,13 +966,54 @@ TEST_F(RaftSnapshotDiagnosisTest,
 
   cluster.StartOnly(leader_index);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[leader_index],
-                                 "corrupted_fallback_44",
-                                 "value_44",
-                                 std::chrono::seconds(5)))
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+      kDiagnosisBucket,
+      ObjectKey("corrupted_fallback", 5),
+      ObjectId("corrupted_fallback", 5),
+      2,
+      60,
+      std::chrono::seconds(5)))
+      << "snapshot-covered metadata was not restored after rejecting the corrupted newest "
+         "snapshot.\n"
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+             expectation);
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+      kDiagnosisBucket,
+      ObjectKey("corrupted_fallback", 44),
+      ObjectId("corrupted_fallback", 44),
+      2,
+      80,
+      std::chrono::seconds(5)))
       << "restart did not replay committed log entries after rejecting the corrupted newest "
          "snapshot. Suspect trusted snapshot fallback or startup log replay.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "corrupted_fallback_44");
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+             expectation);
+  ASSERT_TRUE(test::WaitUntilAllDeletedObjectHidden(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+      kDiagnosisBucket,
+      "corrupted_deleted",
+      "corrupted-deleted-object",
+      80,
+      std::chrono::seconds(5)))
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+             expectation);
+  const MetadataStateMachine* restarted_state_machine =
+      cluster.Nodes()[leader_index]->GetMetadataStateMachineV2();
+  ASSERT_NE(restarted_state_machine, nullptr)
+      << cluster.Nodes()[leader_index]->Describe();
+  EXPECT_GE(restarted_state_machine->RequestCount(), 74u)
+      << cluster.Nodes()[leader_index]->Describe();
+  EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1u)
+      << cluster.Nodes()[leader_index]->Describe();
+  EXPECT_EQ(restarted_state_machine->LastAppliedIndex(), 95u)
+      << cluster.Nodes()[leader_index]->Describe();
+  EXPECT_GE(restarted_state_machine->LastAppliedTerm(), 1u)
+      << cluster.Nodes()[leader_index]->Describe();
 
   const auto restored_snapshot_index =
       ExtractUintField(cluster.Nodes()[leader_index]->Describe(), "last_snapshot_index");
@@ -785,7 +1035,20 @@ TEST_F(RaftSnapshotDiagnosisTest,
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
 
-  WriteManyValues(cluster.Nodes(), "metadata_replay", 30);
+  CreateBucketOrFail(cluster.Nodes(), "metadata-replay-bucket");
+  MetadataRecoveryExpectation expectation = MakeBaseExpectation();
+  WriteManyCommittedObjects(cluster.Nodes(), "metadata_replay", 30);
+  AddCommittedObjects(&expectation, "metadata_replay", 30);
+  CreateCommitDeleteObject(
+      cluster.Nodes(),
+      "metadata_replay_deleted",
+      "metadata-replay-deleted-object",
+      "metadata-replay-deleted");
+  AddDeletedObject(&expectation, "metadata_replay_deleted", "metadata-replay-deleted-object");
+
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expectation, std::chrono::seconds(15)))
+      << DescribeMetadataOnAllNodes(cluster.Nodes(), expectation);
 
   leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader after metadata replay writes\n"
@@ -817,13 +1080,16 @@ TEST_F(RaftSnapshotDiagnosisTest,
 
   cluster.StartOnly(leader_index);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[leader_index],
-                                 "metadata_replay_29",
-                                 "value_29",
-                                 std::chrono::seconds(5)))
+  ASSERT_TRUE(test::WaitUntilAllMetadataRecoveryMatches(
+      std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+      expectation,
+      std::chrono::seconds(5)))
       << "restart did not replay committed log tail after skipping metadata-mismatched visible "
          "snapshot. Suspect trusted snapshot selection or startup replay.\n"
-      << DescribeValueOnAllNodes(cluster.Nodes(), "metadata_replay_29");
+      << DescribeMetadataOnAllNodes(
+             std::vector<std::shared_ptr<RaftNode>>{cluster.Nodes()[leader_index]},
+             expectation);
+  AssertExactMetadataFacts(cluster.Nodes()[leader_index], expectation);
 
   const auto restored_snapshot_index =
       ExtractUintField(cluster.Nodes()[leader_index]->Describe(), "last_snapshot_index");

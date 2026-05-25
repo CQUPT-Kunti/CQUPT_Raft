@@ -13,11 +13,12 @@
 #include <utility>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
 #include "raft/storage/raft_storage.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo
 {
@@ -232,6 +233,56 @@ namespace raftdemo
       return snapshot_config;
     }
 
+    constexpr const char *kPersistenceBoundaryBucket = "persistence-boundary-bucket";
+    constexpr const char *kBoundaryAlphaKey = "boundary_alpha";
+    constexpr const char *kBoundaryAlphaObjectId = "obj-boundary-alpha";
+    constexpr const char *kBoundaryBetaKey = "boundary_beta";
+    constexpr const char *kBoundaryBetaObjectId = "obj-boundary-beta";
+
+    std::vector<LogRecord> BuildPersistenceBoundaryLog(const std::uint64_t term)
+    {
+      return {
+          LogRecord{1,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateBucketCommand(
+                            kPersistenceBoundaryBucket,
+                            "persistence-boundary-create-bucket"))},
+          LogRecord{2,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryAlphaKey,
+                            kBoundaryAlphaObjectId,
+                            "persistence-boundary-create-alpha"))},
+          LogRecord{3,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCommitObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryAlphaKey,
+                            kBoundaryAlphaObjectId,
+                            "persistence-boundary-commit-alpha"))},
+          LogRecord{4,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCreateObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryBetaKey,
+                            kBoundaryBetaObjectId,
+                            "persistence-boundary-create-beta"))},
+          LogRecord{5,
+                    term,
+                    raftdemo::SerializeMetadataCommand(
+                        raftdemo::test::MakeCommitObjectCommand(
+                            kPersistenceBoundaryBucket,
+                            kBoundaryBetaKey,
+                            kBoundaryBetaObjectId,
+                            "persistence-boundary-commit-beta"))},
+      };
+    }
+
     PersistentRaftState MakePersistenceState(std::uint64_t first_index, std::uint64_t last_index)
     {
       PersistentRaftState state;
@@ -240,13 +291,13 @@ namespace raftdemo
       state.commit_index = last_index;
       state.last_applied = last_index;
 
-      for (std::uint64_t index = first_index; index <= last_index; ++index)
+      const auto log = BuildPersistenceBoundaryLog(state.current_term);
+      for (const auto &record : log)
       {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "boundary_key_" + std::to_string(index);
-        command.value = "boundary_value_" + std::to_string(index);
-        state.log.push_back(LogRecord{index, 5, command.Serialize()});
+        if (record.index >= first_index && record.index <= last_index)
+        {
+          state.log.push_back(record);
+        }
       }
 
       return state;
@@ -265,13 +316,13 @@ namespace raftdemo
       state.commit_index = commit_index;
       state.last_applied = last_applied;
 
-      for (std::uint64_t index = first_index; index <= last_index; ++index)
+      const auto log = BuildPersistenceBoundaryLog(current_term);
+      for (const auto &record : log)
       {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "boundary_key_" + std::to_string(index);
-        command.value = "boundary_value_" + std::to_string(index);
-        state.log.push_back(LogRecord{index, current_term, command.Serialize()});
+        if (record.index >= first_index && record.index <= last_index)
+        {
+          state.log.push_back(record);
+        }
       }
 
       return state;
@@ -378,70 +429,27 @@ namespace raftdemo
       }
     }
 
-    bool ProposeSetToLeader(const std::shared_ptr<RaftNode> &leader,
-                            const std::string &key,
-                            const std::string &value)
-    {
-      if (leader == nullptr)
-      {
-        return false;
-      }
-
-      Command cmd;
-      cmd.type = CommandType::kSet;
-      cmd.key = key;
-      cmd.value = value;
-
-      const ProposeResult result = leader->Propose(cmd);
-      return result.Ok();
-    }
-
-    bool ProposeSetWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                             const std::string &key,
-                             const std::string &value,
-                             std::chrono::milliseconds timeout)
+    bool ProposeMetadataWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
+                                  const MetadataCommand &command,
+                                  std::chrono::milliseconds timeout,
+                                  ProposeResult *last_result = nullptr)
     {
       const auto deadline = std::chrono::steady_clock::now() + timeout;
       while (std::chrono::steady_clock::now() < deadline)
       {
         auto leader = WaitForLeader(nodes, 500ms);
-        if (leader != nullptr && ProposeSetToLeader(leader, key, value))
+        if (leader != nullptr)
         {
-          return true;
-        }
-        std::this_thread::sleep_for(100ms);
-      }
-      return false;
-    }
-
-    bool WaitUntilValue(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                        const std::string &key,
-                        const std::string &expected_value,
-                        std::chrono::milliseconds timeout)
-    {
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
-      while (std::chrono::steady_clock::now() < deadline)
-      {
-        bool all_ok = true;
-        for (const auto &node : nodes)
-        {
-          if (node == nullptr)
+          const ProposeResult result =
+              raftdemo::test::ProposeMetadataCommand(leader, command);
+          if (last_result != nullptr)
           {
-            all_ok = false;
-            break;
+            *last_result = result;
           }
-
-          std::string actual;
-          if (!node->DebugGetValue(key, &actual) || actual != expected_value)
+          if (result.status == ProposeStatus::kOk)
           {
-            all_ok = false;
-            break;
+            return true;
           }
-        }
-
-        if (all_ok)
-        {
-          return true;
         }
 
         std::this_thread::sleep_for(100ms);
@@ -496,6 +504,75 @@ namespace raftdemo
       }
     }
 
+    void ExpectBoundaryObjectState(const MetadataStateMachine &state_machine,
+                                   const std::string &object_key,
+                                   const std::string &object_id,
+                                   const bool expected_visible)
+    {
+      const auto response = state_machine.HeadObject(
+          {.bucket = kPersistenceBoundaryBucket, .object_key = object_key});
+      const auto indexed_object_id =
+          state_machine.FindIndexedObjectId(kPersistenceBoundaryBucket, object_key);
+      const auto chunk_refs =
+          state_machine.FindChunkRefs(kPersistenceBoundaryBucket, object_key);
+      const auto internal_object =
+          state_machine.FindObject(kPersistenceBoundaryBucket, object_key);
+
+      if (expected_visible)
+      {
+        ASSERT_TRUE(response.result.Ok());
+        ASSERT_TRUE(response.record.has_value());
+        EXPECT_TRUE(response.record->IsCommitted());
+        EXPECT_EQ(response.record->object_id, object_id);
+        EXPECT_TRUE(indexed_object_id.has_value());
+        EXPECT_EQ(*indexed_object_id, object_id);
+        EXPECT_TRUE(chunk_refs.has_value());
+        EXPECT_EQ(chunk_refs->size(), 2U);
+        EXPECT_TRUE(internal_object.has_value());
+        EXPECT_TRUE(internal_object->IsCommitted());
+      }
+      else
+      {
+        EXPECT_EQ(response.result.code, MetadataStatusCode::kNotFound);
+        EXPECT_FALSE(response.record.has_value());
+        EXPECT_FALSE(chunk_refs.has_value());
+      }
+    }
+
+    void ExpectBoundaryMetadataState(const std::shared_ptr<RaftNode> &node,
+                                     const std::uint64_t expected_last_applied_index,
+                                     const std::uint64_t expected_term,
+                                     const bool expect_alpha_visible,
+                                     const bool expect_beta_visible)
+    {
+      ASSERT_NE(node, nullptr);
+      const MetadataStateMachine *state_machine = node->GetMetadataStateMachineV2();
+      ASSERT_NE(state_machine, nullptr) << node->Describe();
+
+      const auto bucket = state_machine->FindBucket(kPersistenceBoundaryBucket);
+      ASSERT_TRUE(bucket.has_value()) << node->Describe();
+      EXPECT_TRUE(bucket->IsActive()) << node->Describe();
+
+      EXPECT_EQ(state_machine->LastAppliedIndex(), expected_last_applied_index)
+          << node->Describe();
+      EXPECT_EQ(state_machine->LastAppliedTerm(),
+                expected_last_applied_index == 0 ? 0U : expected_term)
+          << node->Describe();
+      EXPECT_EQ(state_machine->RequestCount(),
+                static_cast<std::size_t>(expected_last_applied_index))
+          << node->Describe();
+      EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
+
+      ExpectBoundaryObjectState(*state_machine,
+                                kBoundaryAlphaKey,
+                                kBoundaryAlphaObjectId,
+                                expect_alpha_visible);
+      ExpectBoundaryObjectState(*state_machine,
+                                kBoundaryBetaKey,
+                                kBoundaryBetaObjectId,
+                                expect_beta_visible);
+    }
+
     TEST(PersistenceTest, FullClusterRestartRecovery)
     {
       ScopedDataDir scoped_dir("test_full_restart");
@@ -506,14 +583,50 @@ namespace raftdemo
       ASSERT_NE(WaitForLeader(cluster.nodes, 10s), nullptr)
           << DescribeAllNodes(cluster.nodes);
 
-      ASSERT_TRUE(ProposeSetWithRetry(cluster.nodes, "alpha", "1", 10s))
+      const std::string bucket = "restart-cluster-bucket";
+      const auto create_bucket = raftdemo::test::MakeCreateBucketCommand(
+          bucket, "restart-cluster-create-bucket-1");
+      const auto create_alpha = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "alpha", "obj-alpha", "restart-cluster-create-alpha-1");
+      const auto commit_alpha = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "alpha", "obj-alpha", "restart-cluster-commit-alpha-1");
+      const auto create_gone = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "gone", "obj-gone", "restart-cluster-create-gone-1");
+      const auto commit_gone = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "gone", "obj-gone", "restart-cluster-commit-gone-1");
+      const auto delete_gone = raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "gone", "obj-gone", "restart-cluster-delete-gone-1");
+
+      ProposeResult delete_result;
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, create_bucket, 10s))
           << DescribeAllNodes(cluster.nodes);
-      ASSERT_TRUE(ProposeSetWithRetry(cluster.nodes, "beta", "2", 10s))
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, create_alpha, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, commit_alpha, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, create_gone, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, commit_gone, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, delete_gone, 10s, &delete_result))
           << DescribeAllNodes(cluster.nodes);
 
-      ASSERT_TRUE(WaitUntilValue(cluster.nodes, "alpha", "1", 10s))
-          << DescribeAllNodes(cluster.nodes);
-      ASSERT_TRUE(WaitUntilValue(cluster.nodes, "beta", "2", 10s))
+      const raftdemo::test::MetadataRecoveryExpectation expected_state{
+          .bucket = bucket,
+          .objects =
+              {
+                  {"alpha", "obj-alpha", 2U, false},
+                  {"gone", "obj-gone", 0U, true},
+              },
+          .visible_keys = {"alpha"},
+          .expected_request_count = 6U,
+          .expected_tombstone_count = 1U,
+          .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
+      };
+
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.nodes, expected_state, 10s))
           << DescribeAllNodes(cluster.nodes);
 
       StopCluster(&cluster);
@@ -523,9 +636,8 @@ namespace raftdemo
       ASSERT_NE(WaitForLeader(cluster.nodes, 10s), nullptr)
           << DescribeAllNodes(cluster.nodes);
 
-      EXPECT_TRUE(WaitUntilValue(cluster.nodes, "alpha", "1", 12s))
-          << DescribeAllNodes(cluster.nodes);
-      EXPECT_TRUE(WaitUntilValue(cluster.nodes, "beta", "2", 12s))
+      EXPECT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.nodes, expected_state, 12s))
           << DescribeAllNodes(cluster.nodes);
 
       StopCluster(&cluster);
@@ -552,9 +664,40 @@ namespace raftdemo
       }
       ASSERT_NE(follower, nullptr) << DescribeAllNodes(cluster.nodes);
 
-      ASSERT_TRUE(ProposeSetWithRetry(cluster.nodes, "first", "100", 10s))
+      const std::string bucket = "restart-follower-bucket";
+      const auto create_bucket = raftdemo::test::MakeCreateBucketCommand(
+          bucket, "restart-follower-create-bucket-1");
+      const auto create_first = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "first", "obj-first", "restart-follower-create-first-1");
+      const auto commit_first = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "first", "obj-first", "restart-follower-commit-first-1");
+      const auto create_second = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "second", "obj-second", "restart-follower-create-second-1");
+      const auto commit_second = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "second", "obj-second", "restart-follower-commit-second-1");
+      const auto create_gone = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "gone", "obj-gone", "restart-follower-create-gone-1");
+      const auto commit_gone = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "gone", "obj-gone", "restart-follower-commit-gone-1");
+      const auto delete_gone = raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "gone", "obj-gone", "restart-follower-delete-gone-1");
+
+      ProposeResult commit_first_result;
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, create_bucket, 10s))
           << DescribeAllNodes(cluster.nodes);
-      ASSERT_TRUE(WaitUntilValue(cluster.nodes, "first", "100", 10s))
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, create_first, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(cluster.nodes, commit_first, 10s, &commit_first_result))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.nodes,
+                      {.bucket = bucket,
+                       .objects = {{"first", "obj-first", 2U, false}},
+                       .visible_keys = {"first"},
+                       .expected_request_count = 3U,
+                       .expected_tombstone_count = 0U,
+                       .expected_last_applied_index = commit_first_result.log_index},
+                      10s))
           << DescribeAllNodes(cluster.nodes);
 
       follower->Stop();
@@ -569,9 +712,34 @@ namespace raftdemo
         }
       }
 
-      ASSERT_TRUE(ProposeSetWithRetry(alive_nodes, "second", "200", 10s))
+      ProposeResult delete_result;
+      ASSERT_TRUE(ProposeMetadataWithRetry(alive_nodes, create_second, 10s))
           << DescribeAllNodes(cluster.nodes);
-      ASSERT_TRUE(WaitUntilValue(alive_nodes, "second", "200", 10s))
+      ASSERT_TRUE(ProposeMetadataWithRetry(alive_nodes, commit_second, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(alive_nodes, create_gone, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(alive_nodes, commit_gone, 10s))
+          << DescribeAllNodes(cluster.nodes);
+      ASSERT_TRUE(ProposeMetadataWithRetry(alive_nodes, delete_gone, 10s, &delete_result))
+          << DescribeAllNodes(cluster.nodes);
+
+      const raftdemo::test::MetadataRecoveryExpectation expected_state{
+          .bucket = bucket,
+          .objects =
+              {
+                  {"first", "obj-first", 2U, false},
+                  {"second", "obj-second", 2U, false},
+                  {"gone", "obj-gone", 0U, true},
+              },
+          .visible_keys = {"first", "second"},
+          .expected_request_count = 8U,
+          .expected_tombstone_count = 1U,
+          .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
+      };
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      alive_nodes, expected_state, 10s))
           << DescribeAllNodes(cluster.nodes);
 
       const auto follower_it = std::find(cluster.nodes.begin(), cluster.nodes.end(), follower);
@@ -594,10 +762,17 @@ namespace raftdemo
     restarted_follower->Start();
     restarted_follower->Wait(); });
 
-      EXPECT_TRUE(WaitUntilValue(cluster.nodes, "first", "100", 12s))
+      EXPECT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.nodes, expected_state, 12s))
           << DescribeAllNodes(cluster.nodes);
-      EXPECT_TRUE(WaitUntilValue(cluster.nodes, "second", "200", 12s))
-          << DescribeAllNodes(cluster.nodes);
+
+      const MetadataStateMachine *restarted_state_machine =
+          restarted_follower->GetMetadataStateMachineV2();
+      ASSERT_NE(restarted_state_machine, nullptr);
+      EXPECT_GE(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
+      EXPECT_GE(restarted_state_machine->LastAppliedTerm(), delete_result.term);
+      EXPECT_EQ(restarted_state_machine->RequestCount(), 8U);
+      EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
 
       StopCluster(&cluster);
     }
@@ -623,16 +798,56 @@ namespace raftdemo
         node->Wait(); });
 
       ASSERT_NE(WaitForLeader({node}, 8s), nullptr) << node->Describe();
-      ASSERT_TRUE(ProposeSetWithRetry({node}, "hard_state_alpha", "1", 6s)) << node->Describe();
-      ASSERT_TRUE(ProposeSetWithRetry({node}, "hard_state_beta", "2", 6s)) << node->Describe();
-      ASSERT_TRUE(WaitUntilValue({node}, "hard_state_alpha", "1", 6s)) << node->Describe();
-      ASSERT_TRUE(WaitUntilValue({node}, "hard_state_beta", "2", 6s)) << node->Describe();
+
+      const std::string bucket = "hard-state-bucket";
+      const auto create_bucket = raftdemo::test::MakeCreateBucketCommand(
+          bucket, "hard-state-create-bucket-1");
+      const auto create_alpha = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "alpha", "obj-hard-alpha", "hard-state-create-alpha-1");
+      const auto commit_alpha = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "alpha", "obj-hard-alpha", "hard-state-commit-alpha-1");
+      const auto create_gone = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "gone", "obj-hard-gone", "hard-state-create-gone-1");
+      const auto commit_gone = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "gone", "obj-hard-gone", "hard-state-commit-gone-1");
+      const auto delete_gone = raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "gone", "obj-hard-gone", "hard-state-delete-gone-1");
+
+      ProposeResult delete_result;
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, create_bucket, 6s)) << node->Describe();
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, create_alpha, 6s)) << node->Describe();
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, commit_alpha, 6s)) << node->Describe();
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, create_gone, 6s)) << node->Describe();
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, commit_gone, 6s)) << node->Describe();
+      ASSERT_TRUE(ProposeMetadataWithRetry({node}, delete_gone, 6s, &delete_result))
+          << node->Describe();
+
+      const raftdemo::test::MetadataRecoveryExpectation expected_state{
+          .bucket = bucket,
+          .objects =
+              {
+                  {"alpha", "obj-hard-alpha", 2U, false},
+                  {"gone", "obj-hard-gone", 0U, true},
+              },
+          .visible_keys = {"alpha"},
+          .expected_request_count = 6U,
+          .expected_tombstone_count = 1U,
+          .expected_last_applied_index = delete_result.log_index,
+          .expected_min_last_applied_term = delete_result.term,
+      };
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      {node}, expected_state, 6s))
+          << node->Describe();
 
       const NodeStatusSnapshot before_status = node->GetStatusSnapshot();
       const std::string before_description = node->Describe();
       int before_voted_for = -1;
       ASSERT_TRUE(ExtractIntField(before_description, "voted_for", &before_voted_for))
           << before_description;
+      const MetadataStateMachine *before_state_machine = node->GetMetadataStateMachineV2();
+      ASSERT_NE(before_state_machine, nullptr);
+      EXPECT_EQ(before_state_machine->LastAppliedIndex(), delete_result.log_index);
+      EXPECT_EQ(before_state_machine->LastAppliedTerm(), delete_result.term);
 
       node->Stop();
       if (worker.joinable())
@@ -646,17 +861,77 @@ namespace raftdemo
       int after_voted_for = -1;
       ASSERT_TRUE(ExtractIntField(after_description, "voted_for", &after_voted_for))
           << after_description;
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      {restarted}, expected_state, 500ms))
+          << after_description;
+
+      const MetadataStateMachine *restarted_state_machine =
+          restarted->GetMetadataStateMachineV2();
+      ASSERT_NE(restarted_state_machine, nullptr);
 
       EXPECT_EQ(after_status.term, before_status.term) << after_description;
       EXPECT_EQ(after_status.commit_index, before_status.commit_index) << after_description;
       EXPECT_EQ(after_status.last_applied, before_status.last_applied) << after_description;
       EXPECT_EQ(after_voted_for, before_voted_for) << after_description;
+      EXPECT_EQ(restarted_state_machine->LastAppliedIndex(), delete_result.log_index);
+      EXPECT_EQ(restarted_state_machine->LastAppliedTerm(), delete_result.term);
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("hard_state_alpha", &actual));
-      EXPECT_EQ(actual, "1");
-      EXPECT_TRUE(restarted->DebugGetValue("hard_state_beta", &actual));
-      EXPECT_EQ(actual, "2");
+      const fs::path probe_dir = scoped_dir.path() / "metadata_recovery_probe";
+      std::error_code ec;
+      fs::create_directories(probe_dir, ec);
+      ASSERT_FALSE(ec) << ec.message();
+
+      const fs::path probe_snapshot = probe_dir / "cold-restart-recovered.snapshot";
+      const SnapshotResult save_result =
+          restarted_state_machine->SaveSnapshot(probe_snapshot.string());
+      ASSERT_EQ(save_result.status, SnapshotStatus::kOk) << save_result.message;
+
+      MetadataStateMachine replay_probe;
+      const SnapshotResult load_result = replay_probe.LoadSnapshot(probe_snapshot.string());
+      ASSERT_EQ(load_result.status, SnapshotStatus::kOk) << load_result.message;
+      EXPECT_EQ(replay_probe.RequestCount(), 6U);
+      EXPECT_EQ(replay_probe.TombstoneCount(), 1U);
+      EXPECT_EQ(replay_probe.LastAppliedIndex(), delete_result.log_index);
+      EXPECT_EQ(replay_probe.LastAppliedTerm(), delete_result.term);
+
+      const ApplyResult delete_replay = replay_probe.Apply(
+          delete_result.log_index + 1,
+          SerializeMetadataCommand(delete_gone));
+      EXPECT_TRUE(delete_replay.Ok);
+      EXPECT_EQ(delete_replay.message, "idempotent replay");
+
+      const ApplyResult commit_deleted_replay = replay_probe.Apply(
+          delete_result.log_index + 2,
+          SerializeMetadataCommand(commit_gone));
+      EXPECT_TRUE(commit_deleted_replay.Ok);
+      EXPECT_EQ(commit_deleted_replay.message, "idempotent replay");
+
+      const auto gone_after_replay =
+          replay_probe.HeadObject({.bucket = bucket, .object_key = "gone"});
+      EXPECT_EQ(gone_after_replay.result.code, MetadataStatusCode::kNotFound);
+      EXPECT_FALSE(gone_after_replay.record.has_value());
+      EXPECT_FALSE(replay_probe.FindIndexedObjectId(bucket, "gone").has_value());
+      EXPECT_FALSE(replay_probe.FindChunkRefs(bucket, "gone").has_value());
+      EXPECT_EQ(replay_probe.RequestCount(), 6U);
+      EXPECT_EQ(replay_probe.TombstoneCount(), 1U);
+
+      const MetadataCommand conflicting_delete = raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "alpha", "obj-hard-alpha", "hard-state-delete-gone-1");
+      const ApplyResult conflict = replay_probe.Apply(
+          delete_result.log_index + 3,
+          SerializeMetadataCommand(conflicting_delete));
+      EXPECT_FALSE(conflict.Ok);
+      EXPECT_EQ(conflict.message,
+                "idempotency conflict: request_id maps to different command");
+      EXPECT_EQ(replay_probe.RequestCount(), 6U);
+      EXPECT_EQ(replay_probe.TombstoneCount(), 1U);
+
+      const auto alpha_after_conflict =
+          replay_probe.HeadObject({.bucket = bucket, .object_key = "alpha"});
+      ASSERT_EQ(alpha_after_conflict.result.code, MetadataStatusCode::kOk);
+      ASSERT_TRUE(alpha_after_conflict.record.has_value());
+      EXPECT_EQ(alpha_after_conflict.record->object_id, "obj-hard-alpha");
+      EXPECT_TRUE(alpha_after_conflict.record->IsCommitted());
     }
 
     TEST(PersistenceTest, ColdRestartClampsCommitAndApplyBoundariesToLastLogIndex)
@@ -672,19 +947,7 @@ namespace raftdemo
       config.rpc_deadline = std::chrono::milliseconds(500);
       config.data_dir = (scoped_dir.path() / "raft_data" / "node_1").string();
 
-      PersistentRaftState persisted;
-      persisted.current_term = 3;
-      persisted.voted_for = 1;
-      persisted.commit_index = 99;
-      persisted.last_applied = 99;
-      for (std::uint64_t index = 1; index <= 3; ++index)
-      {
-        Command command;
-        command.type = CommandType::kSet;
-        command.key = "clamp_key_" + std::to_string(index);
-        command.value = "clamp_value_" + std::to_string(index);
-        persisted.log.push_back(LogRecord{index, 3, command.Serialize()});
-      }
+      const auto persisted = MakePersistenceStateWithHardState(1, 3, 3, 1, 99, 99);
 
       std::string error;
       auto storage = CreateFileRaftStorage(config.data_dir);
@@ -698,9 +961,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 3U) << restarted->Describe();
       EXPECT_EQ(status.last_log_index, 3U) << restarted->Describe();
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("clamp_key_3", &actual));
-      EXPECT_EQ(actual, "clamp_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 3U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartUsesPreviouslyTrustedMetaBoundaryWhenNewLogPublishesBeforeMeta)
@@ -753,10 +1014,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, new_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsCommitIndexToLastLogAndReplaysCommittedPrefix)
@@ -790,9 +1048,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, 3U) << description;
       EXPECT_EQ(voted_for, 2) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 4U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsLastAppliedToCommitIndexWhenAppliedExceedsCommit)
@@ -823,10 +1079,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 2U) << description;
       EXPECT_EQ(status.last_log_index, 3U) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_2", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_2");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 2U, 4U, false, false);
     }
 
     TEST(PersistenceTest, ColdRestartClampsLastAppliedToTrustedLogPrefixWhenAppliedPointsPastAvailableLog)
@@ -857,9 +1110,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_applied, 3U) << description;
       EXPECT_EQ(status.last_log_index, 3U) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
+      ExpectBoundaryMetadataState(restarted, 3U, 4U, true, false);
     }
 
     TEST(PersistenceTest, ColdRestartUsesOlderMetaTermAndVoteWhenNewerLogTreeIsVisible)
@@ -909,10 +1160,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual)) << description;
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, new_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, NewMetaWithOldLogBoundaryRejectsUntrustedCurrentTermAndVote)
@@ -1010,10 +1258,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, old_state.current_term, true, false);
     }
 
     TEST(PersistenceTest, MetaDirectorySyncFailureNeedsExactFailureInjectionSeam)
@@ -1078,10 +1323,7 @@ namespace raftdemo
       EXPECT_EQ(status.last_log_index, old_state.log.back().index) << description;
       EXPECT_EQ(voted_for, old_state.voted_for) << description;
 
-      std::string actual;
-      EXPECT_TRUE(restarted->DebugGetValue("boundary_key_3", &actual));
-      EXPECT_EQ(actual, "boundary_value_3");
-      EXPECT_FALSE(restarted->DebugGetValue("boundary_key_5", &actual)) << description;
+      ExpectBoundaryMetadataState(restarted, 3U, old_state.current_term, true, false);
     }
 
   } // namespace

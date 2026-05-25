@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
+#include "metadata_raft_test_utils.h"
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
@@ -222,6 +222,26 @@ namespace raftdemo
       return oss.str();
     }
 
+    std::string StorageObjectKey(const std::uint64_t index)
+    {
+      return "storage_key_" + std::to_string(index);
+    }
+
+    std::string StorageObjectId(const std::uint64_t index)
+    {
+      return "storage-object-" + std::to_string(index);
+    }
+
+    std::string MakeStorageLogCommand(const std::uint64_t index)
+    {
+      return SerializeMetadataCommand(test::MakeCreateObjectCommand(
+          "segment-storage-bucket-" + std::to_string(index),
+          StorageObjectKey(index),
+          StorageObjectId(index),
+          "segment-storage-request-" + std::to_string(index),
+          1710000000 + index));
+    }
+
     PersistentRaftState MakeState(std::uint64_t first_index, std::uint64_t last_index)
     {
       PersistentRaftState state;
@@ -232,10 +252,7 @@ namespace raftdemo
 
       for (std::uint64_t index = first_index; index <= last_index; ++index)
       {
-        state.log.push_back(LogRecord{index,
-                                      7,
-                                      "SET|storage_key_" + std::to_string(index) +
-                                          "|storage_value_" + std::to_string(index)});
+        state.log.push_back(LogRecord{index, 7, MakeStorageLogCommand(index)});
       }
       return state;
     }
@@ -385,13 +402,26 @@ namespace raftdemo
       return node != nullptr && Contains(node->Describe(), "role=Leader");
     }
 
-    Command SetCommand(const std::string &key, const std::string &value)
+    std::string ObjectKey(const std::string &prefix, const int index)
     {
-      Command command;
-      command.type = CommandType::kSet;
-      command.key = key;
-      command.value = value;
-      return command;
+      return prefix + "_" + std::to_string(index);
+    }
+
+    std::string ObjectId(const std::string &prefix, const int index)
+    {
+      return prefix + "-object-" + std::to_string(index);
+    }
+
+    std::vector<std::string> SortedObjectKeys(const std::string &prefix, const int count)
+    {
+      std::vector<std::string> keys;
+      keys.reserve(static_cast<std::size_t>(count));
+      for (int i = 0; i < count; ++i)
+      {
+        keys.push_back(ObjectKey(prefix, i));
+      }
+      std::sort(keys.begin(), keys.end());
+      return keys;
     }
 
     int PickBasePort(const std::string &test_name)
@@ -580,38 +610,6 @@ namespace raftdemo
       return nullptr;
     }
 
-    bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                           const std::string &key,
-                           const std::string &expected_value,
-                           std::chrono::milliseconds timeout)
-    {
-      const auto deadline = Clock::now() + timeout;
-      while (Clock::now() < deadline)
-      {
-        bool all_match = true;
-        for (const auto &node : nodes)
-        {
-          if (!node)
-          {
-            all_match = false;
-            break;
-          }
-          std::string value;
-          if (!node->DebugGetValue(key, &value) || value != expected_value)
-          {
-            all_match = false;
-            break;
-          }
-        }
-        if (all_match)
-        {
-          return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      }
-      return false;
-    }
-
     std::optional<std::uint64_t> ExtractUintField(const std::string &describe,
                                                   const std::string &field_name)
     {
@@ -679,67 +677,60 @@ namespace raftdemo
       return false;
     }
 
-    bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                          const Command &command,
-                          std::chrono::milliseconds timeout,
-                          ProposeResult *final_result)
-    {
-      const auto deadline = Clock::now() + timeout;
-      ProposeResult last_result;
-
-      while (Clock::now() < deadline)
-      {
-        auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1500));
-        if (!leader)
-        {
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-          continue;
-        }
-
-        last_result = leader->Propose(command);
-        if (last_result.Ok())
-        {
-          if (final_result != nullptr)
-          {
-            *final_result = last_result;
-          }
-          return true;
-        }
-
-        if (last_result.status == ProposeStatus::kInvalidCommand ||
-            last_result.status == ProposeStatus::kApplyFailed ||
-            last_result.status == ProposeStatus::kCommitFailed)
-        {
-          break;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-
-      if (final_result != nullptr)
-      {
-        *final_result = last_result;
-      }
-      return false;
-    }
-
-    void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                         const std::string &prefix,
-                         int count)
+    void WriteManyCommittedObjects(const std::vector<std::shared_ptr<RaftNode>> &nodes,
+                                   const std::string &bucket,
+                                   const std::string &prefix,
+                                   int count)
     {
       ProposeResult result;
       for (int i = 0; i < count; ++i)
       {
         SCOPED_TRACE(prefix + " write " + std::to_string(i));
-        ASSERT_TRUE(ProposeWithRetry(nodes,
-                                     SetCommand(prefix + "_" + std::to_string(i),
-                                                "value_" + std::to_string(i)),
-                                     std::chrono::seconds(10),
-                                     &result))
+        ASSERT_TRUE(test::ProposeCreateCommitObjectWithRetry(
+            nodes,
+            bucket,
+            ObjectKey(prefix, i),
+            ObjectId(prefix, i),
+            prefix + "-create-" + std::to_string(i),
+            prefix + "-commit-" + std::to_string(i),
+            std::chrono::seconds(10),
+            &result))
             << "write failed, status=" << ProposeStatusName(result.status)
             << ", message=" << result.message
             << "\n"
             << DescribeAllNodes(nodes);
+      }
+    }
+
+    void ExpectClusterMetadataState(const std::vector<std::shared_ptr<RaftNode>> &nodes,
+                                    const std::string &bucket,
+                                    const std::string &prefix,
+                                    const int object_count,
+                                    const std::uint64_t expected_last_applied_index)
+    {
+      const auto expected_keys = SortedObjectKeys(prefix, object_count);
+      ASSERT_TRUE(test::WaitUntilAllListObjectsMatch(nodes,
+                                                     bucket,
+                                                     prefix,
+                                                     expected_keys,
+                                                     expected_last_applied_index,
+                                                     std::chrono::seconds(20)))
+          << DescribeAllNodes(nodes);
+
+      for (const auto &node : nodes)
+      {
+        ASSERT_NE(node, nullptr);
+        const auto *state_machine = node->GetMetadataStateMachineV2();
+        ASSERT_NE(state_machine, nullptr) << node->Describe();
+        EXPECT_EQ(state_machine->RequestCount(),
+                  static_cast<std::size_t>(1 + object_count * 2))
+            << node->Describe();
+        EXPECT_EQ(state_machine->ObjectCount(), static_cast<std::size_t>(object_count))
+            << node->Describe();
+        EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
+        EXPECT_GE(state_machine->LastAppliedIndex(), expected_last_applied_index)
+            << node->Describe();
+        EXPECT_GT(state_machine->LastAppliedTerm(), 0U) << node->Describe();
       }
     }
 
@@ -815,7 +806,7 @@ namespace raftdemo
       ASSERT_EQ(loaded.log.size(), state.log.size());
       EXPECT_EQ(loaded.log.front().index, 1U);
       EXPECT_EQ(loaded.log.back().index, 1300U);
-      EXPECT_EQ(loaded.log[1023].command, "SET|storage_key_1024|storage_value_1024");
+      EXPECT_EQ(loaded.log[1023].command, MakeStorageLogCommand(1024));
     }
 
     TEST_F(RaftSegmentStorageTest, AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave)
@@ -1365,9 +1356,11 @@ namespace raftdemo
     {
       // Use a deliberately small snapshot threshold so the test quickly produces
       // multiple snapshot files that can be inspected under build/tests/raft_test_data.
+      const std::string bucket = "segment-storage-cluster";
       constexpr std::uint64_t kSnapshotThreshold = 4;
       constexpr int kWriteCount = 160;
       constexpr std::uint64_t kExpectedSnapshotIndex = 80;
+      constexpr std::uint64_t kExpectedLastAppliedIndex = 1 + kWriteCount * 2;
 
       auto cluster = MakeCluster("cluster_generated_many_snapshots_and_logs", kSnapshotThreshold);
       cluster.Start();
@@ -1375,14 +1368,30 @@ namespace raftdemo
       auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
       ASSERT_NE(leader, nullptr) << "no leader elected\n"
                                  << DescribeAllNodes(cluster.Nodes());
-
-      WriteManyValues(cluster.Nodes(), "segment_cluster_many", kWriteCount);
-
-      ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(),
-                                    "segment_cluster_many_159",
-                                    "value_159",
-                                    std::chrono::seconds(20)))
+      ASSERT_TRUE(test::ProposeCreateBucketWithRetry(cluster.Nodes(),
+                                                     bucket,
+                                                     "segment-storage-bucket-create",
+                                                     std::chrono::seconds(6)))
           << DescribeAllNodes(cluster.Nodes());
+
+      WriteManyCommittedObjects(cluster.Nodes(),
+                                bucket,
+                                "segment_cluster_many",
+                                kWriteCount);
+
+      ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                    bucket,
+                                                    ObjectKey("segment_cluster_many", 159),
+                                                    ObjectId("segment_cluster_many", 159),
+                                                    2,
+                                                    kExpectedLastAppliedIndex,
+                                                    std::chrono::seconds(20)))
+          << DescribeAllNodes(cluster.Nodes());
+      ExpectClusterMetadataState(cluster.Nodes(),
+                                 bucket,
+                                 "segment_cluster_many",
+                                 kWriteCount,
+                                 kExpectedLastAppliedIndex);
 
       ASSERT_TRUE(WaitForSnapshotOnAtLeastNodes(cluster.Nodes(),
                                                 kExpectedSnapshotIndex,

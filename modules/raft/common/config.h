@@ -15,10 +15,8 @@ namespace raftdemo
     std::string address;
   };
 
-  struct KvRequestLimits
+  struct ProposalLimits
   {
-    std::size_t max_key_bytes{256};
-    std::size_t max_value_bytes{64 * 1024};
     std::size_t max_command_bytes{1024 * 1024};
   };
 
@@ -36,8 +34,8 @@ namespace raftdemo
     // Raft 硬状态和日志持久化目录。
     std::string data_dir;
 
-    // 业务 KV 请求限制。
-    KvRequestLimits kv_limits;
+    // 业务命令大小限制。
+    ProposalLimits proposal_limits;
   };
 
   struct snapshotConfig

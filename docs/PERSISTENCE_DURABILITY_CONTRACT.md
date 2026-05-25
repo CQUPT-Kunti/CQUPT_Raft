@@ -66,7 +66,7 @@ snapshotConfig::snapshot_dir/
 - `snapshot_<index>/__raft_snapshot_meta` 保存 snapshot header、`last_included_index`、`last_included_term`、`created_unix_ms`、checksum 和 data file name
 - `install_snapshot_node_<id>.bin.tmp` 是 follower 接收远端 snapshot 时的临时文件
 - `snapshot_work_node_<id>.bin` 是本地 snapshot worker 输出给 snapshot storage 的中间文件
-- `*.tmp` 来自 `KvStateMachine::SaveSnapshot()` 的临时输出文件
+- `*.tmp` 来自当前状态机 `SaveSnapshot()` 的临时输出文件
 
 ## 3. 每类对象的写入路径
 
@@ -103,7 +103,7 @@ snapshotConfig::snapshot_dir/
 主路径：
 
 - `RaftNode::SnapshotWorkerLoop()`
-- `KvStateMachine::SaveSnapshot()`
+- `state_machine_->SaveSnapshot()`
 - `FileSnapshotStorage::SaveSnapshotFile()`
 - `CompactLogPrefixLocked()`
 - `PersistStateLocked()`
@@ -111,7 +111,7 @@ snapshotConfig::snapshot_dir/
 当前顺序是：
 
 1. snapshot worker 读取当前 `last_applied_` 和对应 term
-2. `KvStateMachine::SaveSnapshot(temp_path)` 写状态机 snapshot 文件
+2. `state_machine_->SaveSnapshot(temp_path)` 写状态机 snapshot 文件
 3. `FileSnapshotStorage::SaveSnapshotFile(temp_path, snapshot_index, snapshot_term, ...)`
 4. snapshot 保存成功后，`CompactLogPrefixLocked(snapshot_index, snapshot_term)`
 5. compact 后再 `PersistStateLocked()`
@@ -171,7 +171,7 @@ snapshotConfig::snapshot_dir/
 - `raft_storage.cpp::WriteSegments()`
 - `snapshot_storage.cpp::CopyFilePortable()`
 - `snapshot_storage.cpp::WriteMeta()`
-- `state_machine.cpp::KvStateMachine::SaveSnapshot()`
+- 状态机 `SaveSnapshot()` 数据文件写入路径
 - `raft_node.cpp::OnInstallSnapshot()` 中 install-snapshot temp file 写入
 - `raft_storage.cpp::ReadSegmentFile()` 检测坏尾部后调用 `resize_file` 截断，但没有额外 durability barrier
 
@@ -198,7 +198,7 @@ snapshotConfig::snapshot_dir/
 - `snapshot_<index>/` 创建后没有 directory `fsync`
 - `data.bin` 和 `__raft_snapshot_meta` 发布后没有 `snapshot_<index>` 或其父目录 `fsync`
 - `PruneSnapshots()` 删除 snapshot 目录后没有 directory `fsync`
-- `KvStateMachine::SaveSnapshot()` 的 `*.tmp -> final` rename 后没有父目录 `fsync`
+- 状态机 `SaveSnapshot()` 的 `*.tmp -> final` rename 后没有父目录 `fsync`
 
 这意味着即使 rename 成功返回，目录项在 power loss 后是否可见仍依赖底层文件系统语义。
 
@@ -231,7 +231,7 @@ snapshotConfig::snapshot_dir/
 
 ### 6.3 State machine snapshot rename 风险
 
-`KvStateMachine::SaveSnapshot()` 使用：
+当前状态机 `SaveSnapshot()` 使用：
 
 - `*.tmp` 写入
 - 删除旧 final file

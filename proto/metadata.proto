@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package raft;
+
+import "common.proto";
+
+service MetadataService {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
+  rpc CommitObject(CommitObjectRequest) returns (CommitObjectResponse);
+  rpc AbortObject(AbortObjectRequest) returns (AbortObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+}
+
+message CreateBucketRequest {
+  string request_id = 1;
+  string bucket = 2;
+  uint64 client_time_unix_ms = 3;
+}
+
+message CreateBucketResponse {
+  MetadataResponseSummary summary = 1;
+  BucketRecord bucket_record = 2;
+}
+
+message DeleteBucketRequest {
+  string request_id = 1;
+  string bucket = 2;
+  bool if_empty = 3;
+  uint64 client_time_unix_ms = 4;
+}
+
+message DeleteBucketResponse {
+  MetadataResponseSummary summary = 1;
+  BucketRecord bucket_record = 2;
+}
+
+message CreateObjectRequest {
+  string request_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  string object_id = 4;
+  uint64 version = 5;
+  uint64 size = 6;
+  string etag = 7;
+  uint64 client_time_unix_ms = 8;
+}
+
+message CreateObjectResponse {
+  MetadataResponseSummary summary = 1;
+  ObjectRecord object = 2;
+}
+
+message CommitObjectRequest {
+  string request_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  string object_id = 4;
+  uint64 version = 5;
+  uint64 size = 6;
+  string etag = 7;
+  repeated ChunkRef chunks = 8;
+  uint64 client_time_unix_ms = 9;
+}
+
+message CommitObjectResponse {
+  MetadataResponseSummary summary = 1;
+  ObjectRecord object = 2;
+}
+
+message AbortObjectRequest {
+  string request_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  string object_id = 4;
+  uint64 version = 5;
+  uint64 client_time_unix_ms = 6;
+}
+
+message AbortObjectResponse {
+  MetadataResponseSummary summary = 1;
+  ObjectRecord object = 2;
+}
+
+message DeleteObjectRequest {
+  string request_id = 1;
+  string bucket = 2;
+  string object_key = 3;
+  string object_id = 4;
+  uint64 version = 5;
+  uint64 client_time_unix_ms = 6;
+}
+
+message DeleteObjectResponse {
+  MetadataResponseSummary summary = 1;
+  ObjectRecord object = 2;
+}
+
+message HeadObjectRequest {
+  string bucket = 1;
+  string object_key = 2;
+  string object_id = 3;
+  uint64 version = 4;
+}
+
+message HeadObjectResponse {
+  MetadataResponseSummary summary = 1;
+  bool found = 2;
+  ObjectRecord object = 3;
+}
+
+message ListObjectsRequest {
+  string bucket = 1;
+  string prefix = 2;
+  uint32 limit = 3;
+  string continuation_token = 4;
+}
+
+message ListObjectsResponse {
+  MetadataResponseSummary summary = 1;
+  repeated ObjectRecord objects = 2;
+  string next_continuation_token = 3;
+}

@@ -36,7 +36,7 @@
 
 ### 仍停留在 demo / happy path 的能力
 
-- KV client / KV service 仍被当作当前主要外部接口
+- `raft_metadata_client` / `MetadataService` 是当前主要外部接口
 - cluster membership 仍是静态配置
 - transport 仍强依赖 gRPC，同进程内没有抽象 transport boundary
 - durability 语义更接近“ofstream flush + rename 成功路径”，不是严格 power-loss 级别 durability
@@ -67,10 +67,10 @@ KV 在当前项目中不是最终产品雏形，而是：
 ### 哪些模块是 app / demo / service 层
 
 - `apps/main.cpp`
-- `apps/raft_kv_client.cpp`
+- `apps/raft_metadata_client.cpp`
 - `modules/raft/service`
-- `proto/raft.proto` 中的 `KvService`
-- `KvStateMachine` 的 KV 语义部分
+- `proto/metadata.proto` 中的 `MetadataService`
+- 遗留 `KvStateMachine` / `DebugGetValue` 兼容与验证分支
 
 ---
 
@@ -106,11 +106,11 @@ KV 在当前项目中不是最终产品雏形，而是：
 | `node` | 62 | 功能完整度高，覆盖 election/commit/apply/recovery/snapshot orchestration，但职责过重，后续改动风险高 |
 | `replication` | 63 | 已有批量复制、conflict hint、snapshot 切换、backoff；但只验证了部分 failure mode，缺少更严格 transport/fault 模型 |
 | `storage` | 54 | 有 segmented log、checksum、legacy load、tail truncate、snapshot catalog，但 durability 语义仍偏弱，缺少 fsync/故障注入/磁盘错误处理分层 |
-| `state_machine abstraction` | 48 | 已有 `IStateMachine`，但 `RaftNode` 仍有 KV 约束、KV limits、`DebugGetValue` 等耦合，抽象不够“substrate-first” |
-| `service` | 46 | Raft RPC 与 KV RPC 均可用，但仍在同一 proto 中、同一服务适配层内共存，边界不够工业化 |
+| `state_machine abstraction` | 48 | 已有 `IStateMachine`，但 `RaftNode` 仍有 KV limits、`DebugGetValue` 等 legacy 耦合，抽象不够“substrate-first” |
+| `service` | 46 | Raft RPC 与 Metadata RPC 已拆分，但节点内部仍保留少量 legacy KV 调试/兼容耦合，边界还不够工业化 |
 | `runtime` | 57 | timer/thread-pool/logging 足以支撑当前工程，但缺少更强的 lifecycle diagnostics、race hardening 和 executor 抽象 |
 | `apps` | 35 | 适合 demo 和 acceptance，明显不是长期产品入口层 |
-| `proto / contract` | 45 | Raft contract 基本齐全，但和 KV contract 混放，同一 package 内承载内部/外部两层语义 |
+| `proto / contract` | 45 | `raft.proto` 与 `metadata.proto` 已按内部共识面和业务面拆分，但 legacy KV command / 调试语义仍未完全退出实现层 |
 | `tests` | 66 | 功能覆盖面相当不错，尤其 snapshot/restart/catch-up；但 deterministic、fault injection、disk/network failure 建模不足 |
 | `工程化支撑` | 44 | 有 CMake、preset、分组测试脚本、AGENTS 索引；但看不到 CI、sanitizer、clang-format、clang-tidy、发布/兼容策略 |
 
@@ -355,7 +355,6 @@ KV 在当前项目中不是最终产品雏形，而是：
 - `NodeConfig` 内含 `KvRequestLimits`
 - `RaftNode` 暴露 `ValidateKey`、`ValidateValue`
 - `RaftNode` 暴露 `DebugGetValue`
-- `KvServiceImpl` 直接依赖 `CommandType::kSet / kDelete`
 - `RaftNode::Describe()` 会尝试 dynamic_cast 到 `KvStateMachine`
 
 #### 当前 state machine 抽象是否足够
@@ -377,9 +376,8 @@ KV 在当前项目中不是最终产品雏形，而是：
 #### KV 哪些部分只是 demo
 
 - `Command` 的 `SET|...` / `DEL|...`
-- `KvService`
+- 已退役的 `KvService` / `raft_kv_client`
 - `KvStateMachine`
-- `raft_kv_client`
 - KV request limits
 - `DebugGetValue()` 和围绕 KV 的 status 验证逻辑
 
@@ -388,19 +386,20 @@ KV 在当前项目中不是最终产品雏形，而是：
 - `Command` 仍被假设为字符串命令
 - `RaftNode` 仍掌握 KV 级输入校验
 - snapshot restore 接口过于贴近当前单文件 KV snapshot
-- `KvService` 与 Raft service 同处一个 proto
+- `RaftNode` 仍保留 legacy KV 调试/验证分支
 
 ### 3.6 RPC / transport 边界
 
-#### Raft internal RPC 和 KV/client RPC 是否边界清晰
+#### Raft internal RPC 和 metadata/client RPC 是否边界清晰
 
-不够清晰。
+相比早期已明显更清晰，但还没有完全收敛。
 
 现状：
 
-- `RaftService` 和 `KvService` 在同一个 `proto/raft.proto`
-- 两者都依赖同一个 node runtime
-- `RaftNode` 同时对内承载 Raft RPC、对外承载 KV demo 行为
+- `RaftService` 位于 `proto/raft.proto`
+- `MetadataService` 位于 `proto/metadata.proto`
+- 两者仍依赖同一个 node runtime
+- `RaftNode` 对外主路径已是 metadata-only，但内部仍有少量 legacy KV 调试/验证耦合
 
 结论：
 
@@ -596,7 +595,7 @@ KV 在当前项目中不是最终产品雏形，而是：
 
 #### target structure
 
-- `raft_proto` / `raft_core` / `raft_demo` / `raft_kv_client`
+- `raft_proto` / `metadata_proto` / `raft_core` / `raft_demo` / `raft_metadata_client`
 - 对当前阶段够用
 
 #### include structure

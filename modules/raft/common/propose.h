@@ -15,7 +15,8 @@ namespace raftdemo
         kReplicationFailed = 4,
         kCommitFailed = 5,
         kApplyFailed = 6, // 状态机执行失败
-        kTimeout = 7
+        kTimeout = 7,
+        kOverloaded = 8 // metadata proposal admission/backpressure 主动拒绝
 
     };
 

@@ -23,15 +23,17 @@
 #include "raft/common/propose.h"
 #include "raft/storage/raft_storage.h"
 #include "raft/storage/snapshot_storage.h"
-#include "raft/state_machine/state_machine.h"
+#include "raft/state_machine/state_machine_interface.h"
 #include "raft/runtime/thread_pool.h"
 
 namespace raftdemo
 {
 
   class RaftServiceImpl;
-  class KvServiceImpl;
+  class MetadataServiceImpl;
   class Replicator;
+  class MetadataStateMachine;
+  class StrongConsistencyMetadataStateMachine;
 
   enum class Role
   {
@@ -113,9 +115,11 @@ namespace raftdemo
 
     std::string Describe() const;
     ProposeResult Propose(const Command &command);
-    bool DebugGetValue(const std::string &key, std::string *value) const;
-    bool ValidateKey(const std::string &key, std::string *reason) const;
-    bool ValidateValue(const std::string &value, std::string *reason) const;
+    ProposeResult ProposeMetadata(const std::string &metadata_command_data);
+    MetadataStateMachine *GetMetadataStateMachineV2();
+    const MetadataStateMachine *GetMetadataStateMachineV2() const;
+    StrongConsistencyMetadataStateMachine *GetMetadataStateMachine();
+    const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
     NodeStatusSnapshot GetStatusSnapshot() const;
     NodeMetricsSnapshot GetMetricsSnapshot() const;
     bool IsRunning() const;
@@ -143,12 +147,6 @@ namespace raftdemo
       kRequestVote,
       kAppendEntries,
       kInstallSnapshot,
-      kKvPut,
-      kKvDelete,
-      kKvGet,
-      kKvStatus,
-      kKvHealth,
-      kKvMetrics,
     };
 
     struct RpcMetricState
@@ -160,10 +158,23 @@ namespace raftdemo
       std::uint64_t max_latency_us{0};
     };
 
+    struct MetadataProposalTracker
+    {
+      std::mutex mu;
+      std::condition_variable cv;
+      std::string fingerprint;
+      bool completed{false};
+      ProposeResult result;
+    };
+
+    struct CompletedMetadataProposal
+    {
+      std::string fingerprint;
+      ProposeResult result;
+    };
+
     friend class Replicator;
     friend class RaftServiceImpl;
-    friend class KvServiceImpl;
-
     void InitServer();
     void InitClients();
     Replicator *GetOrCreateReplicatorLocked(const PeerConfig &peer);
@@ -211,12 +222,27 @@ namespace raftdemo
     static const char *RoleName(Role role);
 
     bool ValidateCommandUnlocked(const Command &command, std::string *reason) const;
-    bool ValidateKeyUnlocked(const std::string &key, std::string *reason) const;
-    bool ValidateValueUnlocked(const std::string &value, std::string *reason) const;
     std::uint64_t AppendLocalLogUnlocked(const std::string &command_data);
     ReplicationOutcome ReplicateLogEntryToMajority(std::uint64_t log_index);
+    ReplicationOutcome ReplicateLogEntryToMajority(
+        std::uint64_t log_index,
+        std::chrono::steady_clock::time_point deadline);
     void AdvanceCommitIndexUnlocked();
     ApplyResult ApplyCommittedEntries();
+    void ExecuteMetadataProposal(
+        const std::string &request_id,
+        const std::string &metadata_command_data,
+        std::shared_ptr<MetadataProposalTracker> tracker);
+    bool WaitForMetadataProposalTracker(
+        const std::shared_ptr<MetadataProposalTracker> &tracker,
+        std::chrono::steady_clock::time_point deadline,
+        ProposeResult *result) const;
+    void CompleteMetadataProposal(
+        const std::string &request_id,
+        const std::shared_ptr<MetadataProposalTracker> &tracker,
+        const std::string &fingerprint,
+        const ProposeResult &result);
+    void PruneCompletedMetadataProposalsLocked();
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
     std::string AddressForNodeLocked(int node_id) const;
@@ -270,10 +296,15 @@ namespace raftdemo
     std::atomic<bool> running_{false};
 
     std::unique_ptr<RaftServiceImpl> service_;
-    std::unique_ptr<KvServiceImpl> kv_service_;
+    std::unique_ptr<MetadataServiceImpl> metadata_service_;
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
+    std::unordered_map<std::string, std::shared_ptr<MetadataProposalTracker>>
+        metadata_inflight_proposals_;
+    std::unordered_map<std::string, CompletedMetadataProposal>
+        metadata_completed_proposals_;
+    std::vector<std::string> metadata_completed_proposal_order_;
     std::unique_ptr<IStateMachine> state_machine_;
     std::unique_ptr<IRaftStorage> storage_;
     std::unique_ptr<ISnapshotStorage> snapshot_storage_;

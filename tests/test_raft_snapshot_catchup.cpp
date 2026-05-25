@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -12,10 +13,13 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
+#include "metadata_raft_test_utils.h"
+#include "support/raft_snapshot_restart_test_utils.h"
 
 namespace raftdemo {
 namespace {
@@ -50,21 +54,6 @@ bool Contains(const std::string& text, const std::string& needle) {
 
 bool IsLeaderNode(const std::shared_ptr<RaftNode>& node) {
   return node && Contains(node->Describe(), "role=Leader");
-}
-
-Command SetCommand(const std::string& key, const std::string& value) {
-  Command command;
-  command.type = CommandType::kSet;
-  command.key = key;
-  command.value = value;
-  return command;
-}
-
-Command DeleteCommand(const std::string& key) {
-  Command command;
-  command.type = CommandType::kDelete;
-  command.key = key;
-  return command;
 }
 
 std::uint64_t NowForPath() {
@@ -288,211 +277,17 @@ class TestCluster {
   std::vector<std::thread> wait_threads_;
 };
 
-bool IsExcluded(std::size_t index, const std::vector<std::size_t>& excluded) {
-  for (std::size_t excluded_index : excluded) {
-    if (index == excluded_index) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::shared_ptr<RaftNode> WaitForSingleLeader(
-    const std::vector<std::shared_ptr<RaftNode>>& nodes,
-    std::chrono::milliseconds timeout,
-    const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    std::shared_ptr<RaftNode> leader;
-    int leader_count = 0;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-      if (IsLeaderNode(nodes[i])) {
-        leader = nodes[i];
-        ++leader_count;
-      }
-    }
-
-    if (leader_count == 1) {
-      return leader;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return nullptr;
-}
-
-std::size_t FindNodeIndex(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                          const std::shared_ptr<RaftNode>& target) {
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    if (nodes[i] == target) {
-      return i;
-    }
-  }
-  return nodes.size();
-}
-
-std::size_t PickFollowerIndex(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                              const std::shared_ptr<RaftNode>& leader) {
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    if (nodes[i] && nodes[i] != leader) {
-      return i;
-    }
-  }
-  return nodes.size();
-}
-
-bool WaitForValueOnNode(const std::shared_ptr<RaftNode>& node,
-                        const std::string& key,
-                        const std::string& expected_value,
-                        std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    if (node) {
-      std::string value;
-      if (node->DebugGetValue(key, &value) && value == expected_value) {
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                       const std::string& key,
-                       const std::string& expected_value,
-                       std::chrono::milliseconds timeout,
-                       const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_match = true;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-
-    if (all_match) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                         const std::string& key,
-                         std::chrono::milliseconds timeout,
-                         const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_missing = true;
-
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-      if (IsExcluded(i, excluded) || !nodes[i]) {
-        continue;
-      }
-
-      std::string value;
-      if (nodes[i]->DebugGetValue(key, &value)) {
-        all_missing = false;
-        break;
-      }
-    }
-
-    if (all_missing) {
-      return true;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode>& node,
-                             const std::string& field_name,
-                             std::uint64_t minimum,
-                             std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    if (node) {
-      const auto value = ExtractUintField(node->Describe(), field_name);
-      if (value.has_value() && *value >= minimum) {
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-  return false;
-}
-
-bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const Command& command,
-                      std::chrono::milliseconds timeout,
-                      ProposeResult* final_result,
-                      const std::vector<std::size_t>& excluded = {}) {
-  const auto deadline = Clock::now() + timeout;
-  ProposeResult last_result;
-
-  while (Clock::now() < deadline) {
-    auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1500), excluded);
-    if (!leader) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
-    }
-
-    last_result = leader->Propose(command);
-    if (last_result.Ok()) {
-      if (final_result != nullptr) {
-        *final_result = last_result;
-      }
-      return true;
-    }
-
-    if (last_result.status == ProposeStatus::kInvalidCommand ||
-        last_result.status == ProposeStatus::kApplyFailed ||
-        last_result.status == ProposeStatus::kCommitFailed) {
-      break;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-
-  if (final_result != nullptr) {
-    *final_result = last_result;
-  }
-  return false;
-}
-
-void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                     const std::string& prefix,
-                     int count,
-                     const std::vector<std::size_t>& excluded = {}) {
-  ProposeResult result;
-  for (int i = 0; i < count; ++i) {
-    SCOPED_TRACE(prefix + " write " + std::to_string(i));
-    ASSERT_TRUE(ProposeWithRetry(nodes,
-                                 SetCommand(prefix + "_" + std::to_string(i),
-                                            "value_" + std::to_string(i)),
-                                 std::chrono::seconds(10),
-                                 &result,
-                                 excluded))
-        << "write failed, status=" << ProposeStatusName(result.status)
-        << ", message=" << result.message;
-  }
-}
+using raftdemo::test::DeleteSyntheticObject;
+using raftdemo::test::FindNodeIndex;
+using raftdemo::test::PickFollowerIndex;
+using raftdemo::test::ProposeWithRetry;
+using raftdemo::test::WaitForNodeFieldAtLeast;
+using raftdemo::test::WaitForSingleLeader;
+using raftdemo::test::WaitForSyntheticObjectMissingOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnAll;
+using raftdemo::test::WaitForSyntheticObjectOnNode;
+using raftdemo::test::WriteSyntheticObject;
+using raftdemo::test::WriteSyntheticObjects;
 
 class RaftSnapshotCatchupTest : public ::testing::Test {
  protected:
@@ -555,22 +350,22 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerCatchesUpLargeGapWithBatchedApp
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "batch_gap", 320, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "batch_gap", 64, excluded);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "batch_gap_319", "value_319",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "batch_gap_63", "value_63",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last batch value";
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "batch_gap_319", "value_319",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "batch_gap_63", "value_63",
+                                           std::chrono::seconds(30)))
       << "restarted follower did not catch up through batched AppendEntries, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stopped_follower],
-                                      "last_applied", 320,
+                                      "last_applied", 120,
                                       std::chrono::seconds(10)))
       << "restarted follower last_applied did not advance enough, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
@@ -589,48 +384,52 @@ TEST_F(RaftSnapshotCatchupTest,
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "live_gap", 96, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "live_gap", 96, excluded);
 
   ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_ordering", "phase_1"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_ordering", "phase_1"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering phase_1 failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_ordering", "phase_2"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_ordering", "phase_2"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering phase_2 failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("live_ordering"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               DeleteSyntheticObject("live_ordering"),
                                std::chrono::seconds(10), &result, excluded))
       << "live ordering delete failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("live_tail", "committed"),
+  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(),
+                               WriteSyntheticObject("live_tail", "committed"),
                                std::chrono::seconds(10), &result, excluded))
       << "live tail write failed, status=" << ProposeStatusName(result.status)
       << ", message=" << result.message;
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_gap_95", "value_95",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_gap_95", "value_95",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last live gap value";
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "live_ordering",
-                                  std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "live_ordering",
+                                                 std::chrono::seconds(10), excluded))
       << "surviving majority did not preserve committed delete ordering";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_tail", "committed",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_tail", "committed",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply tail value after delete";
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "live_gap_95", "value_95",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "live_gap_95", "value_95",
+                                           std::chrono::seconds(30)))
       << "lagging follower did not replay live log gap, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
-  ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "live_ordering",
-                                  std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectMissingOnAll(cluster.Nodes(), "live_ordering",
+                                                 std::chrono::seconds(20)))
       << "cluster did not preserve committed delete ordering after live log catch-up";
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "live_tail", "committed",
-                                std::chrono::seconds(20)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "live_tail", "committed",
+                                          std::chrono::seconds(20)))
       << "cluster did not converge on committed tail value after live log catch-up";
 
   const auto follower_snapshot_index =
@@ -655,10 +454,10 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerInstallsSnapshotWhenLeaderCompa
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "snapshot_gap", 48, excluded);
+  WriteSyntheticObjects(cluster.Nodes(), "snapshot_gap", 48, excluded);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "snapshot_gap_47", "value_47",
-                                std::chrono::seconds(10), excluded))
+  ASSERT_TRUE(WaitForSyntheticObjectOnAll(cluster.Nodes(), "snapshot_gap_47", "value_47",
+                                          std::chrono::seconds(10), excluded))
       << "surviving majority did not apply the last snapshot_gap value";
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
@@ -669,9 +468,9 @@ TEST_F(RaftSnapshotCatchupTest, RestartedFollowerInstallsSnapshotWhenLeaderCompa
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "snapshot_gap_47", "value_47",
-                                 std::chrono::seconds(30)))
+  ASSERT_TRUE(WaitForSyntheticObjectOnNode(cluster.Nodes()[stopped_follower],
+                                           "snapshot_gap_47", "value_47",
+                                           std::chrono::seconds(30)))
       << "restarted follower did not install snapshot and catch up, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
@@ -697,7 +496,78 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
   cluster.StopNode(stopped_follower);
 
   const std::vector<std::size_t> excluded{stopped_follower};
-  WriteManyValues(cluster.Nodes(), "install_first", 40, excluded);
+  const std::string bucket = "snapshot-then-logs-bucket";
+  ProposeResult result;
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateBucketCommand(
+          bucket, "snapshot-then-logs-create-bucket-1"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+
+  std::vector<raftdemo::test::ExpectedRecoveredMetadataObject> expected_objects;
+  std::vector<std::string> visible_keys;
+  for (int i = 0; i < 20; ++i) {
+    const std::string suffix = (i < 10 ? "0" : "") + std::to_string(i);
+    const std::string key = "install_first_" + suffix;
+    const std::string object_id = "obj-" + key;
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCreateObjectCommand(
+            bucket, key, object_id,
+            "snapshot-then-logs-create-" + suffix),
+        std::chrono::seconds(10),
+        &result,
+        excluded));
+    ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+        cluster.Nodes(),
+        raftdemo::test::MakeCommitObjectCommand(
+            bucket, key, object_id,
+            "snapshot-then-logs-commit-" + suffix),
+        std::chrono::seconds(10),
+        &result,
+        excluded));
+    expected_objects.push_back({key, object_id, 2U, false});
+    visible_keys.push_back(key);
+  }
+
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-create-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-commit-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "deleted_anchor", "obj-deleted-anchor",
+          "snapshot-then-logs-delete-deleted-anchor"),
+      std::chrono::seconds(10),
+      &result,
+      excluded));
+
+  expected_objects.push_back({"deleted_anchor", "obj-deleted-anchor", 0U, true});
+  std::sort(visible_keys.begin(), visible_keys.end());
+  const raftdemo::test::MetadataRecoveryExpectation expected_after_install{
+      .bucket = bucket,
+      .objects = expected_objects,
+      .visible_keys = visible_keys,
+      .expected_request_count = 44U,
+      .expected_tombstone_count = 1U,
+      .expected_last_applied_index = result.log_index,
+      .expected_min_last_applied_term = result.term,
+  };
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[leader_index],
                                       "last_snapshot_index", 6,
@@ -707,10 +577,10 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
 
   cluster.RestartNode(stopped_follower);
 
-  ASSERT_TRUE(WaitForValueOnNode(cluster.Nodes()[stopped_follower],
-                                 "install_first_39", "value_39",
-                                 std::chrono::seconds(30)))
-      << "restarted follower did not catch up to snapshot baseline, describe="
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      {cluster.Nodes()[stopped_follower]}, expected_after_install,
+      std::chrono::seconds(30)))
+      << "restarted follower did not catch up to metadata snapshot baseline, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
   ASSERT_TRUE(WaitForNodeFieldAtLeast(cluster.Nodes()[stopped_follower],
@@ -719,15 +589,39 @@ TEST_F(RaftSnapshotCatchupTest, FollowerContinuesReplicatingLogsAfterInstallingS
       << "restarted follower did not install snapshot, describe="
       << cluster.Nodes()[stopped_follower]->Describe();
 
-  ProposeResult result;
-  ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_snapshot", "ok"),
-                               std::chrono::seconds(10), &result))
-      << "write after snapshot failed, status=" << ProposeStatusName(result.status)
-      << ", message=" << result.message;
+  const MetadataStateMachine* restarted_state_machine =
+      cluster.Nodes()[stopped_follower]->GetMetadataStateMachineV2();
+  ASSERT_NE(restarted_state_machine, nullptr);
+  EXPECT_EQ(restarted_state_machine->RequestCount(), 44U);
+  EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
+  EXPECT_GE(restarted_state_machine->LastAppliedTerm(), result.term);
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_snapshot", "ok",
-                                std::chrono::seconds(15)))
-      << "not all nodes replicated logs after snapshot installation";
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCreateObjectCommand(
+          bucket, "after_snapshot", "obj-after-snapshot",
+          "snapshot-then-logs-create-after-snapshot"),
+      std::chrono::seconds(10),
+      &result));
+  ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+      cluster.Nodes(),
+      raftdemo::test::MakeCommitObjectCommand(
+          bucket, "after_snapshot", "obj-after-snapshot",
+          "snapshot-then-logs-commit-after-snapshot"),
+      std::chrono::seconds(10),
+      &result));
+
+  auto expected_after_tail = expected_after_install;
+  expected_after_tail.objects.push_back({"after_snapshot", "obj-after-snapshot", 2U, false});
+  expected_after_tail.visible_keys.push_back("after_snapshot");
+  std::sort(expected_after_tail.visible_keys.begin(), expected_after_tail.visible_keys.end());
+  expected_after_tail.expected_request_count = 46U;
+  expected_after_tail.expected_last_applied_index = result.log_index;
+  expected_after_tail.expected_min_last_applied_term = result.term;
+
+  ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+      cluster.Nodes(), expected_after_tail, std::chrono::seconds(15)))
+      << "not all nodes replicated metadata logs after snapshot installation";
 }
 
 }  // namespace

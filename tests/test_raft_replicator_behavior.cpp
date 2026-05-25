@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
+#include "metadata_raft_test_utils.h"
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
@@ -107,12 +107,24 @@ bool IsLeaderNode(const std::shared_ptr<RaftNode>& node) {
   return node != nullptr && Contains(node->Describe(), "role=Leader");
 }
 
-Command SetCommand(const std::string& key, const std::string& value) {
-  Command command;
-  command.type = CommandType::kSet;
-  command.key = key;
-  command.value = value;
-  return command;
+std::string ObjectKey(const std::string& prefix, const int index) {
+  return prefix + "_" + std::to_string(index);
+}
+
+std::string ObjectId(const std::string& prefix, const int index) {
+  return prefix + "-object-" + std::to_string(index);
+}
+
+std::vector<std::string> SortedObjectKeys(const std::string& prefix,
+                                          const int begin,
+                                          const int end_exclusive) {
+  std::vector<std::string> keys;
+  keys.reserve(static_cast<std::size_t>(std::max(0, end_exclusive - begin)));
+  for (int i = begin; i < end_exclusive; ++i) {
+    keys.push_back(ObjectKey(prefix, i));
+  }
+  std::sort(keys.begin(), keys.end());
+  return keys;
 }
 
 std::string ProposeStatusName(ProposeStatus status) {
@@ -331,59 +343,6 @@ std::optional<std::size_t> PickRunningFollowerIndex(
   return std::nullopt;
 }
 
-bool WaitForValueOnRunningNodes(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                                const std::string& key,
-                                const std::string& expected_value,
-                                std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool saw_running_node = false;
-    bool all_match = true;
-    for (const auto& node : nodes) {
-      if (!node) {
-        continue;
-      }
-      saw_running_node = true;
-      std::string value;
-      if (!node->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-    if (saw_running_node && all_match) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
-bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                       const std::string& key,
-                       const std::string& expected_value,
-                       std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    bool all_match = true;
-    for (const auto& node : nodes) {
-      if (!node) {
-        all_match = false;
-        break;
-      }
-      std::string value;
-      if (!node->DebugGetValue(key, &value) || value != expected_value) {
-        all_match = false;
-        break;
-      }
-    }
-    if (all_match) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-
 std::optional<std::uint64_t> ExtractUintField(const std::string& describe,
                                               const std::string& field_name) {
   const std::string prefix = field_name + "=";
@@ -437,59 +396,60 @@ bool WaitForSnapshotOnAtLeastNodes(const std::vector<std::shared_ptr<RaftNode>>&
   return false;
 }
 
-bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                      const Command& command,
-                      std::chrono::milliseconds timeout,
-                      ProposeResult* final_result) {
-  const auto deadline = Clock::now() + timeout;
-  ProposeResult last_result;
-
-  while (Clock::now() < deadline) {
-    auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1200));
-    if (!leader) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
-    }
-
-    last_result = leader->Propose(command);
-    if (last_result.Ok()) {
-      if (final_result != nullptr) {
-        *final_result = last_result;
-      }
-      return true;
-    }
-
-    if (last_result.status == ProposeStatus::kInvalidCommand ||
-        last_result.status == ProposeStatus::kApplyFailed ||
-        last_result.status == ProposeStatus::kCommitFailed) {
-      break;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-  }
-
-  if (final_result != nullptr) {
-    *final_result = last_result;
-  }
-  return false;
-}
-
-void WriteManyValues(const std::vector<std::shared_ptr<RaftNode>>& nodes,
-                     const std::string& prefix,
-                     int begin,
-                     int end_exclusive,
-                     std::chrono::milliseconds timeout_per_write) {
+void WriteManyCommittedObjects(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                               const std::string& bucket,
+                               const std::string& prefix,
+                               int begin,
+                               int end_exclusive,
+                               std::chrono::milliseconds timeout_per_write) {
   ProposeResult result;
   for (int i = begin; i < end_exclusive; ++i) {
     SCOPED_TRACE(prefix + " write " + std::to_string(i));
-    ASSERT_TRUE(ProposeWithRetry(nodes,
-                                 SetCommand(prefix + "_" + std::to_string(i),
-                                            "value_" + std::to_string(i)),
-                                 timeout_per_write,
-                                 &result))
+    ASSERT_TRUE(test::ProposeCreateCommitObjectWithRetry(nodes,
+                                                         bucket,
+                                                         ObjectKey(prefix, i),
+                                                         ObjectId(prefix, i),
+                                                         prefix + "-create-" +
+                                                             std::to_string(i),
+                                                         prefix + "-commit-" +
+                                                             std::to_string(i),
+                                                         timeout_per_write,
+                                                         &result))
         << "write failed, status=" << ProposeStatusName(result.status)
         << ", message=" << result.message
         << "\n" << DescribeAllNodes(nodes);
+  }
+}
+
+void ExpectCommittedMetadataState(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                                  const std::string& bucket,
+                                  const std::string& prefix,
+                                  const int visible_object_count,
+                                  const std::size_t expected_request_count,
+                                  const std::size_t expected_object_count,
+                                  const std::uint64_t expected_last_applied_index) {
+  const auto expected_keys = SortedObjectKeys(prefix, 0, visible_object_count);
+  ASSERT_TRUE(test::WaitUntilAllListObjectsMatch(nodes,
+                                                 bucket,
+                                                 prefix,
+                                                 expected_keys,
+                                                 expected_last_applied_index,
+                                                 std::chrono::seconds(20)))
+      << DescribeAllNodes(nodes);
+
+  for (const auto& node : nodes) {
+    if (!node) {
+      continue;
+    }
+
+    const auto* state_machine = node->GetMetadataStateMachineV2();
+    ASSERT_NE(state_machine, nullptr) << node->Describe();
+    EXPECT_EQ(state_machine->RequestCount(), expected_request_count) << node->Describe();
+    EXPECT_EQ(state_machine->ObjectCount(), expected_object_count) << node->Describe();
+    EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
+    EXPECT_GE(state_machine->LastAppliedIndex(), expected_last_applied_index)
+        << node->Describe();
+    EXPECT_GT(state_machine->LastAppliedTerm(), 0U) << node->Describe();
   }
 }
 
@@ -535,11 +495,17 @@ class RaftReplicatorBehaviorTest : public ::testing::Test {
 };
 
 TEST_F(RaftReplicatorBehaviorTest, SlowFollowerDoesNotBlockMajorityCommit) {
+  const std::string bucket = "replicator-behavior-majority";
   auto cluster = MakeCluster("slow_follower_majority_commit", 8);
   cluster.StartAll();
 
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
+  ASSERT_TRUE(test::ProposeCreateBucketWithRetry(cluster.Nodes(),
+                                                 bucket,
+                                                 "bucket-majority",
+                                                 std::chrono::seconds(6)))
+      << DescribeAllNodes(cluster.Nodes());
 
   const auto lagging_index = PickRunningFollowerIndex(cluster.Nodes(), leader);
   ASSERT_TRUE(lagging_index.has_value()) << DescribeAllNodes(cluster.Nodes());
@@ -547,22 +513,44 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerDoesNotBlockMajorityCommit) {
   cluster.StopNode(*lagging_index);
 
   // With one follower down, the leader must still commit with the remaining follower.
-  WriteManyValues(cluster.Nodes(), "majority_while_slow", 0, 64, std::chrono::seconds(6));
+  WriteManyCommittedObjects(cluster.Nodes(),
+                            bucket,
+                            "majority_while_slow",
+                            0,
+                            64,
+                            std::chrono::seconds(6));
 
-  ASSERT_TRUE(WaitForValueOnRunningNodes(cluster.Nodes(),
-                                         "majority_while_slow_63",
-                                         "value_63",
-                                         std::chrono::seconds(8)))
+  constexpr std::uint64_t kExpectedLastAppliedIndex = 1 + 64 * 2;
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                bucket,
+                                                ObjectKey("majority_while_slow", 63),
+                                                ObjectId("majority_while_slow", 63),
+                                                2,
+                                                kExpectedLastAppliedIndex,
+                                                std::chrono::seconds(8)))
       << "leader and the healthy follower did not apply committed logs while another follower was down\n"
       << DescribeAllNodes(cluster.Nodes());
+  ExpectCommittedMetadataState(cluster.Nodes(),
+                               bucket,
+                               "majority_while_slow",
+                               64,
+                               static_cast<std::size_t>(1 + 64 * 2),
+                               64U,
+                               kExpectedLastAppliedIndex);
 }
 
 TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptingNewLogs) {
+  const std::string bucket = "replicator-behavior-catchup";
   auto cluster = MakeCluster("slow_follower_catches_up_with_live_writes", 8);
   cluster.StartAll();
 
   auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
   ASSERT_NE(leader, nullptr) << "no leader elected\n" << DescribeAllNodes(cluster.Nodes());
+  ASSERT_TRUE(test::ProposeCreateBucketWithRetry(cluster.Nodes(),
+                                                 bucket,
+                                                 "bucket-catchup",
+                                                 std::chrono::seconds(6)))
+      << DescribeAllNodes(cluster.Nodes());
 
   const auto lagging_index = PickRunningFollowerIndex(cluster.Nodes(), leader);
   ASSERT_TRUE(lagging_index.has_value()) << DescribeAllNodes(cluster.Nodes());
@@ -570,12 +558,21 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
   cluster.StopNode(*lagging_index);
 
   // Generate enough committed logs while the follower is down to force snapshot/log catch-up paths.
-  WriteManyValues(cluster.Nodes(), "lagged_before_restart", 0, 96, std::chrono::seconds(6));
+  WriteManyCommittedObjects(cluster.Nodes(),
+                            bucket,
+                            "lagged_before_restart",
+                            0,
+                            64,
+                            std::chrono::seconds(8));
 
-  ASSERT_TRUE(WaitForValueOnRunningNodes(cluster.Nodes(),
-                                         "lagged_before_restart_95",
-                                         "value_95",
-                                         std::chrono::seconds(10)))
+  constexpr std::uint64_t kExpectedIndexBeforeRestart = 1 + 64 * 2;
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                bucket,
+                                                ObjectKey("lagged_before_restart", 63),
+                                                ObjectId("lagged_before_restart", 63),
+                                                2,
+                                                kExpectedIndexBeforeRestart,
+                                                std::chrono::seconds(10)))
       << DescribeAllNodes(cluster.Nodes());
 
   ASSERT_TRUE(WaitForSnapshotOnAtLeastNodes(cluster.Nodes(), 32, 2, std::chrono::seconds(20)))
@@ -583,31 +580,75 @@ TEST_F(RaftReplicatorBehaviorTest, SlowFollowerCatchesUpWhileLeaderKeepsAcceptin
       << DescribeAllNodes(cluster.Nodes());
 
   cluster.StartNode(*lagging_index);
+  leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(5));
+  ASSERT_NE(leader, nullptr)
+      << "cluster did not retain a single leader after the lagging follower restarted\n"
+      << DescribeAllNodes(cluster.Nodes());
 
   // Immediately continue writing. These proposes should not wait for the slow follower to fully catch up;
   // the current majority should keep making progress.
-  WriteManyValues(cluster.Nodes(), "live_during_catchup", 0, 32, std::chrono::seconds(8));
+  WriteManyCommittedObjects(cluster.Nodes(),
+                            bucket,
+                            "live_during_catchup",
+                            0,
+                            16,
+                            std::chrono::seconds(8));
 
-  ASSERT_TRUE(WaitForValueOnRunningNodes(cluster.Nodes(),
-                                         "live_during_catchup_31",
-                                         "value_31",
-                                         std::chrono::seconds(8)))
+  constexpr std::uint64_t kExpectedIndexAfterCatchupWrites = 1 + (64 + 16) * 2;
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                bucket,
+                                                ObjectKey("live_during_catchup", 15),
+                                                ObjectId("live_during_catchup", 15),
+                                                2,
+                                                kExpectedIndexAfterCatchupWrites,
+                                                std::chrono::seconds(8)))
       << "running majority stopped applying new logs while the lagging follower was catching up\n"
       << DescribeAllNodes(cluster.Nodes());
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(),
-                                "lagged_before_restart_95",
-                                "value_95",
-                                std::chrono::seconds(35)))
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                bucket,
+                                                ObjectKey("lagged_before_restart", 63),
+                                                ObjectId("lagged_before_restart", 63),
+                                                2,
+                                                kExpectedIndexAfterCatchupWrites,
+                                                std::chrono::seconds(35)))
       << "restarted follower did not catch up old logs/snapshot\n"
       << DescribeAllNodes(cluster.Nodes());
 
-  ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(),
-                                "live_during_catchup_31",
-                                "value_31",
-                                std::chrono::seconds(35)))
+  ASSERT_TRUE(test::WaitUntilAllCommittedObject(cluster.Nodes(),
+                                                bucket,
+                                                ObjectKey("live_during_catchup", 15),
+                                                ObjectId("live_during_catchup", 15),
+                                                2,
+                                                kExpectedIndexAfterCatchupWrites,
+                                                std::chrono::seconds(35)))
       << "restarted follower did not catch up logs written during catch-up\n"
       << DescribeAllNodes(cluster.Nodes());
+  ExpectCommittedMetadataState(cluster.Nodes(),
+                               bucket,
+                               "lagged_before_restart",
+                               64,
+                               static_cast<std::size_t>(1 + 80 * 2),
+                               80U,
+                               kExpectedIndexAfterCatchupWrites);
+  const auto expected_live_keys = SortedObjectKeys("live_during_catchup", 0, 16);
+  ASSERT_TRUE(test::WaitUntilAllListObjectsMatch(cluster.Nodes(),
+                                                 bucket,
+                                                 "live_during_catchup",
+                                                 expected_live_keys,
+                                                 kExpectedIndexAfterCatchupWrites,
+                                                 std::chrono::seconds(20)))
+      << DescribeAllNodes(cluster.Nodes());
+  for (const auto& node : cluster.Nodes()) {
+    ASSERT_NE(node, nullptr);
+    const auto* state_machine = node->GetMetadataStateMachineV2();
+    ASSERT_NE(state_machine, nullptr) << node->Describe();
+    EXPECT_EQ(state_machine->RequestCount(), static_cast<std::size_t>(1 + 80 * 2))
+        << node->Describe();
+    EXPECT_EQ(state_machine->ObjectCount(), 80U) << node->Describe();
+    EXPECT_EQ(state_machine->TombstoneCount(), 0U) << node->Describe();
+    EXPECT_GT(state_machine->LastAppliedTerm(), 0U) << node->Describe();
+  }
 }
 
 }  // namespace

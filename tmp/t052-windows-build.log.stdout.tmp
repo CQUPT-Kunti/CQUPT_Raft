@@ -1,0 +1,103 @@
+适用于 .NET Framework MSBuild 版本 17.12.12+1cce77968
+
+  common_proto.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\common_proto.lib
+  metadata_proto.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\metadata_proto.lib
+  raft_proto.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\raft_proto.lib
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/build/windows/_deps/googletest-src/googlemock/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/build/windows/_deps/googletest-src/googlemock/CMakeLists.txt
+  gtest.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\lib\Debug\gtest.lib
+  raft_core.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\raft_core.lib
+  gtest-all.cc
+  gtest-all.cc
+  raft_metadata_client.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\raft_metadata_client.exe
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/CMakeLists.txt
+  gtest_main.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\lib\Debug\gtest_main.lib
+  main.cpp
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/tests/CMakeLists.txt
+  test_t017_leader_switch_ordering.cpp
+  test_state_machine.cpp
+  test_metadata_client_scenario.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_client_scenario.exe
+  test_raft_split_brain.cpp
+  gmock-all.cc
+  gmock-all.cc
+  test_raft_snapshot_catchup.cpp
+  gmock_main.cc
+  正在生成代码...
+  test_raft_log_replication.cpp
+  test_min_heap_timer.cpp
+  正在生成代码...
+  metadata_snapshot_test.cpp
+  gmock_main.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\lib\Debug\gmock_main.lib
+  test_thread_pool.cpp
+  test_state_machine.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_state_machine.exe
+  test_raft_snapshot_restart.cpp
+  test_snapshot_storage_reliability.cpp
+  test_raft_segment_storage.cpp
+  test_raft_election.cpp
+  test_metadata_state_machine.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_state_machine.exe
+  metadata_manifest_test.cpp
+  test_snapshot_storage_reliability.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_snapshot_storage_reliability.exe
+  metadata_command_types_test.cpp
+  test_t017_leader_switch_ordering.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_t017_leader_switch_ordering.exe
+  test_metadata_manifest.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_manifest.exe
+  test_raft_snapshot_recovery.cpp
+  test_thread_pool.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_thread_pool.exe
+  test_metadata_command_types.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_command_types.exe
+  test_raft_snapshot_diagnosis.cpp
+  test_raft_replicator_behavior.cpp
+  test_raft_log_replication.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_log_replication.exe
+  test_raft_election.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_election.exe
+  raft_demo.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\Debug\raft_demo.exe
+  正在生成代码...
+  test_raft_commit_apply.cpp
+  metadata_records_test.cpp
+  test_metadata_snapshot.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_snapshot.exe
+  test_raft_snapshot_restart.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_snapshot_restart.exe
+  test_raft_replicator_behavior.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_replicator_behavior.exe
+  test_raft_snapshot_catchup.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_snapshot_catchup.exe
+  test_min_heap_timer.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_min_heap_timer.exe
+  test_raft_segment_storage.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_segment_storage.exe
+  test_raft_commit_apply.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_commit_apply.exe
+  test_raft_split_brain.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_split_brain.exe
+  test_command.cpp
+  test_metadata_records.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_records.exe
+  metadata_recovery_stress_test.cpp
+  test_metadata_failover.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_failover.exe
+  gmock.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\lib\Debug\gmock.lib
+  metadata_command_test.cpp
+  snapshot_test.cpp
+  raft_integration_test.cpp
+  persistence_test.cpp
+  test_command.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_command.exe
+  test_metadata_command.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_command.exe
+  test_raft_snapshot_diagnosis.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_raft_snapshot_diagnosis.exe
+  metadata_concurrency_stress_test.cpp
+  test_metadata_recovery_stress.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_recovery_stress.exe
+  raft_integration_test.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\raft_integration_test.exe
+  test_metadata_concurrency_stress.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\test_metadata_concurrency_stress.exe
+  snapshot_test.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\snapshot_test.exe
+  persistence_test.vcxproj -> D:\Code\C++\CQUPT_Raft\build\windows\tests\Debug\persistence_test.exe
+  Building Custom Rule D:/Code/C++/CQUPT_Raft/CMakeLists.txt

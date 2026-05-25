@@ -5,13 +5,15 @@
 ## Files
 
 - `main.cpp`
-- `raft_kv_client.cpp`
+- `raft_metadata_client.cpp`
 
 ## Responsibilities
 
 - 节点进程启动
 - 文本配置解析
 - CLI 客户端命令发起
+- 维护客户端对分拆后 proto 生成头的最小依赖
+- 维护客户端 target 对 proto target 的最小链接边界
 
 ## Out of Scope
 
@@ -28,10 +30,14 @@
 
 - 不要在入口层引入业务逻辑分叉
 - 优先把复杂逻辑留在模块内，入口层保持薄
+- `raft_metadata_client` 只消费 `metadata.proto` 生成头
+- `raft_metadata_client` 只应链接 `metadata_proto`
+- `raft_metadata_client` 当前主路径面向 bucket/object metadata RPC，不能通过 KV fallback 访问 metadata
+- `raft_metadata_client` 的读写输出要保留 request_id / leader hint / status code 等工业化排障信息
 
 ## Relevant Tests
 
-- `tests/test_kv_service.cpp`
+- `tests/metadata_client_scenario_test.cpp`
 - `tests/raft_integration_test.cpp`
 - `scripts/acceptance_cluster.sh`
 
@@ -40,9 +46,10 @@
 - 配置字段解析
 - 启动参数约定
 - CLI 输出格式被脚本依赖
+- proto 边界拆分后的 include 误耦合
 
 ## Context Hints
 
 - 改服务端入口先读 `main.cpp`
-- 改客户端行为先读 `raft_kv_client.cpp`
+- 改 metadata CLI 时先读 `raft_metadata_client.cpp`
 - 涉及 RPC 语义时再去 `proto/` 和 `modules/raft/service`

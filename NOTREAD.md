@@ -11,5 +11,4 @@
 /docs
 /specs/003-persistence-reliability
 /specs/004-raft-industrialization
-/tests
 /temp

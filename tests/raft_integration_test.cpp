@@ -11,10 +11,12 @@
 #include <thread>
 #include <vector>
 
-#include "raft/common/command.h"
 #include "raft/common/config.h"
+#include "raft/common/metadata_command.h"
 #include "raft/common/propose.h"
 #include "raft/node/raft_node.h"
+#include "raft/state_machine/metadata_state_machine.h"
+#include "metadata_raft_test_utils.h"
 
 namespace raftdemo
 {
@@ -89,23 +91,6 @@ namespace raftdemo
       return node && Contains(node->Describe(), "role=Leader");
     }
 
-    Command SetCommand(const std::string &key, const std::string &value)
-    {
-      Command command;
-      command.type = CommandType::kSet;
-      command.key = key;
-      command.value = value;
-      return command;
-    }
-
-    Command DeleteCommand(const std::string &key)
-    {
-      Command command;
-      command.type = CommandType::kDelete;
-      command.key = key;
-      return command;
-    }
-
     std::uint64_t NowForPath()
     {
       return static_cast<std::uint64_t>(
@@ -129,9 +114,9 @@ namespace raftdemo
       }
 
       std::random_device rd;
-      const int jitter = static_cast<int>(rd() % 1000);
-      const auto tick = static_cast<int>(Clock::now().time_since_epoch().count() % 1000);
-      return 35000 + jitter + tick;
+      const int jitter = static_cast<int>(rd() % 12000);
+      const auto tick = static_cast<int>(Clock::now().time_since_epoch().count() % 4000);
+      return 42000 + jitter + tick;
     }
 
     std::filesystem::path TestBinaryDir()
@@ -162,7 +147,7 @@ namespace raftdemo
                                std::to_string(rd());
       return std::filesystem::temp_directory_path() / "rq_ri" / name;
 #else
-      const std::string name = "raft_kv_gtest_" + safe_name + "_" +
+      const std::string name = "raft_metadata_gtest_" + safe_name + "_" +
                                std::to_string(NowForPath()) + "_" +
                                std::to_string(rd());
       return TestBinaryDir() / "raft_test_data" / "integration" / name;
@@ -373,77 +358,6 @@ namespace raftdemo
       return nullptr;
     }
 
-    bool WaitForValueOnAll(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                           const std::string &key,
-                           const std::string &expected_value,
-                           std::chrono::milliseconds timeout,
-                           const std::vector<std::size_t> &excluded = {})
-    {
-      const auto deadline = Clock::now() + timeout;
-      while (Clock::now() < deadline)
-      {
-        bool all_match = true;
-
-        for (std::size_t i = 0; i < nodes.size(); ++i)
-        {
-          if (IsExcluded(i, excluded) || !nodes[i])
-          {
-            continue;
-          }
-
-          std::string value;
-          if (!nodes[i]->DebugGetValue(key, &value) || value != expected_value)
-          {
-            all_match = false;
-            break;
-          }
-        }
-
-        if (all_match)
-        {
-          return true;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      }
-      return false;
-    }
-
-    bool WaitForMissingOnAll(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                             const std::string &key,
-                             std::chrono::milliseconds timeout,
-                             const std::vector<std::size_t> &excluded = {})
-    {
-      const auto deadline = Clock::now() + timeout;
-      while (Clock::now() < deadline)
-      {
-        bool all_missing = true;
-
-        for (std::size_t i = 0; i < nodes.size(); ++i)
-        {
-          if (IsExcluded(i, excluded) || !nodes[i])
-          {
-            continue;
-          }
-
-          std::string value;
-          if (nodes[i]->DebugGetValue(key, &value))
-          {
-            all_missing = false;
-            break;
-          }
-        }
-
-        if (all_missing)
-        {
-          return true;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      }
-      return false;
-    }
-
     bool WaitForNodeFieldAtLeast(const std::shared_ptr<RaftNode> &node,
                                  const std::string &field_name,
                                  std::uint64_t minimum,
@@ -464,51 +378,6 @@ namespace raftdemo
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
 
-      return false;
-    }
-
-    bool ProposeWithRetry(const std::vector<std::shared_ptr<RaftNode>> &nodes,
-                          Command command,
-                          std::chrono::milliseconds timeout,
-                          ProposeResult *final_result,
-                          const std::vector<std::size_t> &excluded = {})
-    {
-      const auto deadline = Clock::now() + timeout;
-      ProposeResult last_result;
-
-      while (Clock::now() < deadline)
-      {
-        auto leader = WaitForSingleLeader(nodes, std::chrono::milliseconds(1500), excluded);
-        if (!leader)
-        {
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-          continue;
-        }
-
-        last_result = leader->Propose(command);
-        if (last_result.Ok())
-        {
-          if (final_result != nullptr)
-          {
-            *final_result = last_result;
-          }
-          return true;
-        }
-
-        if (last_result.status == ProposeStatus::kInvalidCommand ||
-            last_result.status == ProposeStatus::kApplyFailed ||
-            last_result.status == ProposeStatus::kCommitFailed)
-        {
-          break;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-
-      if (final_result != nullptr)
-      {
-        *final_result = last_result;
-      }
       return false;
     }
 
@@ -611,7 +480,7 @@ namespace raftdemo
       ASSERT_NE(leader, nullptr) << "no single leader elected within timeout";
     }
 
-    TEST_F(RaftIntegrationTest, ReplicatesSetAndDeleteCommandsToAllNodes)
+    TEST_F(RaftIntegrationTest, ReplicatesCreateCommitAndDeleteMetadataCommandsToAllNodes)
     {
       auto cluster = MakeCluster("replication", "replication");
       cluster.Start();
@@ -619,34 +488,58 @@ namespace raftdemo
       auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
       ASSERT_NE(leader, nullptr) << "no single leader elected within timeout";
 
+      const std::string bucket = "integration-replication-bucket";
+      const auto create_bucket = raftdemo::test::MakeCreateBucketCommand(
+          bucket, "integration-replication-create-bucket-1");
+      const auto create_x_v1 = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "x", "obj-x-v1", "integration-replication-create-x-v1");
+      const auto commit_x_v1 = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "x", "obj-x-v1", "integration-replication-commit-x-v1");
+      const auto create_y = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "y", "obj-y-v1", "integration-replication-create-y-v1");
+      const auto commit_y = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "y", "obj-y-v1", "integration-replication-commit-y-v1");
+      const auto delete_y = raftdemo::test::MakeDeleteObjectCommand(
+          bucket, "y", "obj-y-v1", "integration-replication-delete-y-v1");
+
       ProposeResult result;
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("x", "1"),
-                                   std::chrono::seconds(8), &result))
-          << "SET x 1 failed, status=" << ProposeStatusName(result.status)
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), create_bucket, std::chrono::seconds(8), &result))
+          << "CreateBucket failed, status=" << ProposeStatusName(result.status)
           << ", message=" << result.message;
-      EXPECT_TRUE(WaitForValueOnAll(cluster.Nodes(), "x", "1", std::chrono::seconds(8)))
-          << "not all nodes applied x=1";
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), create_x_v1, std::chrono::seconds(8), &result))
+          << "CreateObject x failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), commit_x_v1, std::chrono::seconds(8), &result))
+          << "CommitObject x failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), create_y, std::chrono::seconds(8), &result))
+          << "CreateObject y failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), commit_y, std::chrono::seconds(8), &result))
+          << "CommitObject y failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), delete_y, std::chrono::seconds(8), &result))
+          << "DeleteObject y failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
 
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("y", "2"),
-                                   std::chrono::seconds(8), &result))
-          << "SET y 2 failed, status=" << ProposeStatusName(result.status)
-          << ", message=" << result.message;
-      EXPECT_TRUE(WaitForValueOnAll(cluster.Nodes(), "y", "2", std::chrono::seconds(8)))
-          << "not all nodes applied y=2";
-
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("x", "3"),
-                                   std::chrono::seconds(8), &result))
-          << "SET x 3 failed, status=" << ProposeStatusName(result.status)
-          << ", message=" << result.message;
-      EXPECT_TRUE(WaitForValueOnAll(cluster.Nodes(), "x", "3", std::chrono::seconds(8)))
-          << "not all nodes applied x=3";
-
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("y"),
-                                   std::chrono::seconds(8), &result))
-          << "DEL y failed, status=" << ProposeStatusName(result.status)
-          << ", message=" << result.message;
-      EXPECT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "y", std::chrono::seconds(8)))
-          << "not all nodes applied delete y";
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllCommittedObject(
+                      cluster.Nodes(), bucket, "x", "obj-x-v1", 2U, result.log_index,
+                      std::chrono::seconds(8)))
+          << "not all nodes committed metadata object x";
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllDeletedObjectHidden(
+                      cluster.Nodes(), bucket, "y", "obj-y-v1", result.log_index,
+                      std::chrono::seconds(8)))
+          << "not all nodes preserved deleted metadata object y";
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllListObjectsMatch(
+                      cluster.Nodes(), bucket, "", {"x"}, result.log_index,
+                      std::chrono::seconds(8)))
+          << "object_index/ListObjects did not converge to committed metadata view";
     }
 
     TEST_F(RaftIntegrationTest, ElectsNewLeaderAfterCurrentLeaderStops)
@@ -674,15 +567,46 @@ namespace raftdemo
       auto new_leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(10), excluded);
       ASSERT_NE(new_leader, nullptr) << "no new leader after stopping old leader";
 
+      const std::string bucket = "integration-failover-bucket";
+      const auto create_bucket = raftdemo::test::MakeCreateBucketCommand(
+          bucket, "integration-failover-create-bucket-1");
+      const auto create_after_failover = raftdemo::test::MakeCreateObjectCommand(
+          bucket, "after_failover", "obj-after-failover",
+          "integration-failover-create-object-1");
+      const auto commit_after_failover = raftdemo::test::MakeCommitObjectCommand(
+          bucket, "after_failover", "obj-after-failover",
+          "integration-failover-commit-object-1");
+
       ProposeResult result;
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("after_failover", "ok"),
-                                   std::chrono::seconds(10), &result, excluded))
-          << "SET after_failover ok failed, status=" << ProposeStatusName(result.status)
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), create_bucket, std::chrono::seconds(10), &result, excluded))
+          << "CreateBucket after failover failed, status="
+          << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), create_after_failover, std::chrono::seconds(10), &result,
+                      excluded))
+          << "CreateObject after failover failed, status="
+          << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(), commit_after_failover, std::chrono::seconds(10), &result,
+                      excluded))
+          << "CommitObject after failover failed, status="
+          << ProposeStatusName(result.status)
           << ", message=" << result.message;
 
-      EXPECT_TRUE(WaitForValueOnAll(cluster.Nodes(), "after_failover", "ok",
-                                    std::chrono::seconds(8), excluded))
-          << "surviving nodes did not apply after_failover=ok";
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.Nodes(),
+                      {.bucket = bucket,
+                       .objects = {{"after_failover", "obj-after-failover", 2U, false}},
+                       .visible_keys = {"after_failover"},
+                       .expected_request_count = 3U,
+                       .expected_tombstone_count = 0U,
+                       .expected_last_applied_index = result.log_index},
+                      std::chrono::seconds(8),
+                      excluded))
+          << "surviving nodes did not converge on metadata object after_failover";
     }
 
     TEST_F(RaftIntegrationTest, GeneratesSnapshotMetaFileAfterEnoughAppliedLogs)
@@ -693,15 +617,44 @@ namespace raftdemo
       auto leader = WaitForSingleLeader(cluster.Nodes(), std::chrono::seconds(8));
       ASSERT_NE(leader, nullptr) << "no single leader elected within timeout";
 
+      const std::string bucket = "integration-snapshot-bucket";
       ProposeResult result;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCreateBucketCommand(
+                          bucket, "integration-snapshot-create-bucket-1"),
+                      std::chrono::seconds(8), &result))
+          << "CreateBucket for snapshot test failed, status="
+          << ProposeStatusName(result.status) << ", message=" << result.message;
+
+      std::vector<std::string> expected_keys;
       for (int i = 0; i < 8; ++i)
       {
         SCOPED_TRACE("snapshot write " + std::to_string(i));
-        ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("snap_" + std::to_string(i), "value_" + std::to_string(i)),
-                                     std::chrono::seconds(8), &result))
-            << "snapshot write failed, status=" << ProposeStatusName(result.status)
+        const std::string object_key = "snap_" + std::to_string(i);
+        expected_keys.push_back(object_key);
+        ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                        cluster.Nodes(),
+                        raftdemo::test::MakeCreateObjectCommand(
+                            bucket, object_key, "obj-" + object_key,
+                            "integration-snapshot-create-" + std::to_string(i)),
+                        std::chrono::seconds(8), &result))
+            << "snapshot create failed, status=" << ProposeStatusName(result.status)
+            << ", message=" << result.message;
+        ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                        cluster.Nodes(),
+                        raftdemo::test::MakeCommitObjectCommand(
+                            bucket, object_key, "obj-" + object_key,
+                            "integration-snapshot-commit-" + std::to_string(i)),
+                        std::chrono::seconds(8), &result))
+            << "snapshot commit failed, status=" << ProposeStatusName(result.status)
             << ", message=" << result.message;
       }
+
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllListObjectsMatch(
+                      cluster.Nodes(), bucket, "snap_", expected_keys, result.log_index,
+                      std::chrono::seconds(10)))
+          << "metadata object_index/ListObjects did not converge before snapshot generation";
 
       const auto deadline = Clock::now() + std::chrono::seconds(10);
       while (Clock::now() < deadline)
@@ -751,20 +704,56 @@ namespace raftdemo
 
       const std::vector<std::size_t> excluded{stopped_follower};
       ProposeResult result;
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("boundary_key", "before_snapshot"),
-                                   std::chrono::seconds(10), &result, excluded))
-          << "boundary seed write failed, status=" << ProposeStatusName(result.status)
+      const std::string bucket = "integration-boundary-bucket";
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCreateBucketCommand(
+                          bucket, "integration-boundary-create-bucket-1"),
+                      std::chrono::seconds(10), &result, excluded))
+          << "boundary CreateBucket failed, status="
+          << ProposeStatusName(result.status)
           << ", message=" << result.message;
 
-      for (int i = 0; i < 18; ++i)
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCreateObjectCommand(
+                          bucket, "boundary_key", "obj-boundary-key",
+                          "integration-boundary-create-seed"),
+                      std::chrono::seconds(10), &result, excluded))
+          << "boundary seed create failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCommitObjectCommand(
+                          bucket, "boundary_key", "obj-boundary-key",
+                          "integration-boundary-commit-seed"),
+                      std::chrono::seconds(10), &result, excluded))
+          << "boundary seed commit failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+
+      std::vector<std::string> visible_keys;
+      for (int i = 0; i < 8; ++i)
       {
         SCOPED_TRACE("snapshot boundary fill " + std::to_string(i));
+        const std::string object_key = "boundary_fill_" + std::to_string(i);
+        visible_keys.push_back(object_key);
         ASSERT_TRUE(
-            ProposeWithRetry(cluster.Nodes(),
-                             SetCommand("boundary_fill_" + std::to_string(i),
-                                        "value_" + std::to_string(i)),
-                             std::chrono::seconds(10), &result, excluded))
-            << "boundary fill failed, status=" << ProposeStatusName(result.status)
+            raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.Nodes(),
+                raftdemo::test::MakeCreateObjectCommand(
+                    bucket, object_key, "obj-" + object_key,
+                    "integration-boundary-create-fill-" + std::to_string(i)),
+                std::chrono::seconds(10), &result, excluded))
+            << "boundary fill create failed, status=" << ProposeStatusName(result.status)
+            << ", message=" << result.message;
+        ASSERT_TRUE(
+            raftdemo::test::ProposeMetadataCommandWithRetry(
+                cluster.Nodes(),
+                raftdemo::test::MakeCommitObjectCommand(
+                    bucket, object_key, "obj-" + object_key,
+                    "integration-boundary-commit-fill-" + std::to_string(i)),
+                std::chrono::seconds(10), &result, excluded))
+            << "boundary fill commit failed, status=" << ProposeStatusName(result.status)
             << ", message=" << result.message;
       }
 
@@ -779,21 +768,56 @@ namespace raftdemo
       ASSERT_TRUE(leader_snapshot_index.has_value())
           << "leader snapshot index missing from describe output";
 
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), DeleteCommand("boundary_key"),
-                                   std::chrono::seconds(10), &result, excluded))
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeDeleteObjectCommand(
+                          bucket, "boundary_key", "obj-boundary-key",
+                          "integration-boundary-delete-seed"),
+                      std::chrono::seconds(10), &result, excluded))
           << "boundary delete failed, status=" << ProposeStatusName(result.status)
           << ", message=" << result.message;
-      ASSERT_TRUE(ProposeWithRetry(cluster.Nodes(), SetCommand("boundary_tail", "committed"),
-                                   std::chrono::seconds(10), &result, excluded))
-          << "boundary tail write failed, status=" << ProposeStatusName(result.status)
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCreateObjectCommand(
+                          bucket, "boundary_tail", "obj-boundary-tail",
+                          "integration-boundary-create-tail"),
+                      std::chrono::seconds(10), &result, excluded))
+          << "boundary tail create failed, status=" << ProposeStatusName(result.status)
+          << ", message=" << result.message;
+      ASSERT_TRUE(raftdemo::test::ProposeMetadataCommandWithRetry(
+                      cluster.Nodes(),
+                      raftdemo::test::MakeCommitObjectCommand(
+                          bucket, "boundary_tail", "obj-boundary-tail",
+                          "integration-boundary-commit-tail"),
+                      std::chrono::seconds(10), &result, excluded))
+          << "boundary tail commit failed, status=" << ProposeStatusName(result.status)
           << ", message=" << result.message;
 
-      ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "boundary_key",
-                                      std::chrono::seconds(10), excluded))
-          << "surviving majority did not preserve delete after compaction";
-      ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "boundary_tail", "committed",
-                                    std::chrono::seconds(10), excluded))
-          << "surviving majority did not apply tail entry after compaction";
+      visible_keys.push_back("boundary_tail");
+      const raftdemo::test::MetadataRecoveryExpectation expected_state{
+          .bucket = bucket,
+          .objects = {
+              {"boundary_key", "obj-boundary-key", 0U, true},
+              {"boundary_fill_0", "obj-boundary_fill_0", 2U, false},
+              {"boundary_fill_1", "obj-boundary_fill_1", 2U, false},
+              {"boundary_fill_2", "obj-boundary_fill_2", 2U, false},
+              {"boundary_fill_3", "obj-boundary_fill_3", 2U, false},
+              {"boundary_fill_4", "obj-boundary_fill_4", 2U, false},
+              {"boundary_fill_5", "obj-boundary_fill_5", 2U, false},
+              {"boundary_fill_6", "obj-boundary_fill_6", 2U, false},
+              {"boundary_fill_7", "obj-boundary_fill_7", 2U, false},
+              {"boundary_tail", "obj-boundary-tail", 2U, false},
+          },
+          .visible_keys = visible_keys,
+          .expected_request_count = 22U,
+          .expected_tombstone_count = 1U,
+          .expected_last_applied_index = result.log_index,
+          .expected_min_last_applied_term = result.term,
+      };
+
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.Nodes(), expected_state, std::chrono::seconds(10), excluded))
+          << "surviving majority did not preserve metadata ordering after compaction";
 
       cluster.RestartNode(stopped_follower);
 
@@ -803,12 +827,17 @@ namespace raftdemo
                                           std::chrono::seconds(30)))
           << "lagging follower did not install retained snapshot before tail replay, describe="
           << cluster.Nodes()[stopped_follower]->Describe();
-      ASSERT_TRUE(WaitForValueOnAll(cluster.Nodes(), "boundary_tail", "committed",
-                                    std::chrono::seconds(20)))
-          << "cluster did not converge on committed tail value after snapshot handoff";
-      ASSERT_TRUE(WaitForMissingOnAll(cluster.Nodes(), "boundary_key",
-                                      std::chrono::seconds(20)))
-          << "cluster did not preserve committed delete ordering across snapshot boundary";
+      ASSERT_TRUE(raftdemo::test::WaitUntilAllMetadataRecoveryMatches(
+                      cluster.Nodes(), expected_state, std::chrono::seconds(20)))
+          << "cluster did not converge on metadata snapshot + tail replay state";
+
+      const MetadataStateMachine *restarted_state_machine =
+          cluster.Nodes()[stopped_follower]->GetMetadataStateMachineV2();
+      ASSERT_NE(restarted_state_machine, nullptr);
+      EXPECT_EQ(restarted_state_machine->RequestCount(), 22U);
+      EXPECT_EQ(restarted_state_machine->TombstoneCount(), 1U);
+      EXPECT_GE(restarted_state_machine->LastAppliedIndex(), result.log_index);
+      EXPECT_GE(restarted_state_machine->LastAppliedTerm(), result.term);
     }
 
   } // namespace

@@ -86,7 +86,7 @@
             "configuration": "Debug",
             "filter": {
                 "include": {
-                    "name": "^(CommandTest|KvStateMachineTest|TimerSchedulerTest|ThreadPoolTest)\\."
+                    "name": "^(CommandTest|MetadataStateMachineTest|TimerSchedulerTest|ThreadPoolTest)\\."
                 }
             },
             "execution": {
@@ -115,7 +115,7 @@
             "configuration": "Release",
             "filter": {
                 "include": {
-                    "name": "^(CommandTest|KvStateMachineTest|TimerSchedulerTest|ThreadPoolTest)\\."
+                    "name": "^(CommandTest|MetadataStateMachineTest|TimerSchedulerTest|ThreadPoolTest)\\."
                 }
             },
             "execution": {

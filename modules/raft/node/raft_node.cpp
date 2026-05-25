@@ -16,20 +16,43 @@
 #include <vector>
 
 #include "raft/runtime/logging.h"
-#include "raft/service/kv_service_impl.h"
+#include "raft/common/metadata_command.h"
+#include "raft/service/metadata_service_impl.h"
 #include "raft/service/raft_service_impl.h"
 #include "raft/replication/replicator.h"
-#include "raft/state_machine/state_machine.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "raft/storage/snapshot_storage.h"
 
 namespace raftdemo
 {
   namespace
   {
+    struct SnapshotAppliedBoundary
+    {
+      std::uint64_t index{0};
+      std::uint64_t term{0};
+    };
 
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
     constexpr const char *kSnapshotMarkerCommand = "snapshot";
     constexpr const char *kIdentityFileName = "node_identity.txt";
+    constexpr std::size_t kMaxInflightMetadataProposals = 4;
+    constexpr std::size_t kCompletedMetadataProposalCacheLimit = 64;
+
+    std::chrono::milliseconds ScaleDeadline(std::chrono::milliseconds base,
+                                            const int multiplier)
+    {
+      if (base <= std::chrono::milliseconds::zero())
+      {
+        return std::chrono::milliseconds::zero();
+      }
+      const auto count = base.count();
+      if (count > std::numeric_limits<std::int64_t>::max() / multiplier)
+      {
+        return std::chrono::milliseconds::max();
+      }
+      return std::chrono::milliseconds(count * multiplier);
+    }
 
     std::uint64_t SafeAddOne(std::uint64_t value)
     {
@@ -86,15 +109,48 @@ namespace raftdemo
       return values;
     }
 
+    std::optional<SnapshotAppliedBoundary> ResolveLoadedSnapshotAppliedBoundary(
+        const IStateMachine &state_machine,
+        const std::uint64_t expected_index,
+        const std::uint64_t expected_term,
+        std::string *reason)
+    {
+      if (const auto *metadata_state_machine =
+              dynamic_cast<const MetadataStateMachine *>(&state_machine);
+          metadata_state_machine != nullptr)
+      {
+        const SnapshotAppliedBoundary boundary{
+            metadata_state_machine->LastAppliedIndex(),
+            metadata_state_machine->LastAppliedTerm()};
+        if (boundary.index != expected_index || boundary.term != expected_term)
+        {
+          if (reason != nullptr)
+          {
+            std::ostringstream oss;
+            oss << "metadata snapshot boundary mismatch, expected_index="
+                << expected_index
+                << ", expected_term=" << expected_term
+                << ", restored_index=" << boundary.index
+                << ", restored_term=" << boundary.term;
+            *reason = oss.str();
+          }
+          return std::nullopt;
+        }
+        return boundary;
+      }
+
+      return SnapshotAppliedBoundary{expected_index, expected_term};
+    }
+
   } // namespace
 
   RaftNode::RaftNode(NodeConfig config)
-      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<KvStateMachine>())
+      : RaftNode(std::move(config), snapshotConfig{}, std::make_unique<MetadataStateMachine>())
   {
   }
 
   RaftNode::RaftNode(NodeConfig config, snapshotConfig snapshot_config)
-      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<KvStateMachine>())
+      : RaftNode(std::move(config), std::move(snapshot_config), std::make_unique<MetadataStateMachine>())
   {
   }
 
@@ -145,7 +201,7 @@ namespace raftdemo
       // snapshot + committed log replay, so do NOT restore runtime last_applied_
       // to persistent_state.last_applied here. If we did, startup would think
       // those entries were already applied and would skip replay, leaving an
-      // empty KV state after a pure-log restart.
+      // empty metadata state after a pure-log restart.
       commit_index_ = std::max<std::uint64_t>(persistent_state.commit_index,
                                              persistent_state.last_applied);
       last_applied_ = 0;
@@ -346,12 +402,12 @@ namespace raftdemo
   void RaftNode::InitServer()
   {
     service_ = std::make_unique<RaftServiceImpl>(*this);
-    kv_service_ = std::make_unique<KvServiceImpl>(*this);
+    metadata_service_ = std::make_unique<MetadataServiceImpl>(*this);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(config_.address, grpc::InsecureServerCredentials());
     builder.RegisterService(service_.get());
-    builder.RegisterService(kv_service_.get());
+    builder.RegisterService(metadata_service_.get());
     server_ = builder.BuildAndStart();
     if (!server_)
     {
@@ -392,18 +448,6 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
   bool RaftNode::IsRunning() const
   {
     return running_.load();
-  }
-
-  bool RaftNode::ValidateKey(const std::string &key, std::string *reason) const
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    return ValidateKeyUnlocked(key, reason);
-  }
-
-  bool RaftNode::ValidateValue(const std::string &value, std::string *reason) const
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    return ValidateValueUnlocked(value, reason);
   }
 
   NodeStatusSnapshot RaftNode::GetStatusSnapshot() const
@@ -502,23 +546,17 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       oss << "]";
     }
 
-    const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-    if (kv_sm != nullptr)
-    {
-      oss << ", kv=" << kv_sm->DebugString();
-    }
-
     return oss.str();
   }
 
-  bool RaftNode::DebugGetValue(const std::string &key, std::string *value) const
+  MetadataStateMachine *RaftNode::GetMetadataStateMachineV2()
   {
-    const auto *kv_sm = dynamic_cast<const KvStateMachine *>(state_machine_.get());
-    if (kv_sm == nullptr)
-    {
-      return false;
-    }
-    return kv_sm->Get(key, value);
+    return dynamic_cast<MetadataStateMachine *>(state_machine_.get());
+  }
+
+  const MetadataStateMachine *RaftNode::GetMetadataStateMachineV2() const
+  {
+    return dynamic_cast<const MetadataStateMachine *>(state_machine_.get());
   }
 
   void RaftNode::CancelElectionTimerLocked()
@@ -1592,6 +1630,18 @@ void RaftNode::SendHeartbeats()
         return;
       }
 
+      std::string boundary_error;
+      const auto boundary = ResolveLoadedSnapshotAppliedBoundary(
+          *state_machine_,
+          request.last_included_index(),
+          request.last_included_term(),
+          &boundary_error);
+      if (!boundary.has_value())
+      {
+        response->set_message("load installed snapshot boundary check failed: " + boundary_error);
+        return;
+      }
+
       std::lock_guard<std::mutex> lk(mu_);
       if (request.term() < current_term_)
       {
@@ -1600,9 +1650,9 @@ void RaftNode::SendHeartbeats()
         return;
       }
 
-      CompactLogPrefixLocked(request.last_included_index(), request.last_included_term());
-      commit_index_ = std::max<std::uint64_t>(commit_index_, request.last_included_index());
-      last_applied_ = std::max<std::uint64_t>(last_applied_, request.last_included_index());
+      CompactLogPrefixLocked(boundary->index, boundary->term);
+      commit_index_ = std::max<std::uint64_t>(commit_index_, boundary->index);
+      last_applied_ = boundary->index;
 
       std::string persist_error;
       if (!PersistStateLocked(&persist_error))
@@ -1651,18 +1701,6 @@ void RaftNode::SendHeartbeats()
       return "append_entries";
     case RpcKind::kInstallSnapshot:
       return "install_snapshot";
-    case RpcKind::kKvPut:
-      return "kv_put";
-    case RpcKind::kKvDelete:
-      return "kv_delete";
-    case RpcKind::kKvGet:
-      return "kv_get";
-    case RpcKind::kKvStatus:
-      return "kv_status";
-    case RpcKind::kKvHealth:
-      return "kv_health";
-    case RpcKind::kKvMetrics:
-      return "kv_metrics";
     }
     return "unknown";
   }
@@ -1670,17 +1708,11 @@ void RaftNode::SendHeartbeats()
   std::vector<RaftNode::RpcMetricState> RaftNode::BuildRpcMetricStateTemplate()
   {
     std::vector<RpcMetricState> metrics;
-    metrics.reserve(9);
+    metrics.reserve(3);
     for (const RpcKind kind : {
              RpcKind::kRequestVote,
              RpcKind::kAppendEntries,
              RpcKind::kInstallSnapshot,
-             RpcKind::kKvPut,
-             RpcKind::kKvDelete,
-             RpcKind::kKvGet,
-             RpcKind::kKvStatus,
-             RpcKind::kKvHealth,
-             RpcKind::kKvMetrics,
          })
     {
       metrics.push_back(RpcMetricState{RpcKindName(kind), 0, 0, 0, 0});
@@ -1904,6 +1936,389 @@ void RaftNode::SendHeartbeats()
     return result;
   }
 
+  ProposeResult RaftNode::ProposeMetadata(const std::string &metadata_command_data)
+  {
+    ProposeResult result;
+    std::string reason;
+    MetadataCommand metadata_command;
+    if (!ParseMetadataCommand(metadata_command_data, &metadata_command))
+    {
+      result.status = ProposeStatus::kInvalidCommand;
+      result.message = "failed to parse metadata command";
+      RecordProposeResult(false);
+      return result;
+    }
+
+    if (!ValidateMetadataCommand(metadata_command, &reason))
+    {
+      result.status = ProposeStatus::kInvalidCommand;
+      result.message = "invalid metadata command: " + reason;
+      RecordProposeResult(false);
+      return result;
+    }
+
+    const auto wait_timeout = config_.rpc_deadline;
+    if (wait_timeout <= std::chrono::milliseconds::zero())
+    {
+      result.status = ProposeStatus::kTimeout;
+      result.message = "metadata proposal deadline already expired before admission";
+      RecordProposeResult(false);
+      return result;
+    }
+
+    const auto wait_deadline = std::chrono::steady_clock::now() + wait_timeout;
+    const std::string fingerprint =
+        ComputeMetadataCommandFingerprint(metadata_command);
+    const std::string &request_id = metadata_command.request_id;
+    std::shared_ptr<MetadataProposalTracker> tracker;
+    bool joined_existing = false;
+
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+
+      if (!running_.load())
+      {
+        result.status = ProposeStatus::kNodeStopping;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is stopping";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      if (role_ != Role::kLeader)
+      {
+        result.status = ProposeStatus::kNotLeader;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is not the leader";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      if (std::chrono::steady_clock::now() >= wait_deadline)
+      {
+        result.status = ProposeStatus::kTimeout;
+        result.leader_id = config_.node_id;
+        result.term = current_term_;
+        result.message = "metadata proposal deadline already expired before admission";
+        RecordProposeResult(false);
+        return result;
+      }
+
+      PruneCompletedMetadataProposalsLocked();
+
+      const auto completed_it = metadata_completed_proposals_.find(request_id);
+      if (completed_it != metadata_completed_proposals_.end())
+      {
+        if (completed_it->second.fingerprint != fingerprint)
+        {
+          result.status = ProposeStatus::kApplyFailed;
+          result.leader_id = config_.node_id;
+          result.term = current_term_;
+          result.message = "idempotency conflict: request_id maps to different command";
+          RecordProposeResult(false);
+          return result;
+        }
+
+        result = completed_it->second.result;
+        RecordProposeResult(result.Ok());
+        return result;
+      }
+
+      const auto inflight_it = metadata_inflight_proposals_.find(request_id);
+      if (inflight_it != metadata_inflight_proposals_.end())
+      {
+        if (inflight_it->second->fingerprint != fingerprint)
+        {
+          result.status = ProposeStatus::kApplyFailed;
+          result.leader_id = config_.node_id;
+          result.term = current_term_;
+          result.message = "idempotency conflict: request_id maps to different command";
+          RecordProposeResult(false);
+          return result;
+        }
+
+        tracker = inflight_it->second;
+        joined_existing = true;
+      }
+      else
+      {
+        if (metadata_inflight_proposals_.size() >= kMaxInflightMetadataProposals)
+        {
+          result.status = ProposeStatus::kOverloaded;
+          result.leader_id = config_.node_id;
+          result.term = current_term_;
+          result.message =
+              "metadata proposal admission rejected: in-flight limit reached";
+          RecordProposeResult(false);
+          return result;
+        }
+
+        tracker = std::make_shared<MetadataProposalTracker>();
+        tracker->fingerprint = fingerprint;
+        metadata_inflight_proposals_.emplace(request_id, tracker);
+      }
+    }
+
+    if (!joined_existing)
+    {
+      rpc_pool_.Submit(
+          [this, request_id, metadata_command_data, tracker]()
+          {
+            ExecuteMetadataProposal(request_id, metadata_command_data, tracker);
+          });
+    }
+
+    if (WaitForMetadataProposalTracker(tracker, wait_deadline, &result))
+    {
+      RecordProposeResult(result.Ok());
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.status = ProposeStatus::kTimeout;
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      result.message = "timed out waiting for metadata proposal completion";
+    }
+    RecordProposeResult(false);
+    return result;
+  }
+
+  void RaftNode::ExecuteMetadataProposal(
+      const std::string &request_id,
+      const std::string &metadata_command_data,
+      std::shared_ptr<MetadataProposalTracker> tracker)
+  {
+    Command command;
+    command.type = CommandType::kMetadata;
+    command.metadata_payload = metadata_command_data;
+
+    ProposeResult result;
+    std::string reason;
+    std::string command_data;
+    std::uint64_t log_index = 0;
+    std::uint64_t term = 0;
+    bool completed_in_lock_scope = false;
+
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+
+      if (!running_.load())
+      {
+        result.status = ProposeStatus::kNodeStopping;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is stopping";
+        completed_in_lock_scope = true;
+      }
+      else if (role_ != Role::kLeader)
+      {
+        result.status = ProposeStatus::kNotLeader;
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+        result.message = "node is not the leader";
+        completed_in_lock_scope = true;
+      }
+      else if (!ValidateCommandUnlocked(command, &reason))
+      {
+        result.status = ProposeStatus::kInvalidCommand;
+        result.leader_id = config_.node_id;
+        result.term = current_term_;
+        result.message = reason;
+        completed_in_lock_scope = true;
+      }
+      else
+      {
+        command_data = command.Serialize();
+        if (command_data.empty())
+        {
+          result.status = ProposeStatus::kInvalidCommand;
+          result.leader_id = config_.node_id;
+          result.term = current_term_;
+          result.message = "failed to serialize command";
+          completed_in_lock_scope = true;
+        }
+
+        if (!completed_in_lock_scope)
+        {
+          term = current_term_;
+          log_index = AppendLocalLogUnlocked(command_data);
+          if (log_index == 0)
+          {
+            result.status = ProposeStatus::kReplicationFailed;
+            result.leader_id = config_.node_id;
+            result.term = current_term_;
+            result.message = "failed to append and persist local log entry";
+            completed_in_lock_scope = true;
+          }
+        }
+
+        if (!completed_in_lock_scope)
+        {
+          result.leader_id = config_.node_id;
+          result.term = term;
+          result.log_index = log_index;
+          result.message = "log appended locally";
+        }
+      }
+    }
+
+    if (completed_in_lock_scope)
+    {
+      CompleteMetadataProposal(request_id, tracker, tracker->fingerprint, result);
+      return;
+    }
+
+    const ReplicationOutcome replicated = ReplicateLogEntryToMajority(
+        log_index,
+        std::chrono::steady_clock::now() + ScaleDeadline(config_.rpc_deadline, 20));
+    if (replicated != ReplicationOutcome::kReplicated)
+    {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        result.leader_id = leader_id_;
+        result.term = current_term_;
+      }
+      if (replicated == ReplicationOutcome::kTimeout)
+      {
+        result.status = ProposeStatus::kTimeout;
+        result.message = "timed out waiting for majority replication";
+      }
+      else if (replicated == ReplicationOutcome::kLostLeadership)
+      {
+        result.status = ProposeStatus::kNotLeader;
+        result.message = "lost leadership before the log entry reached a majority";
+      }
+      else
+      {
+        result.status = ProposeStatus::kReplicationFailed;
+        result.message = "failed to replicate log entry to majority";
+      }
+      CompleteMetadataProposal(request_id, tracker, tracker->fingerprint, result);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      AdvanceCommitIndexUnlocked();
+    }
+
+    ApplyResult apply_result = ApplyCommittedEntries();
+    if (!apply_result.Ok)
+    {
+      result.status = ProposeStatus::kApplyFailed;
+      result.message = apply_result.message;
+      CompleteMetadataProposal(request_id, tracker, tracker->fingerprint, result);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (last_applied_ < log_index)
+      {
+        result.status = ProposeStatus::kApplyFailed;
+        result.message = "log committed but not applied";
+        completed_in_lock_scope = true;
+      }
+    }
+
+    if (completed_in_lock_scope)
+    {
+      CompleteMetadataProposal(request_id, tracker, tracker->fingerprint, result);
+      return;
+    }
+
+    result.status = ProposeStatus::kOk;
+    result.message = apply_result.message;
+    CompleteMetadataProposal(request_id, tracker, tracker->fingerprint, result);
+  }
+
+  bool RaftNode::WaitForMetadataProposalTracker(
+      const std::shared_ptr<MetadataProposalTracker> &tracker,
+      std::chrono::steady_clock::time_point deadline,
+      ProposeResult *result) const
+  {
+    if (tracker == nullptr)
+    {
+      return false;
+    }
+
+    std::unique_lock<std::mutex> lk(tracker->mu);
+    while (!tracker->completed)
+    {
+      if (tracker->cv.wait_until(lk, deadline) == std::cv_status::timeout)
+      {
+        return false;
+      }
+    }
+
+    if (result != nullptr)
+    {
+      *result = tracker->result;
+    }
+    return true;
+  }
+
+  void RaftNode::CompleteMetadataProposal(
+      const std::string &request_id,
+      const std::shared_ptr<MetadataProposalTracker> &tracker,
+      const std::string &fingerprint,
+      const ProposeResult &result)
+  {
+    if (tracker != nullptr)
+    {
+      {
+        std::lock_guard<std::mutex> tracker_lk(tracker->mu);
+        tracker->completed = true;
+        tracker->result = result;
+      }
+      tracker->cv.notify_all();
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto inflight_it = metadata_inflight_proposals_.find(request_id);
+    if (inflight_it != metadata_inflight_proposals_.end() &&
+        inflight_it->second == tracker)
+    {
+      metadata_inflight_proposals_.erase(inflight_it);
+    }
+    if (result.status == ProposeStatus::kOk ||
+        result.status == ProposeStatus::kApplyFailed ||
+        result.status == ProposeStatus::kInvalidCommand)
+    {
+      metadata_completed_proposals_[request_id] =
+          CompletedMetadataProposal{fingerprint, result};
+      metadata_completed_proposal_order_.push_back(request_id);
+      PruneCompletedMetadataProposalsLocked();
+    }
+  }
+
+  void RaftNode::PruneCompletedMetadataProposalsLocked()
+  {
+    while (metadata_completed_proposal_order_.size() >
+           kCompletedMetadataProposalCacheLimit)
+    {
+      const std::string request_id =
+          metadata_completed_proposal_order_.front();
+      metadata_completed_proposal_order_.erase(
+          metadata_completed_proposal_order_.begin());
+      metadata_completed_proposals_.erase(request_id);
+    }
+  }
+
+  StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine()
+  {
+    return dynamic_cast<StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+  }
+
+  const StrongConsistencyMetadataStateMachine *RaftNode::GetMetadataStateMachine() const
+  {
+    return dynamic_cast<const StrongConsistencyMetadataStateMachine *>(state_machine_.get());
+  }
+
   bool RaftNode::ValidateCommandUnlocked(const Command &command, std::string *reason) const
   {
     if (!command.IsValid())
@@ -1912,16 +2327,6 @@ void RaftNode::SendHeartbeats()
       {
         *reason = "invalid command";
       }
-      return false;
-    }
-
-    if (!ValidateKeyUnlocked(command.key, reason))
-    {
-      return false;
-    }
-
-    if (command.type == CommandType::kSet && !ValidateValueUnlocked(command.value, reason))
-    {
       return false;
     }
 
@@ -1934,61 +2339,11 @@ void RaftNode::SendHeartbeats()
       }
       return false;
     }
-    if (serialized.size() > config_.kv_limits.max_command_bytes)
+    if (serialized.size() > config_.proposal_limits.max_command_bytes)
     {
       if (reason != nullptr)
       {
         *reason = "command size exceeds limit";
-      }
-      return false;
-    }
-    return true;
-  }
-
-  bool RaftNode::ValidateKeyUnlocked(const std::string &key, std::string *reason) const
-  {
-    if (key.empty())
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key must not be empty";
-      }
-      return false;
-    }
-    if (key.find('|') != std::string::npos)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key must not contain '|'";
-      }
-      return false;
-    }
-    if (key.size() > config_.kv_limits.max_key_bytes)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "key size exceeds limit";
-      }
-      return false;
-    }
-    return true;
-  }
-
-  bool RaftNode::ValidateValueUnlocked(const std::string &value, std::string *reason) const
-  {
-    if (value.find('|') != std::string::npos)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "value must not contain '|'";
-      }
-      return false;
-    }
-    if (value.size() > config_.kv_limits.max_value_bytes)
-    {
-      if (reason != nullptr)
-      {
-        *reason = "value size exceeds limit";
       }
       return false;
     }
@@ -2020,9 +2375,18 @@ void RaftNode::SendHeartbeats()
     return new_index;
   }
 
-RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t log_index)
+RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
+    std::uint64_t log_index)
 {
-  const auto deadline = std::chrono::steady_clock::now() + config_.rpc_deadline * 20;
+  return ReplicateLogEntryToMajority(
+      log_index,
+      std::chrono::steady_clock::now() + ScaleDeadline(config_.rpc_deadline, 20));
+}
+
+RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
+    std::uint64_t log_index,
+    std::chrono::steady_clock::time_point deadline)
+{
 
   while (std::chrono::steady_clock::now() < deadline)
   {
@@ -2196,6 +2560,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
     while (true)
     {
       std::uint64_t apply_index = 0;
+      std::uint64_t apply_term = 0;
       std::string command_data;
       IStateMachine *state_machine = nullptr;
 
@@ -2240,6 +2605,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
         }
 
         command_data = record->command;
+        apply_term = record->term;
         state_machine = state_machine_.get();
       }
 
@@ -2248,7 +2614,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
         return {false, "state machine is null"};
       }
 
-      ApplyResult result = state_machine->Apply(apply_index, command_data);
+      ApplyResult result = state_machine->Apply(apply_index, apply_term, command_data);
       if (!result.Ok)
       {
         Log(NodeTag(config_.node_id),
@@ -2372,11 +2738,26 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
         continue;
       }
 
+      std::string boundary_error;
+      const auto boundary = ResolveLoadedSnapshotAppliedBoundary(
+          *state_machine_,
+          meta.last_included_index,
+          meta.last_included_term,
+          &boundary_error);
+      if (!boundary.has_value())
+      {
+        Log(NodeTag(config_.node_id), "skip invalid snapshot ", meta.snapshot_path,
+            ", index=", meta.last_included_index,
+            ", term=", meta.last_included_term,
+            ", reason=", boundary_error);
+        continue;
+      }
+
       {
         std::lock_guard<std::mutex> lk(mu_);
-        CompactLogPrefixLocked(meta.last_included_index, meta.last_included_term);
-        commit_index_ = std::max<std::uint64_t>(commit_index_, meta.last_included_index);
-        last_applied_ = meta.last_included_index;
+        CompactLogPrefixLocked(boundary->index, boundary->term);
+        commit_index_ = std::max<std::uint64_t>(commit_index_, boundary->index);
+        last_applied_ = boundary->index;
 
         std::string persist_error;
         if (!PersistStateLocked(&persist_error))
@@ -2390,7 +2771,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(std::uint64_t
       }
 
       Log(NodeTag(config_.node_id), "loaded snapshot from ", meta.snapshot_path,
-          ", index=", meta.last_included_index, ", term=", meta.last_included_term,
+          ", index=", boundary->index, ", term=", boundary->term,
           ", commit_index=", commit_index_, ", last_applied=", last_applied_,
           ", last_snapshot_index=", last_snapshot_index_,
           ", last_snapshot_term=", last_snapshot_term_,

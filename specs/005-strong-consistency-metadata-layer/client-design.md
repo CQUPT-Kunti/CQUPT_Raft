@@ -24,7 +24,28 @@ Metadata Client 是 `raft_kv_client` 的规划后继，用于验证强一致元�
 
 ## Command Shape
 
-后续实现可采用类似以下 CLI 形态，具体命令名可在 tasks 阶段固定：
+完整 Metadata Client 仍是后续目标；当前阶段只有最小 failover retry 场景，不是完整 command dispatcher。
+
+当前已经固定的最小 CLI 形态如下：
+
+```bash
+raft_metadata_client <addr> commit-retry \
+  --request-id req-commit-1 \
+  --object-key obj/a \
+  --expected-create-request-id req-create-1 \
+  --commit-info "commit after failover" \
+  --max-retries 1 \
+  --timeout-ms 3000
+
+raft_metadata_client <addr> delete-retry \
+  --request-id req-delete-1 \
+  --object-key obj/a \
+  --delete-info "delete after failover" \
+  --max-retries 1 \
+  --timeout-ms 3000
+```
+
+后续完整 Metadata Client 可采用类似以下 CLI 形态，具体命令名可在 tasks 阶段继续固定：
 
 ```bash
 metadata_client <addr> create \
@@ -52,6 +73,12 @@ metadata_client <addr> delete \
   --object-key obj/a \
   --delete-info "demo delete"
 ```
+
+当前限制：
+
+- `raft_metadata_client` 目前只覆盖 `commit-retry` / `delete-retry`
+- 当前不包含完整 `create` / `head` / `list` / `delete` dispatcher
+- 当前尚未接入 CMake target，正式构建接入留到 `T033`
 
 ## Simulated Metadata Generation
 
@@ -109,8 +136,11 @@ metadata_client <addr> delete \
 
 1. create 得到 Pending。
 2. commit 使用 `request_id=req-commit-1`。
-3. commit 响应超时或 leader failover 后，用同一 request_id 重试。
-4. 期望最终只有一个 Committed 结果，Head/List 可见且无重复记录。
+3. 如果 commit 返回 `NOT_LEADER` 或 `TIMEOUT`，客户端不得生成新的 request_id。
+4. 若响应带有 `leader_hint.leader_address`，客户端应优先把它作为下一次 retry 目标地址；如果没有 leader hint，则提示用户对当前地址或已知 leader 地址继续重试。
+5. retry 必须复用同一 `request_id=req-commit-1`，只允许改变目标地址，不允许改变 request identity。
+6. retry 必须受 `max-retries` 限制，不能无限循环。
+7. 期望最终只有一个 Committed 结果，Head/List 可见且无重复记录。
 
 ### Delete Retry
 
@@ -118,8 +148,11 @@ metadata_client <addr> delete \
 
 1. create + commit object。
 2. delete 使用 `request_id=req-delete-1`。
-3. 使用同一 request_id 重试 delete。
-4. 期望 tombstone 只表达一个删除事实，Head/List 不可见。
+3. 如果 delete 返回 `NOT_LEADER` 或 `TIMEOUT`，客户端不得生成新的 request_id。
+4. 若响应带有 `leader_hint.leader_address`，客户端应优先把它作为下一次 retry 目标地址。
+5. retry 必须复用同一 `request_id=req-delete-1`。
+6. retry 必须受 `max-retries` 限制，不能无限循环。
+7. 期望 tombstone 只表达一个删除事实，Head/List 不可见。
 
 ### Read-After-Write Verification
 
@@ -129,6 +162,15 @@ metadata_client <addr> delete \
 2. commit 后 head/list，期望 found 且字段与 manifest 一致。
 3. delete 后 head/list，期望 not found。
 4. restart/failover 后重复 head/list，期望 committed 或 tombstone 结果稳定。
+
+当前阶段建议按以下方式执行 Head/List 验证：
+
+1. `commit-retry` 返回 `OK` 或 `IDEMPOTENT_REPLAY` 后，立即对 leader 执行 `HeadMetadataRecord`。
+2. `HeadMetadataRecord` 期望返回 `found=true` 且 `state=COMMITTED`。
+3. 随后执行 `ListMetadataRecords`，确认 `object_key` 出现在 committed-only 列表中。
+4. `delete-retry` 返回 `OK` 或 `IDEMPOTENT_REPLAY` 后，再次执行 `HeadMetadataRecord`，期望 `found=false` 或 `NOT_FOUND`。
+5. 随后执行 `ListMetadataRecords`，确认目标 `object_key` 不再出现。
+6. 如果 `Head/List` 返回 `NOT_LEADER`，客户端应根据 leader hint 切换到 leader 后再继续验证，且这一步不涉及生成新的 write request_id。
 
 ## Output Format
 
@@ -144,13 +186,26 @@ metadata_client <addr> delete \
 - `term`
 - `log_index`
 
+对于 failover retry 场景，建议额外稳定输出：
+
+- 当前请求投递地址
+- retry 次数 / 下一次 retry 目标地址
+- leader hint 是否来自本次响应
+
 ## Error Handling
 
-- `NOT_LEADER`: 显示 leader hint；可选自动重试到 leader，但必须复用 request_id。
-- `TIMEOUT`: 不生成新 request_id；提示用户重试原请求。
+- `NOT_LEADER`: 显示 `leader_id`、`leader_address`；如做自动 retry，必须复用同一 request_id。
+- `TIMEOUT`: 不生成新 request_id；提示用户使用原 request_id 做有限次数重试。
 - `INVALID_ARGUMENT`: 输出具体字段原因。
 - `IDEMPOTENCY_CONFLICT`: 输出冲突 request_id 和冲突类别，不自动重试。
 - `STATE_CONFLICT`: 输出当前状态和期望状态，不自动重试。
+
+## Current Stage Notes
+
+- 当前 `raft_metadata_client` 只是最小 failover retry 场景实现，不是完整 Metadata Client。
+- 当前只覆盖 `commit-retry` / `delete-retry`。
+- 当前不实现真实文件上传下载，不实现 chunk 生成，不实现完整 read-after-write 自动化流程。
+- 当前尚未接入 CMake target，正式构建接入留到 `T033`。
 
 ## Future Boundary
 

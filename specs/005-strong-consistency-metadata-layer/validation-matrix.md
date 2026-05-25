@@ -2,65 +2,107 @@
 
 ## Scope
 
-当前文件只规划验证矩阵，不读取或分析现有 `tests/**`，不运行测试，不修改源码。后续 tasks 阶段应把这些条目落到具体测试文件、命令和 CI 分组中。
+本文件记录当前已经实现并有验证记录的 Metadata 能力映射。它只回填稳定的测试目标、Linux 已验证状态、Windows 待验证状态和当前阶段边界，不新增源码、测试或平台执行结果。
+
+本矩阵当前只覆盖 metadata control plane：
+
+- create / commit / head / list / delete
+- committed-only visibility
+- `request_id` 幂等与 conflict
+- tombstone delete
+- snapshot / restart recovery
+- leader failover
+- metadata client scenario
+
+本矩阵不覆盖：
+
+- `StorageNode`
+- `ChunkStore`
+- 真实 chunk 文件
+- 真实上传下载
+- repair / rebalance
+- S3 协议
+
+## Current Test Target Mapping
+
+| Test Target | CTest Regex / Target | Current Linux Evidence | Current Windows Status | Notes |
+|-------------|----------------------|------------------------|------------------------|-------|
+| `test_metadata_command` | `^MetadataCommandTest\.` | 已验证，`9/9 PASS` | 待 `T041-T043` | 覆盖 codec、invalid argument、payload 上限、`mock_locations` 解析 |
+| `test_metadata_state_machine` | `^MetadataStateMachineTest\.` | 已验证，`6/6 PASS` | 待 `T041-T043` | 覆盖 create/commit 可见性、幂等、缺失 pending commit |
+| `test_metadata_snapshot` | `^MetadataSnapshotTest\.` | 已验证，`5/5 PASS` | 待 `T041-T043` | 覆盖 snapshot/restart、tombstone、pending 恢复不可见 |
+| `test_metadata_failover` | `^MetadataFailoverTest\.` | 已验证，`2/2 PASS` | 待 `T041-T043` | 覆盖 failover 后 committed 保留、pending 不暴露、同 commit request_id retry |
+| `test_metadata_manifest` | `^MetadataManifestTest\.` | 已验证，`7/7 PASS` | 待 `T041-T043` | 覆盖 manifest 边界、payload boundary、`mock_locations` 边界 |
+| `test_metadata_client_scenario` | `^MetadataClientScenarioTest\.` | 已验证，`5/5 PASS` | 待 `T041-T043` | 覆盖 metadata client create/commit/head/list/delete/read-after-write/retry 场景 |
+| `raft_metadata_client` | build target only | 已在现有 Linux 报告中构建通过，并被 `MetadataClientScenarioTest` 调用 | 待 `T041-T043` | client target 已接入构建链路，当前场景验证基于该 target 完成 |
 
 ## Matrix
 
-| ID | Scenario | Priority | Setup | Action | Expected Result | Evidence |
-|----|----------|----------|-------|--------|-----------------|----------|
-| VM-001 | Create 后 Pending 不可见 | P1 | leader 可用，object_key 不存在 | CreateMetadataRecord 后立即 Head/List | create 成功，状态 Pending；Head/List 均不返回 object | 客户端输出 code/state/head/list |
-| VM-002 | Commit 后 Committed 可见 | P1 | 已有 Pending record | CommitMetadataRecord 后 Head/List | commit 成功，状态 Committed；Head 返回完整 MetadataRecord；List 包含 object_key | 客户端输出 record 和 log_index |
-| VM-003 | Duplicate create 幂等 | P1 | create 请求已成功 | 同一 request_id、同一内容再次 create | 返回 IDEMPOTENT_REPLAY 或等价成功；无重复记录 | Head/List 仍符合 Pending 不可见 |
-| VM-004 | request_id 内容冲突 | P1 | request_id 已用于 create | 同一 request_id 携带不同 object_key 或 manifest | 返回 IDEMPOTENCY_CONFLICT | 错误码和诊断 message |
-| VM-005 | Commit retry 幂等 | P1 | Pending record 存在 | 同一 commit request_id 重复提交 | 只有一个 Committed 结果；Head/List 稳定可见 | commit response + Head/List |
-| VM-006 | Missing Pending commit | P1 | object_key never-created | CommitMetadataRecord | 返回 NOT_FOUND 或 STATE_CONFLICT，不创建可见记录 | Head/List not found |
-| VM-007 | Delete tombstone | P2 | Committed record 存在 | DeleteMetadataRecord 后 Head/List | 状态 Deleted；Head/List 不返回 object；tombstone 内部可恢复 | delete response + Head/List |
-| VM-008 | Delete retry 幂等 | P2 | 删除已成功 | 同一 delete request_id 再次 delete | 返回幂等结果；状态仍 Deleted；无复活 | delete response + Head/List |
-| VM-009 | Delete Pending conflict | P2 | Pending record 存在 | DeleteMetadataRecord | 返回 STATE_CONFLICT；Pending 仍不可见 | code/state + Head/List |
-| VM-010 | Deleted 防旧请求复活 | P2 | object 已 Deleted | 重放旧 create/commit request | 不得变为 Committed；Head/List 仍 not found | Head/List + conflict code |
-| VM-011 | Snapshot/restart 恢复 committed metadata | P2 | 多个 Committed records 已存在 | 触发 snapshot/restart 后 Head/List | committed records 全部恢复可见 | 重启后客户端 Head/List |
-| VM-012 | Snapshot/restart 恢复 tombstone | P2 | Deleted tombstone 已存在 | 触发 snapshot/restart 后 Head/List | deleted object 仍不可见；旧请求不能复活 | 重启后 Head/List + retry |
-| VM-013 | Pending restart 不外部可见 | P2 | Pending record 存在 | restart 后 Head/List | Pending 不可见；若保留内部 Pending，也必须等待 commit 才可见 | 重启后 Head/List |
-| VM-014 | Leader failover 保留 committed metadata | P3 | Committed records 存在 | leader failover 后向新 leader Head/List | committed metadata 不丢失 | 新 leader 客户端输出 |
-| VM-015 | Leader failover 不暴露 Pending | P3 | Pending record 存在 | leader failover 后 Head/List | Pending 不可见 | 新 leader Head/List |
-| VM-016 | Failover 后 commit retry | P3 | commit 请求结果不确定 | 新 leader 上用相同 request_id 重试 | 返回已提交结果或完成提交；无重复记录 | commit response + Head/List |
-| VM-017 | Simulated manifest validation | P3 | 客户端生成 manifest | create with object_size/chunk_size/chunk_count/checksum/mock_locations | 合法 manifest 被接受；非法 manifest 返回 INVALID_ARGUMENT | create response |
-| VM-018 | Payload boundary | P3 | payload 超过规划上限 | CreateMetadataRecord | 返回 INVALID_ARGUMENT；不写入 Pending | response + Head/List |
-| VM-019 | List deterministic ordering | P3 | 多个 Committed records | ListMetadataRecords | 只返回 Committed，按 object_key 确定性排序 | list output |
-| VM-020 | StorageNode boundary | P4 | mock_locations 指向不存在节点 | create/commit/head/list | metadata 操作不要求真实 StorageNode 或 chunk 文件存在 | 成功响应 + 无文件依赖 |
+| ID | Scenario | Primary Test Mapping | Linux Status | Windows Status | Notes |
+|----|----------|----------------------|--------------|----------------|-------|
+| VM-001 | Create 后 Pending 不可见 | `MetadataStateMachineTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | create 成功后 `Head/List` 不返回对象 |
+| VM-002 | Commit 后 Committed 可见 | `MetadataStateMachineTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | commit 成功后 `Head` 返回 record，`List` 包含 `object_key` |
+| VM-003 | Duplicate create 幂等 | `MetadataStateMachineTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | 同 `request_id` + 同内容重放稳定 |
+| VM-004 | request_id 内容冲突 | `MetadataCommandTest`, `MetadataStateMachineTest` | 已验证 | 待 `T041-T043` | 同 `request_id` + 不同内容返回 `IDEMPOTENCY_CONFLICT` |
+| VM-005 | Commit retry 幂等 | `MetadataStateMachineTest`, `MetadataFailoverTest` | 已验证 | 待 `T041-T043` | 同 commit `request_id` 重试不产生重复可见记录 |
+| VM-006 | Missing Pending commit | `MetadataStateMachineTest` | 已验证 | 待 `T041-T043` | 缺失可提交 `Pending` 时返回错误且不产生可见记录 |
+| VM-007 | Delete tombstone | `MetadataStateMachineTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | delete 后对象不可见，删除事实保留 |
+| VM-008 | Delete retry 幂等 | `MetadataSnapshotTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | 同 delete `request_id` 重试稳定 |
+| VM-009 | Delete Pending conflict | `MetadataStateMachineTest` | 已验证 | 待 `T041-T043` | delete pending 返回 `STATE_CONFLICT`，对象仍不可见 |
+| VM-010 | Deleted 防旧请求复活 | `MetadataSnapshotTest` | 已验证 | 待 `T041-T043` | tombstone 恢复后旧 create/commit 不得复活对象 |
+| VM-011 | Snapshot/restart 恢复 committed metadata | `MetadataSnapshotTest` | 已验证 | 待 `T041-T043` | committed records 恢复后仍可见 |
+| VM-012 | Snapshot/restart 恢复 tombstone | `MetadataSnapshotTest` | 已验证 | 待 `T041-T043` | deleted object 恢复后仍不可见 |
+| VM-013 | Pending restart 不外部可见 | `MetadataSnapshotTest` | 已验证 | 待 `T041-T043` | pending 恢复后仍不对 `Head/List` 可见 |
+| VM-014 | Leader failover 保留 committed metadata | `MetadataFailoverTest` | 已验证 | 待 `T041-T043` | 新 leader 上 committed metadata 仍可查询 |
+| VM-015 | Leader failover 不暴露 Pending | `MetadataFailoverTest` | 已验证 | 待 `T041-T043` | failover 后 pending 仍不可见 |
+| VM-016 | Failover 后 commit retry | `MetadataFailoverTest` | 已验证 | 待 `T041-T043` | 相同 commit `request_id` 可在新 leader 上稳定重试 |
+| VM-017 | Simulated manifest validation | `MetadataCommandTest`, `MetadataManifestTest` | 已验证 | 待 `T041-T043` | 合法 manifest 接受，非法 manifest 拒绝 |
+| VM-018 | Payload boundary | `MetadataCommandTest`, `MetadataManifestTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | 超过 `4096` 字节 payload 返回 `INVALID_ARGUMENT` |
+| VM-019 | List deterministic ordering | 未单独建立专项断言；当前由 `MetadataClientScenarioTest` 间接覆盖 list 基本可见性 | 部分覆盖，待补强 | 待 `T041-T043` | 当前已验证 committed-only list；按 `object_key` 确定性排序尚无独立专项测试记录 |
+| VM-020 | StorageNode boundary | `MetadataManifestTest`, `MetadataClientScenarioTest` | 已验证 | 待 `T041-T043` | `mock_locations` 指向不存在节点/伪路径仍可通过 metadata 流程 |
 
-## Validation Layers
+## Linux Validation Evidence
 
-### Unit-Level Planning
+以下结果来自现有任务报告中的已执行验证，不是本次文档任务重新运行：
 
-- Metadata command codec 验证 create/commit/delete 编解码、fingerprint 和 invalid argument。
-- State machine 验证状态转换、committed-only visibility、tombstone、幂等表。
-- Snapshot model 验证 committed metadata、tombstone 和必要幂等表恢复。
+| Area | Evidence |
+|------|----------|
+| Metadata command | `T008`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataCommandTest\.'` -> `9/9 PASS` |
+| Metadata state machine | `T013`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataStateMachineTest\.'` -> `6/6 PASS` |
+| Metadata snapshot | `T021`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataSnapshotTest\.'` -> `5/5 PASS` |
+| Metadata failover | `T023`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataFailoverTest\.'` -> `2/2 PASS` |
+| Metadata manifest | `T028`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataManifestTest\.'` -> `7/7 PASS` |
+| Metadata client scenario | `T034`: `ctest --test-dir build/linux --output-on-failure -R '^MetadataClientScenarioTest\.'` -> `5/5 PASS` |
+| Combined metadata suite | `T034`: `ctest --test-dir build/linux --output-on-failure -R 'Metadata(Command|Manifest|StateMachine|Snapshot|Failover|ClientScenario)Test'` -> `34/34 PASS` |
 
-### Service-Level Planning
+## Platform Status
 
-- Metadata write API 验证 leader hint、term、log_index、request_id 和细分错误码。
-- Metadata read API 验证 Head/List 不暴露 Pending 或 Deleted。
-- Not-leader path 验证客户端可以复用 request_id 重试。
+### Linux
 
-### Client Scenario Planning
+- 当前矩阵中的 Linux 状态只引用既有任务报告中的已执行验证。
+- 本次没有执行 `T038` 的 Linux configure/build validation。
+- 当前能明确标记为 Linux 已验证的范围：
+  - `MetadataCommandTest`
+  - `MetadataManifestTest`
+  - `MetadataStateMachineTest`
+  - `MetadataSnapshotTest`
+  - `MetadataFailoverTest`
+  - `MetadataClientScenarioTest`
 
-- create -> head/list not found。
-- create -> commit -> head/list found。
-- create/commit/delete retry。
-- delete -> head/list not found。
-- failover/restart 后读后写验证。
+### Windows
 
-## Platform Notes
+- 当前没有新的 Windows 执行结果可回填。
+- 所有 Windows 平台状态统一标记为待 `T041-T043` 验证。
+- 不将 Linux 通过结果外推为 Windows 已通过。
 
-- 平台中立验证应覆盖状态机纯内存语义和 API 语义。
-- Linux 可作为 restart/failover 演示的主验证平台。
-- 如果后续实现触碰 durability 或 snapshot 文件发布，必须明确 Windows/macOS 的等价行为、错误返回或 deferred follow-up。
+## Current Gaps
+
+- `VM-019` 的 “按 `object_key` 确定性排序” 目前没有独立专项测试记录，当前只可追踪到 list 基本可见性与 committed-only 语义。
+- 当前阶段没有为真实 `StorageNode`、真实 chunk、S3、rebalance、repair 增加验证项，这些内容不属于本 feature 当前范围。
 
 ## Out Of Scope Validation
 
 - 不验证真实文件上传下载。
 - 不验证真实 chunk 落盘。
-- 不验证 StorageNode 可达性。
-- 不验证 chunk replication、纠删码、rebalance、S3 协议。
-- 不通过读取 Raft 内部日志或禁止路径作为验收手段。
+- 不验证 `StorageNode` 可达性。
+- 不验证 chunk replication、纠删码、rebalance、repair、S3 协议。
+- 不通过读取 Raft 内部日志、snapshot 产物或禁止路径作为验收手段。

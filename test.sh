@@ -1,412 +1,314 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -uo pipefail
 
-# Run Raft project tests in a stable, grouped order.
-#
-# test.sh section map:
-#   Platform-neutral base regression groups:
-#     unit snapshot-storage kv-service segment-basic election replication
-#     integration snapshot-catchup snapshot-restart replicator
-#   Shared restart / durability regression:
-#     persistence
-#   Linux-specific / Linux-primary focus groups:
-#     snapshot-recovery diagnosis segment-cluster
-#   Linux Bash primary sweep:
-#     all
-#
-# --keep-data:
-#   Linux Bash-first retained-artifact mode for reruns that need
-#   raft_data / raft_snapshots / build/linux/tests/raft_test_data for diagnosis.
-#
-# Non-Bash / cross-platform fallback:
-#   ctest --preset debug-tests --output-on-failure
+mkdir -p tmp/test-logs
+mkdir -p specs/006-remove-kv-metadata-state-machine/task-reports
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${PROJECT_ROOT}/build/linux"
+PRESET="debug-ninja-low-parallel"
+BUILD_DIR="build/linux"
+NO_KV_REGEX="^NoKvSurfaceAudit$"
+RECOVERY_REGEX="^(RaftSnapshotRestartTest|RaftSnapshotRecoveryTest|RaftSnapshotCatchupTest)\\."
 
-DO_CLEAN=0
-DO_CONFIGURE=1
-DO_BUILD=1
-KEEP_DATA=0
-SELECTED_GROUP="all"
+GROUP=""
+SKIP_CONFIGURE=0
+SKIP_BUILD=0
 
-BUILD_JOBS="${RAFT_BUILD_JOBS:-1}"
-LINK_JOBS="${RAFT_LINK_JOBS:-1}"
-PROTO_JOBS="${RAFT_PROTO_JOBS:-1}"
-TEST_JOBS="${CTEST_PARALLEL_LEVEL:-1}"
-
-print_usage() {
+show_usage() {
   cat <<'EOF'
 Usage:
   ./test.sh
-  ./test.sh --clean
-  ./test.sh --skip-configure
-  ./test.sh --skip-build
-  ./test.sh --keep-data
-  ./test.sh --group persistence
-  ./test.sh --group all
+  ./test.sh --group no-kv [--skip-configure] [--skip-build]
+  ./test.sh --group recovery [--skip-configure] [--skip-build]
+  ./test.sh --help
 
-Platform-neutral base regression groups:
-  unit               Basic unit tests for commands, scheduler, and thread pool
-  snapshot-storage   Snapshot storage reliability coverage
-  kv-service         KV service redirect and read/write behavior
-  segment-basic      Focused segment storage persistence cases
-  election           Leader election and split-brain related checks
-  replication        Log replication and commit/apply progression
-  integration        Multi-node Raft integration scenarios
-  snapshot-catchup   Lagging follower catch-up and snapshot handoff
-  snapshot-restart   Restart after compacted snapshot scenarios
-  replicator         Single follower replication and catch-up behavior
+Groups:
+  no-kv
+    轻量 no-KV 审计入口；只构建 no_kv_surface_audit target，并运行 NoKvSurfaceAudit。
+  recovery
+    snapshot / recovery / catch-up 低并发入口；固定 CTEST_PARALLEL_LEVEL=1，不与 no-kv 混跑。
 
-Shared restart / durability regression:
-  persistence        Restart recovery and hard-state/log trusted-state checks
-                     Recovery logic is platform-neutral; Linux-specific durability
-                     interpretation remains documented separately.
-
-Linux-specific / Linux-primary focus groups:
-  snapshot-recovery  Snapshot/restart recovery hotspot
-  diagnosis          Recovery diagnosis and snapshot fallback hotspot
-  segment-cluster    Clustered segment/snapshot stress path
-
-Linux Bash primary sweep:
-  all                Runs platform-neutral base regression groups first,
-                     then persistence, then Linux-specific / Linux-primary
-                     focus groups, followed by a final full-suite check.
-
---keep-data:
-  Keep Linux test artifacts under raft_data / raft_snapshots /
-  build/linux/tests/raft_test_data for failure diagnosis.
-  Use it when investigating restart, snapshot, catch-up, replicator, or
-  segment-cluster failures. This is a Linux Bash-first workflow and is not
-  replaced by the non-Bash fallback.
-
-Failure rerun guide:
-  Re-run the failed group with CTEST_PARALLEL_LEVEL=1.
-  Add --keep-data when retained artifacts are required for diagnosis.
-  High-risk rerun commands:
-    CTEST_PARALLEL_LEVEL=1 ./test.sh --group snapshot-recovery --keep-data
-    CTEST_PARALLEL_LEVEL=1 ./test.sh --group diagnosis --keep-data
-    CTEST_PARALLEL_LEVEL=1 ./test.sh --group snapshot-catchup --keep-data
-    CTEST_PARALLEL_LEVEL=1 ./test.sh --group replicator --keep-data
-    CTEST_PARALLEL_LEVEL=1 ./test.sh --group segment-cluster --keep-data
-
-Non-Bash / cross-platform fallback:
-  ctest --preset debug-tests --output-on-failure
+Default:
+  不传 --group 时，保持原 T051 Linux 全量 configure/build/single-worker CTest 流程。
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
+run_step() {
+  local name="$1"
+  local log="$2"
+  shift 2
+
+  echo
+  echo "==== ${name} ===="
+  "$@" 2>&1 | tee "$log"
+  return "${PIPESTATUS[0]}"
+}
+
+run_no_kv_group() {
+  local config_log="tmp/test-logs/t059-no-kv-configure.log"
+  local build_log="tmp/test-logs/t059-no-kv-build.log"
+  local ctest_log="tmp/test-logs/t059-no-kv-ctest.log"
+  local config_exit=0
+  local build_exit=0
+  local ctest_exit=0
+
+  echo "==== no-kv audit ===="
+  echo "Mode: lightweight no-KV audit"
+  echo "Build target: no_kv_surface_audit"
+  echo "CTest regex: ${NO_KV_REGEX}"
+  echo "Recovery/snapshot restart tests are excluded from this group."
+
+  if [ "${SKIP_CONFIGURE}" -eq 0 ]; then
+    run_step "Configure (no-kv)" "${config_log}" cmake --preset "${PRESET}"
+    config_exit=$?
+  fi
+
+  if [ "${SKIP_BUILD}" -eq 0 ]; then
+    run_step "Build no_kv_surface_audit" "${build_log}" \
+      cmake --build --preset "${PRESET}" --target no_kv_surface_audit
+    build_exit=$?
+  fi
+
+  echo
+  echo "==== CTest NoKvSurfaceAudit ===="
+  ctest \
+    --test-dir "${BUILD_DIR}" \
+    --output-on-failure \
+    -R "${NO_KV_REGEX}" \
+    2>&1 | tee "${ctest_log}"
+  ctest_exit=${PIPESTATUS[0]}
+
+  echo
+  echo "==== no-kv summary ===="
+  if [ "${SKIP_CONFIGURE}" -eq 0 ]; then
+    echo "Configure: $([ "${config_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  else
+    echo "Configure: SKIPPED"
+  fi
+  if [ "${SKIP_BUILD}" -eq 0 ]; then
+    echo "Build: $([ "${build_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  else
+    echo "Build: SKIPPED"
+  fi
+  echo "CTest: $([ "${ctest_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  echo "CTest log: ${ctest_log}"
+
+  if [ "${config_exit}" -ne 0 ] || [ "${build_exit}" -ne 0 ] || [ "${ctest_exit}" -ne 0 ]; then
+    exit 1
+  fi
+
+  exit 0
+}
+
+run_recovery_group() {
+  local config_log="tmp/test-logs/t059-recovery-configure.log"
+  local build_log="tmp/test-logs/t059-recovery-build.log"
+  local ctest_log="tmp/test-logs/t059-recovery-ctest.log"
+  local config_exit=0
+  local build_exit=0
+  local ctest_exit=0
+
+  echo "==== recovery validation ===="
+  echo "Mode: low-concurrency snapshot/recovery/catch-up validation"
+  echo "CTest regex: ${RECOVERY_REGEX}"
+  echo "CTEST_PARALLEL_LEVEL=1"
+
+  if [ "${SKIP_CONFIGURE}" -eq 0 ]; then
+    run_step "Configure (recovery)" "${config_log}" cmake --preset "${PRESET}"
+    config_exit=$?
+  fi
+
+  if [ "${SKIP_BUILD}" -eq 0 ]; then
+    run_step "Build recovery targets" "${build_log}" \
+      cmake --build --preset "${PRESET}" \
+      --target snapshot_test test_raft_snapshot_catchup test_raft_snapshot_restart test_metadata_recovery_stress
+    build_exit=$?
+  fi
+
+  echo
+  echo "==== CTest recovery single worker ===="
+  export CTEST_PARALLEL_LEVEL=1
+  ctest \
+    --test-dir "${BUILD_DIR}" \
+    --output-on-failure \
+    -j 1 \
+    -R "${RECOVERY_REGEX}" \
+    2>&1 | tee "${ctest_log}"
+  ctest_exit=${PIPESTATUS[0]}
+
+  echo
+  echo "==== recovery summary ===="
+  if [ "${SKIP_CONFIGURE}" -eq 0 ]; then
+    echo "Configure: $([ "${config_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  else
+    echo "Configure: SKIPPED"
+  fi
+  if [ "${SKIP_BUILD}" -eq 0 ]; then
+    echo "Build: $([ "${build_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  else
+    echo "Build: SKIPPED"
+  fi
+  echo "CTest: $([ "${ctest_exit}" -eq 0 ] && echo PASS || echo FAIL)"
+  echo "CTest log: ${ctest_log}"
+
+  if [ "${config_exit}" -ne 0 ] || [ "${build_exit}" -ne 0 ] || [ "${ctest_exit}" -ne 0 ]; then
+    exit 1
+  fi
+
+  exit 0
+}
+
+while [ "$#" -gt 0 ]; do
   case "$1" in
-    --clean)
-      DO_CLEAN=1
-      shift
+    --group)
+      if [ "$#" -lt 2 ]; then
+        echo "Missing value for --group" >&2
+        exit 1
+      fi
+      GROUP="$2"
+      shift 2
       ;;
     --skip-configure)
-      DO_CONFIGURE=0
+      SKIP_CONFIGURE=1
       shift
       ;;
     --skip-build)
-      DO_BUILD=0
+      SKIP_BUILD=1
       shift
-      ;;
-    --keep-data)
-      KEEP_DATA=1
-      shift
-      ;;
-    --group)
-      if [[ $# -lt 2 ]]; then
-        echo "error: --group requires a value" >&2
-        exit 2
-      fi
-      SELECTED_GROUP="$2"
-      shift 2
       ;;
     -h|--help)
-      print_usage
+      show_usage
       exit 0
       ;;
     *)
-      echo "error: unknown argument: $1" >&2
-      print_usage
-      exit 2
+      echo "Unknown argument: $1" >&2
+      show_usage >&2
+      exit 1
       ;;
   esac
 done
 
-cd "${PROJECT_ROOT}"
+case "${GROUP}" in
+  "")
+    ;;
+  no-kv)
+    run_no_kv_group
+    ;;
+  recovery)
+    run_recovery_group
+    ;;
+  *)
+    echo "Unsupported group: ${GROUP}" >&2
+    show_usage >&2
+    exit 1
+    ;;
+esac
 
-log_section() {
+CONFIG_LOG="tmp/test-logs/t051-linux-configure.log"
+BUILD_LOG="tmp/test-logs/t051-linux-build.log"
+CTEST_LOG="tmp/test-logs/t051-linux-full-ctest-single-worker.log"
+FAILED_FILE="tmp/test-logs/t051-linux-failed-tests.md"
+REPORT_FILE="specs/006-remove-kv-metadata-state-machine/task-reports/T051-linux-final-validation.md"
+
+run_step "Configure" "$CONFIG_LOG" cmake --preset "${PRESET}"
+CONFIG_EXIT=$?
+
+run_step "Build" "$BUILD_LOG" cmake --build --preset "${PRESET}"
+BUILD_EXIT=$?
+
+echo
+echo "==== CTest Full Single Worker ===="
+export CTEST_PARALLEL_LEVEL=1
+
+ctest \
+  --test-dir "${BUILD_DIR}" \
+  --output-on-failure \
+  --progress \
+  -j 1 \
+  2>&1 | tee "$CTEST_LOG"
+
+CTEST_EXIT=${PIPESTATUS[0]}
+
+{
+  echo "# T051 Linux Failed Tests"
   echo
-  echo "============================================================"
-  echo "$1"
-  echo "============================================================"
-}
-
-print_group_catalog() {
-  cat <<'EOF'
-Platform-neutral base regression groups:
-  unit snapshot-storage kv-service segment-basic election replication
-  integration snapshot-catchup snapshot-restart replicator
-
-Shared restart / durability regression:
-  persistence
-  Recovery logic is platform-neutral; Linux-specific durability interpretation
-  remains documented separately.
-
-Linux-specific / Linux-primary focus groups:
-  snapshot-recovery diagnosis segment-cluster
-
-Linux Bash primary sweep:
-  all = platform-neutral base regression groups + persistence +
-        Linux-specific / Linux-primary focus groups + final full-suite check
-
---keep-data:
-  Linux Bash-first retained-artifact mode for raft_data / raft_snapshots /
-  build/linux/tests/raft_test_data.
-
-Failure rerun guide:
-  Re-run the failed group with CTEST_PARALLEL_LEVEL=1.
-  Add --keep-data when retained artifacts are needed for diagnosis.
-
-Non-Bash / cross-platform fallback:
-  ctest --preset debug-tests --output-on-failure
-EOF
-}
-
-print_group_classification() {
-  local group="$1"
-
-  case "${group}" in
-    unit|snapshot-storage|kv-service|segment-basic|election|replication|integration|snapshot-catchup|snapshot-restart|replicator)
-      echo "Section: platform-neutral base regression."
-      ;;
-    persistence)
-      echo "Section: shared restart / durability regression."
-      echo "Note: recovery logic is platform-neutral; Linux-specific durability interpretation remains separate."
-      ;;
-    snapshot-recovery|diagnosis|segment-cluster)
-      echo "Section: Linux-specific / Linux-primary focus group."
-      ;;
-    all)
-      echo "Section: Linux Bash primary sweep."
-      echo "Order: platform-neutral base regression -> persistence -> Linux-specific / Linux-primary focus groups -> final full-suite check."
-      ;;
-  esac
-}
-
-print_group_guidance() {
-  local group="$1"
-
-  print_group_classification "${group}"
-
-  case "${group}" in
-    snapshot-recovery)
-      echo "Purpose: snapshot / restart recovery hotspot (Linux primary)."
-      echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data to retain recovery artifacts."
-      ;;
-    diagnosis)
-      echo "Purpose: recovery diagnosis, snapshot fallback, and failure localization hotspot (Linux primary)."
-      echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data when investigating snapshot skip / fallback."
-      ;;
-    snapshot-catchup)
-      echo "Purpose: lagging follower catch-up and snapshot handoff validation."
-      echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data when follower catch-up state needs inspection."
-      ;;
-    replicator)
-      echo "Purpose: single follower replication state machine and catch-up behavior."
-      echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data when diagnosing replication state drift."
-      ;;
-    segment-cluster)
-      echo "Purpose: clustered segment / snapshot stress path."
-      echo "Hint: prefer CTEST_PARALLEL_LEVEL=1; add --keep-data to retain generated segment and snapshot artifacts."
-      ;;
-  esac
-}
-
-print_failure_rerun_hint() {
-  local group="$1"
-
+  echo "## Result"
   echo
-  echo "Failure localization hints:"
-  echo "  - Low-concurrency recommendation: CTEST_PARALLEL_LEVEL=1"
-  echo "  - Keep Linux artifacts when needed: --keep-data"
-
-  case "${group}" in
-    snapshot-recovery)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group snapshot-recovery --keep-data"
-      echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftSnapshotRecoveryTest\\.'"
-      echo "  - Failure focus: leader churn during recovery, snapshot restore, restart trusted-state."
-      ;;
-    diagnosis)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group diagnosis --keep-data"
-      echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftSnapshotDiagnosisTest\\.'"
-      echo "  - Failure focus: snapshot skip/fallback, restart diagnostics, trusted-state explanation."
-      ;;
-    snapshot-catchup)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group snapshot-catchup --keep-data"
-      echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftSnapshotCatchupTest\\.'"
-      echo "  - Failure focus: follower catch-up via log replay or snapshot handoff."
-      ;;
-    replicator)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group replicator --keep-data"
-      echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftReplicatorBehaviorTest\\.'"
-      echo "  - Failure focus: follower replication state machine and catch-up behavior."
-      ;;
-    segment-cluster)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group segment-cluster --keep-data"
-      echo "  - CTest fallback: CTEST_PARALLEL_LEVEL=1 ctest --test-dir \"${BUILD_DIR}\" --output-on-failure -R '^RaftSegmentStorageTest\\.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory$'"
-      echo "  - Failure focus: segment rollover, clustered snapshot generation, retained artifacts under load."
-      ;;
-    *)
-      echo "  - Rerun: CTEST_PARALLEL_LEVEL=1 ./test.sh --group ${group}"
-      echo "  - Platform-neutral fallback: ctest --preset debug-tests --output-on-failure"
-      ;;
-  esac
-}
-
-clean_test_data() {
-  log_section "Cleaning old Raft test data"
-  rm -rf "${PROJECT_ROOT}/raft_data"
-  rm -rf "${PROJECT_ROOT}/raft_snapshots"
-  rm -rf "${BUILD_DIR}/tests/raft_test_data"
-  rm -rf /tmp/raftdemo_tests
-  rm -rf /tmp/raftdemo_gtests
-  rm -rf /tmp/raft_kv_gtest_*
-}
-
-configure_project() {
-  log_section "Configuring CMake"
-  cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
-    -DRAFT_TEST_FULL_SUITE=ON \
-    -DRAFT_BUILD_JOBS="${BUILD_JOBS}" \
-    -DRAFT_LINK_JOBS="${LINK_JOBS}" \
-    -DRAFT_PROTO_JOBS="${PROTO_JOBS}"
-}
-
-build_project() {
-  log_section "Building project"
-  cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
-}
-
-run_ctest_group() {
-  local name="$1"
-  local regex="$2"
-  local status=0
-
-  log_section "Running test group: ${name}"
-  print_group_guidance "${name}"
-  if [[ "${KEEP_DATA}" -eq 1 ]]; then
-    if ! RAFT_TEST_KEEP_DATA=1 ctest --test-dir "${BUILD_DIR}" -j"${TEST_JOBS}" \
-      --output-on-failure --stop-on-failure -R "${regex}"; then
-      status=$?
-    fi
+  if [ "$CTEST_EXIT" -eq 0 ]; then
+    echo "- CTest: PASS"
   else
-    if ! ctest --test-dir "${BUILD_DIR}" -j"${TEST_JOBS}" \
-      --output-on-failure --stop-on-failure -R "${regex}"; then
-      status=$?
-    fi
+    echo "- CTest: FAIL"
+    echo "- Exit code: $CTEST_EXIT"
   fi
 
-  if [[ "${status}" -ne 0 ]]; then
-    print_failure_rerun_hint "${name}"
-    return "${status}"
+  echo
+  echo "## Failed tests"
+  echo
+
+  if grep -q "The following tests FAILED:" "$CTEST_LOG"; then
+    awk '
+      /The following tests FAILED:/ {flag=1; next}
+      flag && /^[[:space:]]*[0-9]+ - / {print "- " $0; next}
+      flag && !/^[[:space:]]*[0-9]+ - / {flag=0}
+    ' "$CTEST_LOG"
+  else
+    echo "- No failed tests"
   fi
-}
 
-run_group_by_name() {
-  local group="$1"
+  echo
+  echo "## Full CTest log"
+  echo
+  echo "- $CTEST_LOG"
+} > "$FAILED_FILE"
 
-  case "${group}" in
-    unit)
-      run_ctest_group "unit" "^(CommandTest|KvStateMachineTest|TimerSchedulerTest|ThreadPoolTest)\."
-      ;;
-    snapshot-storage)
-      run_ctest_group "snapshot-storage" "^SnapshotStorageReliabilityTest\."
-      ;;
-    kv-service)
-      run_ctest_group "kv-service" "^RaftKvServiceTest\."
-      ;;
-    segment-basic)
-      run_ctest_group "segment-basic" "^RaftSegmentStorageTest\.(WritesMultipleSegmentFilesUnderBuildDirectory|AutomaticallyDeletesObsoleteSegmentsAfterCompactionSave)$"
-      ;;
-    election)
-      run_ctest_group "election" "^RaftElectionTest\."
-      ;;
-    replication)
-      run_ctest_group "replication" "^(RaftLogReplicationTest|RaftCommitApplyTest)\."
-      ;;
-    persistence)
-      run_ctest_group "persistence" "^PersistenceTest\."
-      ;;
-    snapshot-recovery)
-      run_ctest_group "snapshot-recovery" "^RaftSnapshotRecoveryTest\."
-      ;;
-    integration)
-      run_ctest_group "integration" "^RaftIntegrationTest\."
-      ;;
-    snapshot-catchup)
-      run_ctest_group "snapshot-catchup" "^RaftSnapshotCatchupTest\."
-      ;;
-    snapshot-restart)
-      run_ctest_group "snapshot-restart" "^RaftSnapshotRestartTest\."
-      ;;
-    diagnosis)
-      run_ctest_group "diagnosis" "^RaftSnapshotDiagnosisTest\."
-      ;;
-    replicator)
-      run_ctest_group "replicator" "^RaftReplicatorBehaviorTest\."
-      ;;
-    segment-cluster)
-      run_ctest_group "segment-cluster" "^RaftSegmentStorageTest\.RaftClusterGeneratesManySnapshotsAndSegmentLogsUnderBuildDirectory$"
-      ;;
-    all)
-      run_group_by_name unit
-      run_group_by_name snapshot-storage
-      run_group_by_name kv-service
-      run_group_by_name segment-basic
-      run_group_by_name election
-      run_group_by_name replication
-      run_group_by_name persistence
-      run_group_by_name snapshot-recovery
-      run_group_by_name integration
-      run_group_by_name snapshot-catchup
-      run_group_by_name snapshot-restart
-      run_group_by_name diagnosis
-      run_group_by_name replicator
-      run_group_by_name segment-cluster
+{
+  echo "# T051 Linux Final Validation"
+  echo
+  echo "## Result summary"
+  echo
+  echo "- Configure: $([ "$CONFIG_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+  echo "- Build: $([ "$BUILD_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+  echo "- CTest: $([ "$CTEST_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+  echo
+  echo "## Execution mode"
+  echo
+  echo "- CTEST_PARALLEL_LEVEL=1"
+  echo "- ctest -j 1"
+  echo "- Tests run one by one"
+  echo
+  echo "## Failed tests"
+  echo
 
-      log_section "Running final full-suite check"
-      if [[ "${KEEP_DATA}" -eq 1 ]]; then
-        RAFT_TEST_KEEP_DATA=1 ctest --test-dir "${BUILD_DIR}" -j"${TEST_JOBS}" \
-          --output-on-failure --stop-on-failure
-      else
-        ctest --test-dir "${BUILD_DIR}" -j"${TEST_JOBS}" \
-          --output-on-failure --stop-on-failure
-      fi
-      ;;
-    *)
-      echo "error: unknown group: ${group}" >&2
-      print_usage
-      exit 2
-      ;;
-  esac
-}
+  if grep -q "The following tests FAILED:" "$CTEST_LOG"; then
+    awk '
+      /The following tests FAILED:/ {flag=1; next}
+      flag && /^[[:space:]]*[0-9]+ - / {print "- " $0; next}
+      flag && !/^[[:space:]]*[0-9]+ - / {flag=0}
+    ' "$CTEST_LOG"
+  else
+    echo "- No failed tests"
+  fi
 
-if [[ "${DO_CLEAN}" -eq 1 ]]; then
-  clean_test_data
+  echo
+  echo "## Logs"
+  echo
+  echo "- Configure: $CONFIG_LOG"
+  echo "- Build: $BUILD_LOG"
+  echo "- CTest: $CTEST_LOG"
+  echo "- Failed tests summary: $FAILED_FILE"
+} > "$REPORT_FILE"
+
+echo
+echo "==== Summary ===="
+echo "Configure: $([ "$CONFIG_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+echo "Build: $([ "$BUILD_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+echo "CTest: $([ "$CTEST_EXIT" -eq 0 ] && echo PASS || echo FAIL)"
+echo
+echo "Full CTest log: $CTEST_LOG"
+echo "Failed tests file: $FAILED_FILE"
+echo "T051 report: $REPORT_FILE"
+
+if [ "$CONFIG_EXIT" -ne 0 ] || [ "$BUILD_EXIT" -ne 0 ] || [ "$CTEST_EXIT" -ne 0 ]; then
+  exit 1
 fi
 
-if [[ "${DO_CONFIGURE}" -eq 1 ]]; then
-  configure_project
-fi
-
-if [[ "${DO_BUILD}" -eq 1 ]]; then
-  build_project
-fi
-
-log_section "test.sh section map"
-print_group_catalog
-
-run_group_by_name "${SELECTED_GROUP}"
-
-log_section "All requested tests passed"
+exit 0

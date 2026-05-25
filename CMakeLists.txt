@@ -79,7 +79,16 @@ find_package(Threads REQUIRED)
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
-set(PROTO_FILE ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto)
+set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+set(PROTO_FILES
+  ${PROTO_DIR}/common.proto
+  ${PROTO_DIR}/raft.proto
+  ${PROTO_DIR}/metadata.proto
+)
+set(GRPC_PROTO_FILES
+  ${PROTO_DIR}/raft.proto
+  ${PROTO_DIR}/metadata.proto
+)
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(PROJECT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/modules)
 
@@ -93,32 +102,74 @@ else()
   set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
 endif()
 
-set(PROTO_SRCS ${GENERATED_DIR}/raft.pb.cc)
-set(PROTO_HDRS ${GENERATED_DIR}/raft.pb.h)
-set(GRPC_SRCS ${GENERATED_DIR}/raft.grpc.pb.cc)
-set(GRPC_HDRS ${GENERATED_DIR}/raft.grpc.pb.h)
+set(PROTO_SRCS
+  ${GENERATED_DIR}/common.pb.cc
+  ${GENERATED_DIR}/raft.pb.cc
+  ${GENERATED_DIR}/metadata.pb.cc
+)
+set(PROTO_HDRS
+  ${GENERATED_DIR}/common.pb.h
+  ${GENERATED_DIR}/raft.pb.h
+  ${GENERATED_DIR}/metadata.pb.h
+)
+set(GRPC_SRCS
+  ${GENERATED_DIR}/raft.grpc.pb.cc
+  ${GENERATED_DIR}/metadata.grpc.pb.cc
+)
+set(GRPC_HDRS
+  ${GENERATED_DIR}/raft.grpc.pb.h
+  ${GENERATED_DIR}/metadata.grpc.pb.h
+)
 
 add_custom_command(
   OUTPUT
     ${PROTO_SRCS}
     ${PROTO_HDRS}
-    ${GRPC_SRCS}
-    ${GRPC_HDRS}
   COMMAND ${_PROTOBUF_PROTOC}
   ARGS
-    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+    --proto_path=${PROTO_DIR}
     --cpp_out=${GENERATED_DIR}
-    --grpc_out=${GENERATED_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
-    ${PROTO_FILE}
-  DEPENDS ${PROTO_FILE}
+    ${PROTO_FILES}
+  DEPENDS ${PROTO_FILES}
   ${RAFT_PROTO_JOB_POOL_ARGS}
   VERBATIM
 )
 
+add_custom_command(
+  OUTPUT
+    ${GRPC_SRCS}
+    ${GRPC_HDRS}
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS
+    --proto_path=${PROTO_DIR}
+    --grpc_out=${GENERATED_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
+    ${GRPC_PROTO_FILES}
+  DEPENDS ${PROTO_FILES}
+  ${RAFT_PROTO_JOB_POOL_ARGS}
+  VERBATIM
+)
+
+add_library(common_proto
+  ${GENERATED_DIR}/common.pb.cc
+  ${GENERATED_DIR}/common.pb.h
+)
+
+target_include_directories(common_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(common_proto
+  PUBLIC
+    protobuf::libprotobuf
+)
+
 add_library(raft_proto
-  ${PROTO_SRCS}
-  ${GRPC_SRCS}
+  ${GENERATED_DIR}/raft.pb.cc
+  ${GENERATED_DIR}/raft.pb.h
+  ${GENERATED_DIR}/raft.grpc.pb.cc
+  ${GENERATED_DIR}/raft.grpc.pb.h
 )
 
 target_include_directories(raft_proto
@@ -132,21 +183,40 @@ target_link_libraries(raft_proto
     gRPC::grpc++
 )
 
+add_library(metadata_proto
+  ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/metadata.grpc.pb.h
+)
+
+target_include_directories(metadata_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(metadata_proto
+  PUBLIC
+    common_proto
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
 if(WIN32)
-  target_link_libraries(raft_proto
-    PUBLIC
-      Ws2_32
-  )
+  target_link_libraries(common_proto PUBLIC Ws2_32)
+  target_link_libraries(raft_proto PUBLIC Ws2_32)
+  target_link_libraries(metadata_proto PUBLIC Ws2_32)
 endif()
 
 add_library(raft_core
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
   modules/raft/common/command.cpp
+  modules/raft/common/metadata_command.cpp
   modules/raft/node/raft_node.cpp
   modules/raft/service/raft_service_impl.cpp
-  modules/raft/service/kv_service_impl.cpp
-  modules/raft/state_machine/state_machine.cpp
+  modules/raft/service/metadata_service_impl.cpp
+  modules/raft/state_machine/metadata_state_machine.cpp
   modules/raft/storage/raft_storage.cpp
   modules/raft/storage/snapshot_storage.cpp
   modules/raft/replication/replicator.cpp
@@ -155,12 +225,15 @@ add_library(raft_core
 target_include_directories(raft_core
   PUBLIC
     ${PROJECT_INCLUDE_DIR}
+  PRIVATE
     ${GENERATED_DIR}
 )
 
 target_link_libraries(raft_core
   PUBLIC
     raft_proto
+  PRIVATE
+    metadata_proto
     Threads::Threads
 )
 
@@ -173,13 +246,13 @@ target_link_libraries(raft_demo
     raft_core
 )
 
-add_executable(raft_kv_client
-  apps/raft_kv_client.cpp
+add_executable(raft_metadata_client
+  apps/raft_metadata_client.cpp
 )
 
-target_link_libraries(raft_kv_client
+target_link_libraries(raft_metadata_client
   PRIVATE
-    raft_proto
+    metadata_proto
 )
 
 enable_testing()
