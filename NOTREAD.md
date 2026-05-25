@@ -11,4 +11,6 @@
 /docs
 /specs/003-persistence-reliability
 /specs/004-raft-industrialization
+/specs/005-strong-consistency-metadata-layer
+/specs/006-remove-kv-metadata-state-machine
 /temp
