@@ -209,6 +209,7 @@ if(WIN32)
 endif()
 
 add_library(raft_core
+  modules/store/common/store_types.cpp
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
   modules/raft/common/command.cpp
