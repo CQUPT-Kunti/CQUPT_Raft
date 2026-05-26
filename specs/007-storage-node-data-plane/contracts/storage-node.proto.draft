@@ -1,0 +1,318 @@
+// Draft only for specs/007-storage-node-data-plane.
+// Do not copy into proto/ in /speckit-plan. Do not treat as implemented API.
+
+syntax = "proto3";
+
+package raftdemo.storage.draft;
+
+enum StorageNodeStatusCode {
+  STORAGE_STATUS_UNSPECIFIED = 0;
+  STORAGE_STATUS_OK = 1;
+  STORAGE_STATUS_ALREADY_EXISTS = 2;
+  STORAGE_STATUS_NOT_FOUND = 3;
+  STORAGE_STATUS_CONFLICT = 4;
+  STORAGE_STATUS_CHECKSUM_MISMATCH = 5;
+  STORAGE_STATUS_CORRUPTED = 6;
+  STORAGE_STATUS_DISK_FULL = 7;
+  STORAGE_STATUS_PERMISSION_DENIED = 8;
+  STORAGE_STATUS_IO_ERROR = 9;
+  STORAGE_STATUS_TIMEOUT = 10;
+  STORAGE_STATUS_CANCELLED = 11;
+  STORAGE_STATUS_OVERLOADED = 12;
+  STORAGE_STATUS_NODE_UNAVAILABLE = 13;
+  STORAGE_STATUS_UNSUPPORTED = 14;
+  STORAGE_STATUS_INVALID_ARGUMENT = 15;
+}
+
+enum ChunkState {
+  CHUNK_STATE_UNSPECIFIED = 0;
+  CHUNK_STATE_STAGING = 1;
+  CHUNK_STATE_LIVE = 2;
+  CHUNK_STATE_DELETING = 3;
+  CHUNK_STATE_DELETED = 4;
+  CHUNK_STATE_QUARANTINED = 5;
+  CHUNK_STATE_CORRUPTED = 6;
+  CHUNK_STATE_MISSING = 7;
+}
+
+enum StorageNodeHealth {
+  STORAGE_NODE_HEALTH_UNSPECIFIED = 0;
+  STORAGE_NODE_HEALTH_HEALTHY = 1;
+  STORAGE_NODE_HEALTH_DEGRADED = 2;
+  STORAGE_NODE_HEALTH_READ_ONLY = 3;
+  STORAGE_NODE_HEALTH_DRAINING = 4;
+  STORAGE_NODE_HEALTH_UNAVAILABLE = 5;
+}
+
+message StorageError {
+  StorageNodeStatusCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+  uint64 retry_after_ms = 4;
+}
+
+message ChunkChecksum {
+  string algorithm = 1;
+  string value = 2;
+  uint64 size = 3;
+}
+
+message ChunkIdentity {
+  string chunk_id = 1;
+  string object_id = 2;
+  uint64 version = 3;
+  uint64 chunk_index = 4;
+  uint64 offset = 5;
+}
+
+message WriteChunkRequest {
+  string request_id = 1;
+  ChunkIdentity identity = 2;
+  uint64 expected_size = 3;
+  ChunkChecksum expected_checksum = 4;
+  bytes payload = 5; // Future implementation may use streaming instead.
+  uint64 timeout_ms = 6;
+}
+
+message WriteChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  string chunk_id = 4;
+  uint64 size = 5;
+  ChunkChecksum checksum = 6;
+  ChunkState state = 7;
+  bool durable = 8;
+  bool already_exists = 9;
+}
+
+message ReadChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  uint64 range_offset = 3;
+  uint64 range_size = 4;
+  ChunkChecksum expected_checksum = 5;
+  bool verify_checksum = 6;
+  uint64 timeout_ms = 7;
+}
+
+message ReadChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  string chunk_id = 4;
+  uint64 size = 5;
+  ChunkChecksum checksum = 6;
+  bytes payload = 7;
+  bool verified = 8;
+}
+
+message DeleteChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  string reason = 3;
+  string metadata_boundary = 4;
+  ChunkChecksum expected_checksum = 5;
+  uint64 delay_until_unix_ms = 6;
+  uint64 timeout_ms = 7;
+}
+
+message DeleteChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  string chunk_id = 4;
+  bool deleted = 5;
+  bool already_missing = 6;
+  bool tombstoned = 7;
+}
+
+message StatChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  bool include_quarantine = 3;
+  bool verify_checksum = 4;
+}
+
+message StatChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  string chunk_id = 4;
+  ChunkState state = 5;
+  uint64 size = 6;
+  ChunkChecksum checksum = 7;
+  uint64 last_verified_unix_ms = 8;
+  string last_error = 9;
+}
+
+message ListChunksRequest {
+  string request_id = 1;
+  string page_token = 2;
+  uint32 page_size = 3;
+  repeated ChunkState state_filter = 4;
+  string prefix_filter = 5;
+  bool include_quarantine = 6;
+}
+
+message ChunkIndexEntry {
+  string chunk_id = 1;
+  ChunkState state = 2;
+  uint64 size = 3;
+  ChunkChecksum checksum = 4;
+  uint64 updated_unix_ms = 5;
+}
+
+message ListChunksResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  repeated ChunkIndexEntry chunks = 4;
+  string next_page_token = 5;
+  string snapshot_epoch = 6;
+}
+
+message BatchDeleteChunksRequest {
+  string request_id = 1;
+  repeated DeleteChunkRequest items = 2;
+  uint32 max_parallelism = 3;
+}
+
+message BatchDeleteChunksResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  repeated DeleteChunkResponse items = 3;
+  uint32 deleted_count = 4;
+  uint32 failed_count = 5;
+}
+
+message ScrubChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  ChunkChecksum expected_checksum = 3;
+  bool repair_hint = 4;
+  uint32 priority = 5;
+}
+
+message ScrubChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string node_id = 3;
+  string chunk_id = 4;
+  bool verified = 5;
+  ChunkState state = 6;
+  ChunkChecksum checksum = 7;
+  string corruption_reason = 8;
+}
+
+message RepairChunkRequest {
+  string request_id = 1;
+  string repair_task_id = 2;
+  string chunk_id = 3;
+  string source_node = 4;
+  string target_node = 5;
+  uint64 expected_size = 6;
+  ChunkChecksum expected_checksum = 7;
+}
+
+message RepairChunkResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  string chunk_id = 3;
+  string target_node = 4;
+  uint64 size = 5;
+  ChunkChecksum checksum = 6;
+  bool durable = 7;
+  bool already_exists = 8;
+}
+
+message ReportHealthRequest {
+  string request_id = 1;
+  string node_id = 2;
+  StorageNodeHealth health = 3;
+  string disk_pressure = 4;
+  uint64 io_error_count = 5;
+  uint64 corruption_count = 6;
+  string last_error = 7;
+}
+
+message ReportCapacityRequest {
+  string request_id = 1;
+  string node_id = 2;
+  uint64 capacity = 3;
+  uint64 used = 4;
+  uint64 available = 5;
+  uint64 chunk_count = 6;
+  uint64 reserved = 7;
+}
+
+message ReportLoadRequest {
+  string request_id = 1;
+  string node_id = 2;
+  uint32 active_reads = 3;
+  uint32 active_writes = 4;
+  uint32 queued_ops = 5;
+  double io_latency_ms = 6;
+  double bandwidth_bytes_per_sec = 7;
+  repeated string hot_chunks = 8;
+}
+
+message RegistryAck {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  bool accepted = 3;
+  bool stale = 4;
+  string registry_epoch = 5;
+}
+
+message RegisterStorageNodeRequest {
+  string request_id = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  string data_dir_fingerprint = 4;
+  string failure_domain = 5;
+  repeated string capabilities = 6;
+}
+
+message RegisterStorageNodeResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  bool registered = 3;
+  bool already_registered = 4;
+  string registry_epoch = 5;
+}
+
+message UpdateStorageNodeHeartbeatRequest {
+  string request_id = 1;
+  uint64 sequence = 2;
+  uint64 sent_at_unix_ms = 3;
+  ReportHealthRequest health = 4;
+  ReportCapacityRequest capacity = 5;
+  ReportLoadRequest load = 6;
+}
+
+message UpdateStorageNodeHeartbeatResponse {
+  StorageNodeStatusCode status = 1;
+  StorageError error = 2;
+  bool accepted = 3;
+  bool stale = 4;
+  string registry_epoch = 5;
+  bool drain = 6;
+  uint64 suggested_rate_limit_bytes_per_sec = 7;
+}
+
+service StorageNodeService {
+  rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
+  rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  rpc StatChunk(StatChunkRequest) returns (StatChunkResponse);
+  rpc ListChunks(ListChunksRequest) returns (ListChunksResponse);
+  rpc BatchDeleteChunks(BatchDeleteChunksRequest) returns (BatchDeleteChunksResponse);
+  rpc ScrubChunk(ScrubChunkRequest) returns (ScrubChunkResponse);
+  rpc RepairChunk(RepairChunkRequest) returns (RepairChunkResponse);
+  rpc ReportHealth(ReportHealthRequest) returns (RegistryAck);
+  rpc ReportCapacity(ReportCapacityRequest) returns (RegistryAck);
+  rpc ReportLoad(ReportLoadRequest) returns (RegistryAck);
+  rpc RegisterStorageNode(RegisterStorageNodeRequest) returns (RegisterStorageNodeResponse);
+  rpc UpdateStorageNodeHeartbeat(UpdateStorageNodeHeartbeatRequest) returns (UpdateStorageNodeHeartbeatResponse);
+}
