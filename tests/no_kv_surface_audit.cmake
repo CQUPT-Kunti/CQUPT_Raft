@@ -92,6 +92,33 @@ macro(scan_files_for_literal file_list_var literal category)
   endforeach()
 endmacro()
 
+macro(assert_paths_covered subset_list_var covered_list_var category)
+  foreach(_audit_relative_path IN LISTS ${subset_list_var})
+    list(FIND ${covered_list_var} "${_audit_relative_path}" _audit_path_index)
+    if(_audit_path_index EQUAL -1)
+      record_failure("${category}"
+        "${_audit_relative_path} is not included in ${covered_list_var}")
+    endif()
+  endforeach()
+endmacro()
+
+macro(require_file_stems_registered file_list_var registration_file category)
+  set(_audit_registration_path "${RAFT_SOURCE_DIR}/${registration_file}")
+  if(NOT EXISTS "${_audit_registration_path}")
+    record_failure("${category}" "${registration_file} is missing")
+  else()
+    file(READ "${_audit_registration_path}" _audit_registration_content)
+    foreach(_audit_relative_path IN LISTS ${file_list_var})
+      get_filename_component(_audit_file_stem "${_audit_relative_path}" NAME_WE)
+      string(FIND "${_audit_registration_content}" "${_audit_file_stem}" _audit_stem_index)
+      if(_audit_stem_index EQUAL -1)
+        record_failure("${category}"
+          "${registration_file} does not mention ${_audit_file_stem}")
+      endif()
+    endforeach()
+  endif()
+endmacro()
+
 record_whitelist("specs/006-remove-kv-metadata-state-machine/task-reports/** 保留历史迁移说明")
 record_whitelist("specs/006-remove-kv-metadata-state-machine/{research,plan,spec,tasks,quickstart}.md 保留历史上下文")
 record_whitelist("tests/no_kv_surface_audit.cmake 允许出现检测关键词")
@@ -118,9 +145,36 @@ remove_paths(TEST_MAIN_FILES
 remove_matching_paths(TEST_MAIN_FILES "AGENTS\\.md$")
 remove_matching_paths(TEST_MAIN_FILES "^tests/test-reports/")
 
+collect_files(STORE_PRODUCTION_FILES
+  "modules/store/*")
+remove_matching_paths(STORE_PRODUCTION_FILES "AGENTS\\.md$")
+
+set(STORAGE_PROTO_FILES "")
+if(EXISTS "${RAFT_SOURCE_DIR}/proto/storage_node.proto")
+  list(APPEND STORAGE_PROTO_FILES "proto/storage_node.proto")
+endif()
+
+collect_files(STORAGE_TEST_ENTRY_FILES
+  "tests/store*_test.cpp"
+  "tests/storage*_test.cpp"
+  "tests/local_disk_chunk_store_test.cpp"
+  "tests/support/store_*"
+  "tests/support/storage_*")
+remove_matching_paths(STORAGE_TEST_ENTRY_FILES "AGENTS\\.md$")
+
+assert_paths_covered(STORE_PRODUCTION_FILES PRODUCTION_SOURCE_FILES
+  "audit coverage gap")
+assert_paths_covered(STORAGE_PROTO_FILES PRODUCTION_SOURCE_FILES
+  "audit coverage gap")
+assert_paths_covered(STORAGE_TEST_ENTRY_FILES TEST_MAIN_FILES
+  "audit coverage gap")
+require_file_stems_registered(STORAGE_TEST_ENTRY_FILES "tests/CMakeLists.txt"
+  "storage test registration gap")
+
 # Strict: retired files / old paths must stay absent.
 check_path_absent("modules/raft/service/kv_service_impl.h" "forbidden production file")
 check_path_absent("modules/raft/service/kv_service_impl.cpp" "forbidden production file")
+check_path_absent("modules/raft/storage_node" "forbidden production path")
 check_path_absent("apps/raft_kv_client.cpp" "forbidden production file")
 check_path_absent("proto/kv.proto" "forbidden proto file")
 check_path_absent("modules/raft/state_machine/state_machine.h" "forbidden production file")
@@ -131,11 +185,28 @@ check_path_absent("tests/test_state_machine.cpp" "forbidden test file")
 # Strict: build graph / main test registration cannot mention retired KV entry points.
 scan_file_for_literal("CMakeLists.txt" "raft_kv_client" "forbidden build target")
 scan_file_for_literal("CMakeLists.txt" "kv_service_impl" "forbidden build source")
+scan_file_for_literal("CMakeLists.txt" "modules/raft/storage_node"
+  "forbidden build path")
 scan_file_for_literal("CMakeLists.txt"
   "modules/raft/state_machine/state_machine.cpp"
   "forbidden build source")
 scan_file_for_literal("tests/CMakeLists.txt" "test_kv_service" "forbidden test target")
 scan_file_for_literal("tests/CMakeLists.txt" "test_state_machine" "forbidden test target")
+scan_file_for_literal("tests/CMakeLists.txt" "storage_node_types_test.cpp"
+  "forbidden legacy storage test entry")
+
+if(EXISTS "${RAFT_SOURCE_DIR}/proto/storage_node.proto")
+  set(_audit_storage_proto_build_path "${RAFT_SOURCE_DIR}/CMakeLists.txt")
+  if(EXISTS "${_audit_storage_proto_build_path}")
+    file(READ "${_audit_storage_proto_build_path}" _audit_storage_proto_build_content)
+    string(FIND "${_audit_storage_proto_build_content}" "proto/storage_node.proto"
+      _audit_storage_proto_build_index)
+    if(_audit_storage_proto_build_index EQUAL -1)
+      record_failure("storage proto registration gap"
+        "CMakeLists.txt does not mention proto/storage_node.proto")
+    endif()
+  endif()
+endif()
 
 # Strict: production source tree cannot reintroduce retired KV business symbols.
 scan_files_for_regex(PRODUCTION_SOURCE_FILES
