@@ -51,7 +51,7 @@
 
 **Purpose**: 所有用户故事的阻塞前置。完成前不要做 StorageNodeService、上传闭环、Repair 或 Rebalance。
 
-- [ ] T007 定义 `StorageNodeStatusCode`、`ChunkState`、`ChunkChecksum`、`ChunkIdentity`、`ChunkMetadata`、`ChunkIndexEntry`、`ChunkReplica` 基础类型；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`；验收：`tests/store_types_test.cpp` 覆盖状态枚举、错误分类和默认值；依赖：T001
+- [x] T007 定义 `StorageNodeStatusCode`、`ChunkState`、`ChunkChecksum`、`ChunkIdentity`、`ChunkMetadata`、`ChunkIndexEntry`、`ChunkReplica` 基础类型；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`；验收：`tests/store_types_test.cpp` 覆盖状态枚举、错误分类和默认值；依赖：T001
 - [ ] T008 [P] 为 `chunk_id = object_id + version + chunk_index` 规则实现生成和校验 helper；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`、`tests/store_types_test.cpp`；验收：非法 object_id、version、chunk_index、路径逃逸均返回明确错误；依赖：T007
 - [ ] T009 [P] 实现 checksum helper，支持 write/read/scrub/repair/migration 复用；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`、`tests/store_types_test.cpp`；验收：相同 payload checksum 稳定、mismatch 可识别、不做内容寻址或全局去重；依赖：T007
 - [ ] T010 定义 `ChunkStore` 抽象接口覆盖 `WriteChunk`、`ReadChunk`、`DeleteChunk`、`StatChunk`、`ListChunks`；允许修改：`modules/store/storage_node/chunk_store.h`、`modules/store/storage_node/chunk_store.cpp`、`CMakeLists.txt`；验收：接口不暴露 Raft 类型，不保存 object payload 到 metadata；依赖：T007
