@@ -44,7 +44,7 @@
 - [x] T002 创建 Store common 基础测试目标 `tests/store_types_test.cpp` 并在 `tests/CMakeLists.txt` 增加 `storage-node;platform-neutral` 标签；允许修改：`tests/store_types_test.cpp`、`tests/CMakeLists.txt`；验收：`ctest --test-dir build/linux -R "storage_node_types|store_types" --output-on-failure` PASS；依赖：T001
 - [x] T003 在 `tests/no_kv_surface_audit.cmake` 中确认新 `modules/store/`、`proto/storage_node.proto` 和 storage tests 被 no-KV scan 覆盖；允许修改：`tests/no_kv_surface_audit.cmake`；验收：`cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit` PASS；依赖：T001
 - [x] T004 为 StorageNode CTest 标签预留 `storage-node`、`storage-node-concurrency`、`storage-node-recovery`、`storage-node-cross-platform` 分组；允许修改：`tests/CMakeLists.txt`；验收：`ctest -N -L storage-node` 能列出 StorageNode 相关测试入口；依赖：T002
-- [ ] T005 [P] 创建测试辅助目录 `tests/support/storage_node_test_utils.h` 用于临时数据目录、chunk payload 和 checksum fixture；允许修改：`tests/support/storage_node_test_utils.h`；验收：后续 storage tests 可复用且不读取构建产物/运行数据作为源码；依赖：T002
+- [x] T005 [P] 创建测试辅助目录 `tests/support/store_test_utils.h` 用于临时数据目录、chunk payload 和 checksum fixture；允许修改：`tests/support/store_test_utils.h`；验收：后续 storage tests 可复用且不读取构建产物/运行数据作为源码；依赖：T002
 - [ ] T006 运行 no-KV 基线审计并记录失败摘要或 PASS；允许修改：无生产文件，仅运行 `cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit`；验收：PASS 或失败摘要不含新增 StorageNode KV 违规；依赖：T003
 
 ## Phase 2: Foundational
