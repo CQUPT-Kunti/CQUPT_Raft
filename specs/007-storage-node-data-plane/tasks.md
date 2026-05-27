@@ -40,9 +40,9 @@
 
 **Purpose**: 建立可编译的 StorageNode 数据面模块边界和测试入口。此阶段可以修改构建系统，但执行本 tasks 阶段不做实现。
 
-- [x] T001 创建 `modules/store/storage_node/storage_node_types.h` 和 `modules/store/storage_node/storage_node_types.cpp` 的最小类型占位并接入 `CMakeLists.txt` 的 `raft_core`；允许修改：`modules/store/storage_node/storage_node_types.h`、`modules/store/storage_node/storage_node_types.cpp`、`CMakeLists.txt`；验收：`cmake --build --preset debug-ninja-low-parallel` 能编译空模块；依赖：无
-- [ ] T002 创建 StorageNode 基础测试目标 `tests/storage_node_types_test.cpp` 并在 `tests/CMakeLists.txt` 增加 `storage-node;platform-neutral` 标签；允许修改：`tests/storage_node_types_test.cpp`、`tests/CMakeLists.txt`；验收：`ctest -R storage_node_types --output-on-failure` PASS；依赖：T001
-- [ ] T003 在 `tests/no_kv_surface_audit.cmake` 中确认新 `modules/store/storage_node`、`proto/storage_node.proto` 和 storage tests 被 no-KV scan 覆盖；允许修改：`tests/no_kv_surface_audit.cmake`；验收：`cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit` PASS；依赖：T001
+- [x] T001 创建 `modules/store/common/store_types.h` 和 `modules/store/common/store_types.cpp` 的最小类型占位并接入 `CMakeLists.txt` 的 `raft_core`；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`、`CMakeLists.txt`；验收：`cmake --build --preset debug-ninja-low-parallel` 能编译空模块；依赖：无
+- [x] T002 创建 Store common 基础测试目标 `tests/store_types_test.cpp` 并在 `tests/CMakeLists.txt` 增加 `storage-node;platform-neutral` 标签；允许修改：`tests/store_types_test.cpp`、`tests/CMakeLists.txt`；验收：`ctest --test-dir build/linux -R "storage_node_types|store_types" --output-on-failure` PASS；依赖：T001
+- [ ] T003 在 `tests/no_kv_surface_audit.cmake` 中确认新 `modules/store/`、`proto/storage_node.proto` 和 storage tests 被 no-KV scan 覆盖；允许修改：`tests/no_kv_surface_audit.cmake`；验收：`cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit` PASS；依赖：T001
 - [ ] T004 为 StorageNode CTest 标签预留 `storage-node`、`storage-node-concurrency`、`storage-node-recovery`、`storage-node-cross-platform` 分组；允许修改：`tests/CMakeLists.txt`；验收：`ctest -N -L storage-node` 能列出 StorageNode 相关测试入口；依赖：T002
 - [ ] T005 [P] 创建测试辅助目录 `tests/support/storage_node_test_utils.h` 用于临时数据目录、chunk payload 和 checksum fixture；允许修改：`tests/support/storage_node_test_utils.h`；验收：后续 storage tests 可复用且不读取构建产物/运行数据作为源码；依赖：T002
 - [ ] T006 运行 no-KV 基线审计并记录失败摘要或 PASS；允许修改：无生产文件，仅运行 `cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit`；验收：PASS 或失败摘要不含新增 StorageNode KV 违规；依赖：T003
@@ -51,9 +51,9 @@
 
 **Purpose**: 所有用户故事的阻塞前置。完成前不要做 StorageNodeService、上传闭环、Repair 或 Rebalance。
 
-- [ ] T007 定义 `StorageNodeStatusCode`、`ChunkState`、`ChunkChecksum`、`ChunkIdentity`、`ChunkMetadata`、`ChunkIndexEntry`、`ChunkReplica` 基础类型；允许修改：`modules/store/storage_node/storage_node_types.h`、`modules/store/storage_node/storage_node_types.cpp`；验收：`tests/storage_node_types_test.cpp` 覆盖状态枚举、错误分类和默认值；依赖：T001
-- [ ] T008 [P] 为 `chunk_id = object_id + version + chunk_index` 规则实现生成和校验 helper；允许修改：`modules/store/storage_node/storage_node_types.h`、`modules/store/storage_node/storage_node_types.cpp`、`tests/storage_node_types_test.cpp`；验收：非法 object_id、version、chunk_index、路径逃逸均返回明确错误；依赖：T007
-- [ ] T009 [P] 实现 checksum helper，支持 write/read/scrub/repair/migration 复用；允许修改：`modules/store/storage_node/storage_node_types.h`、`modules/store/storage_node/storage_node_types.cpp`、`tests/storage_node_types_test.cpp`；验收：相同 payload checksum 稳定、mismatch 可识别、不做内容寻址或全局去重；依赖：T007
+- [ ] T007 定义 `StorageNodeStatusCode`、`ChunkState`、`ChunkChecksum`、`ChunkIdentity`、`ChunkMetadata`、`ChunkIndexEntry`、`ChunkReplica` 基础类型；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`；验收：`tests/store_types_test.cpp` 覆盖状态枚举、错误分类和默认值；依赖：T001
+- [ ] T008 [P] 为 `chunk_id = object_id + version + chunk_index` 规则实现生成和校验 helper；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`、`tests/store_types_test.cpp`；验收：非法 object_id、version、chunk_index、路径逃逸均返回明确错误；依赖：T007
+- [ ] T009 [P] 实现 checksum helper，支持 write/read/scrub/repair/migration 复用；允许修改：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp`、`tests/store_types_test.cpp`；验收：相同 payload checksum 稳定、mismatch 可识别、不做内容寻址或全局去重；依赖：T007
 - [ ] T010 定义 `ChunkStore` 抽象接口覆盖 `WriteChunk`、`ReadChunk`、`DeleteChunk`、`StatChunk`、`ListChunks`；允许修改：`modules/store/storage_node/chunk_store.h`、`modules/store/storage_node/chunk_store.cpp`、`CMakeLists.txt`；验收：接口不暴露 Raft 类型，不保存 object payload 到 metadata；依赖：T007
 - [ ] T011 定义 durable file 抽象接口和共享错误映射；允许修改：`modules/store/storage_node/durable_file.h`、`modules/store/storage_node/durable_file.cpp`、`CMakeLists.txt`；验收：接口表达 file flush、atomic publish、directory sync、path normalization、unsupported/error 分类；依赖：T007
 - [ ] T012 [P] 为 durable file 写跨平台契约测试骨架；允许修改：`tests/storage_node_durable_file_test.cpp`、`tests/CMakeLists.txt`；验收：测试覆盖 required operation 不能 no-op success；依赖：T011

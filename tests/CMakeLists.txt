@@ -251,6 +251,31 @@ add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp
 add_raft_gtest(test_thread_pool test_thread_pool.cpp
   "platform-neutral;platform-neutral-fallback")
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_types_test.cpp")
+  add_executable(test_store_types
+    store_types_test.cpp
+  )
+
+  target_link_libraries(test_store_types
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_types
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_test(NAME store_types
+    COMMAND test_store_types
+  )
+  set_tests_properties(store_types PROPERTIES
+    LABELS "storage-node;platform-neutral")
+else()
+  message(STATUS "Skip test_store_types: store_types_test.cpp not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic Raft behavior tests
