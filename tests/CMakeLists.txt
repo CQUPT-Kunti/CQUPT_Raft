@@ -36,10 +36,37 @@ FetchContent_MakeAvailable(googletest)
 #   may still exercise platform-neutral logic, but their operational
 #   interpretation is intentionally different from a pure cross-platform
 #   baseline rerun.
+# - storage-node:
+#   StorageNode / store data-plane baseline bucket. For 007 and later store
+#   tests, this is the primary feature grouping label.
+# - storage-node-concurrency:
+#   StorageNode concurrency / backpressure / bounded-queue tests.
+# - storage-node-recovery:
+#   StorageNode restart / rebuild / staging cleanup / corruption recovery
+#   tests.
+# - storage-node-cross-platform:
+#   StorageNode cross-platform durability and path-behavior contract tests.
 #
 # This file does not rename targets or alter test behavior. It only attaches
 # labeling metadata so ctest discovery and related docs can distinguish the
 # validation scope more clearly.
+set(RAFT_STORE_LABELS_BASELINE
+  "storage-node;platform-neutral")
+set(RAFT_STORE_LABELS_CONCURRENCY
+  "storage-node;storage-node-concurrency;platform-neutral")
+set(RAFT_STORE_LABELS_RECOVERY
+  "storage-node;storage-node-recovery;platform-neutral")
+set(RAFT_STORE_LABELS_CROSS_PLATFORM
+  "storage-node;storage-node-cross-platform;platform-neutral")
+
+function(add_store_ctest test_name target_name test_labels)
+  add_test(NAME ${test_name}
+    COMMAND ${target_name}
+  )
+  set_tests_properties(${test_name} PROPERTIES
+    LABELS "${test_labels}")
+endfunction()
+
 function(add_raft_gtest target_name source_file test_labels)
   if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
     message(STATUS "Skip ${target_name}: ${source_file} not found")
@@ -267,11 +294,8 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_types_test.cpp")
       ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
-  add_test(NAME store_types
-    COMMAND test_store_types
-  )
-  set_tests_properties(store_types PROPERTIES
-    LABELS "storage-node;platform-neutral")
+  add_store_ctest(store_types test_store_types
+    "${RAFT_STORE_LABELS_BASELINE}")
 else()
   message(STATUS "Skip test_store_types: store_types_test.cpp not found")
 endif()
