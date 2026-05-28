@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "store/common/store_types.h"
@@ -16,6 +21,8 @@ namespace storedemo
 {
     namespace
     {
+        using namespace std::chrono_literals;
+
         ChunkChecksum MakeEntryChecksum(const std::size_t size,
                                         const std::string_view seed)
         {
@@ -65,6 +72,45 @@ namespace storedemo
             return entry;
         }
 
+        std::string MakeChunkIdValue(const std::string_view object_id,
+                                     const std::uint64_t version,
+                                     const std::uint32_t chunk_index)
+        {
+            std::string chunk_id;
+            std::string error_detail;
+            const auto status = MakeChunkId(object_id,
+                                            version,
+                                            chunk_index,
+                                            &chunk_id,
+                                            &error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to build chunk id: " + error_detail);
+            }
+            return chunk_id;
+        }
+
+        std::string FindChunkIdOnDifferentStripe(ShardedChunkIndex &index,
+                                                 const std::size_t excluded_stripe)
+        {
+            for (std::size_t candidate = 0; candidate < 512; ++candidate)
+            {
+                const std::string chunk_id = MakeChunkIdValue(
+                    "parallel-lock-" + std::to_string(candidate),
+                    1,
+                    0);
+                const std::size_t stripe_index =
+                    std::hash<std::string_view>{}(chunk_id) %
+                    index.config().lock_stripe_count;
+                if (stripe_index != excluded_stripe)
+                {
+                    return chunk_id;
+                }
+            }
+
+            throw std::runtime_error("failed to find chunk id on different lock stripe");
+        }
+
         std::vector<std::string> CollectChunkIds(const ChunkIndexListResponse &response)
         {
             std::vector<std::string> chunk_ids;
@@ -83,6 +129,7 @@ namespace storedemo
             {
                 return ChunkIndexConfig{
                     .shard_count = 4,
+                    .lock_stripe_count = 8,
                     .default_page_size = 3,
                     .max_page_size = 16};
             }
@@ -336,6 +383,117 @@ namespace storedemo
                                                expected_chunk_ids.end()));
             EXPECT_TRUE(third_page.next_page_token.empty());
             EXPECT_EQ(second_page.snapshot_epoch, third_page.snapshot_epoch);
+        }
+
+        TEST_F(StoreChunkIndexTest, AcquireChunkLockRejectsInvalidChunkId)
+        {
+            ShardedChunkIndex index(MakeConfig());
+
+            const auto empty_response = index.AcquireChunkLock("");
+            EXPECT_EQ(empty_response.status, StorageNodeStatusCode::kInvalidArgument);
+            EXPECT_FALSE(empty_response.acquired);
+            EXPECT_FALSE(empty_response.guard.owns_lock());
+
+            const auto unsafe_response = index.AcquireChunkLock("../chunk");
+            EXPECT_EQ(unsafe_response.status, StorageNodeStatusCode::kInvalidArgument);
+            EXPECT_FALSE(unsafe_response.acquired);
+            EXPECT_FALSE(unsafe_response.guard.owns_lock());
+        }
+
+        TEST_F(StoreChunkIndexTest, SameChunkLockSerializesConflictingOperations)
+        {
+            ShardedChunkIndex index(MakeConfig());
+            const std::string chunk_id = MakeChunkIdValue("lock-serial-a", 1, 0);
+
+            std::promise<void> worker_ready_promise;
+            std::future<void> worker_ready = worker_ready_promise.get_future();
+            std::promise<void> acquired_promise;
+            std::future<void> acquired_future = acquired_promise.get_future();
+            std::atomic<bool> entered_critical{false};
+
+            std::thread worker;
+            {
+                auto first_lock = index.AcquireChunkLock(chunk_id);
+                ASSERT_EQ(first_lock.status, StorageNodeStatusCode::kOk);
+                ASSERT_TRUE(first_lock.acquired);
+                ASSERT_TRUE(first_lock.guard.owns_lock());
+
+                worker = std::thread([&]()
+                {
+                    worker_ready_promise.set_value();
+                    auto second_lock = index.AcquireChunkLock(chunk_id);
+                    EXPECT_EQ(second_lock.status, StorageNodeStatusCode::kOk);
+                    EXPECT_TRUE(second_lock.acquired);
+                    EXPECT_TRUE(second_lock.guard.owns_lock());
+                    entered_critical.store(true, std::memory_order_release);
+                    acquired_promise.set_value();
+                });
+
+                ASSERT_EQ(worker_ready.wait_for(200ms), std::future_status::ready);
+                EXPECT_EQ(acquired_future.wait_for(80ms), std::future_status::timeout);
+                EXPECT_FALSE(entered_critical.load(std::memory_order_acquire));
+            }
+
+            EXPECT_EQ(acquired_future.wait_for(500ms), std::future_status::ready);
+            EXPECT_TRUE(entered_critical.load(std::memory_order_acquire));
+            worker.join();
+        }
+
+        TEST_F(StoreChunkIndexTest, DifferentChunkLocksOnDifferentStripesCanProceedInParallel)
+        {
+            ShardedChunkIndex index(MakeConfig());
+            const std::string first_chunk_id = MakeChunkIdValue("lock-parallel-a", 1, 0);
+
+            auto first_lock = index.AcquireChunkLock(first_chunk_id);
+            ASSERT_EQ(first_lock.status, StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(first_lock.acquired);
+            ASSERT_TRUE(first_lock.guard.owns_lock());
+
+            const std::size_t first_stripe = first_lock.guard.stripe_index();
+            const std::string second_chunk_id =
+                FindChunkIdOnDifferentStripe(index, first_stripe);
+
+            std::promise<void> acquired_promise;
+            std::future<void> acquired_future = acquired_promise.get_future();
+            std::promise<std::size_t> stripe_promise;
+            std::future<std::size_t> stripe_future = stripe_promise.get_future();
+
+            std::thread worker([&]()
+            {
+                auto second_lock = index.AcquireChunkLock(second_chunk_id);
+                EXPECT_EQ(second_lock.status, StorageNodeStatusCode::kOk);
+                EXPECT_TRUE(second_lock.acquired);
+                EXPECT_TRUE(second_lock.guard.owns_lock());
+                stripe_promise.set_value(second_lock.guard.stripe_index());
+                acquired_promise.set_value();
+                std::this_thread::sleep_for(40ms);
+            });
+
+            EXPECT_EQ(acquired_future.wait_for(200ms), std::future_status::ready);
+            EXPECT_NE(stripe_future.get(), first_stripe);
+            worker.join();
+        }
+
+        TEST_F(StoreChunkIndexTest, GuardReleaseAllowsSameChunkToBeLockedAgain)
+        {
+            ShardedChunkIndex index(MakeConfig());
+            const std::string chunk_id = MakeChunkIdValue("lock-release-a", 1, 0);
+
+            std::size_t first_stripe = 0;
+            {
+                auto first_lock = index.AcquireChunkLock(chunk_id);
+                ASSERT_EQ(first_lock.status, StorageNodeStatusCode::kOk);
+                ASSERT_TRUE(first_lock.acquired);
+                ASSERT_TRUE(first_lock.guard.owns_lock());
+                first_stripe = first_lock.guard.stripe_index();
+            }
+
+            const auto second_lock = index.AcquireChunkLock(chunk_id);
+            EXPECT_EQ(second_lock.status, StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(second_lock.acquired);
+            EXPECT_TRUE(second_lock.guard.owns_lock());
+            EXPECT_EQ(second_lock.guard.stripe_index(), first_stripe);
+            EXPECT_EQ(second_lock.guard.chunk_id(), chunk_id);
         }
     } // namespace
 } // namespace storedemo

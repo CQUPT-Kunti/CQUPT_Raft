@@ -1,7 +1,9 @@
 #include "store/index/chunk_index.h"
 
 #include <algorithm>
+#include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -14,6 +16,10 @@ namespace storedemo
             if (config.shard_count == 0)
             {
                 config.shard_count = 1;
+            }
+            if (config.lock_stripe_count == 0)
+            {
+                config.lock_stripe_count = std::max<std::size_t>(config.shard_count, 64);
             }
             if (config.default_page_size == 0)
             {
@@ -75,7 +81,13 @@ namespace storedemo
 
     struct ShardedChunkIndex::Shard
     {
+        mutable std::shared_mutex mutex;
         std::unordered_map<ChunkId, ChunkIndexEntry> entries;
+    };
+
+    struct ShardedChunkIndex::LockStripe
+    {
+        std::mutex mutex;
     };
 
     ChunkIndex::~ChunkIndex() = default;
@@ -87,6 +99,11 @@ namespace storedemo
         for (std::size_t index = 0; index < config_.shard_count; ++index)
         {
             shards_.push_back(std::make_unique<Shard>());
+        }
+        lock_stripes_.reserve(config_.lock_stripe_count);
+        for (std::size_t index = 0; index < config_.lock_stripe_count; ++index)
+        {
+            lock_stripes_.push_back(std::make_unique<LockStripe>());
         }
     }
 
@@ -104,19 +121,23 @@ namespace storedemo
         const std::size_t shard_index = ComputeShardIndex(entry.identity.chunk_id);
         auto stored_entry = entry;
         stored_entry.lock_shard = shard_index;
-        const auto [it, inserted] = shards_[shard_index]->entries.emplace(
-            stored_entry.identity.chunk_id,
-            std::move(stored_entry));
-        response.entry = it->second;
-        response.inserted = inserted;
-        if (!inserted)
         {
-            response.status = StorageNodeStatusCode::kAlreadyExists;
-            response.error_detail = "chunk index entry already exists";
-            return response;
+            auto &shard = *shards_[shard_index];
+            std::unique_lock<std::shared_mutex> shard_lock(shard.mutex);
+            const auto [it, inserted] = shard.entries.emplace(
+                stored_entry.identity.chunk_id,
+                std::move(stored_entry));
+            response.entry = it->second;
+            response.inserted = inserted;
+            if (!inserted)
+            {
+                response.status = StorageNodeStatusCode::kAlreadyExists;
+                response.error_detail = "chunk index entry already exists";
+                return response;
+            }
         }
 
-        ++mutation_epoch_;
+        mutation_epoch_.fetch_add(1, std::memory_order_relaxed);
         return response;
     }
 
@@ -130,20 +151,24 @@ namespace storedemo
         }
 
         const std::size_t shard_index = ComputeShardIndex(entry.identity.chunk_id);
-        auto &entries = shards_[shard_index]->entries;
-        const auto it = entries.find(entry.identity.chunk_id);
-        if (it == entries.end())
         {
-            response.status = StorageNodeStatusCode::kNotFound;
-            response.error_detail = "chunk index entry not found";
-            return response;
+            auto &shard = *shards_[shard_index];
+            std::unique_lock<std::shared_mutex> shard_lock(shard.mutex);
+            const auto it = shard.entries.find(entry.identity.chunk_id);
+            if (it == shard.entries.end())
+            {
+                response.status = StorageNodeStatusCode::kNotFound;
+                response.error_detail = "chunk index entry not found";
+                return response;
+            }
+
+            it->second = entry;
+            it->second.lock_shard = shard_index;
+            response.entry = it->second;
+            response.updated = true;
         }
 
-        it->second = entry;
-        it->second.lock_shard = shard_index;
-        response.entry = it->second;
-        response.updated = true;
-        ++mutation_epoch_;
+        mutation_epoch_.fetch_add(1, std::memory_order_relaxed);
         return response;
     }
 
@@ -157,17 +182,21 @@ namespace storedemo
         }
 
         const std::size_t shard_index = ComputeShardIndex(chunk_id);
-        const auto &entries = shards_[shard_index]->entries;
-        const auto it = entries.find(std::string(chunk_id));
-        if (it == entries.end())
         {
-            response.status = StorageNodeStatusCode::kNotFound;
-            response.error_detail = "chunk index entry not found";
-            return response;
+            const auto &shard = *shards_[shard_index];
+            std::shared_lock<std::shared_mutex> shard_lock(shard.mutex);
+            const auto it = shard.entries.find(std::string(chunk_id));
+            if (it == shard.entries.end())
+            {
+                response.status = StorageNodeStatusCode::kNotFound;
+                response.error_detail = "chunk index entry not found";
+                return response;
+            }
+
+            response.entry = it->second;
+            response.found = true;
         }
 
-        response.entry = it->second;
-        response.found = true;
         return response;
     }
 
@@ -181,19 +210,23 @@ namespace storedemo
         }
 
         const std::size_t shard_index = ComputeShardIndex(chunk_id);
-        auto &entries = shards_[shard_index]->entries;
-        const auto it = entries.find(std::string(chunk_id));
-        if (it == entries.end())
         {
-            response.status = StorageNodeStatusCode::kNotFound;
-            response.error_detail = "chunk index entry not found";
-            return response;
+            auto &shard = *shards_[shard_index];
+            std::unique_lock<std::shared_mutex> shard_lock(shard.mutex);
+            const auto it = shard.entries.find(std::string(chunk_id));
+            if (it == shard.entries.end())
+            {
+                response.status = StorageNodeStatusCode::kNotFound;
+                response.error_detail = "chunk index entry not found";
+                return response;
+            }
+
+            response.entry = it->second;
+            response.removed = true;
+            shard.entries.erase(it);
         }
 
-        response.entry = it->second;
-        response.removed = true;
-        entries.erase(it);
-        ++mutation_epoch_;
+        mutation_epoch_.fetch_add(1, std::memory_order_relaxed);
         return response;
     }
 
@@ -208,6 +241,7 @@ namespace storedemo
         std::vector<ChunkIndexEntry> matched_entries;
         for (const auto &shard : shards_)
         {
+            std::shared_lock<std::shared_mutex> shard_lock(shard->mutex);
             for (const auto &[chunk_id, entry] : shard->entries)
             {
                 (void)chunk_id;
@@ -237,7 +271,25 @@ namespace storedemo
             response.entries = std::move(matched_entries);
         }
 
-        response.snapshot_epoch = mutation_epoch_;
+        response.snapshot_epoch = mutation_epoch_.load(std::memory_order_relaxed);
+        return response;
+    }
+
+    ChunkIndexLockResponse ShardedChunkIndex::AcquireChunkLock(std::string_view chunk_id)
+    {
+        ChunkIndexLockResponse response;
+        response.status = ValidateChunkId(chunk_id, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        const std::size_t stripe_index = ComputeLockStripeIndex(chunk_id);
+        std::unique_lock<std::mutex> stripe_lock(lock_stripes_[stripe_index]->mutex);
+        response.guard = ChunkLockGuard(std::string(chunk_id),
+                                        stripe_index,
+                                        std::move(stripe_lock));
+        response.acquired = true;
         return response;
     }
 
@@ -249,5 +301,10 @@ namespace storedemo
     std::size_t ShardedChunkIndex::ComputeShardIndex(std::string_view chunk_id) const
     {
         return std::hash<std::string_view>{}(chunk_id) % config_.shard_count;
+    }
+
+    std::size_t ShardedChunkIndex::ComputeLockStripeIndex(std::string_view chunk_id) const
+    {
+        return std::hash<std::string_view>{}(chunk_id) % config_.lock_stripe_count;
     }
 }

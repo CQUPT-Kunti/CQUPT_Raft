@@ -17,5 +17,10 @@
 
 - 任务编号：T016
   问题：`ShardedChunkIndex::List()` 当前使用 `chunk_id` 字典序和 `page_token` 继续翻页，但还没有为并发修改提供稳定快照分页保证。
-  影响：后续在 T017/T018 引入并发更新后，跨页扫描可能出现页边界漂移或重复/漏读，需要明确 snapshot 语义或更强一致性策略。
-  建议后续在哪类任务处理：T017 已补单线程分页测试；后续在 T018 的并发扩展或更后续索引任务中，继续收紧分页一致性语义，必要时引入 snapshot pinning 或更强 page token 结构。
+  影响：T018 已补 per-chunk 串行化和基础容器并发保护，但跨页扫描在并发修改下仍可能出现页边界漂移或重复/漏读，需要明确 snapshot 语义或更强一致性策略。
+  建议后续在哪类任务处理：在后续索引并发/恢复任务中继续收紧分页一致性语义，必要时引入 snapshot pinning 或更强 page token 结构。
+
+- 任务编号：T018
+  问题：`AcquireChunkLock()` 只为上层提供 chunk 级冲突串行入口，`Insert / Update / Remove` 的跨步骤原子性仍依赖后续 `LocalDiskChunkStore` 等调用方在操作入口显式持有 guard。
+  影响：如果后续写/删/修复流程遗漏 guard，只依赖索引内部容器锁，仍可能在多步骤状态转换上出现交错。
+  建议后续在哪类任务处理：在 T021/T023 及后续 store 业务实现中，把 chunk guard 作为 write/delete/repair 主入口的固定前置步骤，并补对应测试。

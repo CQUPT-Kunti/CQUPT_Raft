@@ -63,7 +63,7 @@
 - [x] T015 实现路径 normalization 和 chunk 目录布局 helper；允许修改：`modules/store/io/durable_file.h`、`modules/store/io/durable_file.cpp`、`tests/store_durable_file_test.cpp`；验收：拒绝绝对路径逃逸、`..`、非法 chunk id、Windows reserved names；依赖：T011
 - [x] T016 定义 `ChunkIndex` 接口和 sharded map 结构；允许修改：`modules/store/index/chunk_index.h`、`modules/store/index/chunk_index.cpp`、`CMakeLists.txt`；验收：支持 insert/update/find/list/remove，状态区分 live/staging/deleting/deleted/quarantined/corrupted/missing；依赖：T007
 - [x] T017 [P] 为 `ChunkIndex` 写单元测试；允许修改：`tests/store_chunk_index_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 sharded list、pagination、state filter、duplicate update、missing lookup；依赖：T016
-- [ ] T018 实现 per-chunk lock 和 lock striping；允许修改：`modules/store/index/chunk_index.h`、`modules/store/index/chunk_index.cpp`、`tests/store_chunk_index_test.cpp`；验收：并发同一 chunk write/delete 串行，不同 chunk 可并行；依赖：T016、T017
+- [x] T018 实现 per-chunk lock 和 lock striping；允许修改：`modules/store/index/chunk_index.h`、`modules/store/index/chunk_index.cpp`、`tests/store_chunk_index_test.cpp`；验收：并发同一 chunk write/delete 串行，不同 chunk 可并行；依赖：T016、T017
 - [ ] T019 定义 bounded executor / bounded IO queue；允许修改：`modules/store/runtime/storage_executor.h`、`modules/store/runtime/storage_executor.cpp`、`CMakeLists.txt`；验收：队列容量、timeout、cancellation、overloaded result 可测；依赖：T007
 - [ ] T020 [P] 为 bounded executor 写单元测试；允许修改：`tests/store_executor_test.cpp`、`tests/CMakeLists.txt`；验收：队列满返回 overloaded，取消任务不泄漏线程；依赖：T019
 - [ ] T021 定义 `LocalDiskChunkStore` 构造配置和目录初始化；允许修改：`modules/store/chunk/local_disk_chunk_store.h`、`modules/store/chunk/local_disk_chunk_store.cpp`、`CMakeLists.txt`；验收：无效 data_dir、权限错误、目录创建失败均返回明确错误；依赖：T010、T011、T016
