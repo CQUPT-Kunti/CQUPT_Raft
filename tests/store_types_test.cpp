@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <string>
+
 #include "store/common/store_types.h"
 
-namespace raftdemo {
+namespace storedemo {
 namespace {
 
 TEST(StoreTypesTest, StorageNodeStatusCodeCoversExpectedClassification) {
@@ -72,6 +75,115 @@ TEST(StoreTypesTest, ChunkLocationAndIdentityValidateLightweightKeys) {
   EXPECT_EQ(identity.offset, 4096U);
 }
 
+TEST(StoreTypesTest, ChunkIdHelpersBuildParseAndValidateCanonicalIds) {
+  std::string chunk_id;
+  std::string error_detail;
+  EXPECT_EQ(MakeChunkId("object-7", 3, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_TRUE(error_detail.empty());
+  EXPECT_EQ(chunk_id, "object-7~3~0");
+
+  ChunkIdentity identity;
+  EXPECT_EQ(ParseChunkId(chunk_id, &identity, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(identity.chunk_id, chunk_id);
+  EXPECT_EQ(identity.object_id, "object-7");
+  EXPECT_EQ(identity.version, 3U);
+  EXPECT_EQ(identity.chunk_index, 0U);
+  EXPECT_EQ(identity.offset, 0U);
+
+  EXPECT_EQ(ValidateChunkId(chunk_id, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_TRUE(error_detail.empty());
+}
+
+TEST(StoreTypesTest, ChunkIdHelpersRejectUnsafeObjectIdsAndInvalidGenerationArgs) {
+  std::string chunk_id;
+  std::string error_detail;
+
+  EXPECT_EQ(MakeChunkId("", 1, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("object_id must not be empty"), std::string::npos);
+
+  EXPECT_EQ(MakeChunkId("object/7", 1, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("unsafe character"), std::string::npos);
+
+  EXPECT_EQ(MakeChunkId("../object7", 1, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("path escape"), std::string::npos);
+
+  EXPECT_EQ(MakeChunkId(".hidden", 1, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("start or end with '.'"), std::string::npos);
+
+  EXPECT_EQ(MakeChunkId("object-7", 0, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("version must be greater than zero"),
+            std::string::npos);
+}
+
+TEST(StoreTypesTest, ChunkIdHelpersRejectInvalidOrNonCanonicalChunkIds) {
+  std::string error_detail;
+
+  EXPECT_EQ(ValidateChunkId("", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("must not be empty"), std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object-7:3:0", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("missing first separator"), std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object-7~0~1", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("version must be greater than zero"),
+            std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object-7~01~1", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("canonical unsigned encoding"),
+            std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object-7~1~01", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("canonical unsigned encoding"),
+            std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object-7~1~4294967296", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("valid uint32"), std::string::npos);
+
+  EXPECT_EQ(ValidateChunkId("object/7~1~0", &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("unsafe character"), std::string::npos);
+}
+
+TEST(StoreTypesTest, ChunkIdHelpersAcceptSafeBoundaryValues) {
+  const std::string object_id(kMaxChunkObjectIdLength, 'a');
+  std::string chunk_id;
+  std::string error_detail;
+
+  EXPECT_EQ(MakeChunkId(object_id,
+                        std::numeric_limits<std::uint64_t>::max(),
+                        std::numeric_limits<std::uint32_t>::max(),
+                        &chunk_id,
+                        &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_LE(chunk_id.size(), kMaxChunkIdLength);
+
+  ChunkIdentity identity;
+  EXPECT_EQ(ParseChunkId(chunk_id, &identity, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(identity.object_id, object_id);
+  EXPECT_EQ(identity.version, std::numeric_limits<std::uint64_t>::max());
+  EXPECT_EQ(identity.chunk_index, std::numeric_limits<std::uint32_t>::max());
+
+  const std::string too_long_object_id(kMaxChunkObjectIdLength + 1U, 'b');
+  EXPECT_EQ(MakeChunkId(too_long_object_id, 1, 0, &chunk_id, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+  EXPECT_NE(error_detail.find("safe length"), std::string::npos);
+}
+
 TEST(StoreTypesTest, ChunkReplicaMetadataAndIndexEntryExposeClearDefaults) {
   ChunkReplica replica;
   EXPECT_TRUE(replica.chunk_id.empty());
@@ -127,4 +239,4 @@ TEST(StoreTypesTest, PlaceholderStageKeepsStableDefaultValue) {
 }
 
 }  // namespace
-}  // namespace raftdemo
+}  // namespace storedemo

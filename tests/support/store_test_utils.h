@@ -14,7 +14,7 @@
 
 #include "store/common/store_types.h"
 
-namespace raftdemo::test
+namespace storedemo::test
 {
     inline std::string SanitizeStoreTestName(std::string_view name)
     {
@@ -165,4 +165,4 @@ namespace raftdemo::test
             << hash;
         return out.str();
     }
-} // namespace raftdemo::test
+} // namespace storedemo::test

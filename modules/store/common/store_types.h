@@ -9,8 +9,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
-namespace raftdemo
+namespace storedemo
 {
     using StorageNodeId = std::string;
     using ChunkId = std::string;
@@ -71,6 +72,40 @@ namespace raftdemo
     // 判断该状态是否表示本轮生命周期已经结束，后续通常需要人工处理或新流程重建。
     bool IsTerminalChunkState(ChunkState state);
 
+    struct ChunkIdentity;
+
+    // chunk_id 采用 object_id + version + chunk_index 的稳定组合。
+    // 分隔符必须可安全用于本地文件名，因此这里不用 ':' 这类跨平台不安全字符。
+    inline constexpr char kChunkIdSeparator = '~';
+
+    // chunk_id 未来会进入本地文件布局，单个路径分量长度需要保持在保守范围内。
+    inline constexpr std::size_t kMaxChunkIdLength = 255;
+    inline constexpr std::size_t kMaxChunkObjectIdLength = 223;
+
+    // 校验 object_id 是否适合作为 chunk_id 组成部分和后续本地路径分量。
+    // 返回 kOk 表示可用；否则返回 kInvalidArgument，并可选写入错误原因。
+    StorageNodeStatusCode ValidateChunkObjectId(std::string_view object_id,
+                                                std::string *error_detail = nullptr);
+
+    // 生成稳定 chunk_id。
+    // version 合法范围为 [1, uint64_t max]，chunk_index 合法范围为 [0, uint32_t max]。
+    // 失败时不会写出非法结果，调用方可通过 error_detail 获取明确原因。
+    StorageNodeStatusCode MakeChunkId(std::string_view object_id,
+                                      std::uint64_t version,
+                                      std::uint32_t chunk_index,
+                                      ChunkId *out_chunk_id,
+                                      std::string *error_detail = nullptr);
+
+    // 解析并校验 chunk_id 的三段式格式。
+    // 仅接受规范化编码，拒绝空字段、非法字符、路径逃逸和数值溢出。
+    StorageNodeStatusCode ParseChunkId(std::string_view chunk_id,
+                                       ChunkIdentity *out_identity,
+                                       std::string *error_detail = nullptr);
+
+    // 仅做合法性校验，不输出解析结果。
+    StorageNodeStatusCode ValidateChunkId(std::string_view chunk_id,
+                                          std::string *error_detail = nullptr);
+
     // 标识某个 chunk 当前位于哪个节点。
     // 用于轻量引用，不包含内容、路径或元数据。
     struct ChunkLocation
@@ -96,7 +131,8 @@ namespace raftdemo
     };
 
     // Chunk 的逻辑身份信息。
-    // chunk_id 之外保留 object/version/index/offset，供后续索引、落盘和副本流程复用。
+    // chunk_id 由 T008 helper 基于 object_id + version + chunk_index 生成，
+    // 其余字段保留给后续索引、落盘和副本流程复用。
     struct ChunkIdentity
     {
         ChunkId chunk_id;
@@ -173,4 +209,4 @@ namespace raftdemo
         kPlaceholder = 0,
     };
 
-} // namespace raftdemo
+} // namespace storedemo

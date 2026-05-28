@@ -15,8 +15,8 @@
 
 ## Decision 2: `chunk_id` MVP 使用 `object_id + version + chunk_index`
 
-**Decision**: MVP 的 chunk identity 使用 `object_id + version + chunk_index`，例如逻辑形式 `{object_id}:{version}:{chunk_index}`。  
-**Rationale**: 现有 metadata 已有 `object_id` 和 `version`，该组合能稳定对应一个对象版本的一个 chunk，便于幂等写、manifest 查询、GC 和 repair。它不要求全局内容寻址索引，也不会把 chunk store 退化成 KV。  
+**Decision**: MVP 的 chunk identity 使用 `object_id + version + chunk_index`，例如逻辑形式 `{object_id}~{version}~{chunk_index}`。  
+**Rationale**: 现有 metadata 已有 `object_id` 和 `version`，该组合能稳定对应一个对象版本的一个 chunk，便于幂等写、manifest 查询、GC 和 repair。分隔符需要可安全进入后续本地文件布局，因此不使用 `:` 这类跨平台不安全字符。它不要求全局内容寻址索引，也不会把 chunk store 退化成 KV。  
 **Alternatives considered**:
 - 使用 checksum 作为 chunk_id：被拒绝，因为会把 checksum 与内容寻址/去重绑定，提前引入引用计数、跨对象共享和 GC 复杂度。
 - 使用随机 UUID：可行但不优先，因为它削弱了从 manifest 推导 chunk identity 的可诊断性。
