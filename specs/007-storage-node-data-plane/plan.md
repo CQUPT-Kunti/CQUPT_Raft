@@ -121,16 +121,24 @@ specs/007-storage-node-data-plane/
 modules/store/
 ├── common/
 │   └── store_types.h / .cpp
-└── storage_node/
-    ├── chunk_store.h / .cpp
-    ├── local_disk_chunk_store.h / .cpp
-    ├── chunk_index.h / .cpp
-    ├── durable_file.h / .cpp
-    ├── storage_node.h / .cpp
-    ├── storage_node_client.h / .cpp
-    ├── storage_node_service.h / .cpp
-    ├── placement_manager.h / .cpp
-    ├── replica_policy.h / .cpp
+├── chunk/
+│   ├── chunk_store.h / .cpp
+│   └── local_disk_chunk_store.h / .cpp
+├── index/
+│   └── chunk_index.h / .cpp
+├── io/
+│   └── durable_file.h / .cpp
+├── runtime/
+│   └── storage_executor.h / .cpp
+├── node/
+│   ├── storage_node.h / .cpp
+│   ├── storage_node_client.h / .cpp
+│   ├── storage_node_service.h / .cpp
+│   └── storage_node_registry.h / .cpp
+├── placement/
+│   ├── placement_manager.h / .cpp
+│   └── replica_policy.h / .cpp
+└── maintenance/
     ├── garbage_collector.h / .cpp
     ├── scrub_manager.h / .cpp
     ├── repair_manager.h / .cpp
@@ -151,7 +159,7 @@ modules/store/
 
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|--------------------------------------|
-| 新增 `modules/store/` 数据面边界 | StorageNode 负责真实 chunk IO、durability、repair/rebalance participation，与 Raft metadata storage 职责不同；`modules/store/common` 承载共享基础类型，`modules/store/storage_node` 承载节点侧实现 | 复用 `modules/raft/storage` 会混淆 Raft log/snapshot 持久化与 chunk 数据落盘，增加误写 object payload 到 Raft 的风险 |
+| 新增 `modules/store/` 数据面边界 | StorageNode 负责真实 chunk IO、durability、repair/rebalance participation，与 Raft metadata storage 职责不同；`modules/store/common` 承载共享基础类型，其余子模块按 `chunk` / `io` / `index` / `runtime` / `node` / `placement` / `maintenance` 分层 | 复用 `modules/raft/storage` 会混淆 Raft log/snapshot 持久化与 chunk 数据落盘，增加误写 object payload 到 Raft 的风险 |
 | 新增跨平台 durable file abstraction | chunk 文件需要独立定义 fsync/fdatasync、FlushFileBuffers、atomic publish、directory sync、path normalization、错误分类 | 直接调用现有 snapshot publish helper 会绑定 Raft snapshot 目录语义，无法表达 chunk staging/index/quarantine/restart rebuild |
 | StorageNode heartbeat 独立于 Raft heartbeat | capacity、used、available、chunk_count、disk pressure、IO error、load 不属于 Raft leader election heartbeat | 复用 Raft heartbeat 无法承载数据面健康和容量事实，会导致 Placement/Repair/Rebalance 盲选节点 |
 
@@ -186,7 +194,7 @@ modules/store/
 - 复核 `MetadataService` bucket/object lifecycle RPC 现状和 `MetadataStateMachine` PENDING/COMMITTED/DELETED 语义。
 - 复核 no-KV 禁止项，保留 `tests/no_kv_surface_audit.cmake` 作为后续实现的持续审计入口。
 - 复核当前无真实 `StorageNode` / `PlacementManager` / `RepairManager` / `RebalanceManager` / `ScrubManager` 残留。
-- 确认新增模块建议路径为 `modules/store/`，其中 `modules/store/common` 用于共享基础类型，`modules/store/storage_node` 用于 StorageNode data-plane 实现；不进入 `modules/raft/storage` 的 Raft persistence 语义。
+- 确认新增模块建议路径为 `modules/store/`，其中 `modules/store/common` 用于共享基础类型，其余能力按 `chunk` / `io` / `index` / `runtime` / `node` / `placement` / `maintenance` 子模块拆分；不进入 `modules/raft/storage` 的 Raft persistence 语义。
 - 确认不应修改的模块：Raft election/replication/apply/snapshot/recovery 主链路、旧 006 文档、CMake/proto/tests。
 - 确认可最小对接的模块：metadata manifest 查询、未来 upload/read/delete coordinator、StorageNode registry/heartbeat 只以明确契约进入 control-plane。
 
