@@ -157,4 +157,25 @@ namespace storedemo
         virtual DurableFileResult SyncDirectory(
             const SyncDurableDirectoryRequest &request) = 0;
     };
+
+    class LinuxDurableFile : public DurableFile
+    {
+    public:
+        explicit LinuxDurableFile(std::filesystem::path root_path);
+        ~LinuxDurableFile() override;
+
+        NormalizeDurablePathResponse NormalizePath(
+            const NormalizeDurablePathRequest &request) override;
+        OpenStagingWriterResponse OpenStagingWriter(
+            const OpenStagingWriterRequest &request) override;
+        DurableFileResult PublishStagedFile(
+            const PublishDurableFileRequest &request) override;
+        DurableFileResult SyncDirectory(
+            const SyncDurableDirectoryRequest &request) override;
+
+        [[nodiscard]] const std::filesystem::path &root_path() const;
+
+    private:
+        std::filesystem::path root_path_;
+    };
 }

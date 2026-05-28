@@ -2,8 +2,12 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string>
 #include <utility>
 
 #include "store/io/durable_file.h"
@@ -217,5 +221,153 @@ namespace storedemo
             EXPECT_TRUE(result.partial_progress);
             EXPECT_FALSE(result.durable_boundary_reached);
         }
+
+#ifdef __linux__
+        TEST(StoreDurableFileTest, LinuxDurableFileSupportsFlushPublishAndDirectorySync)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_success");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            const std::string payload = test::MakeChunkPayload(48, "linux-durable");
+            auto open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("staging/chunk-1.tmp"),
+                    .expected_size = static_cast<std::uint64_t>(payload.size()),
+                    .context = {}});
+
+            ASSERT_TRUE(open_response.ok());
+            ASSERT_NE(open_response.writer, nullptr);
+            EXPECT_EQ(open_response.normalized_path,
+                      temp_dir.Path("staging/chunk-1.tmp").lexically_normal());
+
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            auto append_result = open_response.writer->Append(
+                DurableAppendRequest{
+                    .buffer = std::span(payload_bytes, payload.size()),
+                    .context = {}});
+            EXPECT_TRUE(append_result.ok());
+            EXPECT_EQ(append_result.bytes_transferred, payload.size());
+
+            auto flush_result = open_response.writer->Flush(
+                DurableFlushRequest{
+                    .mode = DurableFlushMode::kDataAndMetadata,
+                    .context = {}});
+            EXPECT_TRUE(flush_result.ok());
+            EXPECT_TRUE(flush_result.durable_boundary_reached);
+
+            auto close_result = open_response.writer->Close(DurableCloseRequest{});
+            EXPECT_TRUE(close_result.ok());
+
+            const auto final_relative_path = std::filesystem::path("chunks/live/chunk-1.bin");
+            auto publish_result = durable_file.PublishStagedFile(
+                PublishDurableFileRequest{
+                    .staging_path = open_response.normalized_path,
+                    .final_path = final_relative_path,
+                    .mode = DurablePublishMode::kExclusive,
+                    .context = {}});
+            EXPECT_TRUE(publish_result.ok());
+            EXPECT_TRUE(publish_result.durable_boundary_reached);
+
+            const auto final_path = temp_dir.Path(final_relative_path.string());
+            EXPECT_FALSE(std::filesystem::exists(open_response.normalized_path));
+            ASSERT_TRUE(std::filesystem::exists(final_path));
+
+            auto sync_result = durable_file.SyncDirectory(
+                SyncDurableDirectoryRequest{
+                    .directory_path = final_path.parent_path(),
+                    .context = {}});
+            EXPECT_TRUE(sync_result.ok());
+            EXPECT_TRUE(sync_result.durable_boundary_reached);
+
+            std::ifstream input(final_path, std::ios::binary);
+            ASSERT_TRUE(input.is_open());
+            const std::string actual_payload{
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>()};
+            EXPECT_EQ(actual_payload, payload);
+        }
+
+        TEST(StoreDurableFileTest, LinuxDurableFileRejectsTraversalAndAbsolutePaths)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_paths");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            auto traversal_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = std::filesystem::path("../escape"),
+                    .path_type = DurablePathType::kStagingData});
+            EXPECT_FALSE(traversal_response.ok());
+            EXPECT_EQ(traversal_response.error, DurableFileErrorCode::kPathInvalid);
+
+            auto absolute_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = temp_dir.Path("absolute/chunk.tmp"),
+                    .path_type = DurablePathType::kChunkData});
+            EXPECT_FALSE(absolute_response.ok());
+            EXPECT_EQ(absolute_response.error, DurableFileErrorCode::kPathInvalid);
+        }
+
+        TEST(StoreDurableFileTest, LinuxDurableFileExclusivePublishRejectsExistingTarget)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_publish_conflict");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            auto open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("staging/chunk-2.tmp"),
+                    .expected_size = 8,
+                    .context = {}});
+            ASSERT_TRUE(open_response.ok());
+            ASSERT_NE(open_response.writer, nullptr);
+
+            const std::string payload = "conflict";
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            ASSERT_TRUE(open_response.writer
+                            ->Append(DurableAppendRequest{
+                                .buffer = std::span(payload_bytes, payload.size()),
+                                .context = {}})
+                            .ok());
+            ASSERT_TRUE(open_response.writer
+                            ->Flush(DurableFlushRequest{
+                                .mode = DurableFlushMode::kDataOnly,
+                                .context = {}})
+                            .ok());
+            ASSERT_TRUE(open_response.writer->Close(DurableCloseRequest{}).ok());
+
+            const auto final_path = temp_dir.Path("chunks/live/chunk-2.bin");
+            std::filesystem::create_directories(final_path.parent_path());
+            {
+                std::ofstream existing_file(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(existing_file.is_open());
+                existing_file << "existing";
+            }
+
+            auto publish_result = durable_file.PublishStagedFile(
+                PublishDurableFileRequest{
+                    .staging_path = open_response.normalized_path,
+                    .final_path = final_path,
+                    .mode = DurablePublishMode::kExclusive,
+                    .context = {}});
+            EXPECT_FALSE(publish_result.ok());
+            EXPECT_EQ(publish_result.error, DurableFileErrorCode::kAtomicPublishFailed);
+            EXPECT_TRUE(std::filesystem::exists(open_response.normalized_path));
+            EXPECT_TRUE(std::filesystem::exists(final_path));
+        }
+
+        TEST(StoreDurableFileTest, LinuxDurableFileSyncDirectoryRejectsMissingDirectory)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_missing_dir");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            auto sync_result = durable_file.SyncDirectory(
+                SyncDurableDirectoryRequest{
+                    .directory_path = std::filesystem::path("missing/dir"),
+                    .context = {}});
+            EXPECT_FALSE(sync_result.ok());
+            EXPECT_EQ(sync_result.error, DurableFileErrorCode::kPathInvalid);
+        }
+#endif
     }
 }

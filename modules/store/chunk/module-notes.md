@@ -1,6 +1,6 @@
 # store/chunk 说明
 
-## 这个模块是做什么的
+## 模块职责
 
 `modules/store/chunk` 定义 chunk data-plane 的抽象接口边界。
 
@@ -22,7 +22,14 @@
 
 本模块统一使用 `storedemo`。
 
-## 主要类型
+## 文件对照
+
+- `chunk_store.h`：接口和 request / response 结构
+- `chunk_store.cpp`：当前只有 `ChunkStore::~ChunkStore()`
+
+这个模块现在本来就以头文件声明为主，所以你在 `.cpp` 里看不到很多对应函数是正常的，不是漏维护。
+
+## 主要结构体和类
 
 ### `ChunkStoreResult`
 
@@ -114,6 +121,14 @@ chunk data-plane 抽象接口。
 - `DeleteChunk(...)`
 - `StatChunk(...)`
 - `ListChunks(...)`
+
+这些函数当前都只在 `chunk_store.h` 里作为纯虚接口声明，真正实现会放到后续 `LocalDiskChunkStore` 一类具体类里。
+
+## `.cpp` 当前实现了什么
+
+- `ChunkStore::~ChunkStore()`
+
+也就是说，当前 `chunk_store.cpp` 的职责只是提供虚析构定义，避免接口类链接缺口。
 
 ## 与其它模块的边界
 
