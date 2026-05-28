@@ -24,3 +24,13 @@
   问题：`AcquireChunkLock()` 只为上层提供 chunk 级冲突串行入口，`Insert / Update / Remove` 的跨步骤原子性仍依赖后续 `LocalDiskChunkStore` 等调用方在操作入口显式持有 guard。
   影响：如果后续写/删/修复流程遗漏 guard，只依赖索引内部容器锁，仍可能在多步骤状态转换上出现交错。
   建议后续在哪类任务处理：在 T021/T023 及后续 store 业务实现中，把 chunk guard 作为 write/delete/repair 主入口的固定前置步骤，并补对应测试。
+
+- 任务编号：T019
+  问题：`BoundedStorageExecutor` 当前只提供有界排队、drain/cancel-pending 停机和 worker 异常统计，还没有实现运行中任务的 deadline 到点取消或任务结果 future 聚合。
+  影响：后续 `LocalDiskChunkStore` 和 StorageNodeService 如果直接把 timeout/cancellation 当成已生效能力，可能高估当前 runtime 的中断与回收能力。
+  建议后续在哪类任务处理：在 T020 的执行器测试和后续接入任务中，明确当前 timeout/cancellation 只是扩展点；如需要真正的取消传播，再单独收紧接口和测试。
+
+- 任务编号：T019
+  问题：`BoundedStorageExecutor::Shutdown()` 当前按 owner 线程模型设计，不支持从 executor worker 回调内部自停或自析构。
+  影响：如果后续业务代码在 worker 回调里直接停止执行器，容易触发错误使用边界，影响停机收口或对象生命周期管理。
+  建议后续在哪类任务处理：在 T020 测试和后续 store runtime 接入任务中，把 owner 线程停机约束写入测试与调用规范；如确实需要 worker 内触发停机，再单独演进生命周期协议。

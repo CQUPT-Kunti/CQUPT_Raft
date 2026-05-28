@@ -3,11 +3,12 @@
 ## 目录职责
 
 - `modules/store/` 是 StorageNode / chunk data-plane 的主目录。
-- 当前按职责拆成三个子模块：
+- 当前按职责拆成多个子模块：
   - `common/`：基础类型、chunk_id helper、checksum helper
   - `chunk/`：`ChunkStore` 抽象接口
   - `io/`：durable file 抽象接口和平台实现边界
   - `index/`：本地 chunk 索引接口和 sharded map 结构
+  - `runtime/`：有界执行器和有界任务队列
 
 ## 阅读顺序
 
@@ -28,3 +29,4 @@
 - `chunk/` 只定义 chunk store 接口，不落本地磁盘实现。
 - `io/` 只处理 durable file 语义，不承接 chunk 业务编排。
 - `index/` 只维护本地索引，不负责磁盘扫描和上层对象可见性。
+- `runtime/` 只负责本地任务调度，不绑定具体 chunk / IO 业务。
