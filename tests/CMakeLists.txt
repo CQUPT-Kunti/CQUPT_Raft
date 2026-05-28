@@ -322,6 +322,28 @@ else()
   message(STATUS "Skip test_store_durable_file: store_durable_file_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_chunk_index_test.cpp")
+  add_executable(test_store_chunk_index
+    store_chunk_index_test.cpp
+  )
+
+  target_link_libraries(test_store_chunk_index
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_chunk_index
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_chunk_index test_store_chunk_index
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_chunk_index: store_chunk_index_test.cpp not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic Raft behavior tests
