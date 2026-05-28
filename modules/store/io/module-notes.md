@@ -194,3 +194,13 @@ durable file 层统一返回结构。
 - T012：契约测试骨架
 - T013：Linux 分支
 - T014：Windows 分支
+
+## 测试边界
+
+T012 的契约测试骨架只固定接口语义，不证明平台 durability 已实现。
+
+当前测试重点是：
+
+- required operation 不能用 silent no-op success 冒充成功
+- `unsupported` 和显式错误必须对调用方可见
+- flush / publish / directory sync 的结果要能区分“达到 durability 边界”和“没有达到边界”
