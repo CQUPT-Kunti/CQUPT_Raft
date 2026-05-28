@@ -10,7 +10,6 @@
 
 namespace storedemo
 {
-    // 统一承载 ChunkStore 接口层的状态和错误信息，便于后续 service/store 复用同一套结果语义。
     struct ChunkStoreResult
     {
         StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
@@ -23,14 +22,12 @@ namespace storedemo
         }
     };
 
-    // range 未设置时表示读取整个 chunk；length 必须大于 0，具体边界由实现侧校验。
     struct ChunkReadRange
     {
         std::uint64_t offset{0};
         std::uint64_t length{0};
     };
 
-    // page_size 为 0 时表示由具体实现使用默认分页大小；page_token 只用于继续同一轮分页扫描。
     struct ListChunksOptions
     {
         std::optional<ChunkState> state_filter;
@@ -40,7 +37,6 @@ namespace storedemo
         bool include_quarantine{false};
     };
 
-    // payload 当前使用 std::string 承载二进制字节，便于后续本地实现和 gRPC 适配共享一套接口。
     struct WriteChunkRequest
     {
         std::string request_id;
@@ -57,7 +53,6 @@ namespace storedemo
         bool already_exists{false};
     };
 
-    // verify_checksum=true 表示读取路径需要做完整性校验；range 只描述返回字节范围，不改变 chunk_id 语义。
     struct ReadChunkRequest
     {
         std::string request_id;
@@ -75,7 +70,6 @@ namespace storedemo
         bool verified{false};
     };
 
-    // metadata_boundary 是控制面传入的数据面删除安全边界，本接口只透传，不解释其来源。
     struct DeleteChunkRequest
     {
         std::string request_id;
@@ -119,7 +113,6 @@ namespace storedemo
         std::uint64_t snapshot_epoch{0};
     };
 
-    // ChunkStore 只定义 data-plane 语义边界，不负责 durable file、目录布局或本地索引实现细节。
     class ChunkStore
     {
     public:
