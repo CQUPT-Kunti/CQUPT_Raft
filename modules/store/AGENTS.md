@@ -7,6 +7,7 @@
   - `common/`：基础类型、chunk_id helper、checksum helper
   - `chunk/`：`ChunkStore` 抽象接口
   - `io/`：durable file 抽象接口和平台实现边界
+  - `index/`：本地 chunk 索引接口和 sharded map 结构
 
 ## 阅读顺序
 
@@ -26,3 +27,4 @@
 - `common/` 不做文件 IO、不做 RPC。
 - `chunk/` 只定义 chunk store 接口，不落本地磁盘实现。
 - `io/` 只处理 durable file 语义，不承接 chunk 业务编排。
+- `index/` 只维护本地索引，不负责磁盘扫描和上层对象可见性。

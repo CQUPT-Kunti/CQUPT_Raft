@@ -14,3 +14,8 @@
   问题：`WindowsDurableFile` 已完成条件编译实现和 Windows 条件测试，但当前环境没有 Windows 编译/测试能力，`MoveFileExW`、long path、UTF-8 path 和 directory durability 的实机行为仍未验证。
   影响：如果直接把当前状态当成跨平台实机通过，后续可能在真实 Windows 机器上暴露路径转换、句柄共享或 durability 语义偏差。
   建议后续在哪类任务处理：执行 `T014-WIN`，在真实 Windows 环境完成 build/test 和必要修正，再关闭该风险。
+
+- 任务编号：T016
+  问题：`ShardedChunkIndex::List()` 当前使用 `chunk_id` 字典序和 `page_token` 继续翻页，但还没有为并发修改提供稳定快照分页保证。
+  影响：后续在 T017/T018 引入并发更新后，跨页扫描可能出现页边界漂移或重复/漏读，需要明确 snapshot 语义或更强一致性策略。
+  建议后续在哪类任务处理：在 T017/T018 的索引测试和并发扩展中，验证并收紧分页一致性语义，必要时引入 snapshot pinning 或更强 page token 结构。
