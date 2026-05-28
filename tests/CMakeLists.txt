@@ -344,6 +344,28 @@ else()
   message(STATUS "Skip test_store_chunk_index: store_chunk_index_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_executor_test.cpp")
+  add_executable(test_store_executor
+    store_executor_test.cpp
+  )
+
+  target_link_libraries(test_store_executor
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_executor
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_executor test_store_executor
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_executor: store_executor_test.cpp not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic Raft behavior tests

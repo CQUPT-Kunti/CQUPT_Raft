@@ -119,9 +119,19 @@
 - `Shutdown()` 需要由执行器 owner 线程触发，不应该从 worker 回调里自停
 - 当前没有做“运行中任务的强制取消”，这部分要等后续业务层或 T020 之后的任务继续收紧
 
+## 当前基础测试已固定的语义
+
+- 非法配置会被修正到安全最小值
+- 空任务提交返回 `kInvalidArgument`
+- 队列满时提交立即返回 overloaded
+- `Shutdown(kDrain)` 会等待已提交任务执行完成
+- `Shutdown(kCancelPending)` 会丢弃尚未开始的 pending task
+- worker 抛异常后仍会继续处理后续任务
+- worker 内调用 `Shutdown()` 返回明确边界错误，不会静默自停
+- 析构会按 drain 语义回收 worker 线程
+
 ## 当前未实现内容
 
-- 完整单元测试，留给 T020
 - deadline 到点自动取消
 - 任务级 future / 返回值聚合
 - 更细粒度的优先级、速率限制和多队列调度
