@@ -178,4 +178,25 @@ namespace storedemo
     private:
         std::filesystem::path root_path_;
     };
+
+    class WindowsDurableFile : public DurableFile
+    {
+    public:
+        explicit WindowsDurableFile(std::filesystem::path root_path);
+        ~WindowsDurableFile() override;
+
+        NormalizeDurablePathResponse NormalizePath(
+            const NormalizeDurablePathRequest &request) override;
+        OpenStagingWriterResponse OpenStagingWriter(
+            const OpenStagingWriterRequest &request) override;
+        DurableFileResult PublishStagedFile(
+            const PublishDurableFileRequest &request) override;
+        DurableFileResult SyncDirectory(
+            const SyncDurableDirectoryRequest &request) override;
+
+        [[nodiscard]] const std::filesystem::path &root_path() const;
+
+    private:
+        std::filesystem::path root_path_;
+    };
 }

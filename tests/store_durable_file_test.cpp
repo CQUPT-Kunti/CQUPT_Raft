@@ -369,5 +369,88 @@ namespace storedemo
             EXPECT_EQ(sync_result.error, DurableFileErrorCode::kPathInvalid);
         }
 #endif
+
+#ifdef _WIN32
+        TEST(StoreDurableFileTest, WindowsDurableFileSupportsFlushAndPublish)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_windows_success");
+            WindowsDurableFile durable_file(temp_dir.root());
+
+            const std::string payload = test::MakeChunkPayload(64, "windows-durable");
+            auto open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("staging/chunk-1.tmp"),
+                    .expected_size = static_cast<std::uint64_t>(payload.size()),
+                    .context = {}});
+
+            ASSERT_TRUE(open_response.ok());
+            ASSERT_NE(open_response.writer, nullptr);
+
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            auto append_result = open_response.writer->Append(
+                DurableAppendRequest{
+                    .buffer = std::span(payload_bytes, payload.size()),
+                    .context = {}});
+            EXPECT_TRUE(append_result.ok());
+            EXPECT_EQ(append_result.bytes_transferred, payload.size());
+
+            auto flush_result = open_response.writer->Flush(
+                DurableFlushRequest{
+                    .mode = DurableFlushMode::kDataAndMetadata,
+                    .context = {}});
+            EXPECT_TRUE(flush_result.ok());
+            EXPECT_TRUE(flush_result.durable_boundary_reached);
+
+            EXPECT_TRUE(open_response.writer->Close(DurableCloseRequest{}).ok());
+
+            const auto final_relative_path = std::filesystem::path("chunks/live/chunk-1.bin");
+            auto publish_result = durable_file.PublishStagedFile(
+                PublishDurableFileRequest{
+                    .staging_path = open_response.normalized_path,
+                    .final_path = final_relative_path,
+                    .mode = DurablePublishMode::kExclusive,
+                    .context = {}});
+            EXPECT_TRUE(publish_result.ok());
+            EXPECT_TRUE(publish_result.durable_boundary_reached);
+
+            const auto final_path = temp_dir.Path(final_relative_path.string());
+            EXPECT_TRUE(std::filesystem::exists(final_path));
+
+            auto sync_result = durable_file.SyncDirectory(
+                SyncDurableDirectoryRequest{
+                    .directory_path = final_path.parent_path(),
+                    .context = {}});
+            EXPECT_FALSE(sync_result.ok());
+            EXPECT_EQ(sync_result.error, DurableFileErrorCode::kUnsupported);
+        }
+
+        TEST(StoreDurableFileTest, WindowsDurableFileRejectsTraversalReservedNamesAndAbsolutePaths)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_windows_paths");
+            WindowsDurableFile durable_file(temp_dir.root());
+
+            auto traversal_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = std::filesystem::path("../escape"),
+                    .path_type = DurablePathType::kStagingData});
+            EXPECT_FALSE(traversal_response.ok());
+            EXPECT_EQ(traversal_response.error, DurableFileErrorCode::kPathInvalid);
+
+            auto reserved_name_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = std::filesystem::path("CON/chunk.tmp"),
+                    .path_type = DurablePathType::kChunkData});
+            EXPECT_FALSE(reserved_name_response.ok());
+            EXPECT_EQ(reserved_name_response.error, DurableFileErrorCode::kPathInvalid);
+
+            auto absolute_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = temp_dir.Path("absolute/chunk.tmp"),
+                    .path_type = DurablePathType::kChunkData});
+            EXPECT_FALSE(absolute_response.ok());
+            EXPECT_EQ(absolute_response.error, DurableFileErrorCode::kPathInvalid);
+        }
+#endif
     }
 }
