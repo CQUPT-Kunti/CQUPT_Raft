@@ -1,10 +1,12 @@
 #include "store/io/durable_file.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cctype>
 #include <climits>
 #include <cstring>
+#include <iterator>
 #include <system_error>
 
 #ifdef __linux__
@@ -158,6 +160,92 @@ namespace storedemo
             return root_it == root_path.end();
         }
 
+        std::string TrimWindowsTrailingDotsAndSpaces(std::string value)
+        {
+            while (!value.empty() &&
+                   (value.back() == ' ' || value.back() == '.'))
+            {
+                value.pop_back();
+            }
+            return value;
+        }
+
+        std::string UppercaseAscii(std::string value)
+        {
+            std::transform(value.begin(),
+                           value.end(),
+                           value.begin(),
+                           [](unsigned char ch)
+                           { return static_cast<char>(std::toupper(ch)); });
+            return value;
+        }
+
+        bool IsWindowsReservedBaseName(const std::string &base_name)
+        {
+            static const char *const kReservedNames[] = {
+                "CON", "PRN", "AUX", "NUL",
+                "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+
+            for (const char *reserved : kReservedNames)
+            {
+                if (base_name == reserved)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool ContainsWindowsInvalidPathChars(const std::string &part)
+        {
+            return part.find_first_of("<>:\"|?*") != std::string::npos;
+        }
+
+        bool IsWindowsReservedPathPart(const std::string &part)
+        {
+            const auto trimmed = TrimWindowsTrailingDotsAndSpaces(part);
+            const auto extension_separator = trimmed.find('.');
+            const auto base_name =
+                UppercaseAscii(trimmed.substr(0, extension_separator));
+            return !base_name.empty() && IsWindowsReservedBaseName(base_name);
+        }
+
+        bool IsValidDurablePathPart(const std::filesystem::path &part,
+                                    std::string *error_detail)
+        {
+            const auto part_string = PathToUtf8String(part);
+            if (part_string.empty())
+            {
+                SetErrorDetail(error_detail, "path segment must not be empty");
+                return false;
+            }
+            if (part_string == "." || part_string == "..")
+            {
+                SetErrorDetail(error_detail, "path traversal is not allowed");
+                return false;
+            }
+            if (part_string.back() == ' ' || part_string.back() == '.')
+            {
+                SetErrorDetail(error_detail,
+                               "path segment must not end with space or dot");
+                return false;
+            }
+            if (ContainsWindowsInvalidPathChars(part_string))
+            {
+                SetErrorDetail(error_detail,
+                               "path segment contains Windows-invalid character");
+                return false;
+            }
+            if (IsWindowsReservedPathPart(part_string))
+            {
+                SetErrorDetail(error_detail,
+                               "path segment uses Windows reserved name");
+                return false;
+            }
+            return true;
+        }
+
         std::optional<std::filesystem::path> ResolvePathWithinRoot(
             const std::filesystem::path &root_path,
             const std::filesystem::path &input_path)
@@ -169,7 +257,21 @@ namespace storedemo
 
             if (!input_path.is_absolute() && !input_path.has_root_name())
             {
-                return (root_path / input_path.lexically_normal()).lexically_normal();
+                std::filesystem::path normalized_relative_path;
+                if (NormalizeDurableRelativePath(input_path,
+                                                &normalized_relative_path,
+                                                nullptr) != StorageNodeStatusCode::kOk)
+                {
+                    return std::nullopt;
+                }
+
+                const auto resolved_path =
+                    (root_path / normalized_relative_path).lexically_normal();
+                if (!IsPathWithinRoot(root_path, resolved_path))
+                {
+                    return std::nullopt;
+                }
+                return resolved_path;
             }
 
             const auto normalized_absolute = input_path.lexically_normal();
@@ -178,6 +280,23 @@ namespace storedemo
                 return std::nullopt;
             }
             return normalized_absolute;
+        }
+
+        std::array<char, 4> BuildChunkShardSegments(const std::string_view chunk_id)
+        {
+            std::uint64_t hash = 1469598103934665603ULL;
+            for (const unsigned char ch : chunk_id)
+            {
+                hash ^= static_cast<std::uint64_t>(ch);
+                hash *= 1099511628211ULL;
+            }
+
+            static constexpr char kHexDigits[] = "0123456789abcdef";
+            return {
+                kHexDigits[(hash >> 60U) & 0x0fU],
+                kHexDigits[(hash >> 56U) & 0x0fU],
+                kHexDigits[(hash >> 52U) & 0x0fU],
+                kHexDigits[(hash >> 48U) & 0x0fU]};
         }
 
         DurableFileResult UnsupportedPlatformResult(const char *operation,
@@ -409,63 +528,6 @@ namespace storedemo
                            [](unsigned char ch)
                            { return static_cast<char>(std::toupper(ch)); });
             return value;
-        }
-
-        bool IsWindowsReservedBaseName(const std::string &base_name)
-        {
-            static const char *const kReservedNames[] = {
-                "CON", "PRN", "AUX", "NUL",
-                "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-                "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
-
-            for (const char *reserved : kReservedNames)
-            {
-                if (base_name == reserved)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        bool ContainsWindowsInvalidPathChars(const std::string &part)
-        {
-            return part.find_first_of("<>:\"|?*") != std::string::npos;
-        }
-
-        bool IsWindowsReservedPathPart(const std::string &part)
-        {
-            const auto trimmed = TrimWindowsTrailingDotsAndSpaces(part);
-            const auto extension_separator = trimmed.find('.');
-            const auto base_name =
-                UppercaseAscii(trimmed.substr(0, extension_separator));
-            return !base_name.empty() && IsWindowsReservedBaseName(base_name);
-        }
-
-        bool IsValidWindowsRelativePathPart(const std::filesystem::path &part)
-        {
-            const auto part_string = PathToUtf8String(part);
-            if (part_string.empty())
-            {
-                return false;
-            }
-            if (part_string == "." || part_string == "..")
-            {
-                return false;
-            }
-            if (part_string.back() == ' ' || part_string.back() == '.')
-            {
-                return false;
-            }
-            if (ContainsWindowsInvalidPathChars(part_string))
-            {
-                return false;
-            }
-            if (IsWindowsReservedPathPart(part_string))
-            {
-                return false;
-            }
-            return true;
         }
 
         std::optional<std::wstring> Utf8ToWide(const std::string &utf8)
@@ -732,6 +794,188 @@ namespace storedemo
         return MapDurableFileErrorCodeImpl(error);
     }
 
+    bool ChunkPathLayout::IsValid() const
+    {
+        return !final_relative_path.empty() &&
+               !staging_relative_path.empty() &&
+               final_relative_path != staging_relative_path;
+    }
+
+    StorageNodeStatusCode NormalizeDurableRelativePath(
+        const std::filesystem::path &relative_path,
+        std::filesystem::path *out_normalized_relative_path,
+        std::string *error_detail)
+    {
+        if (out_normalized_relative_path == nullptr)
+        {
+            SetErrorDetail(error_detail,
+                           "normalized relative path output must not be null");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        out_normalized_relative_path->clear();
+
+        if (relative_path.empty())
+        {
+            SetErrorDetail(error_detail, "relative path must not be empty");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        if (relative_path.is_absolute() || relative_path.has_root_name())
+        {
+            SetErrorDetail(error_detail, "absolute path is not allowed");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        for (const auto &part : relative_path)
+        {
+            if (!IsValidDurablePathPart(part, error_detail))
+            {
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+        }
+
+        const auto normalized_relative_path = relative_path.lexically_normal();
+        if (normalized_relative_path.empty())
+        {
+            SetErrorDetail(error_detail, "normalized path must not be empty");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        for (const auto &part : normalized_relative_path)
+        {
+            if (!IsValidDurablePathPart(part, error_detail))
+            {
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+        }
+
+        *out_normalized_relative_path = normalized_relative_path;
+        return StorageNodeStatusCode::kOk;
+    }
+
+    StorageNodeStatusCode ResolveDurablePathUnderRoot(
+        const std::filesystem::path &root_path,
+        const std::filesystem::path &relative_path,
+        std::filesystem::path *out_resolved_path,
+        std::string *error_detail)
+    {
+        if (out_resolved_path == nullptr)
+        {
+            SetErrorDetail(error_detail, "resolved path output must not be null");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        out_resolved_path->clear();
+
+        std::filesystem::path normalized_relative_path;
+        const auto status = NormalizeDurableRelativePath(
+            relative_path,
+            &normalized_relative_path,
+            error_detail);
+        if (status != StorageNodeStatusCode::kOk)
+        {
+            return status;
+        }
+
+        const auto normalized_root_path =
+            std::filesystem::absolute(root_path).lexically_normal();
+        const auto resolved_path =
+            (normalized_root_path / normalized_relative_path).lexically_normal();
+        if (!IsPathWithinRoot(normalized_root_path, resolved_path))
+        {
+            SetErrorDetail(error_detail, "resolved path escapes durable file root");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        *out_resolved_path = resolved_path;
+        return StorageNodeStatusCode::kOk;
+    }
+
+    StorageNodeStatusCode BuildChunkPathLayout(
+        const std::string_view chunk_id,
+        const std::string_view staging_token,
+        ChunkPathLayout *out_layout,
+        std::string *error_detail)
+    {
+        if (out_layout == nullptr)
+        {
+            SetErrorDetail(error_detail, "chunk path layout output must not be null");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        *out_layout = {};
+
+        const auto chunk_id_status = ValidateChunkId(chunk_id, error_detail);
+        if (chunk_id_status != StorageNodeStatusCode::kOk)
+        {
+            return chunk_id_status;
+        }
+
+        if (staging_token.empty())
+        {
+            SetErrorDetail(error_detail, "staging token must not be empty");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        std::filesystem::path normalized_staging_token;
+        const auto staging_token_status = NormalizeDurableRelativePath(
+            std::filesystem::path(std::string(staging_token)),
+            &normalized_staging_token,
+            error_detail);
+        if (staging_token_status != StorageNodeStatusCode::kOk)
+        {
+            return staging_token_status;
+        }
+
+        if (std::distance(normalized_staging_token.begin(),
+                          normalized_staging_token.end()) != 1)
+        {
+            SetErrorDetail(error_detail,
+                           "staging token must be a single safe path segment");
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        const auto shard_segments = BuildChunkShardSegments(chunk_id);
+        const std::string shard_level_one = {shard_segments[0], shard_segments[1]};
+        const std::string shard_level_two = {shard_segments[2], shard_segments[3]};
+        const auto staging_token_string = PathToUtf8String(normalized_staging_token);
+
+        out_layout->final_relative_path =
+            std::filesystem::path("chunks") / "live" / shard_level_one /
+            shard_level_two / (std::string(chunk_id) + ".chunk");
+        out_layout->staging_relative_path =
+            std::filesystem::path("chunks") / "staging" / shard_level_one /
+            shard_level_two /
+            (std::string(chunk_id) + "." + staging_token_string + ".tmp");
+
+        std::filesystem::path normalized_final_path;
+        const auto final_status = NormalizeDurableRelativePath(
+            out_layout->final_relative_path,
+            &normalized_final_path,
+            error_detail);
+        if (final_status != StorageNodeStatusCode::kOk)
+        {
+            *out_layout = {};
+            return final_status;
+        }
+
+        std::filesystem::path normalized_staging_path;
+        const auto staging_status = NormalizeDurableRelativePath(
+            out_layout->staging_relative_path,
+            &normalized_staging_path,
+            error_detail);
+        if (staging_status != StorageNodeStatusCode::kOk)
+        {
+            *out_layout = {};
+            return staging_status;
+        }
+
+        out_layout->final_relative_path = normalized_final_path;
+        out_layout->staging_relative_path = normalized_staging_path;
+        return StorageNodeStatusCode::kOk;
+    }
+
     DurableFileWriter::~DurableFileWriter() = default;
 
     DurableFile::~DurableFile() = default;
@@ -751,44 +995,14 @@ namespace storedemo
         response = MakeUnsupportedNormalizeResponse("NormalizePath", "Linux");
         return response;
 #else
-        if (request.relative_path.empty())
+        const auto status = ResolveDurablePathUnderRoot(
+            root_path_,
+            request.relative_path,
+            &response.normalized_path,
+            &response.error_detail);
+        if (status != StorageNodeStatusCode::kOk)
         {
             response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "relative path must not be empty";
-            return response;
-        }
-
-        if (request.relative_path.is_absolute() || request.relative_path.has_root_name())
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "absolute path is not allowed";
-            return response;
-        }
-
-        for (const auto &part : request.relative_path)
-        {
-            if (part == "." || part == "..")
-            {
-                response.error = DurableFileErrorCode::kPathInvalid;
-                response.error_detail = "path traversal is not allowed";
-                return response;
-            }
-        }
-
-        const auto normalized_relative = request.relative_path.lexically_normal();
-        if (normalized_relative.empty())
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "normalized path must not be empty";
-            return response;
-        }
-
-        response.normalized_path = (root_path_ / normalized_relative).lexically_normal();
-        if (!IsPathWithinRoot(root_path_, response.normalized_path))
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "normalized path escapes durable file root";
-            response.normalized_path.clear();
             return response;
         }
 
@@ -988,45 +1202,14 @@ namespace storedemo
         response = MakeUnsupportedNormalizeResponse("NormalizePath", "Windows");
         return response;
 #else
-        if (request.relative_path.empty())
+        const auto status = ResolveDurablePathUnderRoot(
+            root_path_,
+            request.relative_path,
+            &response.normalized_path,
+            &response.error_detail);
+        if (status != StorageNodeStatusCode::kOk)
         {
             response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "relative path must not be empty";
-            return response;
-        }
-
-        if (request.relative_path.is_absolute() || request.relative_path.has_root_name())
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "absolute path is not allowed";
-            return response;
-        }
-
-        for (const auto &part : request.relative_path)
-        {
-            if (!IsValidWindowsRelativePathPart(part))
-            {
-                response.error = DurableFileErrorCode::kPathInvalid;
-                response.error_detail =
-                    "Windows path contains traversal, reserved name or invalid character";
-                return response;
-            }
-        }
-
-        const auto normalized_relative = request.relative_path.lexically_normal();
-        if (normalized_relative.empty())
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "normalized path must not be empty";
-            return response;
-        }
-
-        response.normalized_path = (root_path_ / normalized_relative).lexically_normal();
-        if (!IsPathWithinRoot(root_path_, response.normalized_path))
-        {
-            response.error = DurableFileErrorCode::kPathInvalid;
-            response.error_detail = "normalized path escapes durable file root";
-            response.normalized_path.clear();
             return response;
         }
 

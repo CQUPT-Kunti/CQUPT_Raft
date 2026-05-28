@@ -8,8 +8,8 @@
 
 ## 主要文件
 
-- `durable_file.h`：durable file 类型、请求/响应、接口声明
-- `durable_file.cpp`：错误映射、Linux / Windows durable file 实现
+- `durable_file.h`：durable file 类型、请求/响应、接口声明，以及路径 normalization / chunk layout helper 声明
+- `durable_file.cpp`：错误映射、Linux / Windows durable file 实现，以及路径 / 布局 helper 实现
 - `module-notes.md`：结构体、函数和平台边界说明
 
 ## 修改规则

@@ -2,7 +2,7 @@
 
 ## 模块职责
 
-`modules/store/io` 定义 durable file 抽象接口和平台实现边界。
+`modules/store/io` 定义 durable file 抽象接口、路径 normalization helper 和 chunk 布局 helper。
 
 它负责：
 
@@ -11,6 +11,7 @@
 - staging 到 final 的 atomic publish
 - parent directory sync
 - 路径规范化
+- chunk final / staging 相对路径布局
 - 跨平台共享错误分类
 
 它不负责：
@@ -22,8 +23,8 @@
 
 ## 文件对照
 
-- `durable_file.h`：公开错误码、请求/响应、接口声明、`LinuxDurableFile` / `WindowsDurableFile` 声明
-- `durable_file.cpp`：错误映射、Linux / Windows 实现、内部 writer
+- `durable_file.h`：公开错误码、请求/响应、接口声明、路径 / 布局 helper、`LinuxDurableFile` / `WindowsDurableFile` 声明
+- `durable_file.cpp`：错误映射、路径 / 布局 helper、Linux / Windows 实现、内部 writer
 
 如果你想找“某个文档条目具体对应哪个 `.cpp` 函数”，主要看下面这节。
 
@@ -91,6 +92,15 @@ durable file 层统一返回结构。
 
 单独表达 directory sync，因为它和文件 flush 是两个不同的 durability 边界。
 
+### `ChunkPathLayout`
+
+保存后续 chunk store 要用到的两条相对路径：
+
+- `final_relative_path`
+- `staging_relative_path`
+
+它只描述布局，不做真实文件写入。
+
 ### `DurableFileWriter`
 
 表示一次 staging 写入会话。
@@ -117,6 +127,21 @@ Windows 平台上的具体实现入口。
 - `MapDurableFileErrorCode(...)`
 - `IsRetriableDurableFileError(...)`
 - `DurableFileResult::status_code()`
+
+### 路径和布局 helper
+
+- `NormalizeDurableRelativePath(...)`
+- `ResolveDurablePathUnderRoot(...)`
+- `BuildChunkPathLayout(...)`
+- `ChunkPathLayout::IsValid()`
+
+这几项是 T015 新增的公共 helper：
+
+- `NormalizeDurableRelativePath(...)`：只校验和规范化相对路径
+- `ResolveDurablePathUnderRoot(...)`：把安全相对路径解析到 data root 内
+- `BuildChunkPathLayout(...)`：基于 `chunk_id` 和 `staging_token` 生成 final / staging 相对路径
+
+这里对所有平台都采用统一的安全子集规则，所以会主动拒绝 Windows reserved names、非法字符、绝对路径和 `..`。
 
 ### 抽象基类析构
 
@@ -200,6 +225,19 @@ Windows 平台上的具体实现入口。
 - directory durability：`WindowsDurableFile::SyncDirectory(...)`
 
 当前 directory durability 还没有给出等价实现，所以 `WindowsDurableFile::SyncDirectory(...)` 会返回 explicit `kUnsupported`，而不是 no-op success。
+
+## 当前 chunk 布局规则
+
+`BuildChunkPathLayout(...)` 当前会生成：
+
+- final：`chunks/live/<shard-1>/<shard-2>/<chunk_id>.chunk`
+- staging：`chunks/staging/<shard-1>/<shard-2>/<chunk_id>.<staging_token>.tmp`
+
+其中：
+
+- shard 目录来自 `chunk_id` 的稳定 FNV-1a 分片结果
+- `staging_token` 必须是单个安全 path segment
+- final 和 staging 明确区分，给后续 staged write -> publish 预留路径边界
 
 ## 测试边界
 

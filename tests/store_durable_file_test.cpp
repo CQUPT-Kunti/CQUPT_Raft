@@ -222,6 +222,121 @@ namespace storedemo
             EXPECT_FALSE(result.durable_boundary_reached);
         }
 
+        TEST(StoreDurableFileTest, NormalizeDurableRelativePathRejectsEscapeReservedNamesAndInvalidCharacters)
+        {
+            std::filesystem::path normalized_path;
+            std::string error_detail;
+
+            EXPECT_EQ(NormalizeDurableRelativePath(
+                          std::filesystem::path("chunks/live/chunk-1.chunk"),
+                          &normalized_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kOk);
+            EXPECT_EQ(normalized_path,
+                      std::filesystem::path("chunks/live/chunk-1.chunk"));
+
+            EXPECT_EQ(NormalizeDurableRelativePath(
+                          std::filesystem::path("../escape"),
+                          &normalized_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+
+            EXPECT_EQ(NormalizeDurableRelativePath(
+                          std::filesystem::path("/absolute/escape"),
+                          &normalized_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+
+            EXPECT_EQ(NormalizeDurableRelativePath(
+                          std::filesystem::path("CON/chunk-1.chunk"),
+                          &normalized_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+
+            EXPECT_EQ(NormalizeDurableRelativePath(
+                          std::filesystem::path("chunks/bad:name.chunk"),
+                          &normalized_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+        }
+
+        TEST(StoreDurableFileTest, ResolveDurablePathUnderRootKeepsResolvedPathInsideRoot)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_resolve_root");
+            std::filesystem::path resolved_path;
+            std::string error_detail;
+
+            EXPECT_EQ(ResolveDurablePathUnderRoot(
+                          temp_dir.root(),
+                          std::filesystem::path("chunks/live/chunk-1.chunk"),
+                          &resolved_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kOk);
+            EXPECT_EQ(resolved_path,
+                      temp_dir.Path("chunks/live/chunk-1.chunk").lexically_normal());
+
+            EXPECT_EQ(ResolveDurablePathUnderRoot(
+                          temp_dir.root(),
+                          std::filesystem::path("../escape"),
+                          &resolved_path,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+        }
+
+        TEST(StoreDurableFileTest, BuildChunkPathLayoutCreatesDistinctFinalAndStagingPaths)
+        {
+            ChunkId chunk_id;
+            ASSERT_EQ(MakeChunkId("object-alpha", 7, 3, &chunk_id, nullptr),
+                      StorageNodeStatusCode::kOk);
+
+            ChunkPathLayout layout;
+            std::string error_detail;
+            ASSERT_EQ(BuildChunkPathLayout(
+                          chunk_id,
+                          "request-42",
+                          &layout,
+                          &error_detail),
+                      StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(layout.IsValid());
+            EXPECT_NE(layout.final_relative_path, layout.staging_relative_path);
+            EXPECT_EQ(layout.final_relative_path.begin()->string(), "chunks");
+            EXPECT_NE(layout.final_relative_path.generic_string().find("/live/"),
+                      std::string::npos);
+            EXPECT_NE(layout.staging_relative_path.generic_string().find("/staging/"),
+                      std::string::npos);
+            EXPECT_NE(layout.final_relative_path.filename().string().find(chunk_id),
+                      std::string::npos);
+            EXPECT_NE(layout.staging_relative_path.filename().string().find("request-42"),
+                      std::string::npos);
+        }
+
+        TEST(StoreDurableFileTest, BuildChunkPathLayoutRejectsInvalidChunkIdAndStagingToken)
+        {
+            ChunkPathLayout layout;
+            std::string error_detail;
+
+            EXPECT_EQ(BuildChunkPathLayout(
+                          "bad/chunk",
+                          "request-42",
+                          &layout,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+
+            EXPECT_EQ(BuildChunkPathLayout(
+                          "object-alpha~7~3",
+                          "../escape",
+                          &layout,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+
+            EXPECT_EQ(BuildChunkPathLayout(
+                          "object-alpha~7~3",
+                          "CON",
+                          &layout,
+                          &error_detail),
+                      StorageNodeStatusCode::kInvalidArgument);
+        }
+
 #ifdef __linux__
         TEST(StoreDurableFileTest, LinuxDurableFileSupportsFlushPublishAndDirectorySync)
         {

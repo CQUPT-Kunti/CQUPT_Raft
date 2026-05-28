@@ -126,6 +126,31 @@ namespace storedemo
         DurableOperationContext context;
     };
 
+    struct ChunkPathLayout
+    {
+        std::filesystem::path final_relative_path;
+        std::filesystem::path staging_relative_path;
+
+        [[nodiscard]] bool IsValid() const;
+    };
+
+    StorageNodeStatusCode NormalizeDurableRelativePath(
+        const std::filesystem::path &relative_path,
+        std::filesystem::path *out_normalized_relative_path,
+        std::string *error_detail = nullptr);
+
+    StorageNodeStatusCode ResolveDurablePathUnderRoot(
+        const std::filesystem::path &root_path,
+        const std::filesystem::path &relative_path,
+        std::filesystem::path *out_resolved_path,
+        std::string *error_detail = nullptr);
+
+    StorageNodeStatusCode BuildChunkPathLayout(
+        std::string_view chunk_id,
+        std::string_view staging_token,
+        ChunkPathLayout *out_layout,
+        std::string *error_detail = nullptr);
+
     class DurableFileWriter
     {
     public:
