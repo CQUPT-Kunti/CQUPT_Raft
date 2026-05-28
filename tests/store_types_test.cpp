@@ -54,6 +54,104 @@ TEST(StoreTypesTest, ChunkChecksumDefaultsRemainUnsetUntilAlgorithmValueAndSizeE
   EXPECT_TRUE(checksum.IsSet());
 }
 
+TEST(StoreTypesTest, ChunkChecksumHelperComputesStableSha256ForSamePayload) {
+  const std::string payload = "chunk-payload-for-checksum";
+  ChunkChecksum first;
+  ChunkChecksum second;
+  std::string error_detail;
+
+  EXPECT_EQ(ComputeChunkChecksum(payload, &first, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(ComputeChunkChecksum(payload, &second, &error_detail),
+            StorageNodeStatusCode::kOk);
+
+  EXPECT_TRUE(error_detail.empty());
+  EXPECT_EQ(first.algorithm, ChunkChecksumAlgorithm::kSha256);
+  EXPECT_EQ(first.size_bytes, payload.size());
+  EXPECT_EQ(first.computed_at, 0U);
+  EXPECT_EQ(first.value.size(), kSha256DigestHexChars);
+  EXPECT_TRUE(first.IsSet());
+
+  EXPECT_EQ(first.algorithm, second.algorithm);
+  EXPECT_EQ(first.size_bytes, second.size_bytes);
+  EXPECT_EQ(first.value, second.value);
+}
+
+TEST(StoreTypesTest, ChunkChecksumHelperSupportsEmptyAndBinaryPayload) {
+  ChunkChecksum empty_checksum;
+  std::string error_detail;
+  EXPECT_EQ(ComputeChunkChecksum("", &empty_checksum, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_TRUE(error_detail.empty());
+  EXPECT_EQ(empty_checksum.algorithm, ChunkChecksumAlgorithm::kSha256);
+  EXPECT_EQ(empty_checksum.size_bytes, 0U);
+  EXPECT_EQ(
+      empty_checksum.value,
+      "e3b0c44298fc1c149afbf4c8996fb924"
+      "27ae41e4649b934ca495991b7852b855");
+  EXPECT_TRUE(empty_checksum.IsSet());
+
+  const std::string binary_payload(
+      {static_cast<char>(0x00),
+       static_cast<char>(0x01),
+       static_cast<char>(0x02),
+       static_cast<char>(0x7f),
+       static_cast<char>(0x80),
+       static_cast<char>(0xff),
+       'b',
+       'i',
+       'n',
+       static_cast<char>(0x00),
+       't',
+       'a',
+       'i',
+       'l'});
+  ChunkChecksum binary_checksum;
+  EXPECT_EQ(ComputeChunkChecksum(binary_payload, &binary_checksum, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(binary_checksum.algorithm, ChunkChecksumAlgorithm::kSha256);
+  EXPECT_EQ(binary_checksum.size_bytes, binary_payload.size());
+  EXPECT_EQ(binary_checksum.value.size(), kSha256DigestHexChars);
+
+  ChunkChecksum binary_checksum_again;
+  EXPECT_EQ(ComputeChunkChecksum(binary_payload, &binary_checksum_again, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(binary_checksum.value, binary_checksum_again.value);
+}
+
+TEST(StoreTypesTest, ChunkChecksumHelperDetectsMismatchAndSupportsVerification) {
+  const std::string payload = "payload-a";
+  const std::string different_payload = "payload-b";
+  ChunkChecksum expected_checksum;
+  std::string error_detail;
+
+  EXPECT_EQ(ComputeChunkChecksum(payload, &expected_checksum, &error_detail),
+            StorageNodeStatusCode::kOk);
+
+  ChunkChecksum actual_checksum;
+  EXPECT_EQ(VerifyChunkChecksum(payload, expected_checksum, &actual_checksum, &error_detail),
+            StorageNodeStatusCode::kOk);
+  EXPECT_EQ(actual_checksum.value, expected_checksum.value);
+  EXPECT_EQ(actual_checksum.size_bytes, expected_checksum.size_bytes);
+
+  EXPECT_EQ(VerifyChunkChecksum(different_payload,
+                                expected_checksum,
+                                &actual_checksum,
+                                &error_detail),
+            StorageNodeStatusCode::kChecksumMismatch);
+  EXPECT_NE(error_detail.find("mismatch"), std::string::npos);
+
+  ChunkChecksum invalid_expected = expected_checksum;
+  invalid_expected.algorithm = ChunkChecksumAlgorithm::kUnknown;
+  EXPECT_EQ(VerifyChunkChecksum(payload, invalid_expected, nullptr, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+
+  invalid_expected = expected_checksum;
+  invalid_expected.value = "short";
+  EXPECT_EQ(VerifyChunkChecksum(payload, invalid_expected, nullptr, &error_detail),
+            StorageNodeStatusCode::kInvalidArgument);
+}
+
 TEST(StoreTypesTest, ChunkLocationAndIdentityValidateLightweightKeys) {
   ChunkLocation location;
   location.node_id = "node-a";
