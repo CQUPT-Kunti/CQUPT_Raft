@@ -69,3 +69,8 @@
   问题：T028 只通过 test-only `WriteChunk` contract adapter 固定了 request_id 幂等、checksum、durable、already_exists/conflict、overloaded 和“timeout/cancellation 仍是显式边界”的测试语义，当前仓库仍没有真实 StorageNode proto / service / client，也没有跨 RPC 的 deadline/cancelled 映射收口。
   影响：如果后续 T029-T032 在 proto/service/client 接入时把 `already_exists`、`conflict`、`overloaded` 或 deadline/cancellation 解释成与 T028 contract 不一致的 RPC 行为，仍可能在重试、过载回退或模糊超时下出现语义漂移。
   建议后续在哪类任务处理：在 T029-T032 的 StorageNode proto / service / client 实现与回归测试中，对齐 T028 contract 测试，并补 RPC deadline/cancelled/error mapping 的真实端到端验证。
+
+- 任务编号：T029
+  问题：T029 只新增了 `proto/storage_node.proto` 的 MVP `WriteChunk` schema，当前还没有 CMake 生成目标、生成代码链接边界或真实 StorageNodeService/StorageNodeClient 实现。
+  影响：虽然 schema 已静态固定 `WriteChunk` 的字段和状态码范围，但在 T030-T032 完成前，仓库主构建不会编译生成的 storage node bindings，后续仍可能在 proto target 边界、状态码映射或 request/response 字段接线上出现漂移。
+  建议后续在哪类任务处理：在 T030-T032 中补齐 `storage_node.proto` 的生成 target、service/client 映射和针对 `WriteChunk` 的端到端回归，确保不让 `raft_proto` 依赖 storage node 生成代码。

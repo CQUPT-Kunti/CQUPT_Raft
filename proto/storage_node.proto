@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package raft;
+
+enum StorageNodeStatusCode {
+  STORAGE_NODE_STATUS_CODE_UNSPECIFIED = 0;
+  STORAGE_NODE_STATUS_CODE_OK = 1;
+  STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS = 2;
+  STORAGE_NODE_STATUS_CODE_NOT_FOUND = 3;
+  STORAGE_NODE_STATUS_CODE_CONFLICT = 4;
+  STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH = 5;
+  STORAGE_NODE_STATUS_CODE_CORRUPTED = 6;
+  STORAGE_NODE_STATUS_CODE_DISK_FULL = 7;
+  STORAGE_NODE_STATUS_CODE_PERMISSION_DENIED = 8;
+  STORAGE_NODE_STATUS_CODE_IO_ERROR = 9;
+  STORAGE_NODE_STATUS_CODE_TIMEOUT = 10;
+  STORAGE_NODE_STATUS_CODE_CANCELLED = 11;
+  STORAGE_NODE_STATUS_CODE_OVERLOADED = 12;
+  STORAGE_NODE_STATUS_CODE_NODE_UNAVAILABLE = 13;
+  STORAGE_NODE_STATUS_CODE_UNSUPPORTED = 14;
+  STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT = 15;
+}
+
+enum StorageChecksumAlgorithm {
+  STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED = 0;
+  STORAGE_CHECKSUM_ALGORITHM_SHA256 = 1;
+}
+
+enum StorageChunkState {
+  STORAGE_CHUNK_STATE_UNSPECIFIED = 0;
+  STORAGE_CHUNK_STATE_STAGING = 1;
+  STORAGE_CHUNK_STATE_LIVE = 2;
+  STORAGE_CHUNK_STATE_DELETING = 3;
+  STORAGE_CHUNK_STATE_DELETED = 4;
+  STORAGE_CHUNK_STATE_QUARANTINED = 5;
+  STORAGE_CHUNK_STATE_CORRUPTED = 6;
+  STORAGE_CHUNK_STATE_MISSING = 7;
+}
+
+enum WriteChunkDurability {
+  WRITE_CHUNK_DURABILITY_UNSPECIFIED = 0;
+  WRITE_CHUNK_DURABILITY_PUBLISH = 1;
+}
+
+message StorageChunkChecksum {
+  StorageChecksumAlgorithm algorithm = 1;
+  string value = 2;
+  uint64 size_bytes = 3;
+  uint64 computed_at_unix_ms = 4;
+}
+
+message StorageNodeResponseSummary {
+  StorageNodeStatusCode code = 1;
+  string message = 2;
+  string request_id = 3;
+  string node_id = 4;
+  string chunk_id = 5;
+  uint64 retry_after_ms = 6;
+}
+
+message WriteChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  string object_id = 3;
+  uint64 version = 4;
+  uint32 chunk_index = 5;
+  uint64 offset = 6;
+  uint64 expected_size = 7;
+  StorageChunkChecksum expected_checksum = 8;
+  bytes payload = 9;
+  uint64 timeout_ms = 10;
+  bool best_effort_cancel = 11;
+  WriteChunkDurability durability = 12;
+}
+
+message WriteChunkResponse {
+  StorageNodeResponseSummary summary = 1;
+  uint64 size = 2;
+  StorageChunkChecksum checksum = 3;
+  StorageChunkState state = 4;
+  bool durable = 5;
+  bool already_exists = 6;
+}
+
+service StorageNodeService {
+  rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
+}

@@ -152,6 +152,7 @@ remove_matching_paths(STORE_PRODUCTION_FILES "AGENTS\\.md$")
 set(STORAGE_PROTO_FILES "")
 if(EXISTS "${RAFT_SOURCE_DIR}/proto/storage_node.proto")
   list(APPEND STORAGE_PROTO_FILES "proto/storage_node.proto")
+  list(APPEND PRODUCTION_SOURCE_FILES "proto/storage_node.proto")
 endif()
 
 collect_files(STORAGE_TEST_ENTRY_FILES

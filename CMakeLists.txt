@@ -80,6 +80,9 @@ message(STATUS "Using protobuf ${Protobuf_VERSION}")
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+# T029 schema-only registration: proto/storage_node.proto exists in source,
+# but its code generation target stays deferred to T030.
+set(STORAGE_NODE_PROTO_SCHEMA ${PROTO_DIR}/storage_node.proto)
 set(PROTO_FILES
   ${PROTO_DIR}/common.proto
   ${PROTO_DIR}/raft.proto
