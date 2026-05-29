@@ -67,7 +67,7 @@
 - [x] T019 定义 bounded executor / bounded IO queue；允许修改：`modules/store/runtime/storage_executor.h`、`modules/store/runtime/storage_executor.cpp`、`CMakeLists.txt`；验收：队列容量、timeout、cancellation、overloaded result 可测；依赖：T007
 - [x] T020 [P] 为 bounded executor 写单元测试；允许修改：`tests/store_executor_test.cpp`、`tests/CMakeLists.txt`；验收：队列满返回 overloaded，取消任务不泄漏线程；依赖：T019
 - [x] T021 定义 `LocalDiskChunkStore` 构造配置和目录初始化；允许修改：`modules/store/chunk/local_disk_chunk_store.h`、`modules/store/chunk/local_disk_chunk_store.cpp`、`CMakeLists.txt`；验收：无效 data_dir、权限错误、目录创建失败均返回明确错误；依赖：T010、T011、T016
-- [ ] T022 [P] 为 `LocalDiskChunkStore` 写基础单元测试；允许修改：`tests/local_disk_chunk_store_test.cpp`、`tests/CMakeLists.txt`；验收：临时目录隔离，测试不依赖固定绝对路径；依赖：T021
+- [x] T022 [P] 为 `LocalDiskChunkStore` 写基础单元测试；允许修改：`tests/local_disk_chunk_store_test.cpp`、`tests/CMakeLists.txt`；验收：临时目录隔离，测试不依赖固定绝对路径；依赖：T021
 - [ ] T023 实现 `LocalDiskChunkStore::WriteChunk` 的 staging -> checksum -> flush -> publish -> index 更新路径；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：checksum on write、same chunk same content idempotent、mismatch conflict、publish 前不可读；依赖：T013、T014、T015、T018、T021
 - [ ] T024 实现 `LocalDiskChunkStore::ReadChunk` 和 checksum on read；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：只读 live chunk，corrupted/quarantined/staging/deleting 不返回成功，checksum mismatch 标记 corrupted；依赖：T023
 - [ ] T025 实现 `DeleteChunk`、`StatChunk`、`ListChunks` 的本地语义；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：重复 delete 幂等，Stat/List 区分 live/staging/deleting/deleted/quarantined/corrupted/missing；依赖：T024

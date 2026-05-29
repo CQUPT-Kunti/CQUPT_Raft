@@ -366,6 +366,28 @@ else()
   message(STATUS "Skip test_store_executor: store_executor_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/local_disk_chunk_store_test.cpp")
+  add_executable(test_local_disk_chunk_store
+    local_disk_chunk_store_test.cpp
+  )
+
+  target_link_libraries(test_local_disk_chunk_store
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_local_disk_chunk_store
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(local_disk_chunk_store test_local_disk_chunk_store
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_local_disk_chunk_store: local_disk_chunk_store_test.cpp not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic Raft behavior tests
