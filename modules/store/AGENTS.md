@@ -9,6 +9,7 @@
   - `io/`：durable file 抽象接口和平台实现边界
   - `index/`：本地 chunk 索引接口和 sharded map 结构
   - `runtime/`：有界执行器和有界任务队列
+  - `node/`：StorageNode data-plane 的 gRPC service / client 适配层
 
 ## 阅读顺序
 
@@ -30,3 +31,4 @@
 - `io/` 只处理 durable file 语义，不承接 chunk 业务编排。
 - `index/` 只维护本地索引，不负责磁盘扫描和上层对象可见性。
 - `runtime/` 只负责本地任务调度，不绑定具体 chunk / IO 业务。
+- `node/` 只负责 RPC 适配，不负责 metadata commit、upload coordinator 或 Raft control-plane。

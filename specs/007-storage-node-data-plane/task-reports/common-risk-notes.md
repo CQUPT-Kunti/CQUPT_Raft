@@ -66,6 +66,6 @@
   建议后续在哪类任务处理：在 T029-T035 的真实 upload coordinator / service / placement / abort-or-cleanup 任务中，把 commit gate 和 failed-commit orphan cleanup 收紧为生产语义，并补对应集成回归。
 
 - 任务编号：T028
-  问题：T028 只通过 test-only `WriteChunk` contract adapter 固定了 request_id 幂等、checksum、durable、already_exists/conflict、overloaded 和“timeout/cancellation 仍是显式边界”的测试语义，当前仓库仍没有真实 StorageNode proto / service / client，也没有跨 RPC 的 deadline/cancelled 映射收口。
-  影响：如果后续 T029-T032 在 proto/service/client 接入时把 `already_exists`、`conflict`、`overloaded` 或 deadline/cancellation 解释成与 T028 contract 不一致的 RPC 行为，仍可能在重试、过载回退或模糊超时下出现语义漂移。
-  建议后续在哪类任务处理：在 T029-T032 的 StorageNode proto / service / client 实现与回归测试中，对齐 T028 contract 测试，并补 RPC deadline/cancelled/error mapping 的真实端到端验证。
+  问题：T028 的 `WriteChunk` contract 已在 T031 接入真实 `StorageNodeService::WriteChunk`，但当前仓库仍没有 `StorageNodeClient`，也没有跨 RPC 的 deadline/cancelled 映射收口；`timeout_ms` / `best_effort_cancel` 仍只是显式边界字段。
+  影响：如果后续 T032 在 client 接入时把 `already_exists`、`conflict`、`overloaded`、deadline 或 cancellation 解释成与 T028/T031 contract 不一致的 RPC 行为，仍可能在重试、过载回退或模糊超时下出现语义漂移。
+  建议后续在哪类任务处理：在 T032 的 StorageNode client 实现与回归测试中，对齐 T028/T031 contract，并补 RPC deadline/cancelled/error mapping 的真实端到端验证。

@@ -1,0 +1,29 @@
+#pragma once
+
+#include <memory>
+#include <string>
+
+#include <grpcpp/grpcpp.h>
+
+#include "storage_node.grpc.pb.h"
+
+namespace storedemo
+{
+    class ChunkStore;
+
+    class StorageNodeService final : public raft::StorageNodeService::CallbackService
+    {
+    public:
+        explicit StorageNodeService(std::shared_ptr<ChunkStore> chunk_store,
+                                    std::string node_id = {});
+
+        grpc::ServerUnaryReactor *WriteChunk(
+            grpc::CallbackServerContext *context,
+            const raft::WriteChunkRequest *request,
+            raft::WriteChunkResponse *response) override;
+
+    private:
+        std::shared_ptr<ChunkStore> chunk_store_;
+        std::string node_id_;
+    };
+}

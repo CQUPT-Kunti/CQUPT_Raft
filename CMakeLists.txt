@@ -241,6 +241,7 @@ add_library(raft_core
   modules/store/chunk/local_disk_chunk_store.cpp
   modules/store/io/durable_file.cpp
   modules/store/index/chunk_index.cpp
+  modules/store/node/storage_node_service.cpp
   modules/store/runtime/storage_executor.cpp
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
@@ -265,6 +266,7 @@ target_include_directories(raft_core
 target_link_libraries(raft_core
   PUBLIC
     raft_proto
+    storage_node_proto
   PRIVATE
     metadata_proto
     Threads::Threads
