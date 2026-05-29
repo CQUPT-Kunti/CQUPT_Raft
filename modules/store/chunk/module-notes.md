@@ -212,6 +212,8 @@ T023-T025 已实现：
 - 同一个 chunk 的并发写入只允许一个 payload 胜出；同内容后续请求幂等成功，不同内容返回 `kConflict`
 - `ReadChunk` / `ListChunks` 当前不持有 chunk guard，也不提供并发分页快照语义；因此读删交错时允许出现 `kOk`、`kNotFound` 或显式 `kIoError`
 - T027 的上传闭环测试已固定当前集成边界：`LocalDiskChunkStore` 只负责 chunk durable write/read，何时调用 metadata `CommitObject` 必须由上层 coordinator / service orchestration 决定；store 本身不会也不应该直接提交 metadata
+- T028 的 `WriteChunk` contract 测试已固定未来 service/client 适配层的最小兼容语义：成功只表示 chunk 已 durable，不表示 metadata 已 committed；同内容重复写允许以 success/`already_exists` 返回；不同内容冲突必须显式返回；executor admission 满时要映射为 `kOverloaded`
+- `StorageTaskContext.timeout_ms` / `best_effort_cancel` 在当前 runtime 里仍只是扩展字段；适配层不能把它们包装成“已经具备运行中取消传播”的既成事实
 
 ## `.cpp` 当前实现了什么
 

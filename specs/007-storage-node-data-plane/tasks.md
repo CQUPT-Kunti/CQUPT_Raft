@@ -84,7 +84,7 @@
 ### Tests for User Story 1
 
 - [x] T027 [P] [US1] 添加上传闭环集成测试骨架；允许修改：`tests/storage_upload_integration_test.cpp`、`tests/CMakeLists.txt`；验收：测试先表达 commit 前不可见和 durable 后可见；依赖：T025
-- [ ] T028 [P] [US1] 添加 `WriteChunk` contract 测试；允许修改：`tests/storage_node_service_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 request_id、checksum、durable、already_exists、conflict、timeout/overloaded 映射；依赖：T025
+- [x] T028 [P] [US1] 添加 `WriteChunk` contract 测试；允许修改：`tests/storage_write_chunk_contract_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 request_id、checksum、durable、already_exists、conflict、timeout/overloaded 映射；依赖：T025
 
 ### Implementation for User Story 1
 

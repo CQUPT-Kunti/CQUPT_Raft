@@ -414,6 +414,28 @@ else()
   message(STATUS "Skip test_storage_upload_integration: storage_upload_integration_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_write_chunk_contract_test.cpp")
+  add_executable(test_storage_write_chunk_contract
+    storage_write_chunk_contract_test.cpp
+  )
+
+  target_link_libraries(test_storage_write_chunk_contract
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_write_chunk_contract
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_write_chunk_contract test_storage_write_chunk_contract
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_write_chunk_contract: storage_write_chunk_contract_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")
   add_executable(test_store_concurrency_stress
     store_concurrency_stress_test.cpp

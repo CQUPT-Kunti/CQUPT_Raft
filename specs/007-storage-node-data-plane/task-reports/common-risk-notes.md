@@ -64,3 +64,8 @@
   问题：T027 只新增了 `MetadataStateMachine + LocalDiskChunkStore` 的上传闭环集成测试骨架，当前仓库仍没有真实 upload coordinator / StorageNode RPC 来强制“chunk durable 成功后才能 CommitObject”。如果调用方绕过预期顺序，或在 durable chunk 写成后 metadata commit 失败，当前会留下未被 metadata 引用的 orphan chunk。
   影响：测试已经证明 commit 前对象不可见、commit 后可见，但 metadata commit 失败后的本地 chunk 仍会保留在 store data-plane，直到后续 abort/GC/recovery 任务补齐前都可能累积无主 chunk。
   建议后续在哪类任务处理：在 T029-T035 的真实 upload coordinator / service / placement / abort-or-cleanup 任务中，把 commit gate 和 failed-commit orphan cleanup 收紧为生产语义，并补对应集成回归。
+
+- 任务编号：T028
+  问题：T028 只通过 test-only `WriteChunk` contract adapter 固定了 request_id 幂等、checksum、durable、already_exists/conflict、overloaded 和“timeout/cancellation 仍是显式边界”的测试语义，当前仓库仍没有真实 StorageNode proto / service / client，也没有跨 RPC 的 deadline/cancelled 映射收口。
+  影响：如果后续 T029-T032 在 proto/service/client 接入时把 `already_exists`、`conflict`、`overloaded` 或 deadline/cancellation 解释成与 T028 contract 不一致的 RPC 行为，仍可能在重试、过载回退或模糊超时下出现语义漂移。
+  建议后续在哪类任务处理：在 T029-T032 的 StorageNode proto / service / client 实现与回归测试中，对齐 T028 contract 测试，并补 RPC deadline/cancelled/error mapping 的真实端到端验证。
