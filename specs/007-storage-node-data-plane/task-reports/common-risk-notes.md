@@ -44,3 +44,8 @@
   问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
   影响：Linux 上的写入链路已经收口，但在真实 Windows 环境中，WriteChunk 可能表现为 explicit unsupported 或暴露额外的 publish / path / handle 语义偏差。
   建议后续在哪类任务处理：执行 `T023-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
+
+- 任务编号：T024
+  问题：`LocalDiskChunkStore::ReadChunk()` 已经固定为 full read + checksum on read，但当前发现文件大小或 checksum 与 index metadata 不一致时，只返回明确错误，还不会把本地 index 状态自动写回 `CORRUPTED` / `QUARANTINED`。
+  影响：前台读取已经不会把损坏数据当成功返回，但后续如果需要基于读路径直接沉淀损坏事实、触发隔离或给 scrub/repair 复用，还需要补状态回写与恢复协同。
+  建议后续在哪类任务处理：在后续 T025/T恢复/scrub 相关任务中，再统一收紧 corruption 状态写回、隔离和恢复边界。

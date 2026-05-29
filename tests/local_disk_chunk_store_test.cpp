@@ -122,6 +122,14 @@ namespace storedemo
                 .payload = payload};
         }
 
+        ReadChunkRequest MakeReadRequest(const ChunkId &chunk_id,
+                                         const std::string &request_id)
+        {
+            return ReadChunkRequest{
+                .request_id = request_id,
+                .chunk_id = chunk_id};
+        }
+
         std::string ReadBinaryFileOrThrow(const std::filesystem::path &path)
         {
             std::ifstream input(path, std::ios::binary);
@@ -157,6 +165,48 @@ namespace storedemo
             }
 
             return final_path;
+        }
+
+        std::filesystem::path ResolveStagingPathOrThrow(const std::filesystem::path &data_root,
+                                                        const ChunkId &chunk_id,
+                                                        const std::string_view token)
+        {
+            ChunkPathLayout layout;
+            std::string error_detail;
+            const auto layout_status =
+                BuildChunkPathLayout(chunk_id, token, &layout, &error_detail);
+            if (layout_status != StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to build chunk layout: " + error_detail);
+            }
+
+            std::filesystem::path staging_path;
+            const auto resolve_status = ResolveDurablePathUnderRoot(data_root,
+                                                                    layout.staging_relative_path,
+                                                                    &staging_path,
+                                                                    &error_detail);
+            if (resolve_status != StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to resolve staging path: " + error_detail);
+            }
+
+            return staging_path;
+        }
+
+        ChunkIndexEntry MakeIndexEntry(const ChunkIdentity &identity,
+                                       const ChunkState state,
+                                       const std::uint64_t size,
+                                       const ChunkChecksum &checksum,
+                                       const std::filesystem::path &final_path)
+        {
+            ChunkIndexEntry entry;
+            entry.identity = identity;
+            entry.state = state;
+            entry.size = size;
+            entry.checksum = checksum;
+            entry.final_path = final_path;
+            entry.updated_at = 1;
+            return entry;
         }
 
         struct RecordingWriterState
@@ -419,17 +469,12 @@ namespace storedemo
 #endif
         }
 
-        TEST_F(LocalDiskChunkStoreTest, UnsupportedReadDeleteStatAndListRemainExplicitlyUnsupported)
+        TEST_F(LocalDiskChunkStoreTest, UnsupportedDeleteStatAndListRemainExplicitlyUnsupported)
         {
             test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_unsupported_ops");
             LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
                                                  test::MakeStorageNodeIdFixture(6)));
             ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
-
-            const auto read_response = store.ReadChunk(ReadChunkRequest{});
-            EXPECT_EQ(read_response.status, StorageNodeStatusCode::kUnsupported);
-            EXPECT_FALSE(read_response.ok());
-            EXPECT_NE(read_response.error_detail.find("ReadChunk"), std::string::npos);
 
             const auto delete_response = store.DeleteChunk(DeleteChunkRequest{});
             EXPECT_EQ(delete_response.status, StorageNodeStatusCode::kUnsupported);
@@ -715,6 +760,287 @@ namespace storedemo
                       original_request.expected_checksum.value);
             EXPECT_NE(index_find.entry.checksum.value,
                       conflicting_request.expected_checksum.value);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkAfterWriteReturnsOriginalSmallPayload)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_small");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(15),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(72, "read-small");
+            const auto identity = MakeIdentityOrThrow("read-small-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "read-small-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-small-read"));
+            ASSERT_EQ(response.status, StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(response.ok());
+            EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+            EXPECT_EQ(response.metadata.state, ChunkState::kLive);
+            EXPECT_EQ(response.payload, payload);
+            EXPECT_EQ(response.actual_checksum.value, ComputeChecksumOrThrow(payload).value);
+            EXPECT_TRUE(response.verified);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkAfterWriteReturnsOriginalBinaryFixture)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_fixture");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(16),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto fixture = LoadFixtureBinaryPayload();
+            ASSERT_FALSE(fixture.payload.empty());
+            const auto identity = MakeIdentityOrThrow("read-fixture-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, fixture.payload, "read-fixture-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            auto request = MakeReadRequest(identity.chunk_id, "read-fixture-read");
+            request.expected_checksum = ComputeChecksumOrThrow(fixture.payload);
+            const auto response = store.ReadChunk(request);
+            ASSERT_EQ(response.status, StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(response.ok());
+            EXPECT_EQ(response.payload, fixture.payload);
+            EXPECT_EQ(response.actual_checksum.value, request.expected_checksum.value);
+            EXPECT_TRUE(response.verified);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkSupportsEmptyPayload)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_empty");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(17),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("read-empty-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, "", "read-empty-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-empty-read"));
+            ASSERT_EQ(response.status, StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(response.ok());
+            EXPECT_TRUE(response.payload.empty());
+            EXPECT_EQ(response.metadata.size, 0U);
+            EXPECT_EQ(response.actual_checksum.value, ComputeChecksumOrThrow("").value);
+            EXPECT_TRUE(response.verified);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsExpectedChecksumMismatch)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_checksum_mismatch");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(18),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(64, "read-checksum");
+            const auto identity = MakeIdentityOrThrow("read-checksum-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "read-checksum-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            auto request = MakeReadRequest(identity.chunk_id, "read-checksum-read");
+            request.expected_checksum = ComputeChecksumOrThrow("different-payload");
+            const auto response = store.ReadChunk(request);
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kChecksumMismatch);
+            EXPECT_FALSE(response.ok());
+            EXPECT_TRUE(response.payload.empty());
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsTamperedFinalFile)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_tampered");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(19),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(80, "read-tampered");
+            const auto identity = MakeIdentityOrThrow("read-tampered-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "read-tampered-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            {
+                std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << test::MakeChunkPayload(payload.size(), "tampered");
+            }
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-tampered-read"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kCorrupted);
+            EXPECT_FALSE(response.ok());
+            EXPECT_TRUE(response.payload.empty());
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkReturnsNotFoundWhenChunkIsMissingFromIndex)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_not_found");
+            LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
+                                                 test::MakeStorageNodeIdFixture(20)));
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto missing_identity = MakeIdentityOrThrow("read-missing-object", 1, 0, 0);
+            const auto response =
+                store.ReadChunk(MakeReadRequest(missing_identity.chunk_id, "read-missing-read"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kNotFound);
+            EXPECT_FALSE(response.ok());
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsNonLiveCorruptedState)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_corrupted_state");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(21),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("read-corrupted-object", 1, 0, 0);
+            const auto payload = test::MakeChunkPayload(16, "read-corrupted");
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            ASSERT_TRUE(std::filesystem::create_directories(final_path.parent_path()));
+            {
+                std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << payload;
+            }
+
+            ASSERT_TRUE(shared_index->Insert(MakeIndexEntry(identity,
+                                                            ChunkState::kCorrupted,
+                                                            payload.size(),
+                                                            ComputeChecksumOrThrow(payload),
+                                                            final_path))
+                            .ok());
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-corrupted-state"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kCorrupted);
+            EXPECT_FALSE(response.ok());
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsNonLiveStagingState)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_staging_state");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(22),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("read-staging-object", 1, 0, 0);
+            const auto payload = test::MakeChunkPayload(16, "read-staging");
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+
+            ASSERT_TRUE(shared_index->Insert(MakeIndexEntry(identity,
+                                                            ChunkState::kStaging,
+                                                            payload.size(),
+                                                            ComputeChecksumOrThrow(payload),
+                                                            final_path))
+                            .ok());
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-staging-state"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kConflict);
+            EXPECT_FALSE(response.ok());
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsRangeReadInCurrentStage)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_range");
+            LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
+                                                 test::MakeStorageNodeIdFixture(23)));
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("read-range-object", 1, 0, 0);
+            auto request = MakeReadRequest(identity.chunk_id, "read-range-request");
+            request.range = ChunkReadRange{.offset = 0, .length = 4};
+
+            const auto response = store.ReadChunk(request);
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kUnsupported);
+            EXPECT_FALSE(response.ok());
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkDoesNotFallBackToStagingFile)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file read path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_staging_fallback");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(24),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(32, "read-staging-fallback");
+            const auto identity = MakeIdentityOrThrow("read-staging-fallback-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "read-staging-fallback-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            ASSERT_TRUE(std::filesystem::remove(final_path));
+
+            const auto staging_path = ResolveStagingPathOrThrow(store.paths().data_root,
+                                                                identity.chunk_id,
+                                                                "manual-staging");
+            std::filesystem::create_directories(staging_path.parent_path());
+            ASSERT_TRUE(std::filesystem::exists(staging_path.parent_path()));
+            {
+                std::ofstream output(staging_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << payload;
+            }
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-staging-fallback-read"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kNotFound);
+            EXPECT_FALSE(response.ok());
 #endif
         }
     } // namespace

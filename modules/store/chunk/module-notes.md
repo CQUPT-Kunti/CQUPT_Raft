@@ -9,11 +9,11 @@
 - `ChunkStore` 抽象接口
 - chunk 请求/响应结构
 - `LocalDiskChunkStore` 配置、初始化和 `WriteChunk` 写入入口
+- `LocalDiskChunkStore::ReadChunk` 的最小真实读取路径
 - 与 `store/common` 类型的拼装边界
 
 它当前不负责：
 
-- `ReadChunk` 的真实读取路径
 - `DeleteChunk` / `StatChunk` / `ListChunks` 的真实本地语义
 - 完整 durable publish 编排
 - ChunkIndex 的具体容器实现
@@ -182,13 +182,13 @@ T021 已实现：
 - 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`
 - 默认 durable file / chunk index 依赖装配
 
-T023 已实现：
+T023-T024 已实现：
 
 - `WriteChunk`
-
-T023 还没有实现：
-
 - `ReadChunk`
+
+T025 还没有实现：
+
 - `DeleteChunk`
 - `StatChunk`
 - `ListChunks`
@@ -196,7 +196,8 @@ T023 还没有实现：
 其中：
 
 - `WriteChunk` 已经走通 staging -> flush -> publish -> directory sync -> LIVE index update
-- `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 当前仍返回明确的 `kUnsupported`
+- `ReadChunk` 已经走通 index lookup -> state check -> final file read -> checksum verify -> return payload
+- `DeleteChunk` / `StatChunk` / `ListChunks` 当前仍返回明确的 `kUnsupported`
 
 ## `.cpp` 当前实现了什么
 
@@ -212,13 +213,14 @@ T023 还没有实现：
 - `LocalDiskChunkStore::chunk_index()`
 - `LocalDiskChunkStore::executor()`
 - `LocalDiskChunkStore::WriteChunk()`
-- `LocalDiskChunkStore::{ReadChunk, DeleteChunk, StatChunk, ListChunks}()`
+- `LocalDiskChunkStore::ReadChunk()`
+- `LocalDiskChunkStore::{DeleteChunk, StatChunk, ListChunks}()`
 
 也就是说：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
-- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` 的真实写入路径
-- 读/删/查/列举和恢复路径仍未实现
+- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` / `ReadChunk` 的真实路径
+- 删/查/列举和恢复路径仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -342,6 +344,44 @@ T023 还没有实现：
 
 把成功写入后的 metadata 和 final path 组装成 `ChunkIndexEntry`。
 
+### `ResolveReadFinalPath(...)`
+
+给 `ReadChunk` 解析 final 文件路径。
+
+优先级是：
+
+- 先使用 index entry 里已经记录的 `final_path`
+- 如果 entry 里还没有 final path，再基于 `chunk_id` 反推出标准 final layout
+
+它不会回退去读 staging。
+
+### `ValidateReadableChunkState(...)`
+
+把 `ChunkState` 映射成读路径是否允许继续。
+
+当前语义：
+
+- `LIVE` 才允许读
+- `CORRUPTED` / `QUARANTINED` 返回明确损坏错误
+- `DELETED` / `MISSING` 返回 `kNotFound`
+- `STAGING` / `DELETING` 返回冲突类错误
+
+### `ValidateExpectedReadChecksum(...)`
+
+处理 `ReadChunkRequest.expected_checksum` 的形状校验和结果比对。
+
+它负责区分：
+
+- checksum 结构本身非法
+- 算法不支持
+- 期望 checksum 与实际 payload 不一致
+
+### `ReadFilePayload(...)`
+
+按二进制方式读取 final chunk 文件。
+
+它只负责文件读取和 IO 错误分类，不做状态或 checksum 判断。
+
 ### `PrepareWriteIdentity(...)`
 
 统一整理和校验 `WriteChunkRequest.identity`。
@@ -435,6 +475,35 @@ T023 仍然没有解决这些恢复问题：
 - corrupted / quarantine
 
 也就是说，当前 `WriteChunk()` 只保证在线写入时的 durable publish 顺序，不保证重启后的自动收口。
+
+## `ReadChunk()` 当前语义
+
+### 读取顺序
+
+当前 `ReadChunk()` 的主流程是：
+
+1. 必要时触发 `Initialize()`
+2. 校验 `request_id`
+3. 拒绝 range read
+4. 从 `ChunkIndex` 查 chunk
+5. 检查 state 是否为 `LIVE`
+6. 解析 final path
+7. 确认 final 文件存在
+8. 读取整个文件 payload
+9. 校验读取大小与 index metadata 一致
+10. 计算实际 checksum
+11. 校验实际 checksum 与 index checksum 一致
+12. 如果请求带了 `expected_checksum`，继续校验请求期望
+13. 仅在全部通过后返回 payload
+
+### 当前边界
+
+- 只支持 full read，不支持 range read
+- 只读取 final 文件，不回退 staging
+- 非 `LIVE` 状态不会返回成功
+- 检测到文件大小或 checksum 与 index metadata 不一致时，当前返回明确错误，但**不会在 T024 自动把 index 状态改成 `CORRUPTED`**
+
+最后这一点是有意保持收敛范围：T024 先固定读路径校验语义，不在这一轮把损坏状态写回、后台隔离或恢复流程一起做掉。
 
 ## 与其它模块的边界
 

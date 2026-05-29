@@ -1,5 +1,6 @@
 #include "store/chunk/local_disk_chunk_store.h"
 
+#include <fstream>
 #include <chrono>
 #include <iomanip>
 #include <optional>
@@ -224,6 +225,165 @@ namespace storedemo
             entry.final_path = final_path;
             entry.updated_at = timestamp_ms;
             return entry;
+        }
+
+        StorageNodeStatusCode ResolveReadFinalPath(const std::filesystem::path &data_root,
+                                                   const ChunkIndexEntry &entry,
+                                                   std::filesystem::path *final_path,
+                                                   std::string *error_detail)
+        {
+            if (final_path == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "read final_path output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (entry.HasFinalPath())
+            {
+                if (entry.final_path.is_absolute())
+                {
+                    *final_path = entry.final_path.lexically_normal();
+                    return StorageNodeStatusCode::kOk;
+                }
+
+                return ResolveStorePath(data_root, entry.final_path, final_path, error_detail);
+            }
+
+            ChunkPathLayout layout;
+            const auto layout_status = BuildChunkPathLayout(entry.identity.chunk_id,
+                                                            "read-probe",
+                                                            &layout,
+                                                            error_detail);
+            if (layout_status != StorageNodeStatusCode::kOk)
+            {
+                return layout_status;
+            }
+
+            return ResolveStorePath(data_root,
+                                    layout.final_relative_path,
+                                    final_path,
+                                    error_detail);
+        }
+
+        StorageNodeStatusCode ValidateReadableChunkState(const ChunkState state,
+                                                         std::string *error_detail)
+        {
+            if (IsReadableChunkState(state))
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (error_detail != nullptr)
+            {
+                *error_detail = std::string("chunk state is not readable: ") +
+                                ToString(state);
+            }
+
+            switch (state)
+            {
+            case ChunkState::kCorrupted:
+            case ChunkState::kQuarantined:
+                return StorageNodeStatusCode::kCorrupted;
+            case ChunkState::kDeleted:
+            case ChunkState::kMissing:
+                return StorageNodeStatusCode::kNotFound;
+            case ChunkState::kStaging:
+            case ChunkState::kDeleting:
+            case ChunkState::kLive:
+            default:
+                return StorageNodeStatusCode::kConflict;
+            }
+        }
+
+        StorageNodeStatusCode ValidateExpectedReadChecksum(const ChunkChecksum &expected_checksum,
+                                                           const ChunkChecksum &actual_checksum,
+                                                           std::string *error_detail)
+        {
+            if (!HasExpectedChecksumConstraint(expected_checksum))
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (expected_checksum.algorithm == ChunkChecksumAlgorithm::kUnknown)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum algorithm must be set";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (expected_checksum.algorithm != ChunkChecksumAlgorithm::kSha256)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum algorithm is not supported";
+                }
+                return StorageNodeStatusCode::kUnsupported;
+            }
+
+            if (expected_checksum.value.size() != kSha256DigestHexChars)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum value must be 64 hex chars";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (expected_checksum.size_bytes != actual_checksum.size_bytes ||
+                expected_checksum.value != actual_checksum.value)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "payload checksum mismatch";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode ReadFilePayload(const std::filesystem::path &path,
+                                              std::string *payload,
+                                              std::string *error_detail)
+        {
+            if (payload == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "payload output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            std::ifstream input(path, std::ios::binary);
+            if (!input.is_open())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "failed to open chunk file for read: " +
+                                    path.string();
+                }
+                return StorageNodeStatusCode::kIoError;
+            }
+
+            payload->assign(std::istreambuf_iterator<char>(input),
+                            std::istreambuf_iterator<char>());
+            if (!input.good() && !input.eof())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "failed while reading chunk file: " +
+                                    path.string();
+                }
+                return StorageNodeStatusCode::kIoError;
+            }
+
+            return StorageNodeStatusCode::kOk;
         }
 
         StorageNodeStatusCode PrepareWriteIdentity(const WriteChunkRequest &request,
@@ -757,9 +917,136 @@ namespace storedemo
         return response;
     }
 
-    ReadChunkResponse LocalDiskChunkStore::ReadChunk(const ReadChunkRequest &)
+    ReadChunkResponse LocalDiskChunkStore::ReadChunk(const ReadChunkRequest &request)
     {
-        return MakeUnsupportedResponse<ReadChunkResponse>("ReadChunk");
+        ReadChunkResponse response;
+
+        if (!initialized_)
+        {
+            const auto init_result = Initialize();
+            if (!init_result.ok())
+            {
+                response.status = init_result.status;
+                response.error_detail = init_result.error_detail;
+                response.retry_after_ms = init_result.retry_after_ms;
+                return response;
+            }
+        }
+
+        if (request.request_id.empty())
+        {
+            response.status = StorageNodeStatusCode::kInvalidArgument;
+            response.error_detail = "ReadChunk request_id must not be empty";
+            return response;
+        }
+
+        if (request.range.has_value())
+        {
+            response.status = StorageNodeStatusCode::kUnsupported;
+            response.error_detail =
+                "LocalDiskChunkStore::ReadChunk range reads are not implemented in the current stage";
+            return response;
+        }
+
+        if (config_.chunk_index == nullptr)
+        {
+            response.status = StorageNodeStatusCode::kUnsupported;
+            response.error_detail = "ReadChunk requires a valid ChunkIndex";
+            return response;
+        }
+
+        const auto find_response = config_.chunk_index->Find(request.chunk_id);
+        if (!find_response.ok())
+        {
+            response.status = find_response.status;
+            response.error_detail = find_response.error_detail;
+            response.retry_after_ms = find_response.retry_after_ms;
+            return response;
+        }
+
+        const auto &entry = find_response.entry;
+        response.metadata = BuildChunkMetadataFromIndexEntry(config_, entry, "");
+
+        response.status =
+            ValidateReadableChunkState(entry.state, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        std::filesystem::path final_path;
+        response.status =
+            ResolveReadFinalPath(paths_.data_root, entry, &final_path, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        std::error_code exists_error;
+        const bool exists = std::filesystem::exists(final_path, exists_error);
+        if (exists_error)
+        {
+            response.status = MapFilesystemErrorToStatus(exists_error);
+            response.error_detail =
+                BuildFilesystemErrorDetail("exists", final_path, exists_error);
+            return response;
+        }
+        if (!exists)
+        {
+            response.status = StorageNodeStatusCode::kNotFound;
+            response.error_detail = "final chunk file does not exist: " +
+                                    final_path.string();
+            return response;
+        }
+
+        std::string payload;
+        response.status = ReadFilePayload(final_path, &payload, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        if (static_cast<std::uint64_t>(payload.size()) != entry.size)
+        {
+            response.status = StorageNodeStatusCode::kCorrupted;
+            response.error_detail = "chunk file size does not match index metadata";
+            return response;
+        }
+
+        ChunkChecksum actual_checksum;
+        response.status =
+            ComputeChunkChecksum(payload, &actual_checksum, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+        response.actual_checksum = actual_checksum;
+
+        if (entry.checksum.IsSet() &&
+            (entry.checksum.algorithm != actual_checksum.algorithm ||
+             entry.checksum.size_bytes != actual_checksum.size_bytes ||
+             entry.checksum.value != actual_checksum.value))
+        {
+            response.status = StorageNodeStatusCode::kCorrupted;
+            response.error_detail =
+                "chunk file checksum does not match index metadata";
+            return response;
+        }
+
+        response.status = ValidateExpectedReadChecksum(request.expected_checksum,
+                                                       actual_checksum,
+                                                       &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        response.metadata.checksum =
+            entry.checksum.IsSet() ? entry.checksum : actual_checksum;
+        response.payload = std::move(payload);
+        response.verified = request.verify_checksum || entry.checksum.IsSet() ||
+                            HasExpectedChecksumConstraint(request.expected_checksum);
+        return response;
     }
 
     DeleteChunkResponse LocalDiskChunkStore::DeleteChunk(const DeleteChunkRequest &)
