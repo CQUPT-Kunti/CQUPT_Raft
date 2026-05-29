@@ -52,6 +52,8 @@ FetchContent_MakeAvailable(googletest)
 # validation scope more clearly.
 set(RAFT_STORE_LABELS_BASELINE
   "storage-node;platform-neutral")
+set(RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY
+  "storage-node;linux-primary-diagnosis")
 set(RAFT_STORE_LABELS_CONCURRENCY
   "storage-node;storage-node-concurrency;platform-neutral")
 set(RAFT_STORE_LABELS_CONCURRENCY_LINUX_PRIMARY
@@ -388,6 +390,28 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/local_disk_chunk_store_test.cpp")
     "${RAFT_STORE_LABELS_BASELINE}")
 else()
   message(STATUS "Skip test_local_disk_chunk_store: local_disk_chunk_store_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_integration_test.cpp")
+  add_executable(test_storage_upload_integration
+    storage_upload_integration_test.cpp
+  )
+
+  target_link_libraries(test_storage_upload_integration
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_upload_integration
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_upload_integration test_storage_upload_integration
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_upload_integration: storage_upload_integration_test.cpp not found")
 endif()
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")

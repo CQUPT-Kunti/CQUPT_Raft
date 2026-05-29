@@ -18,6 +18,7 @@
 - 完整 durable publish 编排
 - ChunkIndex 的具体容器实现
 - StorageNode RPC
+- `CreateObject` / `CommitObject` / `AbortObject` 之类 metadata control-plane 生命周期决策
 - repair / rebalance / GC 后台能力
 
 ## 命名空间
@@ -210,6 +211,7 @@ T023-T025 已实现：
 - 不同 chunk 的 `WriteChunk` 可以并行推进
 - 同一个 chunk 的并发写入只允许一个 payload 胜出；同内容后续请求幂等成功，不同内容返回 `kConflict`
 - `ReadChunk` / `ListChunks` 当前不持有 chunk guard，也不提供并发分页快照语义；因此读删交错时允许出现 `kOk`、`kNotFound` 或显式 `kIoError`
+- T027 的上传闭环测试已固定当前集成边界：`LocalDiskChunkStore` 只负责 chunk durable write/read，何时调用 metadata `CommitObject` 必须由上层 coordinator / service orchestration 决定；store 本身不会也不应该直接提交 metadata
 
 ## `.cpp` 当前实现了什么
 

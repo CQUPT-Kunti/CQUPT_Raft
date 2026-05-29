@@ -59,3 +59,8 @@
   问题：T026 已在 Linux 上覆盖真实 chunk 文件的高并发 write/read/delete/stat/list 压力，但当前环境没有 Windows 编译/测试能力，Windows 下的 sharing violation、open-handle delete、并发读删可见性和 durable publish 后读取差异仍未验证。
   影响：Linux 上不同 chunk 并行、同 chunk 冲突控制和 bounded backpressure 已有实测证据；如果直接把这组结果外推到 Windows，后续仍可能在真实 NTFS/Win32 文件语义下暴露并发偏差。
   建议后续在哪类任务处理：执行 `T026-WIN`，在 Windows 环境完成 `store_concurrency_stress` 实机验证，并结合 `T023-WIN` / `T025-WIN` 收口必要修正。
+
+- 任务编号：T027
+  问题：T027 只新增了 `MetadataStateMachine + LocalDiskChunkStore` 的上传闭环集成测试骨架，当前仓库仍没有真实 upload coordinator / StorageNode RPC 来强制“chunk durable 成功后才能 CommitObject”。如果调用方绕过预期顺序，或在 durable chunk 写成后 metadata commit 失败，当前会留下未被 metadata 引用的 orphan chunk。
+  影响：测试已经证明 commit 前对象不可见、commit 后可见，但 metadata commit 失败后的本地 chunk 仍会保留在 store data-plane，直到后续 abort/GC/recovery 任务补齐前都可能累积无主 chunk。
+  建议后续在哪类任务处理：在 T029-T035 的真实 upload coordinator / service / placement / abort-or-cleanup 任务中，把 commit gate 和 failed-commit orphan cleanup 收紧为生产语义，并补对应集成回归。

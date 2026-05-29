@@ -24,6 +24,7 @@
 - `ReadChunk` 必须先查 `ChunkIndex`，只读取 `LIVE` final chunk，不要按路径直读未登记文件，也不要回退读取 staging。
 - `DeleteChunk` 必须先走 `ChunkIndex` 的 per-chunk guard，只删除目标 final chunk，不要顺手碰 staging 或其它 chunk。
 - `StatChunk` / `ListChunks` 必须以 `ChunkIndex` 为准，不要直接扫描文件系统绕过 index。
+- 不要在 `LocalDiskChunkStore` 内调用 metadata `CreateObject` / `CommitObject` / `AbortObject`；上传闭环中的 commit gate 必须留给上层 coordinator / service orchestration。
 - 并发测试或后续接入如果覆盖 read/delete/list 交错，断言必须遵守当前 contract：同 chunk write/delete 依赖 guard 串行；read/delete 交错允许返回明确失败，list 分页仍不承诺并发快照一致性。
 - required durability operation 必须检查真实 durable boundary，不能把 `kOk` 但未到达 boundary 的结果当成成功。
 - 请求/响应字段变更要同步维护 `module-notes.md`。
