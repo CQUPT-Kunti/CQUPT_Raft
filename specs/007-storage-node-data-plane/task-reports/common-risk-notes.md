@@ -39,3 +39,8 @@
   问题：`LocalDiskChunkStore` 当前只完成配置持有和目录初始化，还没有做 restart scan、stale staging cleanup、index rebuild 或 live chunk 发现。
   影响：如果后续任务在没有补齐这些恢复路径前就把它当成“可恢复本地存储”使用，重启后可能看不到已有 live chunk，也不会自动处理遗留 staging。
   建议后续在哪类任务处理：在 T022/T023 收紧基础测试和写入入口边界，在 T070/T071 及相关恢复任务中补齐 restart rebuild 与 staging cleanup。
+
+- 任务编号：T023
+  问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
+  影响：Linux 上的写入链路已经收口，但在真实 Windows 环境中，WriteChunk 可能表现为 explicit unsupported 或暴露额外的 publish / path / handle 语义偏差。
+  建议后续在哪类任务处理：执行 `T023-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。

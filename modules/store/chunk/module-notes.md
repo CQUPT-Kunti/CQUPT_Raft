@@ -8,12 +8,13 @@
 
 - `ChunkStore` 抽象接口
 - chunk 请求/响应结构
-- `LocalDiskChunkStore` 配置和初始化入口
+- `LocalDiskChunkStore` 配置、初始化和 `WriteChunk` 写入入口
 - 与 `store/common` 类型的拼装边界
 
 它当前不负责：
 
-- 真实 chunk payload 读写
+- `ReadChunk` 的真实读取路径
+- `DeleteChunk` / `StatChunk` / `ListChunks` 的真实本地语义
 - 完整 durable publish 编排
 - ChunkIndex 的具体容器实现
 - StorageNode RPC
@@ -28,7 +29,7 @@
 - `chunk_store.h`：接口和 request / response 结构
 - `chunk_store.cpp`：当前只有 `ChunkStore::~ChunkStore()`
 - `local_disk_chunk_store.h`：`LocalDiskChunkStore` 配置、初始化结果和类声明
-- `local_disk_chunk_store.cpp`：目录初始化、默认依赖装配和当前未实现接口的显式返回
+- `local_disk_chunk_store.cpp`：目录初始化、默认依赖装配、`WriteChunk` 实现和其余未实现接口的显式返回
 
 `chunk_store.cpp` 现在本来就以虚析构定义为主；真正开始承接本地实现后，新增的逻辑主要会进入 `local_disk_chunk_store.cpp`。
 
@@ -181,15 +182,21 @@ T021 已实现：
 - 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`
 - 默认 durable file / chunk index 依赖装配
 
-T021 还没有实现：
+T023 已实现：
 
 - `WriteChunk`
+
+T023 还没有实现：
+
 - `ReadChunk`
 - `DeleteChunk`
 - `StatChunk`
 - `ListChunks`
 
-这些接口当前会返回明确的 `kUnsupported`，不会伪装成功。
+其中：
+
+- `WriteChunk` 已经走通 staging -> flush -> publish -> directory sync -> LIVE index update
+- `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 当前仍返回明确的 `kUnsupported`
 
 ## `.cpp` 当前实现了什么
 
@@ -204,12 +211,14 @@ T021 还没有实现：
 - `LocalDiskChunkStore::durable_file()`
 - `LocalDiskChunkStore::chunk_index()`
 - `LocalDiskChunkStore::executor()`
-- `LocalDiskChunkStore::{WriteChunk, ReadChunk, DeleteChunk, StatChunk, ListChunks}()`
+- `LocalDiskChunkStore::WriteChunk()`
+- `LocalDiskChunkStore::{ReadChunk, DeleteChunk, StatChunk, ListChunks}()`
 
 也就是说：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
-- `local_disk_chunk_store.cpp` 当前只负责配置/目录初始化骨架，不做真实 chunk 数据路径
+- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` 的真实写入路径
+- 读/删/查/列举和恢复路径仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -287,14 +296,68 @@ T021 还没有实现：
 
 ### `MakeUnsupportedResponse<Response>(...)`
 
-给当前尚未实现的 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 生成统一返回。
+给当前尚未实现的 `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 生成统一返回。
 
 当前语义是：
 
 - `status = kUnsupported`
-- `error_detail` 指明这是 T021 尚未实现的接口
+- `error_detail` 指明这是当前阶段尚未实现的接口
 
-这样做的目的，是在骨架阶段明确拒绝未实现能力，而不是 silent success。
+这样做的目的，是在阶段化实现过程中明确拒绝未实现能力，而不是 silent success。
+
+### `CurrentUnixTimeMillis()`
+
+给 `WriteChunk` 生成本地 metadata / index 更新时间。
+
+### `BuildHexToken(...)`
+
+把 `request_id` 映射成安全的 staging token。
+
+当前 token 只要求：
+
+- 单路径段安全
+- 同 chunk 重试可复现
+- 不把原始 request_id 直接暴露成文件名
+
+### `HasExpectedChecksumConstraint(...)`
+
+判断请求是否真的带了 expected checksum 约束。
+
+它的作用是区分：
+
+- 完全未设置 expected checksum
+- 部分设置但格式不合法的 expected checksum
+
+### `BuildChunkMetadata(...)`
+
+把一次成功写入的结果组装成 `ChunkMetadata`。
+
+### `BuildChunkMetadataFromIndexEntry(...)`
+
+把已有 index 条目转换成返回给调用方的 `ChunkMetadata`。
+
+这个 helper 主要给重复写的 idempotent 成功路径复用。
+
+### `BuildChunkIndexEntry(...)`
+
+把成功写入后的 metadata 和 final path 组装成 `ChunkIndexEntry`。
+
+### `PrepareWriteIdentity(...)`
+
+统一整理和校验 `WriteChunkRequest.identity`。
+
+当前支持两种输入方式：
+
+- 请求直接带合法 `chunk_id`
+- 请求没带 `chunk_id`，但带了 `object_id + version + chunk_index`
+
+如果请求里同时带了 `chunk_id` 和诊断字段，它会检查是否一致。
+
+### `HasRequiredDurableBoundary(...)`
+
+校验 durable file 的 required operation 是否真的到达 durable boundary。
+
+这层检查会拦住“返回 `kOk` 但其实没有 durable boundary”的 silent success。
 
 ## `Initialize()` 的执行顺序
 
@@ -318,6 +381,60 @@ T021 还没有实现：
 7. 写回 `paths_` 和 `initialized_`
 
 也就是说，`Initialize()` 当前只做“配置和目录边界落稳”，还没有进入后续的 chunk 生命周期逻辑。
+
+## `WriteChunk()` 当前语义
+
+### 写入顺序
+
+当前 `WriteChunk()` 的主流程是：
+
+1. 必要时触发 `Initialize()`
+2. 校验 `request_id`
+3. 校验并整理 `ChunkIdentity`
+4. 校验 `expected_size`
+5. 计算或校验 checksum
+6. 获取 `ChunkIndex` 的 per-chunk guard
+7. 检查现有 index 条目，处理重复写 / 冲突
+8. 生成 final / staging 路径
+9. 打开 staging writer
+10. 写入 payload
+11. flush staging
+12. close writer
+13. publish 到 final
+14. sync final parent directory
+15. insert LIVE index
+
+只有第 15 步成功之后，chunk 才会进入 LIVE index。
+
+### 幂等与冲突
+
+当前重复写语义：
+
+- same chunk + same size + same checksum -> 返回成功，并设置 `already_exists=true`
+- same chunk + 不同 size 或 checksum -> 返回 `kConflict`
+- payload 和 `expected_checksum` 自己不一致 -> 返回 `kChecksumMismatch`
+
+当前没有更强的“内容 identity”字段，所以重复写判断以 `size + checksum` 为主。
+
+### chunk guard 边界
+
+`WriteChunk()` 当前已经把 `AcquireChunkLock()` 作为同 chunk 写入主入口的固定前置步骤。
+
+这意味着：
+
+- 同一 chunk 的冲突写入会串行
+- 不同 chunk 仍然可以走不同 stripe 并行
+
+### 当前未解决的恢复边界
+
+T023 仍然没有解决这些恢复问题：
+
+- restart rebuild
+- stale staging cleanup
+- published-but-index-not-inserted 的重启重建
+- corrupted / quarantine
+
+也就是说，当前 `WriteChunk()` 只保证在线写入时的 durable publish 顺序，不保证重启后的自动收口。
 
 ## 与其它模块的边界
 
