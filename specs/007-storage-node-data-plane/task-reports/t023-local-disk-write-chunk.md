@@ -33,11 +33,10 @@
 - 更新 `module-notes.md` / `AGENTS.md`，把 `WriteChunk` 已实现状态、helper 语义和当前未实现边界写清楚。
 - 将 `tasks.md` 中 T023 标记为完成，并新增 `T023-WIN` 待验证任务。
 
-## 是否使用 test/test_file/test_file.deb 作为二进制 fixture；如果未使用，说明原因
+## 是否使用 tests/test_file/test_file.deb 作为二进制 fixture；如果未使用，说明原因
 
-- 未直接使用 `test/test_file/test_file.deb`，因为该路径在当前仓库中不存在。
 - 已使用仓库内实际存在的 `tests/test_file/test_file.deb` 作为真实二进制 fixture。
-- 测试代码仍保留对请求路径 `test/test_file/test_file.deb` 的优先探测；若未来该路径补齐，会优先使用它。
+- `test/test_file/test_file.deb` 在当前仓库中不存在，只作为 fallback 历史路径记录。
 
 ## 验证命令和结果
 

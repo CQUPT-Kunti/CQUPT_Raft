@@ -227,16 +227,16 @@ namespace storedemo
             return entry;
         }
 
-        StorageNodeStatusCode ResolveReadFinalPath(const std::filesystem::path &data_root,
-                                                   const ChunkIndexEntry &entry,
-                                                   std::filesystem::path *final_path,
-                                                   std::string *error_detail)
+        StorageNodeStatusCode ResolveIndexedFinalPath(const std::filesystem::path &data_root,
+                                                      const ChunkIndexEntry &entry,
+                                                      std::filesystem::path *final_path,
+                                                      std::string *error_detail)
         {
             if (final_path == nullptr)
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = "read final_path output must not be null";
+                    *error_detail = "indexed final_path output must not be null";
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
@@ -266,6 +266,41 @@ namespace storedemo
                                     layout.final_relative_path,
                                     final_path,
                                     error_detail);
+        }
+
+        StorageNodeStatusCode CompareChecksums(const ChunkChecksum &expected_checksum,
+                                               const ChunkChecksum &actual_checksum,
+                                               std::string *error_detail)
+        {
+            if (expected_checksum.algorithm == ChunkChecksumAlgorithm::kUnknown)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum algorithm must be set";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (expected_checksum.algorithm != actual_checksum.algorithm)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "checksum algorithm mismatch";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            if (expected_checksum.size_bytes != actual_checksum.size_bytes ||
+                expected_checksum.value != actual_checksum.value)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "payload checksum mismatch";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            return StorageNodeStatusCode::kOk;
         }
 
         StorageNodeStatusCode ValidateReadableChunkState(const ChunkState state,
@@ -307,15 +342,6 @@ namespace storedemo
                 return StorageNodeStatusCode::kOk;
             }
 
-            if (expected_checksum.algorithm == ChunkChecksumAlgorithm::kUnknown)
-            {
-                if (error_detail != nullptr)
-                {
-                    *error_detail = "expected_checksum algorithm must be set";
-                }
-                return StorageNodeStatusCode::kInvalidArgument;
-            }
-
             if (expected_checksum.algorithm != ChunkChecksumAlgorithm::kSha256)
             {
                 if (error_detail != nullptr)
@@ -334,17 +360,7 @@ namespace storedemo
                 return StorageNodeStatusCode::kInvalidArgument;
             }
 
-            if (expected_checksum.size_bytes != actual_checksum.size_bytes ||
-                expected_checksum.value != actual_checksum.value)
-            {
-                if (error_detail != nullptr)
-                {
-                    *error_detail = "payload checksum mismatch";
-                }
-                return StorageNodeStatusCode::kChecksumMismatch;
-            }
-
-            return StorageNodeStatusCode::kOk;
+            return CompareChecksums(expected_checksum, actual_checksum, error_detail);
         }
 
         StorageNodeStatusCode ReadFilePayload(const std::filesystem::path &path,
@@ -384,6 +400,105 @@ namespace storedemo
             }
 
             return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode ResolveEntryChecksum(const std::filesystem::path &data_root,
+                                                   const ChunkIndexEntry &entry,
+                                                   ChunkChecksum *checksum,
+                                                   std::string *error_detail)
+        {
+            if (checksum == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "checksum output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (entry.checksum.IsSet())
+            {
+                *checksum = entry.checksum;
+                return StorageNodeStatusCode::kOk;
+            }
+
+            std::filesystem::path final_path;
+            auto status =
+                ResolveIndexedFinalPath(data_root, entry, &final_path, error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            std::error_code exists_error;
+            const bool exists = std::filesystem::exists(final_path, exists_error);
+            if (exists_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        BuildFilesystemErrorDetail("exists", final_path, exists_error);
+                }
+                return MapFilesystemErrorToStatus(exists_error);
+            }
+            if (!exists)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "final chunk file does not exist: " +
+                                    final_path.string();
+                }
+                return StorageNodeStatusCode::kNotFound;
+            }
+
+            std::string payload;
+            status = ReadFilePayload(final_path, &payload, error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            return ComputeChunkChecksum(payload, checksum, error_detail);
+        }
+
+        StorageNodeStatusCode ValidateDeleteExpectedChecksum(
+            const std::filesystem::path &data_root,
+            const ChunkIndexEntry &entry,
+            const ChunkChecksum &expected_checksum,
+            std::string *error_detail)
+        {
+            if (!HasExpectedChecksumConstraint(expected_checksum))
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (expected_checksum.algorithm != ChunkChecksumAlgorithm::kSha256)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum algorithm is not supported";
+                }
+                return StorageNodeStatusCode::kUnsupported;
+            }
+
+            if (expected_checksum.value.size() != kSha256DigestHexChars)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "expected_checksum value must be 64 hex chars";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            ChunkChecksum actual_checksum;
+            const auto status =
+                ResolveEntryChecksum(data_root, entry, &actual_checksum, error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            return CompareChecksums(expected_checksum, actual_checksum, error_detail);
         }
 
         StorageNodeStatusCode PrepareWriteIdentity(const WriteChunkRequest &request,
@@ -976,7 +1091,7 @@ namespace storedemo
 
         std::filesystem::path final_path;
         response.status =
-            ResolveReadFinalPath(paths_.data_root, entry, &final_path, &response.error_detail);
+            ResolveIndexedFinalPath(paths_.data_root, entry, &final_path, &response.error_detail);
         if (!response.ok())
         {
             return response;
@@ -1049,18 +1164,303 @@ namespace storedemo
         return response;
     }
 
-    DeleteChunkResponse LocalDiskChunkStore::DeleteChunk(const DeleteChunkRequest &)
+    DeleteChunkResponse LocalDiskChunkStore::DeleteChunk(const DeleteChunkRequest &request)
     {
-        return MakeUnsupportedResponse<DeleteChunkResponse>("DeleteChunk");
+        DeleteChunkResponse response;
+
+        if (!initialized_)
+        {
+            const auto init_result = Initialize();
+            if (!init_result.ok())
+            {
+                response.status = init_result.status;
+                response.error_detail = init_result.error_detail;
+                response.retry_after_ms = init_result.retry_after_ms;
+                return response;
+            }
+        }
+
+        if (request.request_id.empty())
+        {
+            response.status = StorageNodeStatusCode::kInvalidArgument;
+            response.error_detail = "DeleteChunk request_id must not be empty";
+            return response;
+        }
+
+        if (config_.chunk_index == nullptr)
+        {
+            response.status = StorageNodeStatusCode::kUnsupported;
+            response.error_detail = "DeleteChunk requires a valid ChunkIndex";
+            return response;
+        }
+
+        auto lock_response = config_.chunk_index->AcquireChunkLock(request.chunk_id);
+        if (!lock_response.ok() || !lock_response.acquired)
+        {
+            response.status = lock_response.status;
+            response.error_detail = lock_response.error_detail;
+            response.retry_after_ms = lock_response.retry_after_ms;
+            return response;
+        }
+
+        const auto find_response = config_.chunk_index->Find(request.chunk_id);
+        if (find_response.status == StorageNodeStatusCode::kNotFound)
+        {
+            response.status = StorageNodeStatusCode::kOk;
+            response.already_missing = true;
+            response.metadata.identity.chunk_id = request.chunk_id;
+            response.metadata.state = ChunkState::kMissing;
+            return response;
+        }
+        if (!find_response.ok())
+        {
+            response.status = find_response.status;
+            response.error_detail = find_response.error_detail;
+            response.retry_after_ms = find_response.retry_after_ms;
+            return response;
+        }
+
+        ChunkIndexEntry updated_entry = find_response.entry;
+        response.metadata = BuildChunkMetadataFromIndexEntry(config_,
+                                                            updated_entry,
+                                                            request.request_id);
+
+        if (updated_entry.state == ChunkState::kDeleted ||
+            updated_entry.state == ChunkState::kMissing)
+        {
+            response.status = StorageNodeStatusCode::kOk;
+            response.already_missing = true;
+            response.metadata.state = ChunkState::kDeleted;
+            return response;
+        }
+
+        response.status = ValidateDeleteExpectedChecksum(paths_.data_root,
+                                                         updated_entry,
+                                                         request.expected_checksum,
+                                                         &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        if (updated_entry.HasFinalPath())
+        {
+            std::filesystem::path final_path;
+            response.status = ResolveIndexedFinalPath(paths_.data_root,
+                                                      updated_entry,
+                                                      &final_path,
+                                                      &response.error_detail);
+            if (!response.ok())
+            {
+                return response;
+            }
+
+            std::error_code remove_error;
+            const bool removed = std::filesystem::remove(final_path, remove_error);
+            if (remove_error)
+            {
+                response.status = MapFilesystemErrorToStatus(remove_error);
+                response.error_detail =
+                    BuildFilesystemErrorDetail("remove", final_path, remove_error);
+                return response;
+            }
+            (void)removed;
+        }
+
+        updated_entry.state = ChunkState::kDeleted;
+        updated_entry.updated_at = CurrentUnixTimeMillis();
+        const auto update_response = config_.chunk_index->Update(updated_entry);
+        if (!update_response.ok())
+        {
+            response.status = update_response.status;
+            response.error_detail = update_response.error_detail;
+            response.retry_after_ms = update_response.retry_after_ms;
+            return response;
+        }
+
+        response.metadata = BuildChunkMetadataFromIndexEntry(config_,
+                                                            update_response.entry,
+                                                            request.request_id);
+        response.deleted = true;
+        return response;
     }
 
-    StatChunkResponse LocalDiskChunkStore::StatChunk(const StatChunkRequest &)
+    StatChunkResponse LocalDiskChunkStore::StatChunk(const StatChunkRequest &request)
     {
-        return MakeUnsupportedResponse<StatChunkResponse>("StatChunk");
+        StatChunkResponse response;
+
+        if (!initialized_)
+        {
+            const auto init_result = Initialize();
+            if (!init_result.ok())
+            {
+                response.status = init_result.status;
+                response.error_detail = init_result.error_detail;
+                response.retry_after_ms = init_result.retry_after_ms;
+                return response;
+            }
+        }
+
+        if (request.request_id.empty())
+        {
+            response.status = StorageNodeStatusCode::kInvalidArgument;
+            response.error_detail = "StatChunk request_id must not be empty";
+            return response;
+        }
+
+        if (config_.chunk_index == nullptr)
+        {
+            response.status = StorageNodeStatusCode::kUnsupported;
+            response.error_detail = "StatChunk requires a valid ChunkIndex";
+            return response;
+        }
+
+        const auto find_response = config_.chunk_index->Find(request.chunk_id);
+        if (!find_response.ok())
+        {
+            response.status = find_response.status;
+            response.error_detail = find_response.error_detail;
+            response.retry_after_ms = find_response.retry_after_ms;
+            return response;
+        }
+
+        response.metadata =
+            BuildChunkMetadataFromIndexEntry(config_, find_response.entry, "");
+        if (!request.verify_checksum)
+        {
+            return response;
+        }
+
+        if (!IsReadableChunkState(find_response.entry.state))
+        {
+            response.status = StorageNodeStatusCode::kConflict;
+            response.error_detail =
+                std::string("cannot verify checksum for non-LIVE chunk state: ") +
+                ToString(find_response.entry.state);
+            return response;
+        }
+
+        std::filesystem::path final_path;
+        response.status = ResolveIndexedFinalPath(paths_.data_root,
+                                                  find_response.entry,
+                                                  &final_path,
+                                                  &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        std::error_code exists_error;
+        const bool exists = std::filesystem::exists(final_path, exists_error);
+        if (exists_error)
+        {
+            response.status = MapFilesystemErrorToStatus(exists_error);
+            response.error_detail =
+                BuildFilesystemErrorDetail("exists", final_path, exists_error);
+            return response;
+        }
+        if (!exists)
+        {
+            response.status = StorageNodeStatusCode::kNotFound;
+            response.error_detail = "final chunk file does not exist: " +
+                                    final_path.string();
+            return response;
+        }
+
+        std::string payload;
+        response.status = ReadFilePayload(final_path, &payload, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        if (static_cast<std::uint64_t>(payload.size()) != find_response.entry.size)
+        {
+            response.status = StorageNodeStatusCode::kCorrupted;
+            response.error_detail = "chunk file size does not match index metadata";
+            return response;
+        }
+
+        ChunkChecksum actual_checksum;
+        response.status =
+            ComputeChunkChecksum(payload, &actual_checksum, &response.error_detail);
+        if (!response.ok())
+        {
+            return response;
+        }
+
+        if (find_response.entry.checksum.IsSet())
+        {
+            response.status = CompareChecksums(find_response.entry.checksum,
+                                               actual_checksum,
+                                               &response.error_detail);
+            if (!response.ok())
+            {
+                response.status = StorageNodeStatusCode::kCorrupted;
+                return response;
+            }
+        }
+
+        response.metadata.checksum =
+            find_response.entry.checksum.IsSet() ? find_response.entry.checksum
+                                                 : actual_checksum;
+        response.verified = true;
+        return response;
     }
 
-    ListChunksResponse LocalDiskChunkStore::ListChunks(const ListChunksRequest &)
+    ListChunksResponse LocalDiskChunkStore::ListChunks(const ListChunksRequest &request)
     {
-        return MakeUnsupportedResponse<ListChunksResponse>("ListChunks");
+        ListChunksResponse response;
+
+        if (!initialized_)
+        {
+            const auto init_result = Initialize();
+            if (!init_result.ok())
+            {
+                response.status = init_result.status;
+                response.error_detail = init_result.error_detail;
+                response.retry_after_ms = init_result.retry_after_ms;
+                return response;
+            }
+        }
+
+        if (request.request_id.empty())
+        {
+            response.status = StorageNodeStatusCode::kInvalidArgument;
+            response.error_detail = "ListChunks request_id must not be empty";
+            return response;
+        }
+
+        if (config_.chunk_index == nullptr)
+        {
+            response.status = StorageNodeStatusCode::kUnsupported;
+            response.error_detail = "ListChunks requires a valid ChunkIndex";
+            return response;
+        }
+
+        ChunkIndexListOptions options;
+        options.state_filter = request.options.state_filter;
+        options.prefix_filter = request.options.prefix_filter;
+        options.page_token = request.options.page_token;
+        options.page_size = request.options.page_size;
+        options.include_quarantine = request.options.include_quarantine;
+
+        const auto list_response = config_.chunk_index->List(options);
+        if (!list_response.ok())
+        {
+            response.status = list_response.status;
+            response.error_detail = list_response.error_detail;
+            response.retry_after_ms = list_response.retry_after_ms;
+            return response;
+        }
+
+        response.next_page_token = list_response.next_page_token;
+        response.snapshot_epoch = list_response.snapshot_epoch;
+        response.chunks.reserve(list_response.entries.size());
+        for (const auto &entry : list_response.entries)
+        {
+            response.chunks.push_back(BuildChunkMetadataFromIndexEntry(config_, entry, ""));
+        }
+        return response;
     }
 }

@@ -39,8 +39,8 @@
 ## 是否使用真实二进制 fixture；如果未使用，说明原因
 
 - 使用了真实二进制 fixture。
-- 当前仓库中 `test/test_file/test_file.deb` 不存在。
 - 实际使用的是仓库中存在的 `tests/test_file/test_file.deb`。
+- `test/test_file/test_file.deb` 在当前仓库中不存在，只作为 fallback 历史路径记录。
 
 ## 验证命令和结果
 

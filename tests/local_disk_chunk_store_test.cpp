@@ -32,12 +32,12 @@ namespace storedemo
         {
             const std::filesystem::path repo_root =
                 std::filesystem::path(__FILE__).parent_path().parent_path();
-            const std::filesystem::path requested_path =
-                repo_root / "test" / "test_file" / "test_file.deb";
-            const std::filesystem::path actual_path =
+            const std::filesystem::path primary_path =
                 repo_root / "tests" / "test_file" / "test_file.deb";
+            const std::filesystem::path fallback_path =
+                repo_root / "test" / "test_file" / "test_file.deb";
 
-            for (const auto &candidate : {requested_path, actual_path})
+            for (const auto &candidate : {primary_path, fallback_path})
             {
                 if (!std::filesystem::exists(candidate))
                 {
@@ -128,6 +128,28 @@ namespace storedemo
             return ReadChunkRequest{
                 .request_id = request_id,
                 .chunk_id = chunk_id};
+        }
+
+        DeleteChunkRequest MakeDeleteRequest(const ChunkId &chunk_id,
+                                             const std::string &request_id)
+        {
+            return DeleteChunkRequest{
+                .request_id = request_id,
+                .chunk_id = chunk_id};
+        }
+
+        StatChunkRequest MakeStatRequest(const ChunkId &chunk_id,
+                                         const std::string &request_id)
+        {
+            return StatChunkRequest{
+                .request_id = request_id,
+                .chunk_id = chunk_id};
+        }
+
+        ListChunksRequest MakeListRequest(const std::string &request_id)
+        {
+            return ListChunksRequest{
+                .request_id = request_id};
         }
 
         std::string ReadBinaryFileOrThrow(const std::filesystem::path &path)
@@ -469,7 +491,7 @@ namespace storedemo
 #endif
         }
 
-        TEST_F(LocalDiskChunkStoreTest, UnsupportedDeleteStatAndListRemainExplicitlyUnsupported)
+        TEST_F(LocalDiskChunkStoreTest, DeleteStatAndListRejectEmptyRequestId)
         {
             test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_unsupported_ops");
             LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
@@ -477,17 +499,17 @@ namespace storedemo
             ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
 
             const auto delete_response = store.DeleteChunk(DeleteChunkRequest{});
-            EXPECT_EQ(delete_response.status, StorageNodeStatusCode::kUnsupported);
+            EXPECT_EQ(delete_response.status, StorageNodeStatusCode::kInvalidArgument);
             EXPECT_FALSE(delete_response.ok());
             EXPECT_NE(delete_response.error_detail.find("DeleteChunk"), std::string::npos);
 
             const auto stat_response = store.StatChunk(StatChunkRequest{});
-            EXPECT_EQ(stat_response.status, StorageNodeStatusCode::kUnsupported);
+            EXPECT_EQ(stat_response.status, StorageNodeStatusCode::kInvalidArgument);
             EXPECT_FALSE(stat_response.ok());
             EXPECT_NE(stat_response.error_detail.find("StatChunk"), std::string::npos);
 
             const auto list_response = store.ListChunks(ListChunksRequest{});
-            EXPECT_EQ(list_response.status, StorageNodeStatusCode::kUnsupported);
+            EXPECT_EQ(list_response.status, StorageNodeStatusCode::kInvalidArgument);
             EXPECT_FALSE(list_response.ok());
             EXPECT_NE(list_response.error_detail.find("ListChunks"), std::string::npos);
         }
@@ -1042,6 +1064,289 @@ namespace storedemo
             EXPECT_EQ(response.status, StorageNodeStatusCode::kNotFound);
             EXPECT_FALSE(response.ok());
 #endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, StatChunkAfterWriteReturnsLiveMetadata)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file stat path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_stat_live");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(25),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto fixture = LoadFixtureBinaryPayload();
+            const auto identity = MakeIdentityOrThrow("stat-live-object", 1, 0, 0);
+            const auto write_request =
+                MakeWriteRequest(identity, fixture.payload, "stat-live-write");
+            ASSERT_EQ(store.WriteChunk(write_request).status, StorageNodeStatusCode::kOk);
+
+            auto stat_request = MakeStatRequest(identity.chunk_id, "stat-live-request");
+            stat_request.verify_checksum = true;
+            const auto response = store.StatChunk(stat_request);
+            ASSERT_EQ(response.status, StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(response.ok());
+            EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+            EXPECT_EQ(response.metadata.state, ChunkState::kLive);
+            EXPECT_EQ(response.metadata.size, fixture.payload.size());
+            EXPECT_EQ(response.metadata.checksum.value, write_request.expected_checksum.value);
+            EXPECT_TRUE(response.verified);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, StatChunkReturnsDeletedStateAfterDelete)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local delete/stat path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_stat_deleted");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(26),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(24, "stat-deleted");
+            const auto identity = MakeIdentityOrThrow("stat-deleted-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "stat-deleted-write")).status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.DeleteChunk(MakeDeleteRequest(identity.chunk_id, "stat-deleted-delete")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto response =
+                store.StatChunk(MakeStatRequest(identity.chunk_id, "stat-deleted-stat"));
+            ASSERT_EQ(response.status, StorageNodeStatusCode::kOk);
+            EXPECT_EQ(response.metadata.state, ChunkState::kDeleted);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ListChunksReturnsLiveEntriesAndSupportsPagination)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local list path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_list_live");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(27),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(12, "list-live");
+            const auto first = MakeIdentityOrThrow("list-live-a", 1, 0, 0);
+            const auto second = MakeIdentityOrThrow("list-live-b", 1, 0, 0);
+            const auto third = MakeIdentityOrThrow("list-live-c", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(first, payload, "list-live-write-a")).status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(second, payload, "list-live-write-b")).status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(third, payload, "list-live-write-c")).status,
+                      StorageNodeStatusCode::kOk);
+
+            auto first_page = MakeListRequest("list-live-page-1");
+            first_page.options.state_filter = ChunkState::kLive;
+            first_page.options.page_size = 2;
+            const auto first_response = store.ListChunks(first_page);
+            ASSERT_EQ(first_response.status, StorageNodeStatusCode::kOk);
+            ASSERT_EQ(first_response.chunks.size(), 2U);
+            ASSERT_FALSE(first_response.next_page_token.empty());
+            EXPECT_EQ(first_response.chunks[0].state, ChunkState::kLive);
+            EXPECT_EQ(first_response.chunks[1].state, ChunkState::kLive);
+
+            auto second_page = MakeListRequest("list-live-page-2");
+            second_page.options.state_filter = ChunkState::kLive;
+            second_page.options.page_size = 2;
+            second_page.options.page_token = first_response.next_page_token;
+            const auto second_response = store.ListChunks(second_page);
+            ASSERT_EQ(second_response.status, StorageNodeStatusCode::kOk);
+            ASSERT_EQ(second_response.chunks.size(), 1U);
+            EXPECT_TRUE(second_response.next_page_token.empty());
+            EXPECT_EQ(second_response.chunks[0].state, ChunkState::kLive);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ListChunksCanFilterDeletedEntries)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local delete/list path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_list_deleted");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(28),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto fixture = LoadFixtureBinaryPayload();
+            const auto live_identity = MakeIdentityOrThrow("list-deleted-live", 1, 0, 0);
+            const auto deleted_identity = MakeIdentityOrThrow("list-deleted-deleted", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(live_identity,
+                                                        test::MakeChunkPayload(10, "list-del-live"),
+                                                        "list-deleted-write-live"))
+                          .status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(deleted_identity,
+                                                        fixture.payload,
+                                                        "list-deleted-write-deleted"))
+                          .status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.DeleteChunk(MakeDeleteRequest(deleted_identity.chunk_id,
+                                                          "list-deleted-delete"))
+                          .status,
+                      StorageNodeStatusCode::kOk);
+
+            auto deleted_request = MakeListRequest("list-deleted-request");
+            deleted_request.options.state_filter = ChunkState::kDeleted;
+            const auto deleted_response = store.ListChunks(deleted_request);
+            ASSERT_EQ(deleted_response.status, StorageNodeStatusCode::kOk);
+            ASSERT_EQ(deleted_response.chunks.size(), 1U);
+            EXPECT_EQ(deleted_response.chunks[0].identity.chunk_id, deleted_identity.chunk_id);
+            EXPECT_EQ(deleted_response.chunks[0].state, ChunkState::kDeleted);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, DeleteChunkAfterWritePreventsFutureReadAndRemovesFile)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local delete path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_delete_success");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(29),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(36, "delete-success");
+            const auto identity = MakeIdentityOrThrow("delete-success-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "delete-success-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            ASSERT_TRUE(std::filesystem::exists(final_path));
+
+            const auto delete_response =
+                store.DeleteChunk(MakeDeleteRequest(identity.chunk_id, "delete-success-delete"));
+            ASSERT_EQ(delete_response.status, StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(delete_response.deleted);
+            EXPECT_FALSE(delete_response.already_missing);
+            EXPECT_FALSE(std::filesystem::exists(final_path));
+
+            const auto read_response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "delete-success-read"));
+            EXPECT_EQ(read_response.status, StorageNodeStatusCode::kNotFound);
+            EXPECT_FALSE(read_response.ok());
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, DeleteChunkIsIdempotentForRepeatedDelete)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local delete path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_delete_idempotent");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(30),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(18, "delete-idempotent");
+            const auto identity = MakeIdentityOrThrow("delete-idempotent-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "delete-idempotent-write")).status,
+                      StorageNodeStatusCode::kOk);
+            ASSERT_EQ(store.DeleteChunk(MakeDeleteRequest(identity.chunk_id, "delete-idempotent-first")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto second_response =
+                store.DeleteChunk(MakeDeleteRequest(identity.chunk_id, "delete-idempotent-second"));
+            EXPECT_EQ(second_response.status, StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(second_response.already_missing);
+            EXPECT_EQ(second_response.metadata.state, ChunkState::kDeleted);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, DeleteChunkRejectsExpectedChecksumMismatchWithoutRemovingFile)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local delete path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_delete_checksum_mismatch");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(31),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto fixture = LoadFixtureBinaryPayload();
+            const auto identity = MakeIdentityOrThrow("delete-checksum-mismatch-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, fixture.payload, "delete-checksum-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            auto delete_request =
+                MakeDeleteRequest(identity.chunk_id, "delete-checksum-delete");
+            delete_request.expected_checksum = ComputeChecksumOrThrow("different-payload");
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+
+            const auto response = store.DeleteChunk(delete_request);
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kChecksumMismatch);
+            EXPECT_FALSE(response.ok());
+            EXPECT_TRUE(std::filesystem::exists(final_path));
+
+            const auto stat_response =
+                store.StatChunk(MakeStatRequest(identity.chunk_id, "delete-checksum-stat"));
+            EXPECT_EQ(stat_response.status, StorageNodeStatusCode::kOk);
+            EXPECT_EQ(stat_response.metadata.state, ChunkState::kLive);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, DeleteChunkReturnsAlreadyMissingForUnknownChunk)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_delete_missing");
+            LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
+                                                 test::MakeStorageNodeIdFixture(32)));
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("delete-missing-object", 1, 0, 0);
+            const auto response =
+                store.DeleteChunk(MakeDeleteRequest(identity.chunk_id, "delete-missing-request"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(response.already_missing);
+            EXPECT_EQ(response.metadata.state, ChunkState::kMissing);
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, ListChunksDoesNotReturnUnindexedFinalFile)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_list_unindexed");
+            LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
+                                                 test::MakeStorageNodeIdFixture(33)));
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("list-unindexed-object", 1, 0, 0);
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            ASSERT_TRUE(std::filesystem::create_directories(final_path.parent_path()));
+            {
+                std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << "orphan";
+            }
+
+            const auto response = store.ListChunks(MakeListRequest("list-unindexed-request"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(response.chunks.empty());
         }
     } // namespace
 } // namespace storedemo

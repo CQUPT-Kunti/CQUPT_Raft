@@ -12,6 +12,7 @@
 
 ## 全局规则
 
+- 每次聊天结束的最后都需要加上一个 "喵!" 来表示结尾
 - 平台相关的 durability 代码不允许静默降级。
 - 如果一个平台实现了真实持久化语义，其他平台分支必须提供等价行为、返回明确错误，或在 durability contract 中明确记录较弱保证。
 - 对 required durability operations，不允许使用 no-op 后直接返回成功的实现。

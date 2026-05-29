@@ -49,3 +49,8 @@
   问题：`LocalDiskChunkStore::ReadChunk()` 已经固定为 full read + checksum on read，但当前发现文件大小或 checksum 与 index metadata 不一致时，只返回明确错误，还不会把本地 index 状态自动写回 `CORRUPTED` / `QUARANTINED`。
   影响：前台读取已经不会把损坏数据当成功返回，但后续如果需要基于读路径直接沉淀损坏事实、触发隔离或给 scrub/repair 复用，还需要补状态回写与恢复协同。
   建议后续在哪类任务处理：在后续 T025/T恢复/scrub 相关任务中，再统一收紧 corruption 状态写回、隔离和恢复边界。
+
+- 任务编号：T025
+  问题：`LocalDiskChunkStore::DeleteChunk()` 现已接入真实文件删除和 `DELETED` index 状态更新，但当前环境没有 Windows 实机验证能力，`std::filesystem::remove` 在 sharing violation / open-handle / unlink 语义上的真实行为仍未验证。
+  影响：Linux 上删除、Stat、List 语义已经收口，但在真实 Windows 环境中，DeleteChunk 可能暴露额外的 sharing violation、删除失败分类或文件可见性差异。
+  建议后续在哪类任务处理：执行 `T025-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。

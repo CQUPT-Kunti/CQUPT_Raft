@@ -10,11 +10,11 @@
 - chunk 请求/响应结构
 - `LocalDiskChunkStore` 配置、初始化和 `WriteChunk` 写入入口
 - `LocalDiskChunkStore::ReadChunk` 的最小真实读取路径
+- `LocalDiskChunkStore::DeleteChunk` / `StatChunk` / `ListChunks` 的本地 index 语义
 - 与 `store/common` 类型的拼装边界
 
 它当前不负责：
 
-- `DeleteChunk` / `StatChunk` / `ListChunks` 的真实本地语义
 - 完整 durable publish 编排
 - ChunkIndex 的具体容器实现
 - StorageNode RPC
@@ -29,7 +29,7 @@
 - `chunk_store.h`：接口和 request / response 结构
 - `chunk_store.cpp`：当前只有 `ChunkStore::~ChunkStore()`
 - `local_disk_chunk_store.h`：`LocalDiskChunkStore` 配置、初始化结果和类声明
-- `local_disk_chunk_store.cpp`：目录初始化、默认依赖装配、`WriteChunk` 实现和其余未实现接口的显式返回
+- `local_disk_chunk_store.cpp`：目录初始化、默认依赖装配，以及 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地实现
 
 `chunk_store.cpp` 现在本来就以虚析构定义为主；真正开始承接本地实现后，新增的逻辑主要会进入 `local_disk_chunk_store.cpp`。
 
@@ -182,22 +182,27 @@ T021 已实现：
 - 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`
 - 默认 durable file / chunk index 依赖装配
 
-T023-T024 已实现：
+T023-T025 已实现：
 
 - `WriteChunk`
 - `ReadChunk`
-
-T025 还没有实现：
-
 - `DeleteChunk`
 - `StatChunk`
 - `ListChunks`
+
+后续任务仍未实现：
+
+- restart rebuild / stale staging cleanup
+- corruption / quarantine 状态自动回写
+- 后台 scrub / repair / rebalance
 
 其中：
 
 - `WriteChunk` 已经走通 staging -> flush -> publish -> directory sync -> LIVE index update
 - `ReadChunk` 已经走通 index lookup -> state check -> final file read -> checksum verify -> return payload
-- `DeleteChunk` / `StatChunk` / `ListChunks` 当前仍返回明确的 `kUnsupported`
+- `DeleteChunk` 已经走通 chunk guard -> expected checksum 校验 -> final file remove -> index state update
+- `StatChunk` 已经走通 index lookup 和可选 checksum verify
+- `ListChunks` 已经走通基于 `ChunkIndex` 的过滤和分页
 
 ## `.cpp` 当前实现了什么
 
@@ -214,13 +219,15 @@ T025 还没有实现：
 - `LocalDiskChunkStore::executor()`
 - `LocalDiskChunkStore::WriteChunk()`
 - `LocalDiskChunkStore::ReadChunk()`
-- `LocalDiskChunkStore::{DeleteChunk, StatChunk, ListChunks}()`
+- `LocalDiskChunkStore::DeleteChunk()`
+- `LocalDiskChunkStore::StatChunk()`
+- `LocalDiskChunkStore::ListChunks()`
 
 也就是说：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
-- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` / `ReadChunk` 的真实路径
-- 删/查/列举和恢复路径仍未实现
+- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地路径
+- restart 恢复和后台维护路径仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -298,7 +305,7 @@ T025 还没有实现：
 
 ### `MakeUnsupportedResponse<Response>(...)`
 
-给当前尚未实现的 `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 生成统一返回。
+给当前尚未实现的接口生成统一返回。
 
 当前语义是：
 
@@ -344,9 +351,9 @@ T025 还没有实现：
 
 把成功写入后的 metadata 和 final path 组装成 `ChunkIndexEntry`。
 
-### `ResolveReadFinalPath(...)`
+### `ResolveIndexedFinalPath(...)`
 
-给 `ReadChunk` 解析 final 文件路径。
+给 `ReadChunk` / `DeleteChunk` / `StatChunk` 解析 final 文件路径。
 
 优先级是：
 
@@ -354,6 +361,35 @@ T025 还没有实现：
 - 如果 entry 里还没有 final path，再基于 `chunk_id` 反推出标准 final layout
 
 它不会回退去读 staging。
+
+### `CompareChecksums(...)`
+
+比较两份已经成形的 checksum。
+
+这个 helper 主要给：
+
+- `ReadChunk` 的 index checksum 对比
+- `DeleteChunk` 的 `expected_checksum` 保护
+- `StatChunk(verify_checksum=true)` 的核验
+
+### `ResolveEntryChecksum(...)`
+
+解析一个 index entry 当前应该用于校验的 checksum。
+
+优先级是：
+
+- 先用 entry 自己记录的 checksum
+- 如果 entry 没有 checksum，再退到 final 文件内容计算
+
+### `ValidateDeleteExpectedChecksum(...)`
+
+处理 `DeleteChunkRequest.expected_checksum`。
+
+它保证：
+
+- 如果 caller 给了 expected checksum，删除前必须校验
+- mismatch 时直接返回错误
+- mismatch 不会误删文件，也不会错误把 index 改成 `DELETED`
 
 ### `ValidateReadableChunkState(...)`
 
@@ -505,6 +541,55 @@ T023 仍然没有解决这些恢复问题：
 
 最后这一点是有意保持收敛范围：T024 先固定读路径校验语义，不在这一轮把损坏状态写回、后台隔离或恢复流程一起做掉。
 
+## `DeleteChunk()` 当前语义
+
+### 删除顺序
+
+当前 `DeleteChunk()` 的主流程是：
+
+1. 必要时触发 `Initialize()`
+2. 校验 `request_id`
+3. 获取 `ChunkIndex` 的 per-chunk guard
+4. 从 index 查 chunk
+5. 如果 chunk 缺失，返回幂等成功并标记 `already_missing=true`
+6. 如果请求带 `expected_checksum`，先校验当前 metadata / 文件 checksum
+7. 只删除 final 文件，不删除 staging 文件
+8. 删除成功后把 index state 更新为 `DELETED`
+
+### 当前删除状态语义
+
+- 当前实现选择**保留 `DELETED` 条目在内存 index 中**
+- 这样本进程生命周期内：
+  - repeated delete 可以幂等返回
+  - `StatChunk` 可以看到 `DELETED`
+  - `ListChunks` 可以按 `DELETED` 过滤
+
+这不是持久 tombstone；重启后是否还能重建出来，仍取决于后续 restart rebuild 任务。
+
+### `expected_checksum` 保护
+
+如果请求带了 `expected_checksum`：
+
+- 优先使用 index 中已有 checksum 做校验
+- 如果 index 没有 checksum，再退到 final 文件内容计算
+- mismatch 时直接返回错误，不删除文件，也不把 index 错误改成 `DELETED`
+
+## `StatChunk()` 当前语义
+
+- 只查 `ChunkIndex`
+- chunk 不存在返回 `kNotFound`
+- 默认不扫描文件系统
+- `verify_checksum=true` 时，仅对 `LIVE` chunk 做 final 文件读取和 checksum 校验
+- 当前发现损坏时会返回明确错误，但不会自动把 index 状态回写成 `CORRUPTED`
+
+## `ListChunks()` 当前语义
+
+- 只通过 `ChunkIndex` 列举，不扫描文件系统
+- 支持 `state_filter`
+- 支持 `page_token` + `page_size`
+- 默认依赖 `ChunkIndex` 的分页边界，不在 T025 引入更强的并发快照语义
+- 不会因为磁盘上存在未登记 final 文件就把它列出来
+
 ## 与其它模块的边界
 
 - 复用 `store/common/store_types.h` 里的 `ChunkId`、`ChunkIdentity`、`ChunkMetadata`、`ChunkChecksum`、`ChunkState`、`StorageNodeStatusCode`
@@ -515,7 +600,7 @@ T023 仍然没有解决这些恢复问题：
 
 ## 当前未实现内容
 
-- 真实 chunk 文件写入 / 读取 / 删除
-- flush / publish / directory sync 的上层编排
-- checksum on write / on read 的实际流程串接
+- restart rebuild / stale staging cleanup
+- 读路径发现损坏后的自动状态回写
 - quarantine / repair / GC / restart recovery
+- range read
