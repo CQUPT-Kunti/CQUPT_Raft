@@ -203,6 +203,13 @@ T023-T025 已实现：
 - `DeleteChunk` 已经走通 chunk guard -> expected checksum 校验 -> final file remove -> index state update
 - `StatChunk` 已经走通 index lookup 和可选 checksum verify
 - `ListChunks` 已经走通基于 `ChunkIndex` 的过滤和分页
+- T026 已用真实本地文件压力测试覆盖不同 chunk 并发写入、同 chunk 冲突写入，以及读/删/查/列交错边界
+
+当前并发边界补充：
+
+- 不同 chunk 的 `WriteChunk` 可以并行推进
+- 同一个 chunk 的并发写入只允许一个 payload 胜出；同内容后续请求幂等成功，不同内容返回 `kConflict`
+- `ReadChunk` / `ListChunks` 当前不持有 chunk guard，也不提供并发分页快照语义；因此读删交错时允许出现 `kOk`、`kNotFound` 或显式 `kIoError`
 
 ## `.cpp` 当前实现了什么
 

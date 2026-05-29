@@ -21,9 +21,9 @@
   建议后续在哪类任务处理：在后续索引并发/恢复任务中继续收紧分页一致性语义，必要时引入 snapshot pinning 或更强 page token 结构。
 
 - 任务编号：T018
-  问题：`AcquireChunkLock()` 只为上层提供 chunk 级冲突串行入口，`Insert / Update / Remove` 的跨步骤原子性仍依赖后续 `LocalDiskChunkStore` 等调用方在操作入口显式持有 guard。
-  影响：如果后续写/删/修复流程遗漏 guard，只依赖索引内部容器锁，仍可能在多步骤状态转换上出现交错。
-  建议后续在哪类任务处理：在 T021/T023 及后续 store 业务实现中，把 chunk guard 作为 write/delete/repair 主入口的固定前置步骤，并补对应测试。
+  问题：T026 已用真实并发压力覆盖 `LocalDiskChunkStore::WriteChunk()` / `DeleteChunk()` 的 chunk guard 主路径，但 `AcquireChunkLock()` 的跨步骤原子性仍依赖未来 repair/rebalance/recovery 等新增业务入口继续显式持有 guard。
+  影响：当前 store 主写删入口的并发串行边界已经被测试固定；如果后续新入口遗漏 guard，只依赖索引内部容器锁，仍可能在多步骤状态转换上出现交错。
+  建议后续在哪类任务处理：在后续 repair/rebalance/recovery/store 业务扩展任务中，继续把 chunk guard 作为多步骤状态切换的固定前置步骤，并补对应测试。
 
 - 任务编号：T019
   问题：`BoundedStorageExecutor` 已通过 T020 测试固定当前“任务上下文不自动触发运行中取消”的边界，但仍没有实现 deadline 到点取消或任务结果 future 聚合。
@@ -54,3 +54,8 @@
   问题：`LocalDiskChunkStore::DeleteChunk()` 现已接入真实文件删除和 `DELETED` index 状态更新，但当前环境没有 Windows 实机验证能力，`std::filesystem::remove` 在 sharing violation / open-handle / unlink 语义上的真实行为仍未验证。
   影响：Linux 上删除、Stat、List 语义已经收口，但在真实 Windows 环境中，DeleteChunk 可能暴露额外的 sharing violation、删除失败分类或文件可见性差异。
   建议后续在哪类任务处理：执行 `T025-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
+
+- 任务编号：T026
+  问题：T026 已在 Linux 上覆盖真实 chunk 文件的高并发 write/read/delete/stat/list 压力，但当前环境没有 Windows 编译/测试能力，Windows 下的 sharing violation、open-handle delete、并发读删可见性和 durable publish 后读取差异仍未验证。
+  影响：Linux 上不同 chunk 并行、同 chunk 冲突控制和 bounded backpressure 已有实测证据；如果直接把这组结果外推到 Windows，后续仍可能在真实 NTFS/Win32 文件语义下暴露并发偏差。
+  建议后续在哪类任务处理：执行 `T026-WIN`，在 Windows 环境完成 `store_concurrency_stress` 实机验证，并结合 `T023-WIN` / `T025-WIN` 收口必要修正。

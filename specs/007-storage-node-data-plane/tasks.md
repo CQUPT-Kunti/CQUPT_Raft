@@ -73,7 +73,8 @@
 - [x] T024 实现 `LocalDiskChunkStore::ReadChunk` 和 checksum on read；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：只读 live chunk，corrupted/quarantined/staging/deleting 不返回成功，checksum mismatch 标记 corrupted；依赖：T023
 - [x] T025 实现 `DeleteChunk`、`StatChunk`、`ListChunks` 的本地语义；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：重复 delete 幂等，Stat/List 区分 live/staging/deleting/deleted/quarantined/corrupted/missing；依赖：T024
 - [ ] T025-WIN 在 Windows 环境验证 `LocalDiskChunkStore::DeleteChunk` 的 sharing violation / remove semantics 与 `StatChunk` / `ListChunks` 路径行为；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：Windows build/test 实机通过，或明确记录 current delete/stat/list contract 与必要修正；依赖：T025、T023-WIN
-- [ ] T026 添加本地高并发 chunk IO 压力测试；允许修改：`tests/store_concurrency_stress_test.cpp`、`tests/CMakeLists.txt`；验收：至少 100 并发 chunk 操作无数据竞争、无无界队列增长，CTest 标签为 `storage-node-concurrency`；依赖：T018、T020、T025
+- [x] T026 添加本地高并发 chunk IO 压力测试；允许修改：`tests/store_concurrency_stress_test.cpp`、`tests/CMakeLists.txt`；验收：至少 100 并发 chunk 操作无数据竞争、无无界队列增长，CTest 标签为 `storage-node-concurrency`；依赖：T018、T020、T025
+- [ ] T026-WIN 在 Windows 环境验证 `LocalDiskChunkStore` 高并发 write/read/delete/stat/list 的 sharing violation、open-handle delete 和 durable publish 后读取 contract；允许修改：`tests/store_concurrency_stress_test.cpp`、`modules/store/chunk/local_disk_chunk_store.cpp`、`modules/store/io/durable_file.cpp`；验收：Windows build/test 实机通过，或明确记录当前并发 contract 与必要修正；依赖：T026、T023-WIN、T025-WIN
 
 ## Phase 3: User Story 1 - 上传对象并在数据 durable 后提交元数据 (Priority: P1) MVP
 

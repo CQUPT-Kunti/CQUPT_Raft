@@ -54,6 +54,8 @@ set(RAFT_STORE_LABELS_BASELINE
   "storage-node;platform-neutral")
 set(RAFT_STORE_LABELS_CONCURRENCY
   "storage-node;storage-node-concurrency;platform-neutral")
+set(RAFT_STORE_LABELS_CONCURRENCY_LINUX_PRIMARY
+  "storage-node;storage-node-concurrency;linux-primary-diagnosis")
 set(RAFT_STORE_LABELS_RECOVERY
   "storage-node;storage-node-recovery;platform-neutral")
 set(RAFT_STORE_LABELS_CROSS_PLATFORM
@@ -386,6 +388,28 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/local_disk_chunk_store_test.cpp")
     "${RAFT_STORE_LABELS_BASELINE}")
 else()
   message(STATUS "Skip test_local_disk_chunk_store: local_disk_chunk_store_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")
+  add_executable(test_store_concurrency_stress
+    store_concurrency_stress_test.cpp
+  )
+
+  target_link_libraries(test_store_concurrency_stress
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_concurrency_stress
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_concurrency_stress test_store_concurrency_stress
+    "${RAFT_STORE_LABELS_CONCURRENCY_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_store_concurrency_stress: store_concurrency_stress_test.cpp not found")
 endif()
 
 # =========================
