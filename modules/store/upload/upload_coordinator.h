@@ -50,6 +50,12 @@ namespace storedemo
         bool commit_eligible{false};
     };
 
+    struct UploadCleanupCandidate
+    {
+        UploadCommittedChunk chunk;
+        std::string reason;
+    };
+
     struct UploadCoordinatorRequest
     {
         std::string request_id;
@@ -75,6 +81,7 @@ namespace storedemo
         bool pending_object_possible{false};
         bool orphan_chunk_possible{false};
         std::vector<UploadCommittedChunk> committed_chunks;
+        std::vector<UploadCleanupCandidate> cleanup_candidates;
         std::vector<UploadChunkExecution> chunk_executions;
 
         [[nodiscard]] bool ok() const

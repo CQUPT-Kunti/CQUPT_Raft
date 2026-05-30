@@ -72,6 +72,17 @@ namespace
         return request;
     }
 
+    storedemo::UploadCoordinatorRequest MakeRequestWithPolicy(
+        const std::string &payload,
+        const std::size_t replica_count,
+        const std::size_t minimum_successful_writes)
+    {
+        auto request = MakeRequest(payload);
+        request.replica_policy =
+            MakeReplicaPolicy(replica_count, minimum_successful_writes);
+        return request;
+    }
+
     class StorageUploadCoordinatorTest : public ::testing::Test
     {
     protected:
@@ -180,6 +191,7 @@ namespace
         EXPECT_TRUE(result.pending_object_possible);
         EXPECT_TRUE(result.orphan_chunk_possible);
         EXPECT_EQ(metadata_client_->commit_calls(), 0U);
+        EXPECT_FALSE(metadata_client_->last_commit_request().has_value());
 
         const auto head = machine_.HeadObject(
             {.bucket = request.bucket, .object_key = request.object_key});
@@ -191,12 +203,18 @@ namespace
         EXPECT_TRUE(list.records.empty());
 
         ASSERT_EQ(result.committed_chunks.size(), 0U);
+        ASSERT_EQ(result.cleanup_candidates.size(), 1U);
         ASSERT_EQ(result.chunk_executions.size(), 1U);
         const auto &execution = result.chunk_executions.front();
         EXPECT_EQ(execution.durable_success_count, 1U);
         ASSERT_EQ(execution.replica_results.size(), 2U);
         EXPECT_EQ(execution.replica_results[1].status,
                   storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        EXPECT_EQ(result.cleanup_candidates.front().chunk.identity.chunk_id,
+                  execution.identity.chunk_id);
+        EXPECT_EQ(result.cleanup_candidates.front().chunk.replica_nodes.size(), 1U);
+        EXPECT_EQ(result.cleanup_candidates.front().chunk.replica_nodes.front(),
+                  store1->config().node_id);
 
         const auto read = store1->ReadChunk(storedemo::ReadChunkRequest{
             .request_id = "read-store-write-failure",
@@ -247,6 +265,11 @@ namespace
             << read2.error_detail;
         EXPECT_EQ(read1.payload, fixture.payload);
         EXPECT_EQ(read2.payload, fixture.payload);
+        ASSERT_EQ(result.cleanup_candidates.size(), 1U);
+        EXPECT_EQ(result.cleanup_candidates.front().chunk.identity.chunk_id,
+                  result.committed_chunks.front().identity.chunk_id);
+        EXPECT_EQ(result.cleanup_candidates.front().chunk.replica_nodes,
+                  result.committed_chunks.front().replica_nodes);
     }
 
     TEST_F(StorageUploadCoordinatorTest, PlacementFailureSkipsWritesAndCommit)
@@ -282,5 +305,94 @@ namespace
             {.bucket = request.bucket, .prefix = "objects/"});
         ASSERT_EQ(list.result.code, raftdemo::MetadataStatusCode::kOk);
         EXPECT_TRUE(list.records.empty());
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           PartialReplicaFailureDoesNotCommitAndMarksCleanupCandidate)
+    {
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_upload_coordinator_partial_replica_failure");
+        auto store1 = MakeStore(temp_dir.Path("stores"), 1);
+
+        storedemo::WriteChunkResponse forced_overloaded;
+        forced_overloaded.status = storedemo::StorageNodeStatusCode::kOverloaded;
+        forced_overloaded.error_detail = "forced overloaded replica";
+        forced_overloaded.retry_after_ms = 15;
+        chunk_writer_->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(2),
+                                     forced_overloaded);
+
+        storedemo::WriteChunkResponse forced_unavailable;
+        forced_unavailable.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+        forced_unavailable.error_detail = "forced unavailable replica";
+        chunk_writer_->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(3),
+                                     forced_unavailable);
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeRequestWithPolicy(fixture.payload, 3, 2);
+        request.request_id = "upload-t037";
+        request.bucket = "bucket-t037";
+        request.object_key = "objects/test_file.deb";
+        request.object_id = "obj-t037";
+
+        const auto result = coordinator.UploadObject(request);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kOverloaded);
+        EXPECT_TRUE(result.create_succeeded);
+        EXPECT_FALSE(result.committed);
+        EXPECT_TRUE(result.pending_object_possible);
+        EXPECT_TRUE(result.orphan_chunk_possible);
+        EXPECT_EQ(metadata_client_->commit_calls(), 0U);
+        EXPECT_FALSE(metadata_client_->last_commit_request().has_value());
+        EXPECT_TRUE(result.committed_chunks.empty());
+        ASSERT_EQ(result.cleanup_candidates.size(), 1U);
+
+        const auto head = machine_.HeadObject(
+            {.bucket = request.bucket, .object_key = request.object_key});
+        EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+
+        const auto list = machine_.ListObjects(
+            {.bucket = request.bucket, .prefix = "objects/"});
+        ASSERT_EQ(list.result.code, raftdemo::MetadataStatusCode::kOk);
+        EXPECT_TRUE(list.records.empty());
+
+        ASSERT_EQ(result.chunk_executions.size(), 1U);
+        const auto &execution = result.chunk_executions.front();
+        EXPECT_EQ(execution.durable_success_count, 1U);
+        EXPECT_FALSE(execution.commit_eligible);
+        ASSERT_EQ(execution.replica_results.size(), 3U);
+        EXPECT_EQ(execution.replica_results[0].status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(execution.replica_results[1].status,
+                  storedemo::StorageNodeStatusCode::kOverloaded);
+        EXPECT_EQ(execution.replica_results[2].status,
+                  storedemo::StorageNodeStatusCode::kNodeUnavailable);
+
+        const auto &cleanup_candidate = result.cleanup_candidates.front();
+        EXPECT_EQ(cleanup_candidate.chunk.identity.chunk_id,
+                  execution.identity.chunk_id);
+        EXPECT_EQ(cleanup_candidate.chunk.identity.object_id, request.object_id);
+        EXPECT_EQ(cleanup_candidate.chunk.identity.version, request.version);
+        EXPECT_EQ(cleanup_candidate.chunk.identity.chunk_index, 0U);
+        EXPECT_EQ(cleanup_candidate.chunk.offset, 0U);
+        EXPECT_EQ(cleanup_candidate.chunk.size,
+                  static_cast<std::uint64_t>(fixture.payload.size()));
+        ASSERT_EQ(cleanup_candidate.chunk.replica_nodes.size(), 1U);
+        EXPECT_EQ(cleanup_candidate.chunk.replica_nodes.front(),
+                  store1->config().node_id);
+        EXPECT_NE(cleanup_candidate.reason.find("cleanup candidate"),
+                  std::string::npos);
+
+        const auto read = store1->ReadChunk(storedemo::ReadChunkRequest{
+            .request_id = "read-store-partial-replica-failure",
+            .chunk_id = execution.identity.chunk_id});
+        ASSERT_EQ(read.status, storedemo::StorageNodeStatusCode::kOk)
+            << read.error_detail;
+        EXPECT_EQ(read.payload, fixture.payload);
+        EXPECT_EQ(cleanup_candidate.chunk.checksum.value,
+                  read.metadata.checksum.value);
     }
 }

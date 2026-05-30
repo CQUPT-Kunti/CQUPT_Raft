@@ -11,6 +11,7 @@
 - 调用抽象 `UploadChunkWriter` 写入 chunk bytes
 - 调用抽象 `UploadMetadataClient` 创建 pending object 并提交 manifest
 - 在结果中显式暴露 `pending_object_possible` 和 `orphan_chunk_possible`
+- 在失败结果中显式暴露 `cleanup_candidates`
 
 当前不负责：
 
@@ -92,7 +93,17 @@
   - `pending_object_possible`
   - `orphan_chunk_possible`
   - `committed_chunks`
+  - `cleanup_candidates`
   - `chunk_executions`
+
+### `UploadCleanupCandidate`
+
+- 描述一次失败上传后需要后续 cleanup / GC 处理的 durable chunk facts
+- 字段：
+  - `chunk`
+    - 以 `UploadCommittedChunk` 形式复用的 durable chunk 身份、大小、checksum 和成功副本节点列表
+  - `reason`
+    - 当前为什么把这个 durable chunk 标成 cleanup candidate
 
 ## 抽象边界
 
@@ -122,10 +133,14 @@
   - `committed == true`
   - `pending_object_possible == false`
   - `orphan_chunk_possible == false`
+  - `cleanup_candidates.empty() == true`
 - 失败语义：
   - `WriteChunk` 不足以达到 `minimum_successful_writes` 时，不调用 `CommitObject`
+  - 如果已经有 durable success，则把这些 durable facts 记录到 `cleanup_candidates`
   - `CommitObject` 失败时，durable chunk 仍可能存在，因此 `orphan_chunk_possible == true`
+  - `CommitObject` 失败时，同样把原本待提交的 durable facts 记录到 `cleanup_candidates`
   - `CreateObject` 成功但后续 placement / write / commit 失败时，`pending_object_possible == true`
+  - 当前不支持 `AbortObject`；失败路径只记录 cleanup candidate 边界，不伪装成已经自动收口
 
 ## `upload_coordinator.cpp` 实现细节
 
@@ -270,6 +285,39 @@
   - `already_exists`
   - `metadata`
 
+### `BuildDurableChunkFacts(const ChunkIdentity&, std::uint64_t, std::uint64_t, const ChunkChecksum&, const WriteChunkResponse&, std::vector<StorageNodeId>)`
+
+- 作用：
+  - 把一次 chunk 的 durable success facts 统一组装成 `UploadCommittedChunk`
+- 输入：
+  - chunk identity / offset / expected size / expected checksum
+  - 第一个 durable success 响应
+  - 所有 durable success 的副本节点列表
+- 输出：
+  - 可复用于 `committed_chunks` 和 `cleanup_candidates.chunk` 的稳定 chunk facts
+
+### `AppendCleanupCandidate(const UploadCommittedChunk&, std::string, std::vector<UploadCleanupCandidate>*)`
+
+- 作用：
+  - 把一个 durable chunk fact 追加到 `cleanup_candidates`
+- 失败边界：
+  - 如果目标容器为空指针则直接返回
+  - 按 `chunk_id` 去重，避免同一个 chunk 在多个失败分支里重复记录
+
+### `AppendCleanupCandidates(const std::vector<UploadCommittedChunk>&, const std::string&, std::vector<UploadCleanupCandidate>*)`
+
+- 作用：
+  - 批量把已有 durable chunk facts 追加到 `cleanup_candidates`
+- 用途：
+  - 主要用于“前面 chunk 已经 durable 成功，后面 chunk 或 commit 失败”的失败路径收口
+
+### `SortCleanupCandidates(std::vector<UploadCleanupCandidate>*)`
+
+- 作用：
+  - 对 cleanup candidate 按 `offset` 和 `chunk_index` 做稳定排序
+- 用途：
+  - 保持测试断言和后续调用方观察顺序稳定
+
 ## `UploadCoordinator::UploadObject()` 的实际执行流程
 
 ### 1. 请求预校验
@@ -347,6 +395,7 @@
 - 如果某个 chunk 不满足：
   - 整个 upload 立即失败
   - 不会调用 `CommitObject`
+  - 已经 durable 的当前 chunk 和之前已 durable 的 chunk facts 会进入 `cleanup_candidates`
   - `status` 通过 `ResolveUploadFailureStatus(...)` 选取
   - `error_detail` 通过 `ResolveUploadFailureDetail(...)` 生成
   - 如果已有 durable chunk，`orphan_chunk_possible = true`
@@ -364,6 +413,7 @@
     - 优先取 `first_durable_response.metadata.checksum`
     - 如果底层没填 checksum，则退回 `expected_checksum`
   - `replica_nodes` 使用所有 durable 成功副本
+- 这些 facts 也会在失败路径中复用为 `cleanup_candidates.chunk`
 
 ### 12. 按 offset / chunk_index 排序 manifest
 
@@ -392,6 +442,7 @@
   - 返回 metadata client 给出的失败状态
   - `error_detail` 形如 `CommitObject failed: ...`
   - `orphan_chunk_possible = !committed_chunks.empty()`
+  - `cleanup_candidates` 记录所有已 durable 但未成功提交 metadata 的 chunk facts
   - `pending_object_possible` 仍保持 `true`
 - `CommitObject` 成功时：
   - `status = kOk`
@@ -399,6 +450,7 @@
   - `committed = true`
   - `pending_object_possible = false`
   - `orphan_chunk_possible = false`
+  - `cleanup_candidates.clear()`
 
 ## 当前边界
 

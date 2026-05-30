@@ -301,6 +301,90 @@ namespace storedemo
             result.metadata = response.metadata;
             return result;
         }
+
+        UploadCommittedChunk BuildDurableChunkFacts(
+            const ChunkIdentity &identity,
+            const std::uint64_t offset,
+            const std::uint64_t expected_size,
+            const ChunkChecksum &expected_checksum,
+            const WriteChunkResponse &first_durable_response,
+            std::vector<StorageNodeId> durable_replicas)
+        {
+            UploadCommittedChunk committed_chunk;
+            committed_chunk.identity = identity;
+            committed_chunk.offset = offset;
+            committed_chunk.size = first_durable_response.metadata.size == 0
+                                       ? expected_size
+                                       : first_durable_response.metadata.size;
+            committed_chunk.checksum =
+                first_durable_response.metadata.checksum.IsSet()
+                    ? first_durable_response.metadata.checksum
+                    : expected_checksum;
+            committed_chunk.replica_nodes = std::move(durable_replicas);
+            return committed_chunk;
+        }
+
+        void AppendCleanupCandidate(const UploadCommittedChunk &chunk,
+                                    std::string reason,
+                                    std::vector<UploadCleanupCandidate> *candidates)
+        {
+            if (candidates == nullptr)
+            {
+                return;
+            }
+
+            const auto existing = std::find_if(
+                candidates->begin(),
+                candidates->end(),
+                [&](const UploadCleanupCandidate &candidate)
+                {
+                    return candidate.chunk.identity.chunk_id == chunk.identity.chunk_id;
+                });
+            if (existing != candidates->end())
+            {
+                return;
+            }
+
+            candidates->push_back(UploadCleanupCandidate{
+                .chunk = chunk,
+                .reason = std::move(reason)});
+        }
+
+        void AppendCleanupCandidates(const std::vector<UploadCommittedChunk> &chunks,
+                                     const std::string &reason,
+                                     std::vector<UploadCleanupCandidate> *candidates)
+        {
+            if (candidates == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &chunk : chunks)
+            {
+                AppendCleanupCandidate(chunk, reason, candidates);
+            }
+        }
+
+        void SortCleanupCandidates(std::vector<UploadCleanupCandidate> *candidates)
+        {
+            if (candidates == nullptr)
+            {
+                return;
+            }
+
+            std::sort(candidates->begin(),
+                      candidates->end(),
+                      [](const UploadCleanupCandidate &lhs,
+                         const UploadCleanupCandidate &rhs)
+                      {
+                          if (lhs.chunk.offset != rhs.chunk.offset)
+                          {
+                              return lhs.chunk.offset < rhs.chunk.offset;
+                          }
+                          return lhs.chunk.identity.chunk_index <
+                                 rhs.chunk.identity.chunk_index;
+                      });
+        }
     }
 
     UploadMetadataClient::~UploadMetadataClient() = default;
@@ -415,6 +499,7 @@ namespace storedemo
 
             std::vector<StorageNodeId> durable_replicas;
             WriteChunkResponse first_durable_response;
+            const auto expected_size = ResolveExpectedSize(chunk);
 
             for (const auto &target :
                  chunk_execution.placement_decision.replica_nodes)
@@ -427,7 +512,7 @@ namespace storedemo
                             "write-" + chunk_execution.identity.chunk_id + "-" +
                                 target.node_id),
                         .identity = chunk_execution.identity,
-                        .expected_size = ResolveExpectedSize(chunk),
+                        .expected_size = expected_size,
                         .expected_checksum = expected_checksum,
                         .payload = chunk.payload},
                     request.context);
@@ -458,6 +543,23 @@ namespace storedemo
 
             if (!chunk_execution.commit_eligible)
             {
+                if (chunk_execution.durable_success_count > 0)
+                {
+                    AppendCleanupCandidates(
+                        result.committed_chunks,
+                        "upload failed before CommitObject; durable chunk requires cleanup candidate",
+                        &result.cleanup_candidates);
+                    AppendCleanupCandidate(
+                        BuildDurableChunkFacts(chunk_execution.identity,
+                                               chunk.offset,
+                                               expected_size,
+                                               expected_checksum,
+                                               first_durable_response,
+                                               std::move(durable_replicas)),
+                        "minimum_successful_writes not reached; durable replica requires cleanup candidate",
+                        &result.cleanup_candidates);
+                    SortCleanupCandidates(&result.cleanup_candidates);
+                }
                 result.status =
                     ResolveUploadFailureStatus(chunk_execution.replica_results);
                 result.error_detail = ResolveUploadFailureDetail(
@@ -471,17 +573,12 @@ namespace storedemo
                 return result;
             }
 
-            UploadCommittedChunk committed_chunk;
-            committed_chunk.identity = chunk_execution.identity;
-            committed_chunk.offset = chunk.offset;
-            committed_chunk.size = first_durable_response.metadata.size == 0
-                                       ? ResolveExpectedSize(chunk)
-                                       : first_durable_response.metadata.size;
-            committed_chunk.checksum =
-                first_durable_response.metadata.checksum.IsSet()
-                    ? first_durable_response.metadata.checksum
-                    : expected_checksum;
-            committed_chunk.replica_nodes = std::move(durable_replicas);
+            auto committed_chunk = BuildDurableChunkFacts(chunk_execution.identity,
+                                                          chunk.offset,
+                                                          expected_size,
+                                                          expected_checksum,
+                                                          first_durable_response,
+                                                          std::move(durable_replicas));
             result.committed_chunks.push_back(std::move(committed_chunk));
         }
 
@@ -515,6 +612,11 @@ namespace storedemo
             result.error_detail = "CommitObject failed: " +
                                   commit_result.error_detail;
             result.orphan_chunk_possible = !result.committed_chunks.empty();
+            AppendCleanupCandidates(
+                result.committed_chunks,
+                "CommitObject failed after durable write; chunk requires cleanup candidate",
+                &result.cleanup_candidates);
+            SortCleanupCandidates(&result.cleanup_candidates);
             return result;
         }
 
@@ -523,6 +625,7 @@ namespace storedemo
         result.committed = true;
         result.pending_object_possible = false;
         result.orphan_chunk_possible = false;
+        result.cleanup_candidates.clear();
         return result;
     }
 }
