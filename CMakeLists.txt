@@ -241,6 +241,7 @@ add_library(raft_core
   modules/store/chunk/local_disk_chunk_store.cpp
   modules/store/io/durable_file.cpp
   modules/store/index/chunk_index.cpp
+  modules/store/node/storage_node_client.cpp
   modules/store/node/storage_node_service.cpp
   modules/store/runtime/storage_executor.cpp
   modules/raft/runtime/min_heap_timer.cpp
