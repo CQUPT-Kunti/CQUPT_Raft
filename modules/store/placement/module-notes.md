@@ -9,6 +9,7 @@
 - `StorageNodePlacementCandidate` 候选节点模型
 - `ReplicaPolicy` 副本数量和最小成功数约束
 - `PlacementRequest` 到 `PlacementDecisionResult` 的纯策略计算
+- `PlacementManager` 对静态候选集的最小协调
 - 节点筛除原因记录、确定性排序和最小 zone spread 语义
 
 当前不负责：
@@ -185,6 +186,40 @@
     - 判断 `status == kOk`。
 
 ## 核心函数
+
+### `PlacementManager::SelectPlacement(const PlacementRequest&, std::span<const StorageNodePlacementCandidate>)`
+
+- 作用：
+  - 承接上层一次“静态候选节点选择”调用。
+  - 它自己不实现筛选和排序，而是把真正的副本决策委托给 `ReplicaPolicySelector::SelectReplicas(...)`。
+- 输入：
+  - `request`
+    - 包含 chunk identity、chunk size、副本策略、显式排除节点和 `decision_epoch`
+  - `candidates`
+    - 上层已经准备好的静态候选节点列表
+- 输出：
+  - 返回 `PlacementDecisionResult`
+  - `decision.replica_nodes`
+    - 由 `ReplicaPolicySelector` 选出的最终副本节点
+  - `decision.excluded_nodes`
+    - 显式排除、健康不可写、容量不足、过载、磁盘压力过高、重复节点等所有未入选原因
+  - `decision.reasons`
+    - manager 追加的决策摘要，加上 selector 产生的排序/zone spread/失败说明
+- 当前 manager 追加的摘要包括：
+  - 本轮评估了多少个静态候选节点
+  - 当前 `replica_count` 和 `minimum_successful_writes`
+  - 调用方显式排除了多少个节点
+- 边界：
+  - 不写 chunk
+  - 不调用 `StorageNodeClient::WriteChunk`
+  - 不调用 metadata commit
+  - 不接 Raft / heartbeat / registry
+  - 不维护失败缓存或动态热点事实
+- 与 `ReplicaPolicySelector` 的职责边界：
+  - `PlacementManager`
+    - 负责承接上层输入、组织一次 placement 调用、补充 manager 视角的 `decision reasons`
+  - `ReplicaPolicySelector`
+    - 负责资格检查、排序、zone spread、去重和最终副本节点选择
 
 ### `ReplicaPolicySelector::SelectReplicas(const PlacementRequest&, std::span<const StorageNodePlacementCandidate>)`
 
@@ -364,6 +399,7 @@
   - `node_id` 字典序兜底
 - 输出副本节点不会重复 `node_id`
 - `prefer_distinct_zones = true` 时，会先尽量跨 zone 选点，再按常规排序补齐剩余副本
+- `PlacementManager` 不改变 `ReplicaPolicySelector` 的排序和筛选结果，只在输出里补决策摘要
 
 ## 默认策略边界
 

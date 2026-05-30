@@ -243,6 +243,7 @@ add_library(raft_core
   modules/store/index/chunk_index.cpp
   modules/store/node/storage_node_client.cpp
   modules/store/node/storage_node_service.cpp
+  modules/store/placement/placement_manager.cpp
   modules/store/placement/replica_policy.cpp
   modules/store/runtime/storage_executor.cpp
   modules/raft/runtime/min_heap_timer.cpp
