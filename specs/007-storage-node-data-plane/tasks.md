@@ -107,7 +107,7 @@
 
 ### Tests for User Story 2
 
-- [ ] T040 [P] [US2] 添加 committed manifest 读取集成测试；允许修改：`tests/storage_read_integration_test.cpp`、`tests/CMakeLists.txt`；验收：测试覆盖 metadata lookup first、offset ordering、未 committed/deleted 不读 StorageNode；依赖：T039
+- [x] T040 [P] [US2] 添加 committed manifest 读取集成测试；允许修改：`tests/storage_read_integration_test.cpp`、`tests/CMakeLists.txt`；验收：测试覆盖 metadata lookup first、offset ordering、未 committed/deleted 不读 StorageNode；依赖：T039
 - [ ] T041 [P] [US2] 添加 `ReadChunk` contract 测试；允许修改：`tests/storage_node_service_test.cpp`；验收：覆盖 range/full read、checksum verify、corrupted/quarantined 拒绝、timeout/error mapping；依赖：T031
 
 ### Implementation for User Story 2
