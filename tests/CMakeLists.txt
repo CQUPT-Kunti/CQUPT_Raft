@@ -480,6 +480,28 @@ else()
   message(STATUS "Skip test_storage_node_client: storage_node_client_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_placement_policy_test.cpp")
+  add_executable(test_store_placement_policy
+    store_placement_policy_test.cpp
+  )
+
+  target_link_libraries(test_store_placement_policy
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_placement_policy
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_placement_policy test_store_placement_policy
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_placement_policy: store_placement_policy_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")
   add_executable(test_store_concurrency_stress
     store_concurrency_stress_test.cpp
