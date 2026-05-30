@@ -61,6 +61,6 @@
   建议后续在哪类任务处理：执行 `T026-WIN`，在 Windows 环境完成 `store_concurrency_stress` 实机验证，并结合 `T023-WIN` / `T025-WIN` 收口必要修正。
 
 - 任务编号：T027
-  问题：T027 只新增了 `MetadataStateMachine + LocalDiskChunkStore` 的上传闭环集成测试骨架，当前仓库仍没有真实 upload coordinator / StorageNode RPC 来强制“chunk durable 成功后才能 CommitObject”。如果调用方绕过预期顺序，或在 durable chunk 写成后 metadata commit 失败，当前会留下未被 metadata 引用的 orphan chunk。
-  影响：测试已经证明 commit 前对象不可见、commit 后可见，但 metadata commit 失败后的本地 chunk 仍会保留在 store data-plane，直到后续 abort/GC/recovery 任务补齐前都可能累积无主 chunk。
-  建议后续在哪类任务处理：在 T029-T035 的真实 upload coordinator / service / placement / abort-or-cleanup 任务中，把 commit gate 和 failed-commit orphan cleanup 收紧为生产语义，并补对应集成回归。
+  问题：T035 已补最小 `UploadCoordinator`，能够按 `CreateObject -> Placement -> WriteChunk -> CommitObject` 顺序串联 metadata/control-plane 与 StorageNode/data-plane，但当前仍没有 `AbortObject`、GC、重试调度或重启恢复协同。只要 `CreateObject` 已成功而后续 placement/write/commit 失败，对象就可能长期停留在 metadata `PENDING`；只要有 durable chunk 而 `CommitObject` 未成功，就仍可能留下 orphan chunk。
+  影响：仓库现在已经有了明确的 commit gate，不再完全缺少 upload coordinator；但失败路径仍依赖调用方或后续 GC/recovery 任务处理 pending object 和 orphan chunk，尚不能把这部分状态自动收口成生产语义。
+  建议后续在哪类任务处理：在 T036-T037 以及后续 abort/GC/recovery 任务中，把 manifest durable facts、最小成功副本数校验、failed-commit orphan cleanup 和 pending object 收口策略继续补齐，并补对应集成回归。

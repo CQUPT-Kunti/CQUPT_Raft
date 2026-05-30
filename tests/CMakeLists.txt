@@ -546,6 +546,28 @@ else()
   message(STATUS "Skip test_store_concurrency_stress: store_concurrency_stress_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_coordinator_test.cpp")
+  add_executable(test_storage_upload_coordinator
+    storage_upload_coordinator_test.cpp
+  )
+
+  target_link_libraries(test_storage_upload_coordinator
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_upload_coordinator
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_upload_coordinator test_storage_upload_coordinator
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_upload_coordinator: storage_upload_coordinator_test.cpp not found")
+endif()
+
 # =========================
 # Platform-neutral baseline:
 # basic Raft behavior tests

@@ -11,6 +11,7 @@
   - `runtime/`：有界执行器和有界任务队列
   - `node/`：StorageNode data-plane 的 gRPC service / client 适配层
   - `placement/`：副本策略和副本候选节点选择
+  - `upload/`：上传协调层和 upload helper
 
 ## 阅读顺序
 
@@ -34,3 +35,4 @@
 - `runtime/` 只负责本地任务调度，不绑定具体 chunk / IO 业务。
 - `node/` 只负责 RPC 适配，不负责 metadata commit、upload coordinator 或 Raft control-plane。
 - `placement/` 只负责候选节点选择和副本策略计算，不负责真正发起写入或提交 metadata。
+- `upload/` 只负责 upload 顺序协调，不负责 metadata 底层实现、StorageNode RPC server 或后台 GC。

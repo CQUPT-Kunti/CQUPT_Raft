@@ -246,6 +246,7 @@ add_library(raft_core
   modules/store/placement/placement_manager.cpp
   modules/store/placement/replica_policy.cpp
   modules/store/runtime/storage_executor.cpp
+  modules/store/upload/upload_coordinator.cpp
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
   modules/raft/common/command.cpp
