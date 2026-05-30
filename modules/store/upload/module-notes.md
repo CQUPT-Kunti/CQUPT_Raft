@@ -129,6 +129,32 @@
 
 ## `upload_coordinator.cpp` 实现细节
 
+### `UploadMetadataClient::~UploadMetadataClient()`
+
+- 作用：
+  - 为 metadata 侧抽象提供 out-of-line 虚析构定义。
+- 边界：
+  - 这里只负责保证多态销毁语义稳定，不承载业务逻辑。
+
+### `UploadChunkWriter::~UploadChunkWriter()`
+
+- 作用：
+  - 为 chunk writer 抽象提供 out-of-line 虚析构定义。
+- 边界：
+  - 这里只负责保证多态销毁语义稳定，不承载业务逻辑。
+
+### `UploadCoordinator::UploadCoordinator(std::shared_ptr<UploadMetadataClient>, std::shared_ptr<UploadChunkWriter>)`
+
+- 作用：
+  - 绑定一次 upload 协调所需的 metadata client 和 chunk writer 依赖。
+- 输入：
+  - `metadata_client`
+    - metadata/control-plane 抽象，不能为空。
+  - `chunk_writer`
+    - data-plane 写入抽象，不能为空。
+- 失败边界：
+  - 任一依赖为空时抛出 `std::invalid_argument`，避免后续在上传流程里空指针崩溃。
+
 ### 匿名命名空间内部 helper
 
 ### `JoinChunkRequestId(std::string_view, std::string_view)`

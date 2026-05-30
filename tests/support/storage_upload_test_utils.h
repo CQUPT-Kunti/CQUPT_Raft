@@ -204,6 +204,7 @@ namespace storedemo::test
             const UploadMetadataCreateRequest &request) override
         {
             ++create_calls_;
+            last_create_request_ = request;
 
             if (forced_create_failure_.has_value())
             {
@@ -233,6 +234,7 @@ namespace storedemo::test
             const UploadMetadataCommitRequest &request) override
         {
             ++commit_calls_;
+            last_commit_request_ = request;
 
             if (forced_commit_failure_.has_value())
             {
@@ -289,6 +291,18 @@ namespace storedemo::test
             return commit_calls_;
         }
 
+        [[nodiscard]] const std::optional<UploadMetadataCreateRequest> &
+        last_create_request() const
+        {
+            return last_create_request_;
+        }
+
+        [[nodiscard]] const std::optional<UploadMetadataCommitRequest> &
+        last_commit_request() const
+        {
+            return last_commit_request_;
+        }
+
     private:
         void EnsureBucket(const std::string &bucket)
         {
@@ -318,6 +332,8 @@ namespace storedemo::test
         std::unordered_set<std::string> created_buckets_;
         std::optional<UploadMetadataResult> forced_create_failure_;
         std::optional<UploadMetadataResult> forced_commit_failure_;
+        std::optional<UploadMetadataCreateRequest> last_create_request_;
+        std::optional<UploadMetadataCommitRequest> last_commit_request_;
     };
 
     class LocalStoreUploadChunkWriter final : public UploadChunkWriter

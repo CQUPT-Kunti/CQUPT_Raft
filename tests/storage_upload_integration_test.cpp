@@ -17,8 +17,10 @@
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
+#include "store/upload/upload_coordinator.h"
 #include "support/metadata_test_utils.h"
 #include "support/store_test_utils.h"
+#include "support/storage_upload_test_utils.h"
 
 namespace raftdemo
 {
@@ -245,6 +247,33 @@ namespace
             commit_time,
             std::nullopt};
         return command;
+    }
+
+    storedemo::StorageNodePlacementCandidate MakeUploadCandidate(
+        const std::size_t index,
+        const std::uint64_t available_capacity_bytes,
+        const std::uint32_t queued_ops = 0)
+    {
+        storedemo::StorageNodePlacementCandidate candidate;
+        candidate.node_id = storedemo::test::MakeStorageNodeIdFixture(index);
+        candidate.endpoint = "127.0.0.1:" + std::to_string(7100 + index);
+        candidate.health = storedemo::StorageNodeHealth::kHealthy;
+        candidate.disk_pressure = storedemo::StorageNodeDiskPressure::kLow;
+        candidate.total_capacity_bytes = available_capacity_bytes + 8192;
+        candidate.used_capacity_bytes = 8192;
+        candidate.available_capacity_bytes = available_capacity_bytes;
+        candidate.load.queued_ops = queued_ops;
+        return candidate;
+    }
+
+    storedemo::ReplicaPolicy MakeUploadReplicaPolicy(const std::size_t replica_count,
+                                                     const std::size_t minimum_successful_writes)
+    {
+        storedemo::ReplicaPolicy policy;
+        policy.replica_count = replica_count;
+        policy.minimum_successful_writes = minimum_successful_writes;
+        policy.avoid_same_node = true;
+        return policy;
     }
 
     class StorageUploadIntegrationTest : public ::testing::Test
@@ -521,6 +550,169 @@ namespace
         EXPECT_EQ(local_read_response.payload, payload);
         EXPECT_EQ(CountRegularFilesRecursively(store.paths().live_root), 1U);
         EXPECT_EQ(CountRegularFilesRecursively(store.paths().staging_root), 0U);
+#endif
+    }
+
+    TEST_F(StorageUploadIntegrationTest, UploadCoordinatorCommitManifestMatchesLocalDurableFacts)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "T036 upload manifest integration currently validated on Linux";
+#else
+        raftdemo::MetadataStateMachine machine;
+        auto metadata_client =
+            std::make_shared<storedemo::test::InMemoryUploadMetadataClient>(machine);
+        auto chunk_writer =
+            std::make_shared<storedemo::test::LocalStoreUploadChunkWriter>();
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_upload_t036_manifest");
+        auto store1 = std::make_shared<storedemo::LocalDiskChunkStore>(
+            storedemo::test::MakeUploadStoreConfig(temp_dir.Path("stores"), 1));
+        auto store2 = std::make_shared<storedemo::LocalDiskChunkStore>(
+            storedemo::test::MakeUploadStoreConfig(temp_dir.Path("stores"), 2));
+        ASSERT_EQ(store1->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store2->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        chunk_writer->RegisterStore(store1->config().node_id, store1);
+        chunk_writer->RegisterStore(store2->config().node_id, store2);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+        ASSERT_GT(fixture.payload.size(), 1U);
+
+        const auto split_point = fixture.payload.size() / 2;
+        ASSERT_GT(split_point, 0U);
+        ASSERT_LT(split_point, fixture.payload.size());
+
+        const std::string first_payload = fixture.payload.substr(0, split_point);
+        const std::string second_payload = fixture.payload.substr(split_point);
+
+        storedemo::WriteChunkResponse forced_failure;
+        forced_failure.status = storedemo::StorageNodeStatusCode::kOverloaded;
+        forced_failure.error_detail = "forced non-durable replica rejection";
+        forced_failure.retry_after_ms = 25;
+        chunk_writer->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(3),
+                                    forced_failure);
+
+        storedemo::UploadCoordinatorRequest request;
+        request.request_id = "upload-t036";
+        request.bucket = "bucket-t036";
+        request.object_key = "objects/test_file.deb";
+        request.object_id = "obj-t036";
+        request.version = 1;
+        request.replica_policy = MakeUploadReplicaPolicy(3, 2);
+        request.candidates = {
+            MakeUploadCandidate(1, 128ULL * 1024ULL * 1024ULL, 1),
+            MakeUploadCandidate(2, 96ULL * 1024ULL * 1024ULL, 2),
+            MakeUploadCandidate(3, 64ULL * 1024ULL * 1024ULL, 3)};
+        request.client_time_unix_ms = 1712002000;
+        request.chunks.push_back(storedemo::UploadChunkInput{
+            .chunk_index = 0,
+            .offset = 0,
+            .payload = first_payload});
+        request.chunks.push_back(storedemo::UploadChunkInput{
+            .chunk_index = 1,
+            .offset = static_cast<std::uint64_t>(first_payload.size()),
+            .payload = second_payload});
+
+        storedemo::UploadCoordinator coordinator(metadata_client, chunk_writer);
+        const auto result = coordinator.UploadObject(request);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_TRUE(result.committed);
+        ASSERT_FALSE(result.pending_object_possible);
+        ASSERT_FALSE(result.orphan_chunk_possible);
+        ASSERT_EQ(result.chunk_executions.size(), 2U);
+        ASSERT_EQ(metadata_client->commit_calls(), 1U);
+        ASSERT_TRUE(metadata_client->last_commit_request().has_value());
+
+        const auto &commit_request = *metadata_client->last_commit_request();
+        ASSERT_EQ(commit_request.request_id, "upload-t036/commit");
+        ASSERT_EQ(commit_request.chunks.size(), 2U);
+
+        const std::vector<storedemo::StorageNodeId> expected_replicas{
+            store1->config().node_id,
+            store2->config().node_id};
+
+        auto assert_manifest_matches_durable_facts =
+            [&](const std::size_t manifest_index,
+                const std::uint32_t chunk_index,
+                const std::uint64_t offset,
+                const std::string &payload)
+        {
+            const auto identity =
+                MakeStoreIdentityOrThrow(request.object_id,
+                                         request.version,
+                                         chunk_index,
+                                         offset);
+            const auto &manifest_chunk = commit_request.chunks.at(manifest_index);
+            EXPECT_EQ(manifest_chunk.identity.chunk_id, identity.chunk_id);
+            EXPECT_EQ(manifest_chunk.identity.object_id, request.object_id);
+            EXPECT_EQ(manifest_chunk.identity.version, request.version);
+            EXPECT_EQ(manifest_chunk.identity.chunk_index, chunk_index);
+            EXPECT_EQ(manifest_chunk.identity.offset, offset);
+            EXPECT_EQ(manifest_chunk.offset, offset);
+            EXPECT_EQ(manifest_chunk.size,
+                      static_cast<std::uint64_t>(payload.size()));
+            EXPECT_EQ(manifest_chunk.replica_nodes, expected_replicas);
+
+            const auto read1 = store1->ReadChunk(
+                MakeReadRequest(identity.chunk_id,
+                                "read-t036-store1-" + std::to_string(chunk_index)));
+            const auto read2 = store2->ReadChunk(
+                MakeReadRequest(identity.chunk_id,
+                                "read-t036-store2-" + std::to_string(chunk_index)));
+            ASSERT_EQ(read1.status, storedemo::StorageNodeStatusCode::kOk)
+                << read1.error_detail;
+            ASSERT_EQ(read2.status, storedemo::StorageNodeStatusCode::kOk)
+                << read2.error_detail;
+            EXPECT_EQ(read1.payload, payload);
+            EXPECT_EQ(read2.payload, payload);
+            EXPECT_EQ(manifest_chunk.size, read1.metadata.size);
+            EXPECT_EQ(manifest_chunk.size, read2.metadata.size);
+            EXPECT_EQ(manifest_chunk.checksum.value, read1.metadata.checksum.value);
+            EXPECT_EQ(manifest_chunk.checksum.value, read2.metadata.checksum.value);
+        };
+
+        assert_manifest_matches_durable_facts(0, 0, 0, first_payload);
+        assert_manifest_matches_durable_facts(1,
+                                              1,
+                                              static_cast<std::uint64_t>(first_payload.size()),
+                                              second_payload);
+
+        for (const auto &execution : result.chunk_executions)
+        {
+            EXPECT_EQ(execution.durable_success_count, 2U);
+            EXPECT_TRUE(execution.commit_eligible);
+            ASSERT_EQ(execution.replica_results.size(), 3U);
+            EXPECT_EQ(execution.replica_results.back().node_id,
+                      storedemo::test::MakeStorageNodeIdFixture(3));
+            EXPECT_EQ(execution.replica_results.back().status,
+                      storedemo::StorageNodeStatusCode::kOverloaded);
+        }
+
+        const auto head = machine.HeadObject(
+            {.bucket = request.bucket, .object_key = request.object_key});
+        ASSERT_EQ(head.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_TRUE(head.record.has_value());
+        ASSERT_EQ(head.record->chunks.size(), commit_request.chunks.size());
+
+        const auto manifest = machine.FindChunkRefs(request.bucket, request.object_key);
+        ASSERT_TRUE(manifest.has_value());
+        ASSERT_EQ(manifest->size(), commit_request.chunks.size());
+        for (std::size_t index = 0; index < manifest->size(); ++index)
+        {
+            EXPECT_EQ(manifest->at(index).chunk_id,
+                      commit_request.chunks.at(index).identity.chunk_id);
+            EXPECT_EQ(manifest->at(index).offset,
+                      commit_request.chunks.at(index).offset);
+            EXPECT_EQ(manifest->at(index).size,
+                      commit_request.chunks.at(index).size);
+            EXPECT_EQ(manifest->at(index).checksum,
+                      commit_request.chunks.at(index).checksum.value);
+            EXPECT_EQ(manifest->at(index).replica_nodes,
+                      commit_request.chunks.at(index).replica_nodes);
+        }
 #endif
     }
 } // namespace

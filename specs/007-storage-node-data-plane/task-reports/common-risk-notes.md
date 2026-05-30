@@ -63,4 +63,4 @@
 - 任务编号：T027
   问题：T035 已补最小 `UploadCoordinator`，能够按 `CreateObject -> Placement -> WriteChunk -> CommitObject` 顺序串联 metadata/control-plane 与 StorageNode/data-plane，但当前仍没有 `AbortObject`、GC、重试调度或重启恢复协同。只要 `CreateObject` 已成功而后续 placement/write/commit 失败，对象就可能长期停留在 metadata `PENDING`；只要有 durable chunk 而 `CommitObject` 未成功，就仍可能留下 orphan chunk。
   影响：仓库现在已经有了明确的 commit gate，不再完全缺少 upload coordinator；但失败路径仍依赖调用方或后续 GC/recovery 任务处理 pending object 和 orphan chunk，尚不能把这部分状态自动收口成生产语义。
-  建议后续在哪类任务处理：在 T036-T037 以及后续 abort/GC/recovery 任务中，把 manifest durable facts、最小成功副本数校验、failed-commit orphan cleanup 和 pending object 收口策略继续补齐，并补对应集成回归。
+  建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定；后续在 T037 以及 abort/GC/recovery 任务中继续补齐 failed-commit orphan cleanup、pending object 收口和重启恢复协同。
