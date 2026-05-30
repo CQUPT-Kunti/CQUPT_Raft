@@ -163,12 +163,26 @@ collect_files(STORAGE_TEST_ENTRY_FILES
   "tests/support/storage_*")
 remove_matching_paths(STORAGE_TEST_ENTRY_FILES "AGENTS\\.md$")
 
+collect_files(UPLOAD_NO_KV_TEST_FILES
+  "tests/storage_upload_integration_test.cpp"
+  "tests/storage_upload_coordinator_test.cpp"
+  "tests/storage_write_chunk_contract_test.cpp"
+  "tests/storage_node_service_test.cpp"
+  "tests/storage_node_client_test.cpp")
+
+collect_files(UPLOAD_NO_KV_HELPER_FILES
+  "tests/support/storage_upload_test_utils.h")
+
 assert_paths_covered(STORE_PRODUCTION_FILES PRODUCTION_SOURCE_FILES
   "audit coverage gap")
 assert_paths_covered(STORAGE_PROTO_FILES PRODUCTION_SOURCE_FILES
   "audit coverage gap")
 assert_paths_covered(STORAGE_TEST_ENTRY_FILES TEST_MAIN_FILES
   "audit coverage gap")
+assert_paths_covered(UPLOAD_NO_KV_TEST_FILES TEST_MAIN_FILES
+  "upload no-kv audit coverage gap")
+assert_paths_covered(UPLOAD_NO_KV_HELPER_FILES TEST_MAIN_FILES
+  "upload no-kv audit coverage gap")
 require_file_stems_registered(STORAGE_TEST_ENTRY_FILES "tests/CMakeLists.txt"
   "storage test registration gap")
 
@@ -303,6 +317,14 @@ scan_files_for_regex(TEST_MAIN_FILES
   "KvStateMachine"
   "forbidden test symbol")
 scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])KvService([^A-Za-z0-9_]|$)"
+  "KvService"
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
+  "(^|[^A-Za-z0-9_])raft_kv_client([^A-Za-z0-9_]|$)"
+  "raft_kv_client"
+  "forbidden test symbol")
+scan_files_for_regex(TEST_MAIN_FILES
   "(^|[^A-Za-z0-9_])KV regression-only path([^A-Za-z0-9_]|$)"
   "KV regression-only path"
   "forbidden test doc symbol")
@@ -314,6 +336,34 @@ scan_files_for_regex(TEST_MAIN_FILES
   "(^|[^A-Za-z0-9_])test_state_machine([^A-Za-z0-9_]|$)"
   "test_state_machine"
   "forbidden test doc symbol")
+
+# Upload-path focused audit: these files are the 007 write/upload chain and
+# must stay free of retired KV demo symbols.
+set(UPLOAD_NO_KV_AUDIT_FILES
+  ${UPLOAD_NO_KV_TEST_FILES}
+  ${UPLOAD_NO_KV_HELPER_FILES})
+scan_files_for_literal(UPLOAD_NO_KV_AUDIT_FILES
+  "SetCommand("
+  "forbidden upload-path symbol")
+scan_files_for_literal(UPLOAD_NO_KV_AUDIT_FILES
+  "DeleteCommand("
+  "forbidden upload-path symbol")
+scan_files_for_regex(UPLOAD_NO_KV_AUDIT_FILES
+  "(^|[^A-Za-z0-9_])DebugGetValue([^A-Za-z0-9_]|$)"
+  "DebugGetValue"
+  "forbidden upload-path symbol")
+scan_files_for_regex(UPLOAD_NO_KV_AUDIT_FILES
+  "(^|[^A-Za-z0-9_])KvStateMachine([^A-Za-z0-9_]|$)"
+  "KvStateMachine"
+  "forbidden upload-path symbol")
+scan_files_for_regex(UPLOAD_NO_KV_AUDIT_FILES
+  "(^|[^A-Za-z0-9_])KvService([^A-Za-z0-9_]|$)"
+  "KvService"
+  "forbidden upload-path symbol")
+scan_files_for_regex(UPLOAD_NO_KV_AUDIT_FILES
+  "(^|[^A-Za-z0-9_])raft_kv_client([^A-Za-z0-9_]|$)"
+  "raft_kv_client"
+  "forbidden upload-path symbol")
 
 # Deferred to T059: script/preset fallback text still needs a metadata-only rewrite.
 set(_audit_ps1_path "${RAFT_SOURCE_DIR}/test.ps1")
