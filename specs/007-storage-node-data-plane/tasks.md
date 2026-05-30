@@ -98,7 +98,7 @@
 - [x] T036 [US1] 在上传闭环中生成 `ChunkRef` manifest 并写入成功 durable replicas；允许修改：`tests/support/storage_upload_test_utils.h`、`tests/storage_upload_integration_test.cpp`；验收：`CommitObjectRequest.chunks` 的 `chunk_id/offset/size/checksum/replica_nodes` 与本地 durable facts 一致；依赖：T035
 - [x] T037 [US1] 覆盖部分副本写失败时不提交对象并触发 AbortObject 或 cleanup candidate；允许修改：`modules/store/upload/upload_coordinator.h`、`modules/store/upload/upload_coordinator.cpp`、`modules/store/upload/module-notes.md`、`tests/storage_upload_coordinator_test.cpp`、`tests/storage_upload_integration_test.cpp`；验收：最小 2 成功不满足时 `HeadObject` 不可见，已写 chunk 标记为待 GC；依赖：T036
 - [x] T038 [US1] 增加上传路径 no-KV 回归检查；允许修改：`tests/no_kv_surface_audit.cmake`、`tests/storage_upload_integration_test.cpp`；验收：上传测试不使用 `SetCommand`、`DeleteCommand`、`DebugGetValue` 或 KV 断言；依赖：T037
-- [ ] T039 [US1] 运行 US1 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_upload|storage_node_service|storage_placement|NoKvSurfaceAudit" --output-on-failure`；验收：PASS；依赖：T027-T038
+- [x] T039 [US1] 运行 US1 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_upload|storage_node_service|storage_placement|NoKvSurfaceAudit" --output-on-failure`；验收：PASS；依赖：T027-T038
 
 ## Phase 4: User Story 2 - 读取 committed 对象并校验 chunk (Priority: P2)
 
