@@ -128,7 +128,7 @@
 ### Tests for User Story 3
 
 - [X] T049 [P] [US3] 添加删除闭环和 GC safety 测试；允许修改：`tests/storage_delete_gc_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 `DeleteObject -> invisible -> async chunk cleanup` 和 live manifest 保护；依赖：T048
-- [ ] T050 [P] [US3] 添加 `DeleteChunk` / `BatchDeleteChunks` contract 测试；允许修改：`tests/storage_node_service_test.cpp`；验收：覆盖 missing/deleted 幂等、partial batch result、retryable failures；依赖：T031
+- [X] T050 [P] [US3] 添加 `DeleteChunk` / `BatchDeleteChunks` contract 测试；允许修改：`tests/storage_delete_chunk_contract_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 missing/deleted 幂等、partial batch result、retryable failures；依赖：T031
 
 ### Implementation for User Story 3
 
