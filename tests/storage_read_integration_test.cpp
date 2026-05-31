@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -15,14 +13,17 @@
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
-#include "store/node/storage_node_client.h"
-#include "store/placement/replica_policy.h"
 #include "support/metadata_test_utils.h"
+#include "support/storage_read_test_utils.h"
 #include "support/store_test_utils.h"
 #include "support/storage_upload_test_utils.h"
 
 namespace
 {
+    using storedemo::test::CountingReplicaReader;
+    using storedemo::test::ReadObjectByManifest;
+    using storedemo::test::ReadObjectByManifestRequest;
+
     storedemo::ChunkIdentity MakeStoreIdentityOrThrow(const std::string_view object_id,
                                                       const std::uint64_t version,
                                                       const std::uint32_t chunk_index,
@@ -82,175 +83,6 @@ namespace
             .size = static_cast<std::uint64_t>(payload.size()),
             .replica_nodes = std::move(replica_nodes),
             .checksum = checksum.value};
-    }
-
-    struct ReadCommittedManifestResult
-    {
-        storedemo::StorageNodeStatusCode status{storedemo::StorageNodeStatusCode::kOk};
-        std::string error_detail;
-        std::string payload;
-    };
-
-    class CountingReplicaReader
-    {
-    public:
-        using Handler = std::function<storedemo::ReadChunkResponse(
-            const storedemo::StorageNodeId &node_id,
-            const storedemo::ReadChunkRequest &request)>;
-
-        explicit CountingReplicaReader(Handler handler)
-            : handler_(std::move(handler))
-        {
-        }
-
-        storedemo::ReadChunkResponse ReadChunk(const storedemo::StorageNodeId &node_id,
-                                               const storedemo::ReadChunkRequest &request)
-        {
-            ++read_calls_;
-            read_node_ids_.push_back(node_id);
-            read_chunk_ids_.push_back(request.chunk_id);
-            ++per_node_calls_[node_id];
-            return handler_(node_id, request);
-        }
-
-        [[nodiscard]] std::size_t read_calls() const
-        {
-            return read_calls_;
-        }
-
-        [[nodiscard]] const std::vector<std::string> &read_chunk_ids() const
-        {
-            return read_chunk_ids_;
-        }
-
-        [[nodiscard]] const std::vector<std::string> &read_node_ids() const
-        {
-            return read_node_ids_;
-        }
-
-        [[nodiscard]] std::size_t calls_for_node(const storedemo::StorageNodeId &node_id) const
-        {
-            const auto it = per_node_calls_.find(node_id);
-            return it == per_node_calls_.end() ? 0U : it->second;
-        }
-
-    private:
-        Handler handler_;
-        std::size_t read_calls_{0};
-        std::vector<std::string> read_node_ids_;
-        std::vector<std::string> read_chunk_ids_;
-        std::unordered_map<std::string, std::size_t> per_node_calls_;
-    };
-
-    ReadCommittedManifestResult ReadCommittedObjectByManifest(
-        const raftdemo::MetadataStateMachine &machine,
-        CountingReplicaReader &reader,
-        const std::string &bucket,
-        const std::string &object_key)
-    {
-        const auto head = machine.HeadObject(
-            {.bucket = bucket, .object_key = object_key});
-        if (head.result.code != raftdemo::MetadataStatusCode::kOk ||
-            !head.record.has_value() ||
-            !head.record->IsCommitted())
-        {
-            return ReadCommittedManifestResult{
-                .status = storedemo::test::MapMetadataStatusCode(head.result.code),
-                .error_detail = head.result.summary.message};
-        }
-
-        const auto manifest = machine.FindChunkRefs(bucket, object_key);
-        if (!manifest.has_value())
-        {
-            return ReadCommittedManifestResult{
-                .status = storedemo::StorageNodeStatusCode::kNotFound,
-                .error_detail = "committed object manifest not found"};
-        }
-
-        std::vector<raftdemo::ChunkRef> ordered_manifest = *manifest;
-        std::stable_sort(ordered_manifest.begin(),
-                         ordered_manifest.end(),
-                         [](const raftdemo::ChunkRef &lhs, const raftdemo::ChunkRef &rhs)
-                         {
-                             if (lhs.offset != rhs.offset)
-                             {
-                                 return lhs.offset < rhs.offset;
-                             }
-                             return lhs.chunk_id < rhs.chunk_id;
-                         });
-
-        ReadCommittedManifestResult result;
-        storedemo::ReplicaPolicySelector selector;
-        for (std::size_t index = 0; index < ordered_manifest.size(); ++index)
-        {
-            const auto &chunk_ref = ordered_manifest.at(index);
-            if (chunk_ref.replica_nodes.empty())
-            {
-                return ReadCommittedManifestResult{
-                    .status = storedemo::StorageNodeStatusCode::kInvalidArgument,
-                    .error_detail = "manifest chunk is missing replica_nodes"};
-            }
-
-            const auto selection = selector.SelectReadReplicas(
-                storedemo::ReadReplicaSelectionRequest{
-                    .chunk_id = chunk_ref.chunk_id,
-                    .replica_nodes = chunk_ref.replica_nodes},
-                std::span<const storedemo::ReadReplicaCandidate>{});
-            if (!selection.ok())
-            {
-                return ReadCommittedManifestResult{
-                    .status = selection.status,
-                    .error_detail = selection.error_detail};
-            }
-
-            std::vector<storedemo::StorageNodeId> ordered_replicas;
-            ordered_replicas.reserve(selection.decision.ordered_replicas.size());
-            for (const auto &candidate : selection.decision.ordered_replicas)
-            {
-                ordered_replicas.push_back(candidate.node_id);
-            }
-
-            const auto read_request =
-                storedemo::MakeReadChunkRequestForCommittedManifestReplica(
-                    "storage-read-" + std::to_string(index),
-                    chunk_ref.chunk_id,
-                    chunk_ref.size,
-                    chunk_ref.checksum);
-            const auto fallback = storedemo::ReadChunkWithReplicaFallback(
-                ordered_replicas,
-                read_request,
-                {},
-                [&](const storedemo::StorageNodeId &node_id,
-                    const storedemo::ReadChunkRequest &request,
-                    const storedemo::StorageNodeClientReadChunkOptions &)
-                {
-                    return reader.ReadChunk(node_id, request);
-                });
-            const auto &read = fallback.response;
-            if (read.status != storedemo::StorageNodeStatusCode::kOk)
-            {
-                return ReadCommittedManifestResult{
-                    .status = read.status,
-                    .error_detail = read.error_detail};
-            }
-
-            if (read.metadata.size != chunk_ref.size)
-            {
-                return ReadCommittedManifestResult{
-                    .status = storedemo::StorageNodeStatusCode::kCorrupted,
-                    .error_detail = "manifest size does not match local chunk facts"};
-            }
-            if (read.metadata.checksum.value != chunk_ref.checksum)
-            {
-                return ReadCommittedManifestResult{
-                    .status = storedemo::StorageNodeStatusCode::kChecksumMismatch,
-                    .error_detail = "manifest checksum does not match local chunk facts"};
-            }
-
-            result.payload.append(read.payload);
-        }
-
-        return result;
     }
 
     class StorageReadIntegrationTest : public ::testing::Test
@@ -399,8 +231,12 @@ namespace
                 EXPECT_EQ(node_id, store.config().node_id);
                 return store.ReadChunk(request);
             });
-        const auto result =
-            ReadCommittedObjectByManifest(machine, reader, "bucket-t040-read", object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t040-read",
+                .object_key = object_key});
 
         ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
             << result.error_detail;
@@ -476,10 +312,12 @@ namespace
                 EXPECT_EQ(node_id, store.config().node_id);
                 return store.ReadChunk(request);
             });
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t040-pending",
-                                                          "objects/pending.deb");
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t040-pending",
+                .object_key = "objects/pending.deb"});
 
         EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kNotFound);
         EXPECT_TRUE(result.payload.empty());
@@ -576,10 +414,12 @@ namespace
                 EXPECT_EQ(node_id, store.config().node_id);
                 return store.ReadChunk(request);
             });
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t040-deleted",
-                                                          "objects/deleted.deb");
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t040-deleted",
+                .object_key = "objects/deleted.deb"});
 
         EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kNotFound);
         EXPECT_TRUE(result.payload.empty());
@@ -676,10 +516,12 @@ namespace
                 return response;
             });
 
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t045-read-first",
-                                                          object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t045-read-first",
+                .object_key = object_key});
 
         ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
             << result.error_detail;
@@ -778,10 +620,12 @@ namespace
                 return response;
             });
 
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t045-read-unavailable",
-                                                          object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t045-read-unavailable",
+                .object_key = object_key});
 
         ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
             << result.error_detail;
@@ -889,10 +733,12 @@ namespace
                 return response;
             });
 
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t045-read-checksum",
-                                                          object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t045-read-checksum",
+                .object_key = object_key});
 
         ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
             << result.error_detail;
@@ -985,10 +831,12 @@ namespace
                 return response;
             });
 
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t045-read-all-fail",
-                                                          object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t045-read-all-fail",
+                .object_key = object_key});
 
         EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kChecksumMismatch);
         EXPECT_TRUE(result.payload.empty());
@@ -1056,10 +904,12 @@ namespace
                 return response;
             });
 
-        const auto result = ReadCommittedObjectByManifest(machine,
-                                                          reader,
-                                                          "bucket-t045-read-empty",
-                                                          object_key);
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t045-read-empty",
+                .object_key = object_key});
 
         EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kInvalidArgument);
         EXPECT_TRUE(result.payload.empty());

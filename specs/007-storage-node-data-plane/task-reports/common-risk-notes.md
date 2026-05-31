@@ -66,6 +66,6 @@
   建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
 
 - 任务编号：T045
-  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
-  影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择和逐副本 fallback，后续任务不能再随意改动 T041/T042/T043/T044/T045 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair 或 scrub。
-  建议后续在哪类任务处理：在 T046/T052/T066 及后续 recovery-scrub 任务中继续接入共享 read helper、registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/T047/后续 recovery-scrub 任务统一处理。
+  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 也已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`；但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
+  影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择、逐副本 fallback 和可复用测试 helper，后续任务不能再随意改动 T041-T046 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair 或 scrub。
+  建议后续在哪类任务处理：在 T047/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/T047/后续 recovery-scrub 任务统一处理。
