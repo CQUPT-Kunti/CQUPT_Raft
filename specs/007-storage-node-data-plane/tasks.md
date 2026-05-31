@@ -133,7 +133,7 @@
 ### Implementation for User Story 3
 
 - [x] T051 [US3] 在 `proto/storage_node.proto` 中补齐 `DeleteChunk`、`BatchDeleteChunks` proto schema 并接入现有 `storage_node_proto` codegen；允许修改：`proto/storage_node.proto`、`tests/storage_node_client_test.cpp`、`CMakeLists.txt`；验收：proto 仍独立于 `metadata.proto`，删除 RPC 只表达 chunk data-plane 删除，不恢复 KV RPC；依赖：T050
-- [ ] T052 [US3] 实现 `StorageNodeService::DeleteChunk`、`StatChunk`、`ListChunks` 和 `BatchDeleteChunks`；允许修改：`modules/store/node/storage_node_service.cpp`、`modules/store/node/storage_node_service.h`；验收：删除幂等，List 分页有界，BatchDelete 内部并发有上限；依赖：T025、T051
+- [x] T052 [US3] 实现 `StorageNodeService::DeleteChunk` 和 `BatchDeleteChunks`；允许修改：`modules/store/node/storage_node_service.cpp`、`modules/store/node/storage_node_service.h`、`modules/store/node/module-notes.md`、`tests/storage_node_service_test.cpp`；验收：删除幂等、identity/checksum mismatch 不误删、partial batch result 与 retry 分类在 service 层保持可观察；依赖：T050、T051
 - [ ] T053 [US3] 实现 `StorageNodeClient` 删除和批量删除调用；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：partial batch result 可重试，非 retryable 错误不盲重试；依赖：T052
 - [ ] T054 [US3] 实现 `GarbageCollector` 任务模型和 bounded 后台队列；允许修改：`modules/store/maintenance/garbage_collector.h`、`modules/store/maintenance/garbage_collector.cpp`、`CMakeLists.txt`；验收：GC task 有 reason、metadata_boundary、attempts、last_error、state；依赖：T019、T053
 - [ ] T055 [US3] 实现 metadata-driven GC safety check；允许修改：`modules/store/maintenance/garbage_collector.cpp`、`tests/storage_delete_gc_test.cpp`；验收：任何 committed live manifest 引用的 chunk 不会被 GC 删除；依赖：T054

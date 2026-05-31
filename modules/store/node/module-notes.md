@@ -8,19 +8,24 @@
 
 - `StorageNodeService::WriteChunk` 的 gRPC `WriteChunk` 入口
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
+- `StorageNodeService::DeleteChunk` 的 gRPC `DeleteChunk` 入口
+- `StorageNodeService::BatchDeleteChunks` 的 gRPC `BatchDeleteChunks` 入口
 - `StorageNodeClient::WriteChunk` 的本地请求到 gRPC `WriteChunk` 调用
 - `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
 - committed manifest 读路径可复用的最小 request builder、错误分类和 replica fallback helper
 - proto `WriteChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `ReadChunkRequest` 到 `ChunkStore::ReadChunk` 的字段转换
+- proto `DeleteChunkRequest` / `BatchDeleteChunkRequest` 到 `ChunkStore::DeleteChunk` 的字段转换
 - `ChunkStore` 结果到 `storage_node.proto` 响应的状态码、checksum、state、durable、already_exists 映射
 - `ChunkStore` 的 `ReadChunkResponse` 到 `storage_node.proto::ReadChunkResponse` 的状态码、checksum、state、payload、offset、complete/full_read 映射
+- `ChunkStore` 的 `DeleteChunkResponse` 到 `storage_node.proto::DeleteChunkResponse` / `BatchDeleteChunkResult` 的状态码、checksum、state、idempotent、retryable 映射
 - `storage_node.proto`（`package storage`）`WriteChunkResponse` 和 gRPC status 到本地 `storedemo::WriteChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`ReadChunkResponse` 和 gRPC status 到本地 `storedemo::ReadChunkResponse` / `StorageNodeStatusCode` 的映射
 
 当前不负责：
 
-- `DeleteChunk` / `StatChunk` / `ListChunks`
+- `StorageNodeClient::DeleteChunk` / `StorageNodeClient::BatchDeleteChunks`
+- `StatChunk` / `ListChunks`
 - metadata `CreateObject` / `CommitObject` / `AbortObject`
 - `RaftNode::ProposeMetadata()`
 - upload coordinator
@@ -29,7 +34,7 @@
 ## 主要文件
 
 - `storage_node_service.h`：service 类声明
-- `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` 适配实现和 proto/store 映射 helper
+- `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` 适配实现和 proto/store 映射 helper
 - `storage_node_client.h`：client 类声明以及 write/read 选项结构
 - `storage_node_client.cpp`：同步 `WriteChunk` / `ReadChunk` 调用、deadline 设置和响应映射
 
@@ -39,17 +44,23 @@
 - `StorageNodeClient` 必须通过构造函数注入 generated stub 或 gRPC channel，不直接依赖 metadata / Raft 模块
 - `WriteChunk` 成功只表示 chunk 已经按当前 store contract durable publish，不表示 metadata object 已 committed
 - `ReadChunk` 成功只表示当前 chunk data-plane 读取成功，不表示 metadata object 已 committed，也不决定 object 可见性
+- `DeleteChunk` / `BatchDeleteChunks` 成功只表示 chunk data-plane 删除 contract 已执行，不表示 metadata object 已 deleted，也不决定 object 可见性
 - service 只调用 `ChunkStore::WriteChunk()`，不触发 metadata commit，也不调用 `RaftNode::ProposeMetadata()`
 - service 的 `ReadChunk` 只调用 `ChunkStore::ReadChunk()`，不调用 metadata service / `MetadataStateMachine` / `RaftNode::ProposeMetadata()`
+- service 的 `DeleteChunk` / `BatchDeleteChunks` 只调用 `ChunkStore::DeleteChunk()`，不调用 metadata service / `MetadataStateMachine` / `RaftNode::ProposeMetadata()`
 - client 只调用 `storage_node.proto` 的 `WriteChunk` RPC，不触发 metadata commit，也不调用 `RaftNode::ProposeMetadata()`
 - client 的 `ReadChunk` 只调用 `storage_node.proto` 的 `ReadChunk` RPC，不调用 metadata service / `MetadataStateMachine` / `RaftNode::ProposeMetadata()`
 - `request_id`、`chunk_id`、`object_id`、`version`、`chunk_index`、`offset`、`expected_size`、`expected_checksum`、`payload` 都会转换到 `ChunkStore::WriteChunk` 请求
 - `ReadChunk` 当前会把 `request_id`、`chunk_id`、`expected_checksum`、`verify_checksum` 转到 `ChunkStore::ReadChunk`；如果 `chunk_id` 为空，则尝试用 `object_id + version + chunk_index` 派生 chunk id；如果 `length > 0`，则把 `offset + length` 转成 `ChunkReadRange`
+- `DeleteChunk` 当前会把 `request_id`、`chunk_id`、`reason`、`metadata_boundary`、`expected_checksum` 转到 `ChunkStore::DeleteChunk`；如果 `chunk_id` 为空，则尝试用 `object_id + version + chunk_index` 派生 chunk id；如果显式 `chunk_id` 与 object identity 同时出现但不一致，则在 service 层返回显式参数错误，避免误删 live chunk
+- `BatchDeleteChunks` 当前按请求顺序逐项构造 `ChunkStore::DeleteChunk` 请求，并把 top-level `request_id` 扩展成 `/item/<index>` 形式的逐项 request id；逐项结果和聚合计数必须保持一致
 - `request_id`、`chunk_id`、`object_id`、`version`、`chunk_index`、`offset`、`expected_size`、`expected_checksum`、`payload`、`timeout_ms`、`best_effort_cancel`、`durability` 都会转换到 `storage_node.proto::WriteChunkRequest`
 - client 的 `ReadChunk` 会把本地 `request_id`、`chunk_id`、`range(offset/length)`、`expected_checksum`、`verify_checksum`、`timeout_ms`、`best_effort_cancel` 转换到 `storage_node.proto::ReadChunkRequest`；本地请求没有 `object_id/version/chunk_index` 时，不伪造对象可见性语义
 - `storage_node.proto::ReadChunkRequest` 中的 `timeout_ms` 和 `best_effort_cancel` 当前只作为 RPC contract 字段接收，不会在 service/store 内伪装成已经具备运行中取消传播
 - proto `summary.code`、`summary.message`、`summary.retry_after_ms`、`durable`、`already_exists`、`size`、`checksum`、`state` 都以 `ChunkStore` 返回事实为准
 - `ReadChunkResponse.summary.code`、`summary.message`、`summary.retry_after_ms`、`chunk_id`、`payload`、`size`、`checksum`、`state`、`offset`、`complete`、`full_read` 都以 `ChunkStore::ReadChunk` 返回事实和当前 request range 语义为准
+- `DeleteChunkResponse.summary.code`、`summary.message`、`summary.retry_after_ms`、`chunk_id`、`size`、`checksum`、`state`、`deleted`、`already_missing`、`already_deleted`、`retryable` 都以 `ChunkStore::DeleteChunk` 返回事实和当前 request identity/checksum 边界为准
+- `BatchDeleteChunksResponse` 的 `results`、`success_count`、`idempotent_count`、`retryable_failure_count`、`non_retryable_failure_count`、`partial_failure` 都以逐项 `ChunkStore::DeleteChunk` 结果聚合，不在 node 层发明 metadata 可见性语义
 - client 会把 proto `summary.code`、`summary.message`、`summary.retry_after_ms`、`durable`、`already_exists`、`size`、`checksum`、`state` 转回本地 `storedemo::WriteChunkResponse`
 - client 会把 proto `ReadChunkResponse.summary.code`、`summary.message`、`summary.retry_after_ms`、`chunk_id`、`payload`、`size`、`checksum`、`state`、`offset` 转回本地 `storedemo::ReadChunkResponse`；如果 proto 成功但 `complete/full_read` 语义与本地请求不一致，会显式映射成 `IO_ERROR`，不做 silent success
 
@@ -62,6 +73,8 @@
 - `WriteChunkDurability` 目前只接受 `UNSPECIFIED` 或 `PUBLISH`；当前 `LocalDiskChunkStore::WriteChunk` 的成功语义就是完成 durable publish
 - `ReadChunk` 当前如果收到 `length > 0` 的 range request，会原样传给 `ChunkStore::ReadChunk`；是否支持 range 由底层 store 决定。当前 `LocalDiskChunkStore` 会返回显式 `UNSUPPORTED`，service 不做 silent partial success
 - `LocalDiskChunkStore::ReadChunk` 当前在 checksum mismatch / corrupted 场景只返回明确错误，不会自动回写 `CORRUPTED` / `QUARANTINED`；service 适配层保持这个边界，不在 node 层强行发明状态回写
+- `DeleteChunkRequest` / `BatchDeleteChunksRequest` 中的 `timeout_ms` 和 `best_effort_cancel` 当前只作为 RPC contract 字段接收，T052 不会把它们包装成已经具备运行中取消传播或后台删除调度
+- `BatchDeleteChunks` 当前逐项串行调用 `ChunkStore::DeleteChunk()`；`retryable/non-retryable` 分类直接复用 `storedemo::IsRetriableStatus()`，不在 service 层发明新的状态体系
 - `StorageNodeClient` 当前支持有限自动重试，但只会重试 retryable 状态：`TIMEOUT`、`IO_ERROR`、`OVERLOADED`、`NODE_UNAVAILABLE`；`CONFLICT`、`CHECKSUM_MISMATCH`、`INVALID_ARGUMENT`、`CANCELLED` 等非 retryable 结果不会重试
 - client 的 `timeout_ms` 当前作为整次 `WriteChunk` 调用的绝对 deadline 预算；每次重试共用同一个 deadline，不会无限延长总等待时间
 - `StorageNodeClient::ReadChunk` 自身仍保持单副本、单次 RPC；T045 额外提供独立 helper 供 committed manifest 读路径按 selector 结果做副本 fallback，但不把副本选择硬编码进单节点 client
@@ -89,6 +102,34 @@
 - 输出：带 `status` / `error_detail` 的 store-style response
 - 边界：只用于 adapter 层参数校验，不触发底层 `ChunkStore`
 
+### `ResolveDeleteRequestChunkId(std::string_view, std::string_view, std::uint64_t, std::uint32_t, ChunkId*, std::string*)`
+
+- 责任：统一收口 `DeleteChunk` / `BatchDeleteChunkRequest` 的 chunk identity 解析
+- 输入：显式 `chunk_id`、可选 `object_id/version/chunk_index`
+- 输出：稳定的本地 `ChunkId`
+- 边界：`chunk_id` 为空时允许由 object identity 派生；两者同时出现但不一致时返回显式参数错误，避免误删
+
+### `MakeDeleteValidationError(StorageNodeStatusCode, std::string)`
+
+- 责任：构造 service 本地请求校验失败时使用的 `DeleteChunkResponse`
+- 输入：目标状态码、错误详情
+- 输出：带 `status` / `error_detail` 的 store-style delete response
+- 边界：只用于 adapter 层参数校验，不触发底层 `ChunkStore`
+
+### `TranslateDeleteRequest(const storage::DeleteChunkRequest&, DeleteChunkRequest*)`
+
+- 责任：把 proto `DeleteChunkRequest` 转成 `ChunkStore::DeleteChunk` 所需本地请求
+- 输入：proto delete request、store request 输出指针
+- 输出：成功时填充 `request_id`、`chunk_id`、`reason`、`metadata_boundary`、`expected_checksum`
+- 边界：优先使用显式 `chunk_id`；必要时由 object identity 派生；当前不会传播 `timeout_ms` / `best_effort_cancel`
+
+### `TranslateBatchDeleteItemRequest(const storage::BatchDeleteChunksRequest&, const storage::BatchDeleteChunkRequest&, std::size_t, DeleteChunkRequest*)`
+
+- 责任：把 batch 中的单个 proto item 转成一次 `ChunkStore::DeleteChunk` 请求
+- 输入：top-level batch request、单个 batch item、item index、store request 输出指针
+- 输出：带 `/item/<index>` request id 的本地 delete request
+- 边界：逐项独立校验；单个 item 校验失败不会阻止其它 item 继续处理
+
 ### `TranslateReadRequest(const storage::ReadChunkRequest&, ReadChunkRequest*)`
 
 - 责任：把 proto `ReadChunkRequest` 转成 `ChunkStore::ReadChunk` 所需本地请求
@@ -109,6 +150,41 @@
 - 输入：gRPC context、proto `ReadChunkRequest`
 - 输出：proto `ReadChunkResponse`
 - 边界：只做字段和状态映射；不调用 metadata / Raft；不决定 object committed 可见性；当前只明确接收 `timeout_ms` / `best_effort_cancel` contract，不承诺运行中取消传播
+
+### `FillDeleteResponse(const storage::DeleteChunkRequest&, const DeleteChunkResponse&, const std::string&, storage::DeleteChunkResponse*)`
+
+- 责任：把 `ChunkStore::DeleteChunk` 的结果映射为 proto `DeleteChunkResponse`
+- 输入：proto delete request、store delete response、service 配置的 node_id
+- 输出：`summary`、`chunk_id`、`size`、`checksum`、`state`、`deleted`、`already_missing`、`already_deleted`、`retryable`
+- 边界：`already_deleted` 由 `already_missing + state == DELETED` 推导；`retryable` 直接复用本地 retryable 状态分类
+
+### `FillBatchDeleteResult(const storage::BatchDeleteChunksRequest&, const storage::BatchDeleteChunkRequest&, std::size_t, const DeleteChunkResponse&, const std::string&, storage::BatchDeleteChunkResult*)`
+
+- 责任：把单个 `ChunkStore::DeleteChunk` 结果映射成一个 proto `BatchDeleteChunkResult`
+- 输入：top-level batch request、单个 batch item、item index、store delete response、service 配置的 node_id
+- 输出：逐项 `summary`、`chunk_id`、`size`、`checksum`、`state`、`deleted`、idempotent/retryable 标记
+- 边界：复用单删响应映射，不发明单独的 batch-only 状态体系
+
+### `FillBatchSummary(const storage::BatchDeleteChunksRequest&, const std::string&, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, storage::StorageNodeResponseSummary*)`
+
+- 责任：为 `BatchDeleteChunksResponse.summary` 聚合 top-level 事实
+- 输入：batch request、service node_id、success/idempotent/retryable/non-retryable 计数、聚合 retry_after
+- 输出：top-level summary
+- 边界：summary 只表达 batch RPC 已执行和是否存在 item failures；逐项成功/失败仍以 `results` 为准
+
+### `StorageNodeService::DeleteChunk(...)`
+
+- 责任：承接 gRPC `DeleteChunk` RPC，请求校验后调用注入的 `ChunkStore::DeleteChunk()`，再把结果映射回 proto 响应
+- 输入：gRPC context、proto `DeleteChunkRequest`
+- 输出：proto `DeleteChunkResponse`
+- 边界：只做字段和状态映射；不调用 metadata / Raft；不决定 object deleted 可见性
+
+### `StorageNodeService::BatchDeleteChunks(...)`
+
+- 责任：承接 gRPC `BatchDeleteChunks` RPC，按请求顺序逐项调用 `ChunkStore::DeleteChunk()`，并聚合 top-level 计数和 partial failure 事实
+- 输入：gRPC context、proto `BatchDeleteChunksRequest`
+- 输出：proto `BatchDeleteChunksResponse`
+- 边界：逐项结果独立返回；校验失败或 non-retryable item 不会污染已成功项；当前不做后台 GC 或并发删除调度
 
 ## storage_node_client.cpp 关键 helper
 
@@ -207,4 +283,4 @@
 
 ## 后续演进
 
-- T045 已补最小 committed-manifest 读 fallback helper；后续仍需继续补 registry/heartbeat facts 接入、read replica health 演进，以及 `DeleteChunk` / `StatChunk` / `ListChunks`
+- T045 已补最小 committed-manifest 读 fallback helper；T052 已补 service 侧 `DeleteChunk` / `BatchDeleteChunks` 适配；后续仍需继续补 registry/heartbeat facts 接入、read replica health 演进，以及 `StorageNodeClient` 删除路径、`StatChunk` / `ListChunks`

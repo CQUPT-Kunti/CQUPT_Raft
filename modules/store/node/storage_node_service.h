@@ -27,6 +27,16 @@ namespace storedemo
             const storage::ReadChunkRequest *request,
             storage::ReadChunkResponse *response) override;
 
+        grpc::ServerUnaryReactor *DeleteChunk(
+            grpc::CallbackServerContext *context,
+            const storage::DeleteChunkRequest *request,
+            storage::DeleteChunkResponse *response) override;
+
+        grpc::ServerUnaryReactor *BatchDeleteChunks(
+            grpc::CallbackServerContext *context,
+            const storage::BatchDeleteChunksRequest *request,
+            storage::BatchDeleteChunksResponse *response) override;
+
     private:
         std::shared_ptr<ChunkStore> chunk_store_;
         std::string node_id_;
