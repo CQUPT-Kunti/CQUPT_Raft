@@ -10,6 +10,7 @@
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeClient::WriteChunk` 的本地请求到 gRPC `WriteChunk` 调用
 - `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
+- committed manifest 读路径可复用的最小 request builder、错误分类和 replica fallback helper
 - proto `WriteChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `ReadChunkRequest` 到 `ChunkStore::ReadChunk` 的字段转换
 - `ChunkStore` 结果到 `storage_node.proto` 响应的状态码、checksum、state、durable、already_exists 映射
@@ -63,7 +64,7 @@
 - `LocalDiskChunkStore::ReadChunk` 当前在 checksum mismatch / corrupted 场景只返回明确错误，不会自动回写 `CORRUPTED` / `QUARANTINED`；service 适配层保持这个边界，不在 node 层强行发明状态回写
 - `StorageNodeClient` 当前支持有限自动重试，但只会重试 retryable 状态：`TIMEOUT`、`IO_ERROR`、`OVERLOADED`、`NODE_UNAVAILABLE`；`CONFLICT`、`CHECKSUM_MISMATCH`、`INVALID_ARGUMENT`、`CANCELLED` 等非 retryable 结果不会重试
 - client 的 `timeout_ms` 当前作为整次 `WriteChunk` 调用的绝对 deadline 预算；每次重试共用同一个 deadline，不会无限延长总等待时间
-- `StorageNodeClient::ReadChunk` 当前只做单副本、单次 RPC 读取；T044 不实现 read retry、read fallback 或 replica selection，这些由 T045 之后处理
+- `StorageNodeClient::ReadChunk` 自身仍保持单副本、单次 RPC；T045 额外提供独立 helper 供 committed manifest 读路径按 selector 结果做副本 fallback，但不把副本选择硬编码进单节点 client
 
 ## storage_node_service.cpp 关键 helper
 
@@ -132,6 +133,50 @@
 - 输出：填充 `request_id`、`chunk_id`、`offset/length`、`expected_checksum`、`timeout_ms`、`best_effort_cancel`、`verify_checksum`
 - 边界：本地请求当前只有 `chunk_id` 身份语义，不额外发明 `object_id/version/chunk_index`
 
+### `MakeReadChunkRequestForCommittedManifestReplica(std::string_view, std::string_view, std::uint64_t, std::string_view)`
+
+- 责任：把 committed manifest 中的 `chunk_id / size / checksum` 收口成一次完整 full-read 请求
+- 输入：上层生成的 `request_id`、manifest `chunk_id`、manifest `size`、manifest `checksum`
+- 输出：本地 `ReadChunkRequest`
+- 边界：固定生成 `verify_checksum=true`、`expected_checksum.algorithm=SHA256` 的 full read；不决定 object committed 可见性，也不引入 range 语义
+
+### `ClassifyReadReplicaFailure(const ReadChunkResponse&)`
+
+- 责任：把单副本读失败分类为“停止”或“继续尝试下一副本”
+- 输入：单次副本读返回的本地 `ReadChunkResponse`
+- 输出：`ReadReplicaFailureAction`
+- 当前继续尝试的状态：
+  - `TIMEOUT`
+  - `NODE_UNAVAILABLE`
+  - `OVERLOADED`
+  - `IO_ERROR`
+  - `NOT_FOUND`
+  - `CONFLICT`
+  - `CHECKSUM_MISMATCH`
+  - `CORRUPTED`
+- 当前停止的状态：
+  - `INVALID_ARGUMENT`
+  - `CANCELLED`
+  - `UNSUPPORTED`
+  - `PERMISSION_DENIED`
+  - 以及其余明显不适合继续扩散的状态
+- 边界：这里只做客户端侧 fallback 分类，不做副本坏块写回或 repair 调度
+
+### `ReadChunkWithReplicaFallback(std::span<const StorageNodeId>, const ReadChunkRequest&, StorageNodeClientReadChunkOptions, const ReadChunkReplicaInvoker&)`
+
+- 责任：按上层已经选好的副本顺序逐个尝试读取，成功即返回，遇到不可继续错误则立即停止
+- 输入：有序 `replica_nodes`、本地读请求、读选项、调用方提供的单副本 invoker
+- 输出：`ReadReplicaFallbackResult`
+- 当前行为：
+  - 空副本列表或空 invoker 直接返回 `kInvalidArgument`
+  - 成功时记录 `selected_node_id`
+  - 可继续错误则进入下一个副本
+  - 所有可继续副本都失败后，会按“checksum/corrupted 优先于 conflict/not_found，再优先于瞬时错误”的原则聚合一个明确失败
+- 边界：
+  - 不做 replica selection，顺序完全由上层提供
+  - 不接 metadata / Raft
+  - 不做后台 repair、坏副本写回或健康状态持久化
+
 ### `ResolveReadResponseIdentity(const ReadChunkRequest&, const storage::ReadChunkResponse&, ChunkIdentity*, std::string*)`
 
 - 责任：从 proto `chunk_id` / `summary.chunk_id` / 本地请求中恢复本地 `ChunkIdentity`
@@ -158,8 +203,8 @@
 - 责任：组装 proto request、设置 deadline、发起同步 `ReadChunk` RPC，并把结果转回本地 read response
 - 输入：本地 `ReadChunkRequest`、client read options
 - 输出：本地 `ReadChunkResponse`
-- 边界：不调用 metadata / Raft；不决定 object committed 可见性；不做 read fallback / replica selection
+- 边界：不调用 metadata / Raft；不决定 object committed 可见性；自身不做 replica selection，只承担单副本 RPC 适配
 
 ## 后续演进
 
-- T045/T052 之后再继续补 read fallback / replica selection、`DeleteChunk` / `StatChunk` / `ListChunks`
+- T045 已补最小 committed-manifest 读 fallback helper；后续仍需继续补 registry/heartbeat facts 接入、read replica health 演进，以及 `DeleteChunk` / `StatChunk` / `ListChunks`

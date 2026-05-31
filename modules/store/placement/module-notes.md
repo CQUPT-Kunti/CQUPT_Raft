@@ -7,8 +7,10 @@
 当前只负责：
 
 - `StorageNodePlacementCandidate` 候选节点模型
+- `ReadReplicaCandidate` 读副本候选事实模型
 - `ReplicaPolicy` 副本数量和最小成功数约束
 - `PlacementRequest` 到 `PlacementDecisionResult` 的纯策略计算
+- `ReadReplicaSelectionRequest` 到 `ReadReplicaSelectionResult` 的纯策略计算
 - `PlacementManager` 对静态候选集的最小协调
 - 节点筛除原因记录、确定性排序和最小 zone spread 语义
 
@@ -185,6 +187,64 @@
   - `ok()`
     - 判断 `status == kOk`。
 
+### `ReadReplicaCandidate`
+
+- 作用：
+  - 描述 committed manifest 中某个副本在读路径上的最小可观测事实。
+- 关键字段：
+  - `node_id`
+    - 副本节点 ID；为空时直接排除。
+  - `health`
+    - 读路径健康状态；当前跳过 `kUnavailable` / `kDraining`。
+  - `load`
+    - 当前读写负载快照；排序时优先比较 `active_reads`，再比较 `TotalInflight()`。
+  - `stale`
+    - 节点事实是否已经陈旧；为 `true` 时直接排除。
+  - `read_admission_overloaded`
+    - 读接纳层是否明确过载；为 `true` 时直接排除。
+  - `known_corrupted`
+    - 是否已有“该副本数据损坏”的读路径事实；为 `true` 时直接排除。
+  - `known_missing`
+    - 是否已有“该副本缺块”的读路径事实；为 `true` 时直接排除。
+  - `has_observed_facts`
+    - 是否真的是外部观测事实。为 `false` 时表示当前只是 manifest 列出的中性候选，仍可作为 fallback 保留。
+
+### `ReadReplicaSelectionRequest`
+
+- 作用：
+  - 封装一次 committed manifest 读副本选择所需的最小输入。
+- 字段：
+  - `chunk_id`
+    - 必填 chunk 标识；当前必须能通过 `ValidateChunkId()`。
+  - `replica_nodes`
+    - manifest 中声明的副本节点顺序；为空直接返回 `kInvalidArgument`。
+  - `excluded_nodes`
+    - 调用方显式要求跳过的副本节点。
+
+### `ReadReplicaSelectionDecision`
+
+- 作用：
+  - 描述一次读副本选择后的有序可读副本列表及筛除原因。
+- 字段：
+  - `ordered_replicas`
+    - 最终可读副本顺序。后续 fallback 应按该顺序尝试。
+  - `excluded_nodes`
+    - 被跳过的副本及原因，例如 `corrupted`、`unavailable`、`stale`、`overloaded`、显式排除或 manifest 重复。
+  - `reasons`
+    - 面向调用方的补充说明，记录排序依据和“未知事实副本作为中性 fallback 保留”等边界。
+
+### `ReadReplicaSelectionResult`
+
+- 作用：
+  - 统一封装读副本选择结果。
+- 字段：
+  - `status`
+    - 成功为 `kOk`；`replica_nodes` 为空返回 `kInvalidArgument`；所有副本都被过滤后返回 `kNodeUnavailable`。
+  - `error_detail`
+    - 失败时的人类可读说明。
+  - `decision`
+    - 即使失败，也尽量保留 `chunk_id` 和已累计的排除原因，便于上层诊断。
+
 ## 核心函数
 
 ### `PlacementManager::SelectPlacement(const PlacementRequest&, std::span<const StorageNodePlacementCandidate>)`
@@ -238,6 +298,40 @@
   - 把被排除节点写入 `decision.excluded_nodes`
   - 对可用候选执行稳定排序
   - 如开启 `prefer_distinct_zones`，先尽量跨 zone 选点
+
+### `ReplicaPolicySelector::SelectReadReplicas(const ReadReplicaSelectionRequest&, std::span<const ReadReplicaCandidate>)`
+
+- 作用：
+  - 对 committed manifest 中声明的副本列表执行纯策略筛选和排序，产出读路径可尝试的副本顺序。
+- 输入：
+  - `request`
+    - 包含 `chunk_id`、manifest `replica_nodes` 和显式排除列表。
+  - `candidates`
+    - 可选的外部观测事实；当前允许为空，便于在 registry 尚未接入前先按 manifest 收口最小 fallback 语义。
+- 输出：
+  - `decision.ordered_replicas`
+    - 可读副本顺序，供后续逐副本 fallback 使用。
+  - `decision.excluded_nodes`
+    - 被过滤副本及原因。
+  - `decision.reasons`
+    - 排序/边界说明。
+- 当前筛除语义：
+  - 跳过 `known_corrupted`
+  - 跳过 `known_missing`
+  - 跳过 `stale`
+  - 跳过 `read_admission_overloaded`
+  - 跳过 `health = kUnavailable / kDraining`
+  - 跳过空 `node_id`、显式排除和 manifest 内重复节点
+- 当前排序语义：
+  - 先排已观测到事实的副本
+  - 再按更好的读健康状态
+  - 再按更低 `active_reads`
+  - 再按更低 `TotalInflight()`
+  - 最后按 manifest 原始顺序兜底
+- 边界：
+  - 不做 RPC / IO
+  - 不接 metadata / Raft
+  - 未接 registry facts 时，未知副本会作为中性 fallback 保留，不会被静态策略层提前丢弃
   - 选满 `replica_count`，或在候选不足时返回明确错误
 - 返回语义：
   - 成功时返回 `kOk`，并在 `decision.replica_nodes` 中给出最终节点列表
@@ -412,5 +506,6 @@
 
 - `rack` spread 当前只是字段占位，还没有单独策略
 - 没有真实 registry snapshot、staleness、failure cache、recent failure scoring
+- 读副本选择当前只消费调用方传入的最小事实，还没有接真实 heartbeat / registry 事实
 - 没有动态热点规避、局部性优先、跨 failure domain 复杂策略
 - 没有把选择结果接到实际 `StorageNodeClient::WriteChunk` 调用

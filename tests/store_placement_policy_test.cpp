@@ -46,6 +46,20 @@ namespace
         return request;
     }
 
+    storedemo::ReadReplicaCandidate MakeReadCandidate(
+        const std::size_t index,
+        const std::uint32_t active_reads = 0,
+        const storedemo::StorageNodeHealth health =
+            storedemo::StorageNodeHealth::kHealthy)
+    {
+        storedemo::ReadReplicaCandidate candidate;
+        candidate.node_id = storedemo::test::MakeStorageNodeIdFixture(index);
+        candidate.health = health;
+        candidate.load.active_reads = active_reads;
+        candidate.has_observed_facts = true;
+        return candidate;
+    }
+
     TEST(StorePlacementPolicyTest, ReplicaCountOneSelectsHealthyNode)
     {
         storedemo::ReplicaPolicySelector selector;
@@ -229,5 +243,103 @@ namespace
         ASSERT_EQ(result.decision.replica_nodes.size(), 2U);
         EXPECT_EQ(result.decision.replica_nodes[0].zone, "zone-a");
         EXPECT_EQ(result.decision.replica_nodes[1].zone, "zone-b");
+    }
+
+    TEST(StorePlacementPolicyTest, ReadReplicaSelectionPreservesManifestOrderWhenFactsAreNeutral)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t045-neutral~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3)};
+
+        const auto result =
+            selector.SelectReadReplicas(request,
+                                        std::span<const storedemo::ReadReplicaCandidate>{});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 3U);
+        EXPECT_EQ(result.decision.ordered_replicas[0].node_id, request.replica_nodes[0]);
+        EXPECT_EQ(result.decision.ordered_replicas[1].node_id, request.replica_nodes[1]);
+        EXPECT_EQ(result.decision.ordered_replicas[2].node_id, request.replica_nodes[2]);
+        EXPECT_FALSE(result.decision.ordered_replicas[0].has_observed_facts);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionSkipsCorruptedUnavailableStaleAndOverloadedReplicas)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t045-filter~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3),
+            storedemo::test::MakeStorageNodeIdFixture(4),
+            storedemo::test::MakeStorageNodeIdFixture(5)};
+
+        auto corrupted = MakeReadCandidate(1, 1);
+        corrupted.known_corrupted = true;
+        auto unavailable = MakeReadCandidate(2, 1, storedemo::StorageNodeHealth::kUnavailable);
+        auto stale = MakeReadCandidate(3, 1);
+        stale.stale = true;
+        auto overloaded = MakeReadCandidate(4, 1);
+        overloaded.read_admission_overloaded = true;
+        auto healthy = MakeReadCandidate(5, 2);
+
+        const std::vector<storedemo::ReadReplicaCandidate> candidates = {
+            corrupted, unavailable, stale, overloaded, healthy};
+        const auto result = selector.SelectReadReplicas(request, candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 1U);
+        EXPECT_EQ(result.decision.ordered_replicas.front().node_id, healthy.node_id);
+        ASSERT_EQ(result.decision.excluded_nodes.size(), 4U);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionPrefersObservedFactsBeforeUnknownFallbackReplicas)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t045-observed~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3)};
+
+        auto observed_second = MakeReadCandidate(2, 1);
+        auto observed_third = MakeReadCandidate(3, 5);
+        const std::vector<storedemo::ReadReplicaCandidate> candidates = {
+            observed_third, observed_second};
+
+        const auto result = selector.SelectReadReplicas(request, candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 3U);
+        EXPECT_EQ(result.decision.ordered_replicas[0].node_id, observed_second.node_id);
+        EXPECT_EQ(result.decision.ordered_replicas[1].node_id, observed_third.node_id);
+        EXPECT_EQ(result.decision.ordered_replicas[2].node_id, request.replica_nodes[0]);
+        EXPECT_FALSE(result.decision.ordered_replicas[2].has_observed_facts);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionReturnsInvalidArgumentWhenManifestReplicaNodesEmpty)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t045-empty~1~0";
+
+        const auto result =
+            selector.SelectReadReplicas(request,
+                                        std::span<const storedemo::ReadReplicaCandidate>{});
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kInvalidArgument);
+        EXPECT_TRUE(result.decision.ordered_replicas.empty());
     }
 }

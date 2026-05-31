@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <functional>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace storedemo
@@ -15,7 +16,14 @@ namespace storedemo
             std::size_t original_index{0};
         };
 
-        void AddExclusion(PlacementDecision *decision,
+        struct RankedReadReplicaCandidate
+        {
+            ReadReplicaCandidate candidate;
+            std::size_t manifest_index{0};
+        };
+
+        template <typename Decision>
+        void AddExclusion(Decision *decision,
                           std::string_view node_id,
                           std::string reason)
         {
@@ -109,6 +117,69 @@ namespace storedemo
                                 const std::unordered_set<std::string> &selected_zones)
         {
             return !candidate.zone.empty() && !selected_zones.contains(candidate.zone);
+        }
+
+        std::optional<std::string> EvaluateReadReplicaEligibility(
+            const ReadReplicaCandidate &candidate,
+            const std::unordered_set<std::string> &explicit_excluded)
+        {
+            if (candidate.node_id.empty())
+            {
+                return "replica node_id must not be empty";
+            }
+
+            if (explicit_excluded.contains(candidate.node_id))
+            {
+                return "node is explicitly excluded";
+            }
+
+            if (candidate.known_corrupted)
+            {
+                return "node is marked corrupted for read";
+            }
+
+            if (candidate.known_missing)
+            {
+                return "node is known missing requested chunk";
+            }
+
+            if (candidate.stale)
+            {
+                return "node facts are stale";
+            }
+
+            if (candidate.read_admission_overloaded)
+            {
+                return "node read admission is overloaded";
+            }
+
+            if (candidate.health == StorageNodeHealth::kUnavailable ||
+                candidate.health == StorageNodeHealth::kDraining)
+            {
+                return std::string("node health is not readable: ") +
+                       ToString(candidate.health);
+            }
+
+            return std::nullopt;
+        }
+
+        std::uint8_t ReadHealthRank(const StorageNodeHealth health)
+        {
+            switch (health)
+            {
+            case StorageNodeHealth::kHealthy:
+                return 0;
+            case StorageNodeHealth::kReadOnly:
+                return 1;
+            case StorageNodeHealth::kDegraded:
+                return 2;
+            case StorageNodeHealth::kUnavailable:
+                return 3;
+            case StorageNodeHealth::kDraining:
+                return 4;
+            }
+
+            return 5;
         }
     }
 
@@ -359,6 +430,137 @@ namespace storedemo
 
         result.decision.reasons.push_back(
             "replicas are ordered by available capacity, lower inflight load, then node_id");
+        return result;
+    }
+
+    ReadReplicaSelectionResult ReplicaPolicySelector::SelectReadReplicas(
+        const ReadReplicaSelectionRequest &request,
+        const std::span<const ReadReplicaCandidate> candidates) const
+    {
+        ReadReplicaSelectionResult result;
+        result.decision.chunk_id = request.chunk_id;
+
+        result.status = ValidateChunkId(request.chunk_id, &result.error_detail);
+        if (!result.ok())
+        {
+            return result;
+        }
+
+        if (request.replica_nodes.empty())
+        {
+            result.status = StorageNodeStatusCode::kInvalidArgument;
+            result.error_detail = "read replica selection requires at least one replica node";
+            return result;
+        }
+
+        std::unordered_set<std::string> explicit_excluded(request.excluded_nodes.begin(),
+                                                          request.excluded_nodes.end());
+        std::unordered_map<std::string, ReadReplicaCandidate> observed_candidates;
+        observed_candidates.reserve(candidates.size());
+        for (const auto &candidate : candidates)
+        {
+            if (candidate.node_id.empty())
+            {
+                continue;
+            }
+
+            ReadReplicaCandidate observed = candidate;
+            observed.has_observed_facts = true;
+            observed_candidates.insert_or_assign(observed.node_id, std::move(observed));
+        }
+
+        std::unordered_set<std::string> seen_nodes;
+        std::vector<RankedReadReplicaCandidate> eligible_candidates;
+        eligible_candidates.reserve(request.replica_nodes.size());
+
+        for (std::size_t index = 0; index < request.replica_nodes.size(); ++index)
+        {
+            const auto &node_id = request.replica_nodes[index];
+            if (!seen_nodes.insert(node_id).second)
+            {
+                AddExclusion(&result.decision, node_id, "duplicate node_id in replica_nodes");
+                continue;
+            }
+
+            ReadReplicaCandidate candidate;
+            const auto observed = observed_candidates.find(node_id);
+            if (observed != observed_candidates.end())
+            {
+                candidate = observed->second;
+            }
+            else
+            {
+                candidate.node_id = node_id;
+                candidate.has_observed_facts = false;
+            }
+
+            const auto rejection_reason =
+                EvaluateReadReplicaEligibility(candidate, explicit_excluded);
+            if (rejection_reason.has_value())
+            {
+                AddExclusion(&result.decision, node_id, *rejection_reason);
+                continue;
+            }
+
+            eligible_candidates.push_back(RankedReadReplicaCandidate{
+                .candidate = std::move(candidate),
+                .manifest_index = index});
+        }
+
+        std::stable_sort(eligible_candidates.begin(),
+                         eligible_candidates.end(),
+                         [](const RankedReadReplicaCandidate &lhs,
+                            const RankedReadReplicaCandidate &rhs)
+                         {
+                             if (lhs.candidate.has_observed_facts != rhs.candidate.has_observed_facts)
+                             {
+                                 return lhs.candidate.has_observed_facts;
+                             }
+
+                             if (ReadHealthRank(lhs.candidate.health) !=
+                                 ReadHealthRank(rhs.candidate.health))
+                             {
+                                 return ReadHealthRank(lhs.candidate.health) <
+                                        ReadHealthRank(rhs.candidate.health);
+                             }
+
+                             if (lhs.candidate.load.active_reads != rhs.candidate.load.active_reads)
+                             {
+                                 return lhs.candidate.load.active_reads <
+                                        rhs.candidate.load.active_reads;
+                             }
+
+                             if (lhs.candidate.load.TotalInflight() !=
+                                 rhs.candidate.load.TotalInflight())
+                             {
+                                 return lhs.candidate.load.TotalInflight() <
+                                        rhs.candidate.load.TotalInflight();
+                             }
+
+                             return lhs.manifest_index < rhs.manifest_index;
+                         });
+
+        for (auto &candidate : eligible_candidates)
+        {
+            result.decision.ordered_replicas.push_back(std::move(candidate.candidate));
+        }
+
+        if (result.decision.ordered_replicas.empty())
+        {
+            result.status = StorageNodeStatusCode::kNodeUnavailable;
+            result.error_detail = "no readable replicas remain after selection filtering";
+            result.decision.reasons.push_back(
+                "all manifest replicas were filtered by explicit exclusions or read facts");
+            return result;
+        }
+
+        result.decision.reasons.push_back(
+            "read replicas are ordered by observed health, lower active_reads, lower inflight load, then manifest order");
+        if (observed_candidates.size() < request.replica_nodes.size())
+        {
+            result.decision.reasons.push_back(
+                "replicas without observed facts remain eligible and preserve manifest order as neutral fallback candidates");
+        }
         return result;
     }
 }

@@ -106,11 +106,55 @@ namespace storedemo
         }
     };
 
+    struct ReadReplicaCandidate
+    {
+        StorageNodeId node_id;
+        StorageNodeHealth health{StorageNodeHealth::kHealthy};
+        StorageNodeDiskPressure disk_pressure{StorageNodeDiskPressure::kLow};
+        StorageNodeLoadSnapshot load;
+        bool stale{false};
+        bool read_admission_overloaded{false};
+        bool known_corrupted{false};
+        bool known_missing{false};
+        bool has_observed_facts{false};
+    };
+
+    struct ReadReplicaSelectionRequest
+    {
+        ChunkId chunk_id;
+        std::vector<StorageNodeId> replica_nodes;
+        std::vector<StorageNodeId> excluded_nodes;
+    };
+
+    struct ReadReplicaSelectionDecision
+    {
+        ChunkId chunk_id;
+        std::vector<ReadReplicaCandidate> ordered_replicas;
+        std::vector<PlacementNodeExclusion> excluded_nodes;
+        std::vector<std::string> reasons;
+    };
+
+    struct ReadReplicaSelectionResult
+    {
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        ReadReplicaSelectionDecision decision;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == StorageNodeStatusCode::kOk;
+        }
+    };
+
     class ReplicaPolicySelector
     {
     public:
         PlacementDecisionResult SelectReplicas(
             const PlacementRequest &request,
             std::span<const StorageNodePlacementCandidate> candidates) const;
+
+        ReadReplicaSelectionResult SelectReadReplicas(
+            const ReadReplicaSelectionRequest &request,
+            std::span<const ReadReplicaCandidate> candidates) const;
     };
 }

@@ -1,6 +1,7 @@
 #include "store/node/storage_node_client.h"
 
 #include <chrono>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -601,6 +602,185 @@ namespace storedemo
             return IsRetriableStatus(response.status) &&
                    attempt_index < config.max_write_retries;
         }
+
+        int ReplicaFailurePriority(const StorageNodeStatusCode status)
+        {
+            switch (status)
+            {
+            case StorageNodeStatusCode::kChecksumMismatch:
+                return 0;
+            case StorageNodeStatusCode::kCorrupted:
+                return 1;
+            case StorageNodeStatusCode::kConflict:
+                return 2;
+            case StorageNodeStatusCode::kNotFound:
+                return 3;
+            case StorageNodeStatusCode::kTimeout:
+            case StorageNodeStatusCode::kNodeUnavailable:
+            case StorageNodeStatusCode::kOverloaded:
+            case StorageNodeStatusCode::kIoError:
+                return 4;
+            case StorageNodeStatusCode::kCancelled:
+                return 5;
+            case StorageNodeStatusCode::kUnsupported:
+                return 6;
+            case StorageNodeStatusCode::kPermissionDenied:
+                return 7;
+            case StorageNodeStatusCode::kInvalidArgument:
+                return 8;
+            case StorageNodeStatusCode::kDiskFull:
+                return 9;
+            case StorageNodeStatusCode::kAlreadyExists:
+                return 10;
+            case StorageNodeStatusCode::kOk:
+            default:
+                return 11;
+            }
+        }
+
+        ReadChunkResponse SelectDominantReplicaFailure(
+            const std::vector<ReadReplicaAttempt> &attempts,
+            const std::vector<ReadChunkResponse> &responses)
+        {
+            if (attempts.empty() || attempts.size() != responses.size())
+            {
+                ReadChunkResponse response;
+                response.status = StorageNodeStatusCode::kInvalidArgument;
+                response.error_detail =
+                    "replica fallback attempts are inconsistent";
+                return response;
+            }
+
+            std::size_t best_index = responses.size() - 1;
+            int best_priority =
+                ReplicaFailurePriority(responses[best_index].status);
+            for (std::size_t index = 0; index + 1 < responses.size(); ++index)
+            {
+                const int priority = ReplicaFailurePriority(responses[index].status);
+                if (priority < best_priority)
+                {
+                    best_priority = priority;
+                    best_index = index;
+                }
+            }
+
+            ReadChunkResponse dominant = responses[best_index];
+            if (dominant.error_detail.empty())
+            {
+                dominant.error_detail =
+                    "all replicas failed after " + std::to_string(attempts.size()) +
+                    " attempts";
+            }
+            else
+            {
+                dominant.error_detail +=
+                    "; all replicas failed after " +
+                    std::to_string(attempts.size()) + " attempts";
+            }
+            return dominant;
+        }
+    }
+
+    ReadChunkRequest MakeReadChunkRequestForCommittedManifestReplica(
+        const std::string_view request_id,
+        const std::string_view chunk_id,
+        const std::uint64_t expected_size,
+        const std::string_view expected_checksum)
+    {
+        ReadChunkRequest request;
+        request.request_id = std::string(request_id);
+        request.chunk_id = std::string(chunk_id);
+        request.expected_checksum.algorithm = ChunkChecksumAlgorithm::kSha256;
+        request.expected_checksum.value = std::string(expected_checksum);
+        request.expected_checksum.size_bytes = expected_size;
+        request.verify_checksum = true;
+        return request;
+    }
+
+    ReadReplicaFailureAction ClassifyReadReplicaFailure(
+        const ReadChunkResponse &response)
+    {
+        switch (response.status)
+        {
+        case StorageNodeStatusCode::kOk:
+            return ReadReplicaFailureAction::kStop;
+        case StorageNodeStatusCode::kTimeout:
+        case StorageNodeStatusCode::kNodeUnavailable:
+        case StorageNodeStatusCode::kOverloaded:
+        case StorageNodeStatusCode::kIoError:
+        case StorageNodeStatusCode::kNotFound:
+        case StorageNodeStatusCode::kConflict:
+        case StorageNodeStatusCode::kChecksumMismatch:
+        case StorageNodeStatusCode::kCorrupted:
+            return ReadReplicaFailureAction::kTryNext;
+        case StorageNodeStatusCode::kAlreadyExists:
+        case StorageNodeStatusCode::kDiskFull:
+        case StorageNodeStatusCode::kPermissionDenied:
+        case StorageNodeStatusCode::kCancelled:
+        case StorageNodeStatusCode::kUnsupported:
+        case StorageNodeStatusCode::kInvalidArgument:
+        default:
+            return ReadReplicaFailureAction::kStop;
+        }
+    }
+
+    ReadReplicaFallbackResult ReadChunkWithReplicaFallback(
+        const std::span<const StorageNodeId> replica_nodes,
+        const ReadChunkRequest &request,
+        const StorageNodeClientReadChunkOptions options,
+        const ReadChunkReplicaInvoker &invoker)
+    {
+        ReadReplicaFallbackResult result;
+        if (replica_nodes.empty())
+        {
+            result.response.status = StorageNodeStatusCode::kInvalidArgument;
+            result.response.error_detail =
+                "replica fallback requires at least one replica node";
+            return result;
+        }
+
+        if (!invoker)
+        {
+            result.response.status = StorageNodeStatusCode::kInvalidArgument;
+            result.response.error_detail =
+                "replica fallback requires a non-null invoker";
+            return result;
+        }
+
+        std::vector<ReadChunkResponse> failed_responses;
+        failed_responses.reserve(replica_nodes.size());
+        result.attempts.reserve(replica_nodes.size());
+
+        for (const auto &node_id : replica_nodes)
+        {
+            const ReadChunkResponse response = invoker(node_id, request, options);
+            const ReadReplicaFailureAction action =
+                ClassifyReadReplicaFailure(response);
+
+            result.attempts.push_back(ReadReplicaAttempt{
+                .node_id = node_id,
+                .status = response.status,
+                .error_detail = response.error_detail,
+                .action = action});
+
+            if (response.status == StorageNodeStatusCode::kOk)
+            {
+                result.response = response;
+                result.selected_node_id = node_id;
+                return result;
+            }
+
+            failed_responses.push_back(response);
+            if (action == ReadReplicaFailureAction::kStop)
+            {
+                result.response = response;
+                return result;
+            }
+        }
+
+        result.response =
+            SelectDominantReplicaFailure(result.attempts, failed_responses);
+        return result;
     }
 
     StorageNodeClient::StorageNodeClient(
