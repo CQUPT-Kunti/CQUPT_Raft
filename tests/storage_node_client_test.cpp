@@ -116,17 +116,17 @@ namespace
     }
 
     void FillProtoChecksum(const storedemo::ChunkChecksum &checksum,
-                           raft::StorageChunkChecksum *proto_checksum)
+                           storage::StorageChunkChecksum *proto_checksum)
     {
         ASSERT_NE(proto_checksum, nullptr);
         switch (checksum.algorithm)
         {
         case storedemo::ChunkChecksumAlgorithm::kSha256:
-            proto_checksum->set_algorithm(raft::STORAGE_CHECKSUM_ALGORITHM_SHA256);
+            proto_checksum->set_algorithm(storage::STORAGE_CHECKSUM_ALGORITHM_SHA256);
             break;
         case storedemo::ChunkChecksumAlgorithm::kUnknown:
         default:
-            proto_checksum->set_algorithm(raft::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED);
+            proto_checksum->set_algorithm(storage::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED);
             break;
         }
         proto_checksum->set_value(checksum.value);
@@ -134,7 +134,7 @@ namespace
         proto_checksum->set_computed_at_unix_ms(checksum.computed_at);
     }
 
-    raft::WriteChunkResponse MakeProtoWriteResponse(
+    storage::WriteChunkResponse MakeProtoWriteResponse(
         const storedemo::StorageNodeStatusCode status,
         const storedemo::ChunkIdentity &identity,
         const std::string &node_id,
@@ -146,32 +146,32 @@ namespace
         const std::string &message = {},
         const std::uint64_t retry_after_ms = 0)
     {
-        raft::WriteChunkResponse response;
+        storage::WriteChunkResponse response;
 
-        raft::StorageNodeStatusCode proto_status =
-            raft::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
+        storage::StorageNodeStatusCode proto_status =
+            storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
         switch (status)
         {
         case storedemo::StorageNodeStatusCode::kOk:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_OK;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_OK;
             break;
         case storedemo::StorageNodeStatusCode::kAlreadyExists:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS;
             break;
         case storedemo::StorageNodeStatusCode::kConflict:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_CONFLICT;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CONFLICT;
             break;
         case storedemo::StorageNodeStatusCode::kChecksumMismatch:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
             break;
         case storedemo::StorageNodeStatusCode::kOverloaded:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_OVERLOADED;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_OVERLOADED;
             break;
         case storedemo::StorageNodeStatusCode::kInvalidArgument:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
             break;
         default:
-            proto_status = raft::STORAGE_NODE_STATUS_CODE_IO_ERROR;
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_IO_ERROR;
             break;
         }
 
@@ -187,26 +187,26 @@ namespace
         switch (state)
         {
         case storedemo::ChunkState::kStaging:
-            response.set_state(raft::STORAGE_CHUNK_STATE_STAGING);
+            response.set_state(storage::STORAGE_CHUNK_STATE_STAGING);
             break;
         case storedemo::ChunkState::kLive:
-            response.set_state(raft::STORAGE_CHUNK_STATE_LIVE);
+            response.set_state(storage::STORAGE_CHUNK_STATE_LIVE);
             break;
         case storedemo::ChunkState::kDeleting:
-            response.set_state(raft::STORAGE_CHUNK_STATE_DELETING);
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETING);
             break;
         case storedemo::ChunkState::kDeleted:
-            response.set_state(raft::STORAGE_CHUNK_STATE_DELETED);
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETED);
             break;
         case storedemo::ChunkState::kQuarantined:
-            response.set_state(raft::STORAGE_CHUNK_STATE_QUARANTINED);
+            response.set_state(storage::STORAGE_CHUNK_STATE_QUARANTINED);
             break;
         case storedemo::ChunkState::kCorrupted:
-            response.set_state(raft::STORAGE_CHUNK_STATE_CORRUPTED);
+            response.set_state(storage::STORAGE_CHUNK_STATE_CORRUPTED);
             break;
         case storedemo::ChunkState::kMissing:
         default:
-            response.set_state(raft::STORAGE_CHUNK_STATE_MISSING);
+            response.set_state(storage::STORAGE_CHUNK_STATE_MISSING);
             break;
         }
 
@@ -215,12 +215,12 @@ namespace
         return response;
     }
 
-    class FakeStorageNodeStub final : public raft::StorageNodeService::StubInterface
+    class FakeStorageNodeStub final : public storage::StorageNodeService::StubInterface
     {
     public:
         grpc::Status WriteChunk(grpc::ClientContext *context,
-                                const raft::WriteChunkRequest &request,
-                                raft::WriteChunkResponse *response) override
+                                const storage::WriteChunkRequest &request,
+                                storage::WriteChunkResponse *response) override
         {
             ++write_calls;
             last_request = request;
@@ -236,50 +236,50 @@ namespace
         }
 
         grpc::Status ReadChunk(grpc::ClientContext *,
-                               const raft::ReadChunkRequest &,
-                               raft::ReadChunkResponse *) override
+                               const storage::ReadChunkRequest &,
+                               storage::ReadChunkResponse *) override
         {
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
                                 "ReadChunk is not implemented in T042 tests");
         }
 
         std::function<grpc::Status(grpc::ClientContext *,
-                                   const raft::WriteChunkRequest &,
-                                   raft::WriteChunkResponse *)>
+                                   const storage::WriteChunkRequest &,
+                                   storage::WriteChunkResponse *)>
             write_handler;
-        raft::WriteChunkRequest last_request;
+        storage::WriteChunkRequest last_request;
         std::size_t write_calls{0};
         std::chrono::system_clock::time_point call_observed_at{};
         std::chrono::system_clock::time_point observed_deadline{};
 
     private:
-        grpc::ClientAsyncResponseReaderInterface<raft::WriteChunkResponse> *
+        grpc::ClientAsyncResponseReaderInterface<storage::WriteChunkResponse> *
         AsyncWriteChunkRaw(grpc::ClientContext *,
-                           const raft::WriteChunkRequest &,
+                           const storage::WriteChunkRequest &,
                            grpc::CompletionQueue *) override
         {
             return nullptr;
         }
 
-        grpc::ClientAsyncResponseReaderInterface<raft::WriteChunkResponse> *
+        grpc::ClientAsyncResponseReaderInterface<storage::WriteChunkResponse> *
         PrepareAsyncWriteChunkRaw(grpc::ClientContext *,
-                                  const raft::WriteChunkRequest &,
+                                  const storage::WriteChunkRequest &,
                                   grpc::CompletionQueue *) override
         {
             return nullptr;
         }
 
-        grpc::ClientAsyncResponseReaderInterface<raft::ReadChunkResponse> *
+        grpc::ClientAsyncResponseReaderInterface<storage::ReadChunkResponse> *
         AsyncReadChunkRaw(grpc::ClientContext *,
-                          const raft::ReadChunkRequest &,
+                          const storage::ReadChunkRequest &,
                           grpc::CompletionQueue *) override
         {
             return nullptr;
         }
 
-        grpc::ClientAsyncResponseReaderInterface<raft::ReadChunkResponse> *
+        grpc::ClientAsyncResponseReaderInterface<storage::ReadChunkResponse> *
         PrepareAsyncReadChunkRaw(grpc::ClientContext *,
-                                 const raft::ReadChunkRequest &,
+                                 const storage::ReadChunkRequest &,
                                  grpc::CompletionQueue *) override
         {
             return nullptr;
@@ -359,7 +359,7 @@ namespace
     TEST_F(StorageNodeClientTest, ConstructingWithoutStubThrows)
     {
         EXPECT_THROW(storedemo::StorageNodeClient(
-                         std::unique_ptr<raft::StorageNodeService::StubInterface>()),
+                         std::unique_ptr<storage::StorageNodeService::StubInterface>()),
                      std::invalid_argument);
     }
 
@@ -372,8 +372,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(storedemo::StorageNodeStatusCode::kOk,
                                                identity,
@@ -387,7 +387,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
 
         const auto response = client.WriteChunk(
             MakeWriteRequest(identity, payload, "write-success-t032"),
@@ -407,7 +407,7 @@ namespace
         EXPECT_EQ(stub_ptr->last_request.timeout_ms(), 1200U);
         EXPECT_TRUE(stub_ptr->last_request.best_effort_cancel());
         EXPECT_EQ(stub_ptr->last_request.durability(),
-                  raft::WRITE_CHUNK_DURABILITY_PUBLISH);
+                  storage::WRITE_CHUNK_DURABILITY_PUBLISH);
 
         const auto deadline_delta = stub_ptr->observed_deadline - stub_ptr->call_observed_at;
         EXPECT_GT(deadline_delta, 0ms);
@@ -438,8 +438,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(
                 storedemo::StorageNodeStatusCode::kAlreadyExists,
@@ -455,7 +455,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto response =
             client.WriteChunk(MakeWriteRequest(identity, payload, "write-already-t032"));
 
@@ -474,8 +474,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(storedemo::StorageNodeStatusCode::kConflict,
                                                identity,
@@ -490,7 +490,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto response =
             client.WriteChunk(MakeWriteRequest(identity, payload, "write-conflict-t032"));
 
@@ -508,8 +508,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(
                 storedemo::StorageNodeStatusCode::kChecksumMismatch,
@@ -525,7 +525,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto response =
             client.WriteChunk(MakeWriteRequest(identity, payload, "write-checksum-t032"));
 
@@ -544,8 +544,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(storedemo::StorageNodeStatusCode::kOverloaded,
                                                identity,
@@ -561,7 +561,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto response =
             client.WriteChunk(MakeWriteRequest(identity, payload, "write-overloaded-t032"));
 
@@ -575,15 +575,15 @@ namespace
         auto *stub_ptr = new FakeStorageNodeStub();
         stub_ptr->write_handler =
             [](grpc::ClientContext *,
-               const raft::WriteChunkRequest &,
-               raft::WriteChunkResponse *)
+               const storage::WriteChunkRequest &,
+               storage::WriteChunkResponse *)
         {
             return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
                                 "rpc deadline exceeded");
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto identity = MakeStoreIdentityOrThrow("obj-t032-timeout", 1, 0, 0);
         const auto payload = storedemo::test::MakeChunkPayload(48, "t032-timeout");
 
@@ -600,15 +600,15 @@ namespace
         auto *stub_ptr = new FakeStorageNodeStub();
         stub_ptr->write_handler =
             [](grpc::ClientContext *,
-               const raft::WriteChunkRequest &,
-               raft::WriteChunkResponse *)
+               const storage::WriteChunkRequest &,
+               storage::WriteChunkResponse *)
         {
             return grpc::Status(grpc::StatusCode::CANCELLED,
                                 "cancelled by caller");
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto identity = MakeStoreIdentityOrThrow("obj-t032-cancelled", 1, 0, 0);
         const auto payload = storedemo::test::MakeChunkPayload(48, "t032-cancelled");
 
@@ -625,14 +625,14 @@ namespace
         auto *stub_ptr = new FakeStorageNodeStub();
         stub_ptr->write_handler =
             [](grpc::ClientContext *,
-               const raft::WriteChunkRequest &,
-               raft::WriteChunkResponse *)
+               const storage::WriteChunkRequest &,
+               storage::WriteChunkResponse *)
         {
             return grpc::Status(grpc::StatusCode::UNAVAILABLE, "remote unavailable");
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto identity = MakeStoreIdentityOrThrow("obj-t032-unavailable", 1, 0, 0);
         const auto payload = storedemo::test::MakeChunkPayload(48, "t032-unavailable");
 
@@ -655,8 +655,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(
                 storedemo::StorageNodeStatusCode::kInvalidArgument,
@@ -672,7 +672,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr)};
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
         const auto response = client.WriteChunk(
             MakeWriteRequest(identity, payload, "write-invalid-argument-t032"));
 
@@ -690,8 +690,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum, attempts = 0](grpc::ClientContext *,
-                                               const raft::WriteChunkRequest &,
-                                               raft::WriteChunkResponse *response) mutable
+                                               const storage::WriteChunkRequest &,
+                                               storage::WriteChunkResponse *response) mutable
         {
             ++attempts;
             if (attempts == 1)
@@ -711,7 +711,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr),
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr),
             {.max_write_retries = 1}};
         const auto response = client.WriteChunk(
             MakeWriteRequest(identity, payload, "write-retry-t032"));
@@ -730,8 +730,8 @@ namespace
 
         stub_ptr->write_handler =
             [identity, checksum](grpc::ClientContext *,
-                                 const raft::WriteChunkRequest &,
-                                 raft::WriteChunkResponse *response)
+                                 const storage::WriteChunkRequest &,
+                                 storage::WriteChunkResponse *response)
         {
             *response = MakeProtoWriteResponse(storedemo::StorageNodeStatusCode::kConflict,
                                                identity,
@@ -746,7 +746,7 @@ namespace
         };
 
         storedemo::StorageNodeClient client{
-            std::unique_ptr<raft::StorageNodeService::StubInterface>(stub_ptr),
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr),
             {.max_write_retries = 3}};
         const auto response = client.WriteChunk(
             MakeWriteRequest(identity, payload, "write-no-retry-t032"));

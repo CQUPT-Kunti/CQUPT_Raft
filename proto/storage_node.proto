@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package raft;
+package storage;
 
 enum StorageNodeStatusCode {
   STORAGE_NODE_STATUS_CODE_UNSPECIFIED = 0;

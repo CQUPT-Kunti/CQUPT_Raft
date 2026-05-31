@@ -10,83 +10,83 @@ namespace storedemo
 {
     namespace
     {
-        raft::StorageNodeStatusCode ToProtoStatusCode(const StorageNodeStatusCode code)
+        storage::StorageNodeStatusCode ToProtoStatusCode(const StorageNodeStatusCode code)
         {
             switch (code)
             {
             case StorageNodeStatusCode::kOk:
-                return raft::STORAGE_NODE_STATUS_CODE_OK;
+                return storage::STORAGE_NODE_STATUS_CODE_OK;
             case StorageNodeStatusCode::kAlreadyExists:
-                return raft::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS;
+                return storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS;
             case StorageNodeStatusCode::kNotFound:
-                return raft::STORAGE_NODE_STATUS_CODE_NOT_FOUND;
+                return storage::STORAGE_NODE_STATUS_CODE_NOT_FOUND;
             case StorageNodeStatusCode::kConflict:
-                return raft::STORAGE_NODE_STATUS_CODE_CONFLICT;
+                return storage::STORAGE_NODE_STATUS_CODE_CONFLICT;
             case StorageNodeStatusCode::kChecksumMismatch:
-                return raft::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
+                return storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
             case StorageNodeStatusCode::kCorrupted:
-                return raft::STORAGE_NODE_STATUS_CODE_CORRUPTED;
+                return storage::STORAGE_NODE_STATUS_CODE_CORRUPTED;
             case StorageNodeStatusCode::kDiskFull:
-                return raft::STORAGE_NODE_STATUS_CODE_DISK_FULL;
+                return storage::STORAGE_NODE_STATUS_CODE_DISK_FULL;
             case StorageNodeStatusCode::kPermissionDenied:
-                return raft::STORAGE_NODE_STATUS_CODE_PERMISSION_DENIED;
+                return storage::STORAGE_NODE_STATUS_CODE_PERMISSION_DENIED;
             case StorageNodeStatusCode::kIoError:
-                return raft::STORAGE_NODE_STATUS_CODE_IO_ERROR;
+                return storage::STORAGE_NODE_STATUS_CODE_IO_ERROR;
             case StorageNodeStatusCode::kTimeout:
-                return raft::STORAGE_NODE_STATUS_CODE_TIMEOUT;
+                return storage::STORAGE_NODE_STATUS_CODE_TIMEOUT;
             case StorageNodeStatusCode::kCancelled:
-                return raft::STORAGE_NODE_STATUS_CODE_CANCELLED;
+                return storage::STORAGE_NODE_STATUS_CODE_CANCELLED;
             case StorageNodeStatusCode::kOverloaded:
-                return raft::STORAGE_NODE_STATUS_CODE_OVERLOADED;
+                return storage::STORAGE_NODE_STATUS_CODE_OVERLOADED;
             case StorageNodeStatusCode::kNodeUnavailable:
-                return raft::STORAGE_NODE_STATUS_CODE_NODE_UNAVAILABLE;
+                return storage::STORAGE_NODE_STATUS_CODE_NODE_UNAVAILABLE;
             case StorageNodeStatusCode::kUnsupported:
-                return raft::STORAGE_NODE_STATUS_CODE_UNSUPPORTED;
+                return storage::STORAGE_NODE_STATUS_CODE_UNSUPPORTED;
             case StorageNodeStatusCode::kInvalidArgument:
-                return raft::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
+                return storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
             default:
-                return raft::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
+                return storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
             }
         }
 
-        raft::StorageChunkState ToProtoChunkState(const ChunkState state)
+        storage::StorageChunkState ToProtoChunkState(const ChunkState state)
         {
             switch (state)
             {
             case ChunkState::kStaging:
-                return raft::STORAGE_CHUNK_STATE_STAGING;
+                return storage::STORAGE_CHUNK_STATE_STAGING;
             case ChunkState::kLive:
-                return raft::STORAGE_CHUNK_STATE_LIVE;
+                return storage::STORAGE_CHUNK_STATE_LIVE;
             case ChunkState::kDeleting:
-                return raft::STORAGE_CHUNK_STATE_DELETING;
+                return storage::STORAGE_CHUNK_STATE_DELETING;
             case ChunkState::kDeleted:
-                return raft::STORAGE_CHUNK_STATE_DELETED;
+                return storage::STORAGE_CHUNK_STATE_DELETED;
             case ChunkState::kQuarantined:
-                return raft::STORAGE_CHUNK_STATE_QUARANTINED;
+                return storage::STORAGE_CHUNK_STATE_QUARANTINED;
             case ChunkState::kCorrupted:
-                return raft::STORAGE_CHUNK_STATE_CORRUPTED;
+                return storage::STORAGE_CHUNK_STATE_CORRUPTED;
             case ChunkState::kMissing:
-                return raft::STORAGE_CHUNK_STATE_MISSING;
+                return storage::STORAGE_CHUNK_STATE_MISSING;
             default:
-                return raft::STORAGE_CHUNK_STATE_UNSPECIFIED;
+                return storage::STORAGE_CHUNK_STATE_UNSPECIFIED;
             }
         }
 
-        raft::StorageChecksumAlgorithm ToProtoChecksumAlgorithm(
+        storage::StorageChecksumAlgorithm ToProtoChecksumAlgorithm(
             const ChunkChecksumAlgorithm algorithm)
         {
             switch (algorithm)
             {
             case ChunkChecksumAlgorithm::kSha256:
-                return raft::STORAGE_CHECKSUM_ALGORITHM_SHA256;
+                return storage::STORAGE_CHECKSUM_ALGORITHM_SHA256;
             case ChunkChecksumAlgorithm::kUnknown:
             default:
-                return raft::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED;
+                return storage::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED;
             }
         }
 
         StorageNodeStatusCode FromProtoChecksumAlgorithm(
-            const raft::StorageChecksumAlgorithm algorithm,
+            const storage::StorageChecksumAlgorithm algorithm,
             ChunkChecksumAlgorithm *out_algorithm,
             std::string *error_detail)
         {
@@ -101,10 +101,10 @@ namespace storedemo
 
             switch (algorithm)
             {
-            case raft::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED:
+            case storage::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED:
                 *out_algorithm = ChunkChecksumAlgorithm::kUnknown;
                 return StorageNodeStatusCode::kOk;
-            case raft::STORAGE_CHECKSUM_ALGORITHM_SHA256:
+            case storage::STORAGE_CHECKSUM_ALGORITHM_SHA256:
                 *out_algorithm = ChunkChecksumAlgorithm::kSha256;
                 return StorageNodeStatusCode::kOk;
             default:
@@ -116,7 +116,7 @@ namespace storedemo
             }
         }
 
-        StorageNodeStatusCode FromProtoChecksum(const raft::StorageChunkChecksum &proto_checksum,
+        StorageNodeStatusCode FromProtoChecksum(const storage::StorageChunkChecksum &proto_checksum,
                                                 ChunkChecksum *out_checksum,
                                                 std::string *error_detail)
         {
@@ -146,7 +146,7 @@ namespace storedemo
         }
 
         void FillProtoChecksum(const ChunkChecksum &checksum,
-                               raft::StorageChunkChecksum *out_checksum)
+                               storage::StorageChunkChecksum *out_checksum)
         {
             if (out_checksum == nullptr)
             {
@@ -159,7 +159,7 @@ namespace storedemo
             out_checksum->set_computed_at_unix_ms(checksum.computed_at);
         }
 
-        std::string ResolveResponseChunkId(const raft::WriteChunkRequest &request,
+        std::string ResolveResponseChunkId(const storage::WriteChunkRequest &request,
                                            const WriteChunkResponse &store_response)
         {
             if (!store_response.metadata.identity.chunk_id.empty())
@@ -192,10 +192,70 @@ namespace storedemo
             return chunk_id;
         }
 
-        void FillSummary(const raft::WriteChunkRequest &request,
+        std::string ResolveResponseChunkId(const storage::ReadChunkRequest &request,
+                                           const ReadChunkResponse &store_response)
+        {
+            if (!store_response.metadata.identity.chunk_id.empty())
+            {
+                return store_response.metadata.identity.chunk_id;
+            }
+
+            if (!request.chunk_id().empty())
+            {
+                return request.chunk_id();
+            }
+
+            if (request.object_id().empty() || request.version() == 0)
+            {
+                return {};
+            }
+
+            ChunkId chunk_id;
+            std::string error_detail;
+            const auto status = MakeChunkId(request.object_id(),
+                                            request.version(),
+                                            request.chunk_index(),
+                                            &chunk_id,
+                                            &error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return {};
+            }
+
+            return chunk_id;
+        }
+
+        void FillSummary(const storage::WriteChunkRequest &request,
                          const WriteChunkResponse &store_response,
                          const std::string &configured_node_id,
-                         raft::StorageNodeResponseSummary *summary)
+                         storage::StorageNodeResponseSummary *summary)
+        {
+            if (summary == nullptr)
+            {
+                return;
+            }
+
+            summary->set_code(ToProtoStatusCode(store_response.status));
+            summary->set_message(store_response.error_detail);
+            summary->set_request_id(request.request_id());
+
+            if (!store_response.metadata.node_id.empty())
+            {
+                summary->set_node_id(store_response.metadata.node_id);
+            }
+            else
+            {
+                summary->set_node_id(configured_node_id);
+            }
+
+            summary->set_chunk_id(ResolveResponseChunkId(request, store_response));
+            summary->set_retry_after_ms(store_response.retry_after_ms);
+        }
+
+        void FillSummary(const storage::ReadChunkRequest &request,
+                         const ReadChunkResponse &store_response,
+                         const std::string &configured_node_id,
+                         storage::StorageNodeResponseSummary *summary)
         {
             if (summary == nullptr)
             {
@@ -228,7 +288,16 @@ namespace storedemo
             return response;
         }
 
-        WriteChunkResponse TranslateWriteRequest(const raft::WriteChunkRequest &request,
+        ReadChunkResponse MakeReadValidationError(const StorageNodeStatusCode status,
+                                                  std::string error_detail)
+        {
+            ReadChunkResponse response;
+            response.status = status;
+            response.error_detail = std::move(error_detail);
+            return response;
+        }
+
+        WriteChunkResponse TranslateWriteRequest(const storage::WriteChunkRequest &request,
                                                  WriteChunkRequest *store_request)
         {
             if (store_request == nullptr)
@@ -239,8 +308,8 @@ namespace storedemo
 
             switch (request.durability())
             {
-            case raft::WRITE_CHUNK_DURABILITY_UNSPECIFIED:
-            case raft::WRITE_CHUNK_DURABILITY_PUBLISH:
+            case storage::WRITE_CHUNK_DURABILITY_UNSPECIFIED:
+            case storage::WRITE_CHUNK_DURABILITY_PUBLISH:
                 break;
             default:
                 return MakeValidationError(StorageNodeStatusCode::kInvalidArgument,
@@ -268,10 +337,67 @@ namespace storedemo
             return {};
         }
 
-        void FillWriteResponse(const raft::WriteChunkRequest &request,
+        ReadChunkResponse TranslateReadRequest(const storage::ReadChunkRequest &request,
+                                               ReadChunkRequest *store_request)
+        {
+            if (store_request == nullptr)
+            {
+                return MakeReadValidationError(StorageNodeStatusCode::kInvalidArgument,
+                                               "store read request output must not be null");
+            }
+
+            store_request->request_id = request.request_id();
+
+            if (!request.chunk_id().empty())
+            {
+                store_request->chunk_id = request.chunk_id();
+            }
+            else if (!request.object_id().empty() && request.version() != 0)
+            {
+                ChunkId chunk_id;
+                std::string error_detail;
+                const auto chunk_status = MakeChunkId(request.object_id(),
+                                                      request.version(),
+                                                      request.chunk_index(),
+                                                      &chunk_id,
+                                                      &error_detail);
+                if (chunk_status != StorageNodeStatusCode::kOk)
+                {
+                    return MakeReadValidationError(chunk_status, std::move(error_detail));
+                }
+
+                store_request->chunk_id = std::move(chunk_id);
+            }
+            else
+            {
+                return MakeReadValidationError(StorageNodeStatusCode::kInvalidArgument,
+                                               "ReadChunk requires chunk_id or object identity");
+            }
+
+            if (request.length() != 0)
+            {
+                store_request->range = ChunkReadRange{
+                    .offset = request.offset(),
+                    .length = request.length()};
+            }
+
+            std::string error_detail;
+            const auto checksum_status = FromProtoChecksum(request.expected_checksum(),
+                                                           &store_request->expected_checksum,
+                                                           &error_detail);
+            if (checksum_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeReadValidationError(checksum_status, std::move(error_detail));
+            }
+
+            store_request->verify_checksum = request.verify_checksum();
+            return {};
+        }
+
+        void FillWriteResponse(const storage::WriteChunkRequest &request,
                                const WriteChunkResponse &store_response,
                                const std::string &configured_node_id,
-                               raft::WriteChunkResponse *response)
+                               storage::WriteChunkResponse *response)
         {
             if (response == nullptr)
             {
@@ -295,8 +421,66 @@ namespace storedemo
             }
             else
             {
-                response->set_state(raft::STORAGE_CHUNK_STATE_UNSPECIFIED);
+                response->set_state(storage::STORAGE_CHUNK_STATE_UNSPECIFIED);
             }
+        }
+
+        void FillReadResponse(const storage::ReadChunkRequest &request,
+                              const ReadChunkResponse &store_response,
+                              const std::string &configured_node_id,
+                              storage::ReadChunkResponse *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            FillSummary(request,
+                        store_response,
+                        configured_node_id,
+                        response->mutable_summary());
+
+            const auto resolved_chunk_id = ResolveResponseChunkId(request, store_response);
+            response->set_chunk_id(resolved_chunk_id);
+            response->set_payload(store_response.payload);
+
+            if (store_response.metadata.size != 0)
+            {
+                response->set_size(store_response.metadata.size);
+            }
+            else
+            {
+                response->set_size(
+                    static_cast<std::uint64_t>(store_response.payload.size()));
+            }
+
+            if (store_response.actual_checksum.IsSet())
+            {
+                FillProtoChecksum(store_response.actual_checksum,
+                                  response->mutable_checksum());
+            }
+            else
+            {
+                FillProtoChecksum(store_response.metadata.checksum,
+                                  response->mutable_checksum());
+            }
+
+            if (!resolved_chunk_id.empty() ||
+                store_response.metadata.state != ChunkState::kMissing)
+            {
+                response->set_state(ToProtoChunkState(store_response.metadata.state));
+            }
+            else
+            {
+                response->set_state(storage::STORAGE_CHUNK_STATE_UNSPECIFIED);
+            }
+
+            response->set_offset(store_response.metadata.identity.offset);
+
+            const bool has_range = request.length() != 0;
+            response->set_complete(store_response.status == StorageNodeStatusCode::kOk);
+            response->set_full_read(store_response.status == StorageNodeStatusCode::kOk &&
+                                    !has_range);
         }
     }
 
@@ -313,8 +497,8 @@ namespace storedemo
 
     grpc::ServerUnaryReactor *StorageNodeService::WriteChunk(
         grpc::CallbackServerContext *context,
-        const raft::WriteChunkRequest *request,
-        raft::WriteChunkResponse *response)
+        const storage::WriteChunkRequest *request,
+        storage::WriteChunkResponse *response)
     {
         auto *reactor = context->DefaultReactor();
 
@@ -336,6 +520,35 @@ namespace storedemo
         }
 
         FillWriteResponse(*request, store_response, node_id_, response);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor *StorageNodeService::ReadChunk(
+        grpc::CallbackServerContext *context,
+        const storage::ReadChunkRequest *request,
+        storage::ReadChunkResponse *response)
+    {
+        auto *reactor = context->DefaultReactor();
+
+        if (request == nullptr || response == nullptr)
+        {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                         "ReadChunk request/response must not be null"));
+            return reactor;
+        }
+
+        (void)request->timeout_ms();
+        (void)request->best_effort_cancel();
+
+        ReadChunkRequest store_request;
+        auto store_response = TranslateReadRequest(*request, &store_request);
+        if (store_response.status == StorageNodeStatusCode::kOk)
+        {
+            store_response = chunk_store_->ReadChunk(store_request);
+        }
+
+        FillReadResponse(*request, store_response, node_id_, response);
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }

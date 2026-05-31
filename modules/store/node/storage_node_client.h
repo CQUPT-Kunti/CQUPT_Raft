@@ -32,7 +32,7 @@ namespace storedemo
     {
     public:
         explicit StorageNodeClient(
-            std::unique_ptr<raft::StorageNodeService::StubInterface> stub,
+            std::unique_ptr<storage::StorageNodeService::StubInterface> stub,
             StorageNodeClientConfig config = {});
         explicit StorageNodeClient(std::shared_ptr<grpc::Channel> channel,
                                    StorageNodeClientConfig config = {});
@@ -44,7 +44,7 @@ namespace storedemo
         [[nodiscard]] const StorageNodeClientConfig &config() const;
 
     private:
-        std::unique_ptr<raft::StorageNodeService::StubInterface> stub_;
+        std::unique_ptr<storage::StorageNodeService::StubInterface> stub_;
         StorageNodeClientConfig config_;
     };
 }

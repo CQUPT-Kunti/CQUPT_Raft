@@ -11,7 +11,7 @@ namespace storedemo
 {
     class ChunkStore;
 
-    class StorageNodeService final : public raft::StorageNodeService::CallbackService
+    class StorageNodeService final : public storage::StorageNodeService::CallbackService
     {
     public:
         explicit StorageNodeService(std::shared_ptr<ChunkStore> chunk_store,
@@ -19,8 +19,13 @@ namespace storedemo
 
         grpc::ServerUnaryReactor *WriteChunk(
             grpc::CallbackServerContext *context,
-            const raft::WriteChunkRequest *request,
-            raft::WriteChunkResponse *response) override;
+            const storage::WriteChunkRequest *request,
+            storage::WriteChunkResponse *response) override;
+
+        grpc::ServerUnaryReactor *ReadChunk(
+            grpc::CallbackServerContext *context,
+            const storage::ReadChunkRequest *request,
+            storage::ReadChunkResponse *response) override;
 
     private:
         std::shared_ptr<ChunkStore> chunk_store_;

@@ -20,6 +20,7 @@
 #include "raft/metadata/metadata_query.h"
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
+#include "store/index/chunk_index.h"
 #include "store/node/storage_node_service.h"
 #include "support/metadata_test_utils.h"
 #include "support/store_test_utils.h"
@@ -127,6 +128,53 @@ namespace
             .chunk_id = chunk_id};
     }
 
+    storage::ReadChunkRequest MakeProtoReadRequest(const storedemo::ChunkIdentity &identity,
+                                                const std::string &request_id)
+    {
+        storage::ReadChunkRequest request;
+        request.set_request_id(request_id);
+        request.set_chunk_id(identity.chunk_id);
+        request.set_object_id(identity.object_id);
+        request.set_version(identity.version);
+        request.set_chunk_index(identity.chunk_index);
+        request.set_timeout_ms(1500);
+        request.set_best_effort_cancel(true);
+        return request;
+    }
+
+    std::shared_ptr<storedemo::ShardedChunkIndex> MakeSharedIndex()
+    {
+        return std::make_shared<storedemo::ShardedChunkIndex>();
+    }
+
+    storedemo::ChunkIndexEntry FindIndexEntryOrThrow(storedemo::ChunkIndex &index,
+                                                     const storedemo::ChunkId &chunk_id)
+    {
+        const auto find_response = index.Find(chunk_id);
+        if (!find_response.ok())
+        {
+            throw std::runtime_error("failed to find chunk index entry: " +
+                                     find_response.error_detail);
+        }
+        return find_response.entry;
+    }
+
+    void UpdateIndexStateOrThrow(storedemo::ChunkIndex &index,
+                                 const storedemo::ChunkId &chunk_id,
+                                 const storedemo::ChunkState state)
+    {
+        auto entry = FindIndexEntryOrThrow(index, chunk_id);
+        entry.state = state;
+        ++entry.updated_at;
+
+        const auto update_response = index.Update(entry);
+        if (!update_response.ok())
+        {
+            throw std::runtime_error("failed to update chunk index entry: " +
+                                     update_response.error_detail);
+        }
+    }
+
     raftdemo::MetadataCommand MakeCreateObjectCommandWithSize(
         const std::string &bucket,
         const std::string &object_key,
@@ -164,17 +212,17 @@ namespace
     }
 
     void FillProtoChecksum(const storedemo::ChunkChecksum &checksum,
-                           raft::StorageChunkChecksum *proto_checksum)
+                           storage::StorageChunkChecksum *proto_checksum)
     {
         ASSERT_NE(proto_checksum, nullptr);
         switch (checksum.algorithm)
         {
         case storedemo::ChunkChecksumAlgorithm::kSha256:
-            proto_checksum->set_algorithm(raft::STORAGE_CHECKSUM_ALGORITHM_SHA256);
+            proto_checksum->set_algorithm(storage::STORAGE_CHECKSUM_ALGORITHM_SHA256);
             break;
         case storedemo::ChunkChecksumAlgorithm::kUnknown:
         default:
-            proto_checksum->set_algorithm(raft::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED);
+            proto_checksum->set_algorithm(storage::STORAGE_CHECKSUM_ALGORITHM_UNSPECIFIED);
             break;
         }
         proto_checksum->set_value(checksum.value);
@@ -182,11 +230,11 @@ namespace
         proto_checksum->set_computed_at_unix_ms(checksum.computed_at);
     }
 
-    raft::WriteChunkRequest MakeProtoWriteRequest(const storedemo::ChunkIdentity &identity,
+    storage::WriteChunkRequest MakeProtoWriteRequest(const storedemo::ChunkIdentity &identity,
                                                   const std::string &payload,
                                                   const std::string &request_id)
     {
-        raft::WriteChunkRequest request;
+        storage::WriteChunkRequest request;
         request.set_request_id(request_id);
         request.set_chunk_id(identity.chunk_id);
         request.set_object_id(identity.object_id);
@@ -199,7 +247,7 @@ namespace
         request.set_payload(payload);
         request.set_timeout_ms(1500);
         request.set_best_effort_cancel(true);
-        request.set_durability(raft::WRITE_CHUNK_DURABILITY_PUBLISH);
+        request.set_durability(storage::WRITE_CHUNK_DURABILITY_PUBLISH);
         return request;
     }
 
@@ -219,12 +267,15 @@ namespace
         }
 
         storedemo::ReadChunkResponse ReadChunk(
-            const storedemo::ReadChunkRequest &) override
+            const storedemo::ReadChunkRequest &request) override
         {
-            storedemo::ReadChunkResponse response;
-            response.status = storedemo::StorageNodeStatusCode::kUnsupported;
-            response.error_detail = "not used in RecordingChunkStore";
-            return response;
+            ++read_calls;
+            last_read_request = request;
+            if (read_handler)
+            {
+                return read_handler(request);
+            }
+            return default_read_response;
         }
 
         storedemo::DeleteChunkResponse DeleteChunk(
@@ -256,9 +307,14 @@ namespace
 
         std::function<storedemo::WriteChunkResponse(const storedemo::WriteChunkRequest &)>
             write_handler;
+        std::function<storedemo::ReadChunkResponse(const storedemo::ReadChunkRequest &)>
+            read_handler;
         storedemo::WriteChunkRequest last_write_request;
+        storedemo::ReadChunkRequest last_read_request;
         storedemo::WriteChunkResponse default_write_response;
+        storedemo::ReadChunkResponse default_read_response;
         std::size_t write_calls{0};
+        std::size_t read_calls{0};
     };
 
     class RunningStorageNodeService
@@ -293,7 +349,7 @@ namespace
                 throw std::runtime_error("storage node test channel did not connect");
             }
 
-            stub_ = raft::StorageNodeService::NewStub(channel_);
+            stub_ = storage::StorageNodeService::NewStub(channel_);
         }
 
         ~RunningStorageNodeService()
@@ -308,14 +364,29 @@ namespace
         RunningStorageNodeService(const RunningStorageNodeService &) = delete;
         RunningStorageNodeService &operator=(const RunningStorageNodeService &) = delete;
 
-        raft::WriteChunkResponse WriteChunk(const raft::WriteChunkRequest &request,
+        storage::WriteChunkResponse WriteChunk(const storage::WriteChunkRequest &request,
                                             grpc::Status *grpc_status = nullptr)
         {
             grpc::ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() + 5s);
 
-            raft::WriteChunkResponse response;
+            storage::WriteChunkResponse response;
             grpc::Status status = stub_->WriteChunk(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::ReadChunkResponse ReadChunk(const storage::ReadChunkRequest &request,
+                                          grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::ReadChunkResponse response;
+            grpc::Status status = stub_->ReadChunk(&context, request, &response);
             if (grpc_status != nullptr)
             {
                 *grpc_status = status;
@@ -327,7 +398,7 @@ namespace
         std::shared_ptr<storedemo::StorageNodeService> service_;
         std::unique_ptr<grpc::Server> server_;
         std::shared_ptr<grpc::Channel> channel_;
-        std::unique_ptr<raft::StorageNodeService::Stub> stub_;
+        std::unique_ptr<storage::StorageNodeService::Stub> stub_;
         int selected_port_{0};
     };
 
@@ -400,7 +471,7 @@ namespace
         EXPECT_EQ(recording_store->last_write_request.payload, payload);
 
         EXPECT_EQ(response.summary().code(),
-                  raft::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS);
+                  storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS);
         EXPECT_EQ(response.summary().message(), "already durable");
         EXPECT_EQ(response.summary().request_id(), "write-recording-t031");
         EXPECT_EQ(response.summary().node_id(), "service-node-t031");
@@ -409,9 +480,9 @@ namespace
         EXPECT_TRUE(response.durable());
         EXPECT_TRUE(response.already_exists());
         EXPECT_EQ(response.size(), checksum.size_bytes);
-        EXPECT_EQ(response.state(), raft::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_LIVE);
         EXPECT_EQ(response.checksum().algorithm(),
-                  raft::STORAGE_CHECKSUM_ALGORITHM_SHA256);
+                  storage::STORAGE_CHECKSUM_ALGORITHM_SHA256);
         EXPECT_EQ(response.checksum().value(), checksum.value);
         EXPECT_EQ(response.checksum().size_bytes(), checksum.size_bytes);
     }
@@ -459,12 +530,12 @@ namespace
             &grpc_status);
 
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
-        EXPECT_EQ(response.summary().code(), raft::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
         EXPECT_TRUE(response.durable());
         EXPECT_FALSE(response.already_exists());
         EXPECT_EQ(response.summary().node_id(), store->config().node_id);
         EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
-        EXPECT_EQ(response.state(), raft::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_LIVE);
 
         const auto head = machine.HeadObject(
             {.bucket = "bucket-t031-durable", .object_key = "uploads/t031-durable"});
@@ -508,7 +579,7 @@ namespace
 
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
         EXPECT_EQ(response.summary().code(),
-                  raft::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH);
+                  storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH);
         EXPECT_FALSE(response.durable());
         EXPECT_FALSE(response.already_exists());
 
@@ -538,15 +609,15 @@ namespace
         grpc::Status grpc_status;
         const auto first = server.WriteChunk(request, &grpc_status);
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
-        ASSERT_EQ(first.summary().code(), raft::STORAGE_NODE_STATUS_CODE_OK);
+        ASSERT_EQ(first.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
 
         const auto retry = server.WriteChunk(request, &grpc_status);
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
         EXPECT_TRUE(retry.durable());
         EXPECT_TRUE(retry.already_exists());
-        EXPECT_TRUE(retry.summary().code() == raft::STORAGE_NODE_STATUS_CODE_OK ||
+        EXPECT_TRUE(retry.summary().code() == storage::STORAGE_NODE_STATUS_CODE_OK ||
                     retry.summary().code() ==
-                        raft::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS);
+                        storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS);
 
         const auto read_response =
             store->ReadChunk(MakeReadRequest(identity.chunk_id, "read-idempotent-t031"));
@@ -581,7 +652,7 @@ namespace
                       &grpc_status)
                       .summary()
                       .code(),
-                  raft::STORAGE_NODE_STATUS_CODE_OK);
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
 
         const auto conflict = server.WriteChunk(
@@ -590,7 +661,7 @@ namespace
                                   "write-conflict-different-t031"),
             &grpc_status);
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
-        EXPECT_EQ(conflict.summary().code(), raft::STORAGE_NODE_STATUS_CODE_CONFLICT);
+        EXPECT_EQ(conflict.summary().code(), storage::STORAGE_NODE_STATUS_CODE_CONFLICT);
         EXPECT_FALSE(conflict.durable());
 
         const auto read_response =
@@ -612,7 +683,7 @@ namespace
             store->config().node_id);
         RunningStorageNodeService server(service);
 
-        raft::WriteChunkRequest request;
+        storage::WriteChunkRequest request;
         request.set_object_id("obj-t031-invalid");
         request.set_version(1);
         request.set_chunk_index(0);
@@ -624,7 +695,7 @@ namespace
 
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
         EXPECT_EQ(response.summary().code(),
-                  raft::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+                  storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
         EXPECT_FALSE(response.durable());
     }
 
@@ -649,10 +720,330 @@ namespace
             &grpc_status);
 
         ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
-        EXPECT_EQ(response.summary().code(), raft::STORAGE_NODE_STATUS_CODE_OVERLOADED);
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OVERLOADED);
         EXPECT_EQ(response.summary().message(), "executor queue is full");
         EXPECT_EQ(response.summary().retry_after_ms(), 88U);
         EXPECT_FALSE(response.durable());
         EXPECT_FALSE(response.already_exists());
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkMapsDerivedFieldsAndResponseFacts)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-recording", 9, 2, 8192);
+        const auto payload = storedemo::test::MakeChunkPayload(160, "t043-recording");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        recording_store->read_handler =
+            [identity, payload, checksum](const storedemo::ReadChunkRequest &request)
+                -> storedemo::ReadChunkResponse
+        {
+            EXPECT_EQ(request.request_id, "read-recording-t043");
+            EXPECT_EQ(request.chunk_id, identity.chunk_id);
+            EXPECT_TRUE(request.range.has_value());
+            if (!request.range.has_value())
+            {
+                storedemo::ReadChunkResponse error_response;
+                error_response.status = storedemo::StorageNodeStatusCode::kInvalidArgument;
+                error_response.error_detail = "expected range for recording read test";
+                return error_response;
+            }
+            EXPECT_EQ(request.range->offset, 17U);
+            EXPECT_EQ(request.range->length, 33U);
+            EXPECT_EQ(request.expected_checksum.algorithm, checksum.algorithm);
+            EXPECT_EQ(request.expected_checksum.value, checksum.value);
+            EXPECT_TRUE(request.verify_checksum);
+
+            storedemo::ReadChunkResponse response;
+            response.status = storedemo::StorageNodeStatusCode::kOk;
+            response.metadata.identity = identity;
+            response.metadata.node_id = "service-node-t043";
+            response.metadata.size = checksum.size_bytes;
+            response.metadata.checksum = checksum;
+            response.metadata.state = storedemo::ChunkState::kLive;
+            response.actual_checksum = checksum;
+            response.payload = payload;
+            response.verified = true;
+            return response;
+        };
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(recording_store,
+                                                                       "service-node-t043");
+        RunningStorageNodeService server(service);
+
+        storage::ReadChunkRequest request;
+        request.set_request_id("read-recording-t043");
+        request.set_object_id(identity.object_id);
+        request.set_version(identity.version);
+        request.set_chunk_index(identity.chunk_index);
+        request.set_offset(17);
+        request.set_length(33);
+        request.set_timeout_ms(2500);
+        request.set_best_effort_cancel(true);
+        request.set_verify_checksum(true);
+        FillProtoChecksum(checksum, request.mutable_expected_checksum());
+
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        ASSERT_EQ(recording_store->read_calls, 1U);
+        EXPECT_EQ(recording_store->last_read_request.request_id, "read-recording-t043");
+        EXPECT_EQ(recording_store->last_read_request.chunk_id, identity.chunk_id);
+        ASSERT_TRUE(recording_store->last_read_request.range.has_value());
+        EXPECT_EQ(recording_store->last_read_request.range->offset, 17U);
+        EXPECT_EQ(recording_store->last_read_request.range->length, 33U);
+        EXPECT_EQ(recording_store->last_read_request.expected_checksum.value,
+                  checksum.value);
+        EXPECT_TRUE(recording_store->last_read_request.verify_checksum);
+
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().request_id(), "read-recording-t043");
+        EXPECT_EQ(response.summary().node_id(), "service-node-t043");
+        EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.payload(), payload);
+        EXPECT_EQ(response.size(), checksum.size_bytes);
+        EXPECT_EQ(response.checksum().algorithm(),
+                  storage::STORAGE_CHECKSUM_ALGORITHM_SHA256);
+        EXPECT_EQ(response.checksum().value(), checksum.value);
+        EXPECT_EQ(response.checksum().size_bytes(), checksum.size_bytes);
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.offset(), identity.offset);
+        EXPECT_TRUE(response.complete());
+        EXPECT_FALSE(response.full_read());
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkFullReadReturnsPayloadAndKeepsMetadataUncommitted)
+    {
+        const auto fixture = LoadFixtureBinaryPayload();
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t043-read",
+                            "create-bucket-t043-read"))
+                        .Ok);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-read", 1, 0, 4096);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        MakeCreateObjectCommandWithSize("bucket-t043-read",
+                                                        "objects/test_file.deb",
+                                                        identity.object_id,
+                                                        "create-object-t043-read",
+                                                        fixture.payload.size(),
+                                                        "etag-t043-read"))
+                        .Ok);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_read_full");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 43));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-read-full-t043",
+                          .identity = identity,
+                          .expected_size =
+                              static_cast<std::uint64_t>(fixture.payload.size()),
+                          .expected_checksum =
+                              ComputeStoreChecksumOrThrow(fixture.payload),
+                          .payload = fixture.payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        auto request = MakeProtoReadRequest(identity, "read-full-t043");
+        FillProtoChecksum(ComputeStoreChecksumOrThrow(fixture.payload),
+                          request.mutable_expected_checksum());
+        request.set_verify_checksum(true);
+
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().node_id(), store->config().node_id);
+        EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.payload(), fixture.payload);
+        EXPECT_EQ(response.size(), fixture.payload.size());
+        EXPECT_EQ(response.checksum().algorithm(),
+                  storage::STORAGE_CHECKSUM_ALGORITHM_SHA256);
+        EXPECT_EQ(response.checksum().value(),
+                  ComputeStoreChecksumOrThrow(fixture.payload).value);
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.offset(), identity.offset);
+        EXPECT_TRUE(response.complete());
+        EXPECT_TRUE(response.full_read());
+
+        const auto head = machine.HeadObject(
+            {.bucket = "bucket-t043-read", .object_key = "objects/test_file.deb"});
+        EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+        EXPECT_FALSE(head.record.has_value());
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkChecksumMismatchReturnsExplicitError)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_read_checksum");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 44));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-checksum", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(128, "t043-checksum");
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-read-checksum-t043",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = ComputeStoreChecksumOrThrow(payload),
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        auto request = MakeProtoReadRequest(identity, "read-checksum-t043");
+        FillProtoChecksum(ComputeStoreChecksumOrThrow("different-payload"),
+                          request.mutable_expected_checksum());
+        request.set_verify_checksum(true);
+
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH);
+        EXPECT_FALSE(response.complete());
+        EXPECT_FALSE(response.full_read());
+        EXPECT_TRUE(response.payload().empty());
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.checksum().value(),
+                  ComputeStoreChecksumOrThrow(payload).value);
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkMissingChunkReturnsNotFound)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_read_missing");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 45));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-missing", 1, 0, 0);
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(
+            MakeProtoReadRequest(identity, "read-missing-t043"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_NOT_FOUND);
+        EXPECT_TRUE(response.payload().empty());
+        EXPECT_FALSE(response.complete());
+        EXPECT_FALSE(response.full_read());
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkRejectsNonLiveState)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_read_non_live");
+        const auto shared_index = MakeSharedIndex();
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            storedemo::LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.root(),
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(46),
+                .chunk_index = shared_index});
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-non-live", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(96, "t043-non-live");
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-read-non-live-t043",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = ComputeStoreChecksumOrThrow(payload),
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_NO_THROW(UpdateIndexStateOrThrow(*shared_index,
+                                                identity.chunk_id,
+                                                storedemo::ChunkState::kQuarantined));
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(
+            MakeProtoReadRequest(identity, "read-non-live-t043"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CORRUPTED);
+        EXPECT_EQ(response.state(), storage::STORAGE_CHUNK_STATE_QUARANTINED);
+        EXPECT_TRUE(response.payload().empty());
+        EXPECT_FALSE(response.complete());
+        EXPECT_FALSE(response.full_read());
+    }
+
+    TEST_F(StorageNodeServiceTest, ReadChunkRangeRequestReturnsExplicitBoundary)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_read_range");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 47));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t043-range", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(120, "t043-range");
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-read-range-t043",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = ComputeStoreChecksumOrThrow(payload),
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        auto request = MakeProtoReadRequest(identity, "read-range-t043");
+        request.set_offset(4);
+        request.set_length(8);
+
+        grpc::Status grpc_status;
+        const auto response = server.ReadChunk(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_TRUE(response.summary().code() ==
+                        storage::STORAGE_NODE_STATUS_CODE_UNSUPPORTED ||
+                    response.summary().code() ==
+                        storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+        EXPECT_TRUE(response.payload().empty());
+        EXPECT_FALSE(response.complete());
+        EXPECT_FALSE(response.full_read());
     }
 } // namespace
