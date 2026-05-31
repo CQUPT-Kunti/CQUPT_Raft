@@ -69,3 +69,8 @@
   问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`，T047 也补了 unavailable / not_found / timeout / checksum mismatch fallback、全部副本失败和已知坏副本跳过的失败路径覆盖；但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
   影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择、逐副本 fallback、可复用测试 helper 和失败路径测试边界，后续任务不能再随意改动 T041-T047 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair、scrub 或后台 quarantine 动作。
   建议后续在哪类任务处理：在 T048/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/后续 recovery-scrub 任务统一处理。
+
+- 任务编号：T049
+  问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍没有生产 `DeleteChunk` / `BatchDeleteChunks` RPC、生产 `GarbageCollector`、restart 后继续 cleanup 或后台调度执行。
+  影响：如果把 T049 的测试 helper 和定向验证当成 US3 生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实 chunk 回收能力；当前通过的只是 metadata-first 和 metadata-driven safety contract，不是后台 GC 功能落地。
+  建议后续在哪类任务处理：在 T050-T057 中继续实现 `DeleteChunk` contract/service/client、生产 `GarbageCollector`、metadata-driven GC safety check、pending/abort cleanup 和 restart 后继续清理，再关闭该风险。
