@@ -112,7 +112,7 @@
 
 ### Implementation for User Story 2
 
-- [ ] T042 [US2] 在 `proto/storage_node.proto` 中补齐 `ReadChunk` MVP 字段和生成映射；允许修改：`proto/storage_node.proto`、`CMakeLists.txt`；验收：不修改 metadata proto，read response 不携带 object state 决策；依赖：T030
+- [x] T042 [US2] 在 `proto/storage_node.proto` 中补齐 `ReadChunk` MVP 字段和生成映射；允许修改：`proto/storage_node.proto`、`CMakeLists.txt`；验收：不修改 metadata proto，read response 不携带 object state 决策；依赖：T030
 - [ ] T043 [US2] 实现 `StorageNodeService::ReadChunk`；允许修改：`modules/store/node/storage_node_service.cpp`、`modules/store/node/storage_node_service.h`；验收：只从 `ChunkStore` 读取 live chunk，checksum mismatch 返回明确错误并标记 corrupted；依赖：T024、T042
 - [ ] T044 [US2] 实现 `StorageNodeClient::ReadChunk` fallback 输入/输出结构；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：timeout/node unavailable 可尝试下一副本，checksum mismatch 不使用该副本数据；依赖：T043
 - [ ] T045 [US2] 实现 read replica selection 的基础排序逻辑；允许修改：`modules/store/placement/replica_policy.cpp`、`modules/store/placement/replica_policy.h`、`tests/storage_placement_test.cpp`；验收：跳过 corrupted/unavailable/stale/overloaded candidates；依赖：T033、T044

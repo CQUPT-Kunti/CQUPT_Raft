@@ -65,7 +65,7 @@
   影响：仓库现在已经有了明确的 commit gate，不再完全缺少 upload coordinator；但失败路径仍依赖调用方或后续 GC/recovery 任务处理 pending object 和 orphan chunk，尚不能把这部分状态自动收口成生产语义。
   建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
 
-- 任务编号：T041
-  问题：`ReadChunk` 目前只通过 `tests/storage_read_chunk_contract_test.cpp` 中的 test-only contract adapter 固定行为边界；`proto/storage_node.proto`、`StorageNodeService::ReadChunk`、`StorageNodeClient::ReadChunk` 和 read replica selection 仍未实现。
-  影响：full read、range boundary、checksum verify、live-only 读取以及 not_found/invalid_argument/timeout/unavailable/io_error 映射已经有契约测试约束，但当前还不是可用的生产 RPC 读链路，也还没有真实副本 fallback。
-  建议后续在哪类任务处理：在 T042-T045 落地 proto/service/client/read replica selection 时，必须保持与 T041 contract test 一致，不得以“先实现 MVP”为由放宽这些边界。
+- 任务编号：T042
+  问题：T042 已在 `proto/storage_node.proto` 中补齐 `ReadChunk` RPC、request/response schema 和 codegen，但 `StorageNodeService::ReadChunk`、`StorageNodeClient::ReadChunk` 以及 read replica selection 仍未实现。
+  影响：ReadChunk 的 wire contract 已固定，后续 service/client/fallback 不能再随意改字段语义；同时当前仓库仍没有可用的生产 RPC 读链路，也没有真实副本 fallback / replica selection。
+  建议后续在哪类任务处理：在 T043-T045 落地 service/client/read replica selection 时，必须保持与 T041 contract test 和 T042 proto schema 一致，不得以“先实现 MVP”为由放宽 live-only、checksum、range boundary 和错误映射边界。

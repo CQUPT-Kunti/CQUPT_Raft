@@ -235,6 +235,14 @@ namespace
             return grpc::Status::OK;
         }
 
+        grpc::Status ReadChunk(grpc::ClientContext *,
+                               const raft::ReadChunkRequest &,
+                               raft::ReadChunkResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "ReadChunk is not implemented in T042 tests");
+        }
+
         std::function<grpc::Status(grpc::ClientContext *,
                                    const raft::WriteChunkRequest &,
                                    raft::WriteChunkResponse *)>
@@ -257,6 +265,22 @@ namespace
         PrepareAsyncWriteChunkRaw(grpc::ClientContext *,
                                   const raft::WriteChunkRequest &,
                                   grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<raft::ReadChunkResponse> *
+        AsyncReadChunkRaw(grpc::ClientContext *,
+                          const raft::ReadChunkRequest &,
+                          grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<raft::ReadChunkResponse> *
+        PrepareAsyncReadChunkRaw(grpc::ClientContext *,
+                                 const raft::ReadChunkRequest &,
+                                 grpc::CompletionQueue *) override
         {
             return nullptr;
         }
