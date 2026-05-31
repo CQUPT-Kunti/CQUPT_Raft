@@ -639,6 +639,216 @@ namespace
         EXPECT_EQ(reader.read_node_ids(), expected_order);
     }
 
+    TEST_F(StorageReadIntegrationTest, CommittedObjectFallsBackAfterNotFoundReplica)
+    {
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t047-read-not-found",
+                            "create-bucket-t047-read-not-found"))
+                        .Ok);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        const std::string object_id = "obj-t047-not-found";
+        const std::string object_key = "objects/fallback-not-found.deb";
+        const std::uint64_t version = 1;
+        const auto payload_parts = SplitPayloadIntoChunks(fixture.payload);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t047-read-not-found",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t047-read-not-found",
+                            fixture.payload.size(),
+                            "etag-t047-read-not-found"))
+                        .Ok);
+
+        std::vector<raftdemo::ChunkRef> manifest;
+        std::unordered_map<std::string, std::string> payload_by_chunk_id;
+        std::uint64_t next_offset = 0;
+        for (std::size_t chunk_index = 0; chunk_index < payload_parts.size(); ++chunk_index)
+        {
+            auto identity = MakeStoreIdentityOrThrow(object_id,
+                                                     version,
+                                                     static_cast<std::uint32_t>(chunk_index),
+                                                     next_offset);
+            manifest.push_back(MakeChunkRef(identity,
+                                            payload_parts[chunk_index],
+                                            {"replica-a", "replica-b"}));
+            payload_by_chunk_id.emplace(identity.chunk_id, payload_parts[chunk_index]);
+            next_offset += payload_parts[chunk_index].size();
+        }
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t047-read-not-found",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t047-read-not-found",
+                            fixture.payload.size(),
+                            "etag-t047-read-not-found",
+                            manifest))
+                        .Ok);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
+            {
+                if (node_id == "replica-a")
+                {
+                    storedemo::ReadChunkResponse response;
+                    response.status = storedemo::StorageNodeStatusCode::kNotFound;
+                    response.error_detail = "replica-a missing chunk";
+                    response.metadata.identity.chunk_id = request.chunk_id;
+                    response.metadata.node_id = node_id;
+                    return response;
+                }
+
+                storedemo::ReadChunkResponse response;
+                response.status = storedemo::StorageNodeStatusCode::kOk;
+                response.payload = payload_by_chunk_id.at(request.chunk_id);
+                response.metadata.identity.chunk_id = request.chunk_id;
+                response.metadata.node_id = node_id;
+                response.metadata.size = request.expected_checksum.size_bytes;
+                response.metadata.checksum = request.expected_checksum;
+                response.metadata.state = storedemo::ChunkState::kLive;
+                response.actual_checksum = request.expected_checksum;
+                response.verified = true;
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t047-read-not-found",
+                .object_key = object_key});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, fixture.payload);
+        EXPECT_EQ(reader.calls_for_node("replica-a"), payload_parts.size());
+        EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
+    }
+
+    TEST_F(StorageReadIntegrationTest, CommittedObjectFallsBackAfterTimeoutReplica)
+    {
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t047-read-timeout",
+                            "create-bucket-t047-read-timeout"))
+                        .Ok);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        const std::string object_id = "obj-t047-timeout";
+        const std::string object_key = "objects/fallback-timeout.deb";
+        const std::uint64_t version = 1;
+        const auto payload_parts = SplitPayloadIntoChunks(fixture.payload);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t047-read-timeout",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t047-read-timeout",
+                            fixture.payload.size(),
+                            "etag-t047-read-timeout"))
+                        .Ok);
+
+        std::vector<raftdemo::ChunkRef> manifest;
+        std::unordered_map<std::string, std::string> payload_by_chunk_id;
+        std::uint64_t next_offset = 0;
+        for (std::size_t chunk_index = 0; chunk_index < payload_parts.size(); ++chunk_index)
+        {
+            auto identity = MakeStoreIdentityOrThrow(object_id,
+                                                     version,
+                                                     static_cast<std::uint32_t>(chunk_index),
+                                                     next_offset);
+            manifest.push_back(MakeChunkRef(identity,
+                                            payload_parts[chunk_index],
+                                            {"replica-a", "replica-b"}));
+            payload_by_chunk_id.emplace(identity.chunk_id, payload_parts[chunk_index]);
+            next_offset += payload_parts[chunk_index].size();
+        }
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t047-read-timeout",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t047-read-timeout",
+                            fixture.payload.size(),
+                            "etag-t047-read-timeout",
+                            manifest))
+                        .Ok);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
+            {
+                if (node_id == "replica-a")
+                {
+                    storedemo::ReadChunkResponse response;
+                    response.status = storedemo::StorageNodeStatusCode::kTimeout;
+                    response.error_detail = "replica-a timeout";
+                    response.metadata.identity.chunk_id = request.chunk_id;
+                    response.metadata.node_id = node_id;
+                    return response;
+                }
+
+                storedemo::ReadChunkResponse response;
+                response.status = storedemo::StorageNodeStatusCode::kOk;
+                response.payload = payload_by_chunk_id.at(request.chunk_id);
+                response.metadata.identity.chunk_id = request.chunk_id;
+                response.metadata.node_id = node_id;
+                response.metadata.size = request.expected_checksum.size_bytes;
+                response.metadata.checksum = request.expected_checksum;
+                response.metadata.state = storedemo::ChunkState::kLive;
+                response.actual_checksum = request.expected_checksum;
+                response.verified = true;
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t047-read-timeout",
+                .object_key = object_key});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, fixture.payload);
+        EXPECT_EQ(reader.calls_for_node("replica-a"), payload_parts.size());
+        EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
+    }
+
     TEST_F(StorageReadIntegrationTest, CommittedObjectFallsBackAfterChecksumMismatchReplica)
     {
         raftdemo::MetadataStateMachine machine;
@@ -712,6 +922,7 @@ namespace
                     storedemo::ReadChunkResponse failure;
                     failure.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
                     failure.error_detail = "replica-a checksum mismatch";
+                    failure.payload = "corrupted-payload-must-not-surface";
                     failure.metadata.identity.chunk_id = request.chunk_id;
                     failure.metadata.node_id = node_id;
                     failure.metadata.size = request.expected_checksum.size_bytes;
@@ -745,6 +956,15 @@ namespace
         EXPECT_EQ(result.payload, fixture.payload);
         EXPECT_EQ(reader.calls_for_node("replica-a"), payload_parts.size());
         EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
+        ASSERT_EQ(result.chunk_results.size(), payload_parts.size());
+        for (const auto &chunk_result : result.chunk_results)
+        {
+            ASSERT_EQ(chunk_result.attempts.size(), 2U);
+            EXPECT_EQ(chunk_result.attempts[0].node_id, "replica-a");
+            EXPECT_EQ(chunk_result.attempts[0].status,
+                      storedemo::StorageNodeStatusCode::kChecksumMismatch);
+            EXPECT_EQ(chunk_result.selected_node_id, "replica-b");
+        }
     }
 
     TEST_F(StorageReadIntegrationTest, AllReplicaFailuresReturnExplicitError)
@@ -844,6 +1064,122 @@ namespace
                   std::string::npos);
         EXPECT_EQ(reader.calls_for_node("replica-a"), 1U);
         EXPECT_EQ(reader.calls_for_node("replica-b"), 1U);
+    }
+
+    TEST_F(StorageReadIntegrationTest, CommittedObjectSkipsKnownCorruptedReplicaFacts)
+    {
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t047-read-skip-corrupted",
+                            "create-bucket-t047-read-skip-corrupted"))
+                        .Ok);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        const std::string object_id = "obj-t047-skip-corrupted";
+        const std::string object_key = "objects/skip-corrupted.deb";
+        const std::uint64_t version = 1;
+        const auto payload_parts = SplitPayloadIntoChunks(fixture.payload);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t047-read-skip-corrupted",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t047-read-skip-corrupted",
+                            fixture.payload.size(),
+                            "etag-t047-read-skip-corrupted"))
+                        .Ok);
+
+        std::vector<raftdemo::ChunkRef> manifest;
+        std::unordered_map<std::string, std::string> payload_by_chunk_id;
+        std::uint64_t next_offset = 0;
+        for (std::size_t chunk_index = 0; chunk_index < payload_parts.size(); ++chunk_index)
+        {
+            auto identity = MakeStoreIdentityOrThrow(object_id,
+                                                     version,
+                                                     static_cast<std::uint32_t>(chunk_index),
+                                                     next_offset);
+            manifest.push_back(MakeChunkRef(identity,
+                                            payload_parts[chunk_index],
+                                            {"replica-a", "replica-b"}));
+            payload_by_chunk_id.emplace(identity.chunk_id, payload_parts[chunk_index]);
+            next_offset += payload_parts[chunk_index].size();
+        }
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t047-read-skip-corrupted",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t047-read-skip-corrupted",
+                            fixture.payload.size(),
+                            "etag-t047-read-skip-corrupted",
+                            manifest))
+                        .Ok);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
+            {
+                if (node_id == "replica-a")
+                {
+                    ADD_FAILURE() << "known corrupted replica should be filtered before read";
+                    storedemo::ReadChunkResponse response;
+                    response.status = storedemo::StorageNodeStatusCode::kCorrupted;
+                    response.error_detail = "unexpected read against replica-a";
+                    return response;
+                }
+
+                storedemo::ReadChunkResponse response;
+                response.status = storedemo::StorageNodeStatusCode::kOk;
+                response.payload = payload_by_chunk_id.at(request.chunk_id);
+                response.metadata.identity.chunk_id = request.chunk_id;
+                response.metadata.node_id = node_id;
+                response.metadata.size = request.expected_checksum.size_bytes;
+                response.metadata.checksum = request.expected_checksum;
+                response.metadata.state = storedemo::ChunkState::kLive;
+                response.actual_checksum = request.expected_checksum;
+                response.verified = true;
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t047-read-skip-corrupted",
+                .object_key = object_key,
+                .candidate_resolver =
+                    [](const raftdemo::ChunkRef &chunk_ref)
+                    {
+                        return std::vector<storedemo::ReadReplicaCandidate>{
+                            storedemo::ReadReplicaCandidate{
+                                .node_id = chunk_ref.replica_nodes.at(0),
+                                .known_corrupted = true,
+                                .has_observed_facts = true},
+                            storedemo::ReadReplicaCandidate{
+                                .node_id = chunk_ref.replica_nodes.at(1),
+                                .has_observed_facts = true}};
+                    }});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, fixture.payload);
+        EXPECT_EQ(reader.calls_for_node("replica-a"), 0U);
+        EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
     }
 
     TEST_F(StorageReadIntegrationTest, EmptyReplicaNodesFailBeforeDataPlaneRead)

@@ -931,6 +931,10 @@ namespace storedemo
             EXPECT_EQ(response.status, StorageNodeStatusCode::kCorrupted);
             EXPECT_FALSE(response.ok());
             EXPECT_TRUE(response.payload.empty());
+
+            const auto entry_response = shared_index->Find(identity.chunk_id);
+            ASSERT_TRUE(entry_response.ok()) << entry_response.error_detail;
+            EXPECT_EQ(entry_response.entry.state, ChunkState::kLive);
 #endif
         }
 
@@ -1010,11 +1014,45 @@ namespace storedemo
             EXPECT_FALSE(response.ok());
         }
 
+        TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsNonLiveQuarantinedState)
+        {
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_quarantined_state");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(23),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto identity = MakeIdentityOrThrow("read-quarantined-object", 1, 0, 0);
+            const auto payload = test::MakeChunkPayload(16, "read-quarantined");
+            const auto final_path = ResolveFinalPathOrThrow(store.paths().data_root,
+                                                            identity.chunk_id);
+            ASSERT_TRUE(std::filesystem::create_directories(final_path.parent_path()));
+            {
+                std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << payload;
+            }
+
+            ASSERT_TRUE(shared_index->Insert(MakeIndexEntry(identity,
+                                                            ChunkState::kQuarantined,
+                                                            payload.size(),
+                                                            ComputeChecksumOrThrow(payload),
+                                                            final_path))
+                            .ok());
+
+            const auto response =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id, "read-quarantined-state"));
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kCorrupted);
+            EXPECT_FALSE(response.ok());
+        }
+
         TEST_F(LocalDiskChunkStoreTest, ReadChunkRejectsRangeReadInCurrentStage)
         {
             test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_read_range");
             LocalDiskChunkStore store(MakeConfig(temp_dir.Path("node-data"),
-                                                 test::MakeStorageNodeIdFixture(23)));
+                                                 test::MakeStorageNodeIdFixture(24)));
             ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
 
             const auto identity = MakeIdentityOrThrow("read-range-object", 1, 0, 0);
@@ -1035,7 +1073,7 @@ namespace storedemo
             const auto shared_index = MakeSharedIndex();
             LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
                 .data_dir = temp_dir.Path("node-data"),
-                .node_id = test::MakeStorageNodeIdFixture(24),
+                .node_id = test::MakeStorageNodeIdFixture(25),
                 .chunk_index = shared_index});
             ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
 

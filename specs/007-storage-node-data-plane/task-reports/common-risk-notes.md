@@ -46,9 +46,9 @@
   建议后续在哪类任务处理：执行 `T023-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
 
 - 任务编号：T024
-  问题：`LocalDiskChunkStore::ReadChunk()` 已经固定为 full read + checksum on read，但当前发现文件大小或 checksum 与 index metadata 不一致时，只返回明确错误，还不会把本地 index 状态自动写回 `CORRUPTED` / `QUARANTINED`。
-  影响：前台读取已经不会把损坏数据当成功返回，但后续如果需要基于读路径直接沉淀损坏事实、触发隔离或给 scrub/repair 复用，还需要补状态回写与恢复协同。
-  建议后续在哪类任务处理：在后续 T025/T恢复/scrub 相关任务中，再统一收紧 corruption 状态写回、隔离和恢复边界。
+  问题：`LocalDiskChunkStore::ReadChunk()` 已经固定为 full read + checksum on read；T047 也补了“checksum mismatch 不向上层返回有效 payload、quarantined/corrupted 状态拒读、坏文件读取后不自动把 index 改写为 quarantine”的测试边界。但当前发现文件大小或 checksum 与 index metadata 不一致时，store 仍只返回明确错误，还不会把本地 index 状态自动写回 `CORRUPTED` / `QUARANTINED`。
+  影响：前台读取已经不会把损坏数据当成功返回，测试层也已经把 quarantine/corrupted 的拒读和 fallback 边界固定；但后续如果需要基于读路径直接沉淀损坏事实、触发真实隔离、后台清理或给 scrub/repair 复用，还需要补状态回写与恢复协同。
+  建议后续在哪类任务处理：在后续 T恢复/scrub/repair 相关任务中，再统一收紧 corruption 状态写回、隔离和恢复边界。
 
 - 任务编号：T025
   问题：`LocalDiskChunkStore::DeleteChunk()` 现已接入真实文件删除和 `DELETED` index 状态更新，但当前环境没有 Windows 实机验证能力，`std::filesystem::remove` 在 sharing violation / open-handle / unlink 语义上的真实行为仍未验证。
@@ -66,6 +66,6 @@
   建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
 
 - 任务编号：T045
-  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 也已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`；但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
-  影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择、逐副本 fallback 和可复用测试 helper，后续任务不能再随意改动 T041-T046 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair 或 scrub。
-  建议后续在哪类任务处理：在 T047/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/T047/后续 recovery-scrub 任务统一处理。
+  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`，T047 也补了 unavailable / not_found / timeout / checksum mismatch fallback、全部副本失败和已知坏副本跳过的失败路径覆盖；但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
+  影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择、逐副本 fallback、可复用测试 helper 和失败路径测试边界，后续任务不能再随意改动 T041-T047 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair、scrub 或后台 quarantine 动作。
+  建议后续在哪类任务处理：在 T048/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/后续 recovery-scrub 任务统一处理。
