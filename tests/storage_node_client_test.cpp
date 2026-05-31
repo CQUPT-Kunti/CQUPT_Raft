@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,9 +15,13 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "raft/common/metadata_command.h"
+#include "raft/metadata/metadata_query.h"
+#include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/node/storage_node_client.h"
 #include "store/node/storage_node_service.h"
+#include "support/metadata_test_utils.h"
 #include "support/store_test_utils.h"
 
 namespace
@@ -113,6 +118,42 @@ namespace
         return storedemo::ReadChunkRequest{
             .request_id = request_id,
             .chunk_id = chunk_id};
+    }
+
+    raftdemo::MetadataCommand MakeCreateObjectCommandWithSize(
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        const std::string &request_id,
+        const std::uint64_t size,
+        const std::string &etag,
+        const std::uint64_t create_time = 1712000001)
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kCreateObject;
+        command.request_id = request_id;
+        command.create_object = raftdemo::CreateObjectCommandPayload{
+            raftdemo::ObjectRecord{bucket,
+                                   object_key,
+                                   object_id,
+                                   1,
+                                   size,
+                                   etag,
+                                   raftdemo::ObjectState::PENDING,
+                                   {},
+                                   create_time,
+                                   std::nullopt,
+                                   std::nullopt}};
+        command.request_context = raftdemo::RequestRecord{
+            request_id,
+            raftdemo::MetadataRequestType::kCreateObject,
+            bucket,
+            object_key,
+            "accepted",
+            0,
+            create_time,
+            std::nullopt};
+        return command;
     }
 
     void FillProtoChecksum(const storedemo::ChunkChecksum &checksum,
@@ -215,6 +256,95 @@ namespace
         return response;
     }
 
+    storage::ReadChunkResponse MakeProtoReadResponse(
+        const storedemo::StorageNodeStatusCode status,
+        const storedemo::ChunkIdentity &identity,
+        const std::string &node_id,
+        const storedemo::ChunkChecksum &checksum,
+        const std::uint64_t size,
+        const storedemo::ChunkState state,
+        const std::string &payload,
+        const std::uint64_t offset,
+        const bool complete,
+        const bool full_read,
+        const std::string &message = {},
+        const std::uint64_t retry_after_ms = 0)
+    {
+        storage::ReadChunkResponse response;
+
+        storage::StorageNodeStatusCode proto_status =
+            storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
+        switch (status)
+        {
+        case storedemo::StorageNodeStatusCode::kOk:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_OK;
+            break;
+        case storedemo::StorageNodeStatusCode::kNotFound:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_NOT_FOUND;
+            break;
+        case storedemo::StorageNodeStatusCode::kConflict:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CONFLICT;
+            break;
+        case storedemo::StorageNodeStatusCode::kChecksumMismatch:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
+            break;
+        case storedemo::StorageNodeStatusCode::kCorrupted:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CORRUPTED;
+            break;
+        case storedemo::StorageNodeStatusCode::kUnsupported:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_UNSUPPORTED;
+            break;
+        case storedemo::StorageNodeStatusCode::kInvalidArgument:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
+            break;
+        default:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_IO_ERROR;
+            break;
+        }
+
+        response.mutable_summary()->set_code(proto_status);
+        response.mutable_summary()->set_message(message);
+        response.mutable_summary()->set_request_id("proto-read-request-id");
+        response.mutable_summary()->set_node_id(node_id);
+        response.mutable_summary()->set_chunk_id(identity.chunk_id);
+        response.mutable_summary()->set_retry_after_ms(retry_after_ms);
+        response.set_chunk_id(identity.chunk_id);
+        response.set_payload(payload);
+        response.set_size(size);
+        FillProtoChecksum(checksum, response.mutable_checksum());
+
+        switch (state)
+        {
+        case storedemo::ChunkState::kStaging:
+            response.set_state(storage::STORAGE_CHUNK_STATE_STAGING);
+            break;
+        case storedemo::ChunkState::kLive:
+            response.set_state(storage::STORAGE_CHUNK_STATE_LIVE);
+            break;
+        case storedemo::ChunkState::kDeleting:
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETING);
+            break;
+        case storedemo::ChunkState::kDeleted:
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETED);
+            break;
+        case storedemo::ChunkState::kQuarantined:
+            response.set_state(storage::STORAGE_CHUNK_STATE_QUARANTINED);
+            break;
+        case storedemo::ChunkState::kCorrupted:
+            response.set_state(storage::STORAGE_CHUNK_STATE_CORRUPTED);
+            break;
+        case storedemo::ChunkState::kMissing:
+        default:
+            response.set_state(storage::STORAGE_CHUNK_STATE_MISSING);
+            break;
+        }
+
+        response.set_offset(offset);
+        response.set_complete(complete);
+        response.set_full_read(full_read);
+        return response;
+    }
+
     class FakeStorageNodeStub final : public storage::StorageNodeService::StubInterface
     {
     public:
@@ -235,22 +365,40 @@ namespace
             return grpc::Status::OK;
         }
 
-        grpc::Status ReadChunk(grpc::ClientContext *,
-                               const storage::ReadChunkRequest &,
-                               storage::ReadChunkResponse *) override
+        grpc::Status ReadChunk(grpc::ClientContext *context,
+                               const storage::ReadChunkRequest &request,
+                               storage::ReadChunkResponse *response) override
         {
+            ++read_calls;
+            last_read_request = request;
+            read_call_observed_at = std::chrono::system_clock::now();
+            read_observed_deadline = context->deadline();
+
+            if (read_handler)
+            {
+                return read_handler(context, request, response);
+            }
+
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
-                                "ReadChunk is not implemented in T042 tests");
+                                "ReadChunk is not implemented in this fake stub");
         }
 
         std::function<grpc::Status(grpc::ClientContext *,
                                    const storage::WriteChunkRequest &,
                                    storage::WriteChunkResponse *)>
             write_handler;
+        std::function<grpc::Status(grpc::ClientContext *,
+                                   const storage::ReadChunkRequest &,
+                                   storage::ReadChunkResponse *)>
+            read_handler;
         storage::WriteChunkRequest last_request;
+        storage::ReadChunkRequest last_read_request;
         std::size_t write_calls{0};
+        std::size_t read_calls{0};
         std::chrono::system_clock::time_point call_observed_at{};
         std::chrono::system_clock::time_point observed_deadline{};
+        std::chrono::system_clock::time_point read_call_observed_at{};
+        std::chrono::system_clock::time_point read_observed_deadline{};
 
     private:
         grpc::ClientAsyncResponseReaderInterface<storage::WriteChunkResponse> *
@@ -788,5 +936,421 @@ namespace
         ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk)
             << read_response.error_detail;
         EXPECT_EQ(read_response.payload, fixture.payload);
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsRequestFieldsAndFullReadSuccessResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-success", 9, 2, 2048);
+        const auto payload = storedemo::test::MakeChunkPayload(180, "t044-success");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        stub_ptr->read_handler =
+            [identity, payload, checksum](grpc::ClientContext *,
+                                          const storage::ReadChunkRequest &,
+                                          storage::ReadChunkResponse *response)
+        {
+            *response = MakeProtoReadResponse(storedemo::StorageNodeStatusCode::kOk,
+                                              identity,
+                                              "client-node-t044",
+                                              checksum,
+                                              checksum.size_bytes,
+                                              storedemo::ChunkState::kLive,
+                                              payload,
+                                              identity.offset,
+                                              true,
+                                              true);
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+
+        auto request = MakeReadRequest(identity.chunk_id, "read-success-t044");
+        request.expected_checksum = checksum;
+        request.verify_checksum = true;
+        const auto response = client.ReadChunk(
+            request,
+            {.context = {.timeout_ms = 1200, .best_effort_cancel = true}});
+
+        ASSERT_EQ(stub_ptr->read_calls, 1U);
+        EXPECT_EQ(stub_ptr->last_read_request.request_id(), "read-success-t044");
+        EXPECT_EQ(stub_ptr->last_read_request.chunk_id(), identity.chunk_id);
+        EXPECT_EQ(stub_ptr->last_read_request.offset(), 0U);
+        EXPECT_EQ(stub_ptr->last_read_request.length(), 0U);
+        EXPECT_EQ(stub_ptr->last_read_request.expected_checksum().value(), checksum.value);
+        EXPECT_EQ(stub_ptr->last_read_request.timeout_ms(), 1200U);
+        EXPECT_TRUE(stub_ptr->last_read_request.best_effort_cancel());
+        EXPECT_TRUE(stub_ptr->last_read_request.verify_checksum());
+
+        const auto deadline_delta =
+            stub_ptr->read_observed_deadline - stub_ptr->read_call_observed_at;
+        EXPECT_GT(deadline_delta, 0ms);
+        EXPECT_LE(deadline_delta, 1500ms);
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(response.metadata.identity.object_id, identity.object_id);
+        EXPECT_EQ(response.metadata.identity.version, identity.version);
+        EXPECT_EQ(response.metadata.identity.chunk_index, identity.chunk_index);
+        EXPECT_EQ(response.metadata.identity.offset, identity.offset);
+        EXPECT_EQ(response.metadata.node_id, "client-node-t044");
+        EXPECT_EQ(response.metadata.size, checksum.size_bytes);
+        EXPECT_EQ(response.metadata.checksum.value, checksum.value);
+        EXPECT_EQ(response.actual_checksum.value, checksum.value);
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kLive);
+        EXPECT_EQ(response.payload, payload);
+        EXPECT_TRUE(response.verified);
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsChecksumMismatchResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-checksum", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(80, "t044-checksum");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        stub_ptr->read_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::ReadChunkRequest &,
+                                 storage::ReadChunkResponse *response)
+        {
+            *response = MakeProtoReadResponse(
+                storedemo::StorageNodeStatusCode::kChecksumMismatch,
+                identity,
+                "client-node-t044",
+                checksum,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                {},
+                identity.offset,
+                false,
+                false,
+                "checksum mismatch");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        auto request = MakeReadRequest(identity.chunk_id, "read-checksum-t044");
+        request.expected_checksum = ComputeStoreChecksumOrThrow("different-payload");
+        request.verify_checksum = true;
+        const auto response = client.ReadChunk(request);
+
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        EXPECT_EQ(response.error_detail, "checksum mismatch");
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kLive);
+        EXPECT_EQ(response.actual_checksum.value, checksum.value);
+        EXPECT_TRUE(response.verified);
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsMissingChunkResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-missing", 1, 0, 0);
+        const storedemo::ChunkChecksum checksum;
+
+        stub_ptr->read_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::ReadChunkRequest &,
+                                 storage::ReadChunkResponse *response)
+        {
+            *response = MakeProtoReadResponse(storedemo::StorageNodeStatusCode::kNotFound,
+                                              identity,
+                                              "client-node-t044",
+                                              checksum,
+                                              0,
+                                              storedemo::ChunkState::kMissing,
+                                              {},
+                                              0,
+                                              false,
+                                              false,
+                                              "missing chunk");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response =
+            client.ReadChunk(MakeReadRequest(identity.chunk_id, "read-missing-t044"));
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kNotFound);
+        EXPECT_EQ(response.error_detail, "missing chunk");
+        EXPECT_TRUE(response.payload.empty());
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kMissing);
+        EXPECT_FALSE(response.verified);
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsNonLiveCorruptedResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-non-live", 1, 0, 0);
+        const auto checksum =
+            ComputeStoreChecksumOrThrow(storedemo::test::MakeChunkPayload(48, "t044-non-live"));
+
+        stub_ptr->read_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::ReadChunkRequest &,
+                                 storage::ReadChunkResponse *response)
+        {
+            *response = MakeProtoReadResponse(storedemo::StorageNodeStatusCode::kCorrupted,
+                                              identity,
+                                              "client-node-t044",
+                                              checksum,
+                                              checksum.size_bytes,
+                                              storedemo::ChunkState::kQuarantined,
+                                              {},
+                                              0,
+                                              false,
+                                              false,
+                                              "quarantined chunk");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response =
+            client.ReadChunk(MakeReadRequest(identity.chunk_id, "read-non-live-t044"));
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kCorrupted);
+        EXPECT_EQ(response.error_detail, "quarantined chunk");
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kQuarantined);
+        EXPECT_FALSE(response.verified);
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsRangeBoundaryResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-range", 1, 0, 0);
+        const auto checksum =
+            ComputeStoreChecksumOrThrow(storedemo::test::MakeChunkPayload(48, "t044-range"));
+
+        stub_ptr->read_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::ReadChunkRequest &request,
+                                 storage::ReadChunkResponse *response)
+        {
+            EXPECT_EQ(request.offset(), 7U);
+            EXPECT_EQ(request.length(), 19U);
+            *response = MakeProtoReadResponse(storedemo::StorageNodeStatusCode::kUnsupported,
+                                              identity,
+                                              "client-node-t044",
+                                              checksum,
+                                              checksum.size_bytes,
+                                              storedemo::ChunkState::kLive,
+                                              {},
+                                              0,
+                                              false,
+                                              false,
+                                              "range unsupported");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        auto request = MakeReadRequest(identity.chunk_id, "read-range-t044");
+        request.range = storedemo::ChunkReadRange{.offset = 7, .length = 19};
+        request.expected_checksum = checksum;
+        const auto response = client.ReadChunk(request);
+
+        EXPECT_EQ(stub_ptr->read_calls, 1U);
+        EXPECT_EQ(stub_ptr->last_read_request.offset(), 7U);
+        EXPECT_EQ(stub_ptr->last_read_request.length(), 19U);
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kUnsupported);
+        EXPECT_EQ(response.error_detail, "range unsupported");
+        EXPECT_TRUE(response.payload.empty());
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsGrpcDeadlineExceededToTimeout)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        stub_ptr->read_handler =
+            [](grpc::ClientContext *,
+               const storage::ReadChunkRequest &,
+               storage::ReadChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                "rpc deadline exceeded");
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response = client.ReadChunk(
+            MakeReadRequest("obj-t044-timeout~1~0", "read-timeout-t044"),
+            {.context = {.timeout_ms = 50}});
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kTimeout);
+        EXPECT_EQ(response.error_detail, "rpc deadline exceeded");
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsGrpcCancelledToCancelled)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        stub_ptr->read_handler =
+            [](grpc::ClientContext *,
+               const storage::ReadChunkRequest &,
+               storage::ReadChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::CANCELLED,
+                                "cancelled by caller");
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response = client.ReadChunk(
+            MakeReadRequest("obj-t044-cancelled~1~0", "read-cancelled-t044"),
+            {.context = {.timeout_ms = 300, .best_effort_cancel = true}});
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kCancelled);
+        EXPECT_EQ(response.error_detail, "cancelled by caller");
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsGrpcUnavailableToNodeUnavailable)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        stub_ptr->read_handler =
+            [](grpc::ClientContext *,
+               const storage::ReadChunkRequest &,
+               storage::ReadChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "remote unavailable");
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response = client.ReadChunk(
+            MakeReadRequest("obj-t044-unavailable~1~0", "read-unavailable-t044"));
+
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kNodeUnavailable);
+        EXPECT_EQ(response.error_detail, "remote unavailable");
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsGrpcInternalToIoError)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        stub_ptr->read_handler =
+            [](grpc::ClientContext *,
+               const storage::ReadChunkRequest &,
+               storage::ReadChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::INTERNAL, "backend io error");
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response =
+            client.ReadChunk(MakeReadRequest("obj-t044-io~1~0", "read-io-t044"));
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kIoError);
+        EXPECT_EQ(response.error_detail, "backend io error");
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkMapsInvalidArgumentResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-invalid", 1, 0, 0);
+        const storedemo::ChunkChecksum checksum;
+
+        stub_ptr->read_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::ReadChunkRequest &,
+                                 storage::ReadChunkResponse *response)
+        {
+            *response = MakeProtoReadResponse(
+                storedemo::StorageNodeStatusCode::kInvalidArgument,
+                identity,
+                "client-node-t044",
+                checksum,
+                0,
+                storedemo::ChunkState::kMissing,
+                {},
+                0,
+                false,
+                false,
+                "request invalid");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+        const auto response =
+            client.ReadChunk(MakeReadRequest(identity.chunk_id, "read-invalid-t044"));
+
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kInvalidArgument);
+        EXPECT_EQ(response.error_detail, "request invalid");
+    }
+
+    TEST_F(StorageNodeClientTest, ReadChunkBinaryPayloadUsesFixtureThroughRealServiceWithoutCommittingMetadata)
+    {
+        const auto fixture = LoadFixtureBinaryPayload();
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t044-read",
+                            "create-bucket-t044-read"))
+                        .Ok);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t044-read", 1, 0, 4096);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        MakeCreateObjectCommandWithSize("bucket-t044-read",
+                                                        "objects/test_file.deb",
+                                                        identity.object_id,
+                                                        "create-object-t044-read",
+                                                        fixture.payload.size(),
+                                                        "etag-t044-read"))
+                        .Ok);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_client_read_binary");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 44));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-read-binary-t044",
+                          .identity = identity,
+                          .expected_size =
+                              static_cast<std::uint64_t>(fixture.payload.size()),
+                          .expected_checksum =
+                              ComputeStoreChecksumOrThrow(fixture.payload),
+                          .payload = fixture.payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        storedemo::StorageNodeClient client{server.channel()};
+        auto request = MakeReadRequest(identity.chunk_id, "read-binary-t044");
+        request.expected_checksum = ComputeStoreChecksumOrThrow(fixture.payload);
+        request.verify_checksum = true;
+        const auto response = client.ReadChunk(
+            request,
+            {.context = {.timeout_ms = 1500, .best_effort_cancel = true}});
+
+        ASSERT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk)
+            << response.error_detail;
+        EXPECT_EQ(response.metadata.node_id, store->config().node_id);
+        EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(response.metadata.identity.offset, identity.offset);
+        EXPECT_EQ(response.payload, fixture.payload);
+        EXPECT_EQ(response.metadata.checksum.value, request.expected_checksum.value);
+        EXPECT_TRUE(response.verified);
+
+        const auto head = machine.HeadObject(
+            {.bucket = "bucket-t044-read", .object_key = "objects/test_file.deb"});
+        EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
+        EXPECT_FALSE(head.record.has_value());
     }
 } // namespace

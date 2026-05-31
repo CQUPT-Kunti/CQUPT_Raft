@@ -228,6 +228,34 @@ namespace storedemo
             }
         }
 
+        std::chrono::system_clock::time_point ResolveAbsoluteDeadline(
+            const StorageTaskContext &context,
+            const std::chrono::system_clock::time_point start_time)
+        {
+            return context.timeout_ms == 0
+                       ? std::chrono::system_clock::time_point::max()
+                       : start_time + std::chrono::milliseconds(context.timeout_ms);
+        }
+
+        bool HasDeadlineExpired(const StorageTaskContext &context,
+                                const std::chrono::system_clock::time_point absolute_deadline)
+        {
+            return context.timeout_ms != 0 &&
+                   std::chrono::system_clock::now() >= absolute_deadline;
+        }
+
+        void ApplyDeadlineToContext(const StorageTaskContext &context,
+                                    const std::chrono::system_clock::time_point absolute_deadline,
+                                    grpc::ClientContext *grpc_context)
+        {
+            if (grpc_context == nullptr || context.timeout_ms == 0)
+            {
+                return;
+            }
+
+            grpc_context->set_deadline(absolute_deadline);
+        }
+
         void FillProtoWriteRequest(const WriteChunkRequest &request,
                                    const StorageNodeClientWriteChunkOptions &options,
                                    storage::WriteChunkRequest *proto_request)
@@ -251,6 +279,29 @@ namespace storedemo
             proto_request->set_timeout_ms(options.context.timeout_ms);
             proto_request->set_best_effort_cancel(options.context.best_effort_cancel);
             proto_request->set_durability(ToProtoDurability(options.durability));
+        }
+
+        void FillProtoReadRequest(const ReadChunkRequest &request,
+                                  const StorageNodeClientReadChunkOptions &options,
+                                  storage::ReadChunkRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_chunk_id(request.chunk_id);
+            if (request.range.has_value())
+            {
+                proto_request->set_offset(request.range->offset);
+                proto_request->set_length(request.range->length);
+            }
+            FillProtoChecksum(request.expected_checksum,
+                              proto_request->mutable_expected_checksum());
+            proto_request->set_timeout_ms(options.context.timeout_ms);
+            proto_request->set_best_effort_cancel(options.context.best_effort_cancel);
+            proto_request->set_verify_checksum(request.verify_checksum);
         }
 
         StorageNodeStatusCode ResolveResponseIdentity(
@@ -368,9 +419,176 @@ namespace storedemo
             return response;
         }
 
+        StorageNodeStatusCode ResolveReadResponseIdentity(
+            const ReadChunkRequest &request,
+            const storage::ReadChunkResponse &proto_response,
+            ChunkIdentity *out_identity,
+            std::string *error_detail)
+        {
+            if (out_identity == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "identity output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            ChunkIdentity identity;
+            identity.chunk_id = request.chunk_id;
+            identity.offset = proto_response.offset();
+
+            const std::string candidate_chunk_id =
+                !proto_response.chunk_id().empty()
+                    ? proto_response.chunk_id()
+                    : proto_response.summary().chunk_id();
+            if (candidate_chunk_id.empty())
+            {
+                if (request.chunk_id.empty())
+                {
+                    *out_identity = std::move(identity);
+                    return StorageNodeStatusCode::kOk;
+                }
+
+                ChunkIdentity parsed_identity;
+                const auto parse_status =
+                    ParseChunkId(request.chunk_id, &parsed_identity, error_detail);
+                if (parse_status == StorageNodeStatusCode::kOk)
+                {
+                    parsed_identity.offset = proto_response.offset();
+                    identity = std::move(parsed_identity);
+                }
+
+                *out_identity = std::move(identity);
+                return StorageNodeStatusCode::kOk;
+            }
+
+            ChunkIdentity parsed_identity;
+            const auto parse_status =
+                ParseChunkId(candidate_chunk_id, &parsed_identity, error_detail);
+            if (parse_status != StorageNodeStatusCode::kOk)
+            {
+                return parse_status;
+            }
+
+            parsed_identity.offset = proto_response.offset();
+            *out_identity = std::move(parsed_identity);
+            return StorageNodeStatusCode::kOk;
+        }
+
+        ReadChunkResponse TranslateProtoReadResponse(
+            const ReadChunkRequest &request,
+            const storage::ReadChunkResponse &proto_response)
+        {
+            ReadChunkResponse response;
+            response.status = FromProtoStatusCode(proto_response.summary().code());
+            response.error_detail = proto_response.summary().message();
+            response.retry_after_ms = proto_response.summary().retry_after_ms();
+            response.payload = proto_response.payload();
+
+            response.metadata.node_id = proto_response.summary().node_id();
+            response.metadata.size = proto_response.size();
+            response.metadata.state = ToStoreChunkState(proto_response.state());
+            response.metadata.last_error = response.status;
+
+            if (response.status == StorageNodeStatusCode::kIoError &&
+                proto_response.summary().code() ==
+                    storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED &&
+                response.error_detail.empty())
+            {
+                response.error_detail = "ReadChunk response status is unspecified";
+            }
+
+            std::string error_detail;
+            const auto identity_status = ResolveReadResponseIdentity(request,
+                                                                     proto_response,
+                                                                     &response.metadata.identity,
+                                                                     &error_detail);
+            if (identity_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid ReadChunk response chunk identity: " +
+                                        error_detail;
+                response.payload.clear();
+                return response;
+            }
+
+            ChunkChecksum checksum;
+            const auto checksum_status = FillChecksumFromProto(proto_response.checksum(),
+                                                               &checksum,
+                                                               &error_detail);
+            if (checksum_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid ReadChunk response checksum: " +
+                                        error_detail;
+                response.payload.clear();
+                return response;
+            }
+
+            const auto state_status = FromProtoChunkState(proto_response.state());
+            if (state_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid ReadChunk response chunk state";
+                response.payload.clear();
+                return response;
+            }
+
+            response.metadata.checksum = checksum;
+            response.actual_checksum = checksum;
+            response.verified =
+                checksum.IsSet() &&
+                (response.status == StorageNodeStatusCode::kOk ||
+                 response.status == StorageNodeStatusCode::kChecksumMismatch);
+
+            if (response.status == StorageNodeStatusCode::kOk)
+            {
+                if (!proto_response.complete())
+                {
+                    response.status = StorageNodeStatusCode::kIoError;
+                    response.error_detail =
+                        "invalid ReadChunk response: successful response is incomplete";
+                    response.payload.clear();
+                    response.verified = false;
+                    return response;
+                }
+
+                if (!request.range.has_value() && !proto_response.full_read())
+                {
+                    response.status = StorageNodeStatusCode::kIoError;
+                    response.error_detail =
+                        "invalid ReadChunk response: full read request returned partial response";
+                    response.payload.clear();
+                    response.verified = false;
+                    return response;
+                }
+
+                if (request.range.has_value() && proto_response.full_read())
+                {
+                    response.status = StorageNodeStatusCode::kIoError;
+                    response.error_detail =
+                        "invalid ReadChunk response: range read must not report full_read";
+                    response.payload.clear();
+                    response.verified = false;
+                    return response;
+                }
+            }
+
+            return response;
+        }
+
         WriteChunkResponse MakeGrpcFailureResponse(const grpc::Status &status)
         {
             WriteChunkResponse response;
+            response.status = MapGrpcStatusCode(status.error_code());
+            response.error_detail = status.error_message();
+            return response;
+        }
+
+        ReadChunkResponse MakeGrpcReadFailureResponse(const grpc::Status &status)
+        {
+            ReadChunkResponse response;
             response.status = MapGrpcStatusCode(status.error_code());
             response.error_detail = status.error_message();
             return response;
@@ -410,14 +628,11 @@ namespace storedemo
     {
         const auto start_time = std::chrono::system_clock::now();
         const auto absolute_deadline =
-            options.context.timeout_ms == 0
-                ? std::chrono::system_clock::time_point::max()
-                : start_time + std::chrono::milliseconds(options.context.timeout_ms);
+            ResolveAbsoluteDeadline(options.context, start_time);
 
         for (std::uint32_t attempt_index = 0;; ++attempt_index)
         {
-            if (options.context.timeout_ms != 0 &&
-                std::chrono::system_clock::now() >= absolute_deadline)
+            if (HasDeadlineExpired(options.context, absolute_deadline))
             {
                 WriteChunkResponse response;
                 response.status = StorageNodeStatusCode::kTimeout;
@@ -426,10 +641,7 @@ namespace storedemo
             }
 
             grpc::ClientContext context;
-            if (options.context.timeout_ms != 0)
-            {
-                context.set_deadline(absolute_deadline);
-            }
+            ApplyDeadlineToContext(options.context, absolute_deadline, &context);
 
             storage::WriteChunkRequest proto_request;
             FillProtoWriteRequest(request, options, &proto_request);
@@ -453,6 +665,40 @@ namespace storedemo
                 return response;
             }
         }
+    }
+
+    ReadChunkResponse StorageNodeClient::ReadChunk(
+        const ReadChunkRequest &request,
+        StorageNodeClientReadChunkOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            ReadChunkResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail = "ReadChunk client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::ReadChunkRequest proto_request;
+        FillProtoReadRequest(request, options, &proto_request);
+
+        storage::ReadChunkResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->ReadChunk(&context, proto_request, &proto_response);
+
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcReadFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoReadResponse(request, proto_response);
     }
 
     const StorageNodeClientConfig &StorageNodeClient::config() const

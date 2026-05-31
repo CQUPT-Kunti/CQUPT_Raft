@@ -9,15 +9,16 @@
 - `StorageNodeService::WriteChunk` 的 gRPC `WriteChunk` 入口
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeClient::WriteChunk` 的本地请求到 gRPC `WriteChunk` 调用
+- `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
 - proto `WriteChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `ReadChunkRequest` 到 `ChunkStore::ReadChunk` 的字段转换
 - `ChunkStore` 结果到 `storage_node.proto` 响应的状态码、checksum、state、durable、already_exists 映射
 - `ChunkStore` 的 `ReadChunkResponse` 到 `storage_node.proto::ReadChunkResponse` 的状态码、checksum、state、payload、offset、complete/full_read 映射
 - `storage_node.proto`（`package storage`）`WriteChunkResponse` 和 gRPC status 到本地 `storedemo::WriteChunkResponse` / `StorageNodeStatusCode` 的映射
+- `storage_node.proto`（`package storage`）`ReadChunkResponse` 和 gRPC status 到本地 `storedemo::ReadChunkResponse` / `StorageNodeStatusCode` 的映射
 
 当前不负责：
 
-- `StorageNodeClient::ReadChunk`
 - `DeleteChunk` / `StatChunk` / `ListChunks`
 - metadata `CreateObject` / `CommitObject` / `AbortObject`
 - `RaftNode::ProposeMetadata()`
@@ -28,8 +29,8 @@
 
 - `storage_node_service.h`：service 类声明
 - `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` 适配实现和 proto/store 映射 helper
-- `storage_node_client.h`：client 类声明和 write 选项结构
-- `storage_node_client.cpp`：同步 `WriteChunk` 调用、deadline 设置、重试和响应映射
+- `storage_node_client.h`：client 类声明以及 write/read 选项结构
+- `storage_node_client.cpp`：同步 `WriteChunk` / `ReadChunk` 调用、deadline 设置和响应映射
 
 ## T031/T032 固定边界
 
@@ -40,13 +41,16 @@
 - service 只调用 `ChunkStore::WriteChunk()`，不触发 metadata commit，也不调用 `RaftNode::ProposeMetadata()`
 - service 的 `ReadChunk` 只调用 `ChunkStore::ReadChunk()`，不调用 metadata service / `MetadataStateMachine` / `RaftNode::ProposeMetadata()`
 - client 只调用 `storage_node.proto` 的 `WriteChunk` RPC，不触发 metadata commit，也不调用 `RaftNode::ProposeMetadata()`
+- client 的 `ReadChunk` 只调用 `storage_node.proto` 的 `ReadChunk` RPC，不调用 metadata service / `MetadataStateMachine` / `RaftNode::ProposeMetadata()`
 - `request_id`、`chunk_id`、`object_id`、`version`、`chunk_index`、`offset`、`expected_size`、`expected_checksum`、`payload` 都会转换到 `ChunkStore::WriteChunk` 请求
 - `ReadChunk` 当前会把 `request_id`、`chunk_id`、`expected_checksum`、`verify_checksum` 转到 `ChunkStore::ReadChunk`；如果 `chunk_id` 为空，则尝试用 `object_id + version + chunk_index` 派生 chunk id；如果 `length > 0`，则把 `offset + length` 转成 `ChunkReadRange`
 - `request_id`、`chunk_id`、`object_id`、`version`、`chunk_index`、`offset`、`expected_size`、`expected_checksum`、`payload`、`timeout_ms`、`best_effort_cancel`、`durability` 都会转换到 `storage_node.proto::WriteChunkRequest`
+- client 的 `ReadChunk` 会把本地 `request_id`、`chunk_id`、`range(offset/length)`、`expected_checksum`、`verify_checksum`、`timeout_ms`、`best_effort_cancel` 转换到 `storage_node.proto::ReadChunkRequest`；本地请求没有 `object_id/version/chunk_index` 时，不伪造对象可见性语义
 - `storage_node.proto::ReadChunkRequest` 中的 `timeout_ms` 和 `best_effort_cancel` 当前只作为 RPC contract 字段接收，不会在 service/store 内伪装成已经具备运行中取消传播
 - proto `summary.code`、`summary.message`、`summary.retry_after_ms`、`durable`、`already_exists`、`size`、`checksum`、`state` 都以 `ChunkStore` 返回事实为准
 - `ReadChunkResponse.summary.code`、`summary.message`、`summary.retry_after_ms`、`chunk_id`、`payload`、`size`、`checksum`、`state`、`offset`、`complete`、`full_read` 都以 `ChunkStore::ReadChunk` 返回事实和当前 request range 语义为准
 - client 会把 proto `summary.code`、`summary.message`、`summary.retry_after_ms`、`durable`、`already_exists`、`size`、`checksum`、`state` 转回本地 `storedemo::WriteChunkResponse`
+- client 会把 proto `ReadChunkResponse.summary.code`、`summary.message`、`summary.retry_after_ms`、`chunk_id`、`payload`、`size`、`checksum`、`state`、`offset` 转回本地 `storedemo::ReadChunkResponse`；如果 proto 成功但 `complete/full_read` 语义与本地请求不一致，会显式映射成 `IO_ERROR`，不做 silent success
 
 ## timeout / cancellation / durability 边界
 
@@ -59,6 +63,7 @@
 - `LocalDiskChunkStore::ReadChunk` 当前在 checksum mismatch / corrupted 场景只返回明确错误，不会自动回写 `CORRUPTED` / `QUARANTINED`；service 适配层保持这个边界，不在 node 层强行发明状态回写
 - `StorageNodeClient` 当前支持有限自动重试，但只会重试 retryable 状态：`TIMEOUT`、`IO_ERROR`、`OVERLOADED`、`NODE_UNAVAILABLE`；`CONFLICT`、`CHECKSUM_MISMATCH`、`INVALID_ARGUMENT`、`CANCELLED` 等非 retryable 结果不会重试
 - client 的 `timeout_ms` 当前作为整次 `WriteChunk` 调用的绝对 deadline 预算；每次重试共用同一个 deadline，不会无限延长总等待时间
+- `StorageNodeClient::ReadChunk` 当前只做单副本、单次 RPC 读取；T044 不实现 read retry、read fallback 或 replica selection，这些由 T045 之后处理
 
 ## storage_node_service.cpp 关键 helper
 
@@ -104,6 +109,57 @@
 - 输出：proto `ReadChunkResponse`
 - 边界：只做字段和状态映射；不调用 metadata / Raft；不决定 object committed 可见性；当前只明确接收 `timeout_ms` / `best_effort_cancel` contract，不承诺运行中取消传播
 
+## storage_node_client.cpp 关键 helper
+
+### `ResolveAbsoluteDeadline(const StorageTaskContext&, std::chrono::system_clock::time_point)`
+
+- 责任：把本地 `timeout_ms` 转成整次 RPC 调用共享的绝对 deadline
+- 输入：本地 task context、调用开始时间
+- 输出：`ClientContext` 可复用的绝对 deadline
+- 边界：`timeout_ms == 0` 时返回无穷 deadline，不伪造超时
+
+### `ApplyDeadlineToContext(const StorageTaskContext&, std::chrono::system_clock::time_point, grpc::ClientContext*)`
+
+- 责任：把绝对 deadline 写入 gRPC `ClientContext`
+- 输入：本地 task context、绝对 deadline、gRPC context
+- 输出：带 deadline 的 `ClientContext`
+- 边界：只约束 RPC 生命周期，不承诺 service/store 具备运行中取消传播
+
+### `FillProtoReadRequest(const ReadChunkRequest&, const StorageNodeClientReadChunkOptions&, storage::ReadChunkRequest*)`
+
+- 责任：把本地 `storedemo::ReadChunkRequest` 转成 proto `ReadChunkRequest`
+- 输入：本地 read request、client read options、proto 输出指针
+- 输出：填充 `request_id`、`chunk_id`、`offset/length`、`expected_checksum`、`timeout_ms`、`best_effort_cancel`、`verify_checksum`
+- 边界：本地请求当前只有 `chunk_id` 身份语义，不额外发明 `object_id/version/chunk_index`
+
+### `ResolveReadResponseIdentity(const ReadChunkRequest&, const storage::ReadChunkResponse&, ChunkIdentity*, std::string*)`
+
+- 责任：从 proto `chunk_id` / `summary.chunk_id` / 本地请求中恢复本地 `ChunkIdentity`
+- 输入：本地 read request、proto read response
+- 输出：尽量完整的 `ChunkIdentity`
+- 边界：服务端返回无效 chunk id 视为协议错误并返回失败；只有请求本身无法解析时，才退化为仅保留原始 `chunk_id`
+
+### `TranslateProtoReadResponse(const ReadChunkRequest&, const storage::ReadChunkResponse&)`
+
+- 责任：把 proto `ReadChunkResponse` 转回本地 `storedemo::ReadChunkResponse`
+- 输入：本地 read request、proto read response
+- 输出：本地 `status`、`payload`、`metadata`、`actual_checksum`、`verified`
+- 边界：成功响应若 `complete/full_read` 与本地请求语义矛盾，会显式返回 `IO_ERROR`，避免 silent partial success
+
+### `MakeGrpcReadFailureResponse(const grpc::Status&)`
+
+- 责任：把非 OK gRPC status 映射成明确的本地读错误
+- 输入：gRPC status
+- 输出：本地 `ReadChunkResponse`
+- 边界：`DEADLINE_EXCEEDED/CANCELLED/UNAVAILABLE` 保持明确映射，其它失败默认收口到本地 `IO_ERROR`
+
+### `StorageNodeClient::ReadChunk(...)`
+
+- 责任：组装 proto request、设置 deadline、发起同步 `ReadChunk` RPC，并把结果转回本地 read response
+- 输入：本地 `ReadChunkRequest`、client read options
+- 输出：本地 `ReadChunkResponse`
+- 边界：不调用 metadata / Raft；不决定 object committed 可见性；不做 read fallback / replica selection
+
 ## 后续演进
 
-- T044/T045/T052 之后再继续补 `StorageNodeClient::ReadChunk`、read fallback / replica selection、`DeleteChunk` / `StatChunk` / `ListChunks`
+- T045/T052 之后再继续补 read fallback / replica selection、`DeleteChunk` / `StatChunk` / `ListChunks`

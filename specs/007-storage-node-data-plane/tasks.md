@@ -114,7 +114,7 @@
 
 - [x] T042 [US2] 在 `proto/storage_node.proto` 中补齐 `ReadChunk` MVP 字段和生成映射；允许修改：`proto/storage_node.proto`、`CMakeLists.txt`；验收：不修改 metadata proto，read response 不携带 object state 决策；依赖：T030
 - [x] T043 [US2] 实现 `StorageNodeService::ReadChunk`；允许修改：`modules/store/node/storage_node_service.cpp`、`modules/store/node/storage_node_service.h`；验收：只从 `ChunkStore` 读取 live chunk，checksum mismatch 返回明确错误并标记 corrupted；依赖：T024、T042
-- [ ] T044 [US2] 实现 `StorageNodeClient::ReadChunk` fallback 输入/输出结构；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：timeout/node unavailable 可尝试下一副本，checksum mismatch 不使用该副本数据；依赖：T043
+- [x] T044 [US2] 实现 `StorageNodeClient::ReadChunk` 输入/输出结构；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：本地请求/响应与 T042/T043 `ReadChunk` proto/service 语义一致，timeout/cancel/unavailable/io/invalid argument 映射明确，不实现 read replica fallback；依赖：T043
 - [ ] T045 [US2] 实现 read replica selection 的基础排序逻辑；允许修改：`modules/store/placement/replica_policy.cpp`、`modules/store/placement/replica_policy.h`、`tests/storage_placement_test.cpp`；验收：跳过 corrupted/unavailable/stale/overloaded candidates；依赖：T033、T044
 - [ ] T046 [US2] 实现测试侧 ReadObject by manifest helper；允许修改：`tests/support/storage_read_test_utils.h`、`tests/storage_read_integration_test.cpp`；验收：helper 先调用 `HeadObject`，只读取 COMMITTED manifest，按 offset 拼接；依赖：T040、T045
 - [ ] T047 [US2] 覆盖副本失败 fallback 和 checksum mismatch quarantine；允许修改：`tests/storage_read_integration_test.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：首选副本失败读备用副本，所有副本失败返回明确错误；依赖：T046

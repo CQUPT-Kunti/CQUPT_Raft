@@ -28,6 +28,11 @@ namespace storedemo
         StorageNodeWriteDurability durability{StorageNodeWriteDurability::kPublish};
     };
 
+    struct StorageNodeClientReadChunkOptions
+    {
+        StorageTaskContext context;
+    };
+
     class StorageNodeClient
     {
     public:
@@ -40,6 +45,10 @@ namespace storedemo
         WriteChunkResponse WriteChunk(
             const WriteChunkRequest &request,
             StorageNodeClientWriteChunkOptions options = {});
+
+        ReadChunkResponse ReadChunk(
+            const ReadChunkRequest &request,
+            StorageNodeClientReadChunkOptions options = {});
 
         [[nodiscard]] const StorageNodeClientConfig &config() const;
 

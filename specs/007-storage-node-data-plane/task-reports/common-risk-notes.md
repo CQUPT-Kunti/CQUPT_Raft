@@ -65,7 +65,7 @@
   影响：仓库现在已经有了明确的 commit gate，不再完全缺少 upload coordinator；但失败路径仍依赖调用方或后续 GC/recovery 任务处理 pending object 和 orphan chunk，尚不能把这部分状态自动收口成生产语义。
   建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
 
-- 任务编号：T043
-  问题：T043 已落地 `StorageNodeService::ReadChunk`，但 `StorageNodeClient::ReadChunk` 和 read replica selection 仍未实现；当前读取链路也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
-  影响：仓库现在已经有了可用的生产 RPC service 读适配层，后续 client/fallback/select 不能再随意改动 T041/T042/T043 固定下来的字段与状态语义；同时当前仍没有真实副本 fallback / replica selection，也没有基于读路径的 corruption 状态自动沉淀。
-  建议后续在哪类任务处理：在 T044-T045 落地 client/read replica selection 时，必须保持与 T041 contract test、T042 proto schema 和 T043 service 映射一致；corrupted 状态自动回写仍按 T024/T047/后续 recovery-scrub 任务统一处理。
+- 任务编号：T044
+  问题：T044 已落地 `StorageNodeClient::ReadChunk`，但 read replica selection / fallback 仍未实现；当前读取链路也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
+  影响：仓库现在已经有了可用的生产 RPC service/client 读适配层，后续 replica selection / fallback 不能再随意改动 T041/T042/T043/T044 固定下来的字段与状态语义；同时当前仍没有真实副本 fallback / replica selection，也没有基于读路径的 corruption 状态自动沉淀。
+  建议后续在哪类任务处理：在 T045 落地 read replica selection / fallback 时，必须保持与 T041 contract test、T042 proto schema、T043 service 映射和 T044 client 映射一致；corrupted 状态自动回写仍按 T024/T047/后续 recovery-scrub 任务统一处理。
