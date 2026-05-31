@@ -75,7 +75,7 @@
   影响：如果把 T049 的测试 helper 和定向验证当成 US3 生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实 chunk 回收能力；当前通过的只是 metadata-first 和 metadata-driven safety contract，不是后台 GC 功能落地。
   建议后续在哪类任务处理：在 T050-T057 中继续实现 `DeleteChunk` contract/service/client、生产 `GarbageCollector`、metadata-driven GC safety check、pending/abort cleanup 和 restart 后继续清理，再关闭该风险。
 
-- 任务编号：T050
-  问题：T050 已用 `storage_delete_chunk_contract_test` 固定 `DeleteChunk` / `BatchDeleteChunks` 的 test-only contract，包括 missing/deleted 幂等、live 删除后不可读、metadata 可见性不由 StorageNode 决定、以及 partial batch result 的 retryable/non-retryable 分类；但当前还没有 proto 字段、生产 `StorageNodeService::DeleteChunk`、生产 `StorageNodeClient::DeleteChunk` 或真实批删线协议。
-  影响：如果把当前 test-only adapter 当成生产删除 RPC 已经落地，后续会误判 T051-T053 的工作量，也可能在真正接 proto/service/client 时破坏 T050 固定下来的逐项结果和重试分类语义。
-  建议后续在哪类任务处理：在 T051-T053 中把 T050 固定下来的删除 contract、batch item 独立结果和 retry 分类完整映射到 proto/service/client，并继续保留生产 GC、restart cleanup 和 Windows 待验证风险。
+- 任务编号：T051
+  问题：T050 已用 `storage_delete_chunk_contract_test` 固定 `DeleteChunk` / `BatchDeleteChunks` 的 test-only contract；T051 也已在 `proto/storage_node.proto` 补齐删除相关 schema 和 `StorageNodeService` RPC，并通过现有 `storage_node_proto` codegen 生成。但当前仍没有生产 `StorageNodeService::DeleteChunk`、生产 `StorageNodeClient::DeleteChunk`、真实批删执行路径或生产 `GarbageCollector`。
+  影响：如果把当前 proto/codegen 通过当成删除 RPC 已完成，后续会高估真实 delete/batch-delete/cleanup 能力；尤其 partial batch result 的 retryable/non-retryable 分类目前仍只在 contract test 和 schema 层固定，还没有经过真实 service/client 映射验证。
+  建议后续在哪类任务处理：在 T052-T054 中继续实现 `StorageNodeService::DeleteChunk` / `BatchDeleteChunks`、`StorageNodeClient` 删除路径和生产 GC，同时保留 restart cleanup、Windows 待验证和批删重试语义的后续验证。

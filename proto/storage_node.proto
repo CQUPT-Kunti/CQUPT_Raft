@@ -108,7 +108,73 @@ message ReadChunkResponse {
   bool full_read = 9;
 }
 
+message DeleteChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  string object_id = 3;
+  uint64 version = 4;
+  uint32 chunk_index = 5;
+  StorageChunkChecksum expected_checksum = 6;
+  string reason = 7;
+  string metadata_boundary = 8;
+  uint64 timeout_ms = 9;
+  bool best_effort_cancel = 10;
+}
+
+message DeleteChunkResponse {
+  StorageNodeResponseSummary summary = 1;
+  string chunk_id = 2;
+  uint64 size = 3;
+  StorageChunkChecksum checksum = 4;
+  StorageChunkState state = 5;
+  bool deleted = 6;
+  bool already_missing = 7;
+  bool already_deleted = 8;
+  bool retryable = 9;
+}
+
+message BatchDeleteChunkRequest {
+  string chunk_id = 1;
+  string object_id = 2;
+  uint64 version = 3;
+  uint32 chunk_index = 4;
+  StorageChunkChecksum expected_checksum = 5;
+  string reason = 6;
+  string metadata_boundary = 7;
+}
+
+message BatchDeleteChunkResult {
+  StorageNodeResponseSummary summary = 1;
+  string chunk_id = 2;
+  uint64 size = 3;
+  StorageChunkChecksum checksum = 4;
+  StorageChunkState state = 5;
+  bool deleted = 6;
+  bool already_missing = 7;
+  bool already_deleted = 8;
+  bool retryable = 9;
+}
+
+message BatchDeleteChunksRequest {
+  string request_id = 1;
+  repeated BatchDeleteChunkRequest chunks = 2;
+  uint64 timeout_ms = 3;
+  bool best_effort_cancel = 4;
+}
+
+message BatchDeleteChunksResponse {
+  StorageNodeResponseSummary summary = 1;
+  repeated BatchDeleteChunkResult results = 2;
+  uint32 success_count = 3;
+  uint32 idempotent_count = 4;
+  uint32 retryable_failure_count = 5;
+  uint32 non_retryable_failure_count = 6;
+  bool partial_failure = 7;
+}
+
 service StorageNodeService {
   rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
   rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  rpc BatchDeleteChunks(BatchDeleteChunksRequest) returns (BatchDeleteChunksResponse);
 }

@@ -383,6 +383,22 @@ namespace
                                 "ReadChunk is not implemented in this fake stub");
         }
 
+        grpc::Status DeleteChunk(grpc::ClientContext *,
+                                 const storage::DeleteChunkRequest &,
+                                 storage::DeleteChunkResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "DeleteChunk is not implemented in this fake stub");
+        }
+
+        grpc::Status BatchDeleteChunks(grpc::ClientContext *,
+                                       const storage::BatchDeleteChunksRequest &,
+                                       storage::BatchDeleteChunksResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "BatchDeleteChunks is not implemented in this fake stub");
+        }
+
         std::function<grpc::Status(grpc::ClientContext *,
                                    const storage::WriteChunkRequest &,
                                    storage::WriteChunkResponse *)>
@@ -429,6 +445,38 @@ namespace
         PrepareAsyncReadChunkRaw(grpc::ClientContext *,
                                  const storage::ReadChunkRequest &,
                                  grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::DeleteChunkResponse> *
+        AsyncDeleteChunkRaw(grpc::ClientContext *,
+                            const storage::DeleteChunkRequest &,
+                            grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::DeleteChunkResponse> *
+        PrepareAsyncDeleteChunkRaw(grpc::ClientContext *,
+                                   const storage::DeleteChunkRequest &,
+                                   grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::BatchDeleteChunksResponse> *
+        AsyncBatchDeleteChunksRaw(grpc::ClientContext *,
+                                  const storage::BatchDeleteChunksRequest &,
+                                  grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::BatchDeleteChunksResponse> *
+        PrepareAsyncBatchDeleteChunksRaw(grpc::ClientContext *,
+                                         const storage::BatchDeleteChunksRequest &,
+                                         grpc::CompletionQueue *) override
         {
             return nullptr;
         }
