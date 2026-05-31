@@ -118,7 +118,7 @@
 - [X] T045 [US2] 实现 read replica selection / fallback 的最小 committed-manifest 读路径；实际修改：`modules/store/placement/replica_policy.cpp`、`modules/store/placement/replica_policy.h`、`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`、`tests/store_placement_policy_test.cpp`、`tests/storage_read_integration_test.cpp`；验收：跳过 corrupted/unavailable/stale/overloaded candidates，并按已排序副本执行 fallback；依赖：T033、T044
 - [X] T046 [US2] 实现测试侧 ReadObject by manifest helper；实际修改：`tests/support/storage_read_test_utils.h`、`tests/storage_read_integration_test.cpp`；验收：helper 先调用 `HeadObject`，只读取 COMMITTED manifest，按 offset 拼接，并复用 T045 的 replica selection / fallback 语义；依赖：T040、T045
 - [X] T047 [US2] 覆盖副本失败 fallback 和 checksum mismatch quarantine；实际修改：`tests/storage_read_integration_test.cpp`、`tests/local_disk_chunk_store_test.cpp`；验收：首选副本 unavailable/not_found/timeout/checksum mismatch 时读备用副本，known corrupted 副本不会被选为有效读取源，所有副本失败返回明确错误；依赖：T046
-- [ ] T048 [US2] 运行 US2 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_read|storage_node_service|local_disk_chunk_store" --output-on-failure`；验收：PASS；依赖：T040-T047
+- [X] T048 [US2] 运行 US2 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_read|storage_node_service|local_disk_chunk_store" --output-on-failure`；验收：PASS；依赖：T040-T047
 
 ## Phase 5: User Story 3 - 删除对象并异步清理 chunk (Priority: P3)
 
