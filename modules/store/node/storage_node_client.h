@@ -38,6 +38,62 @@ namespace storedemo
         StorageTaskContext context;
     };
 
+    struct StorageNodeClientDeleteChunkOptions
+    {
+        StorageTaskContext context;
+    };
+
+    struct StorageNodeClientDeleteChunkRequest
+    {
+        std::string request_id;
+        ChunkId chunk_id;
+        std::string object_id;
+        std::uint64_t version{0};
+        std::uint32_t chunk_index{0};
+        ChunkChecksum expected_checksum;
+        std::string reason;
+        std::string metadata_boundary;
+    };
+
+    struct StorageNodeClientDeleteChunkResponse : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        bool deleted{false};
+        bool already_missing{false};
+        bool already_deleted{false};
+        bool retryable{false};
+    };
+
+    struct StorageNodeClientBatchDeleteChunkRequest
+    {
+        ChunkId chunk_id;
+        std::string object_id;
+        std::uint64_t version{0};
+        std::uint32_t chunk_index{0};
+        ChunkChecksum expected_checksum;
+        std::string reason;
+        std::string metadata_boundary;
+    };
+
+    using StorageNodeClientBatchDeleteChunkResult =
+        StorageNodeClientDeleteChunkResponse;
+
+    struct StorageNodeClientBatchDeleteChunksRequest
+    {
+        std::string request_id;
+        std::vector<StorageNodeClientBatchDeleteChunkRequest> chunks;
+    };
+
+    struct StorageNodeClientBatchDeleteChunksResponse : ChunkStoreResult
+    {
+        std::vector<StorageNodeClientBatchDeleteChunkResult> results;
+        std::uint32_t success_count{0};
+        std::uint32_t idempotent_count{0};
+        std::uint32_t retryable_failure_count{0};
+        std::uint32_t non_retryable_failure_count{0};
+        bool partial_failure{false};
+    };
+
     enum class ReadReplicaFailureAction : std::uint8_t
     {
         kStop = 0,
@@ -100,6 +156,18 @@ namespace storedemo
         ReadChunkResponse ReadChunk(
             const ReadChunkRequest &request,
             StorageNodeClientReadChunkOptions options = {});
+
+        StorageNodeClientDeleteChunkResponse DeleteChunk(
+            const StorageNodeClientDeleteChunkRequest &request,
+            StorageNodeClientDeleteChunkOptions options = {});
+
+        StorageNodeClientDeleteChunkResponse DeleteChunk(
+            const DeleteChunkRequest &request,
+            StorageNodeClientDeleteChunkOptions options = {});
+
+        StorageNodeClientBatchDeleteChunksResponse BatchDeleteChunks(
+            const StorageNodeClientBatchDeleteChunksRequest &request,
+            StorageNodeClientDeleteChunkOptions options = {});
 
         [[nodiscard]] const StorageNodeClientConfig &config() const;
 

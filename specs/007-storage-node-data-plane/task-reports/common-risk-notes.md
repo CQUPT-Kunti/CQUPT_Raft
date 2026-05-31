@@ -75,7 +75,7 @@
   影响：如果把 T049 的测试 helper 和定向验证当成 US3 生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实 chunk 回收能力；当前通过的只是 metadata-first 和 metadata-driven safety contract，不是后台 GC 功能落地。
   建议后续在哪类任务处理：在 T050-T057 中继续实现 `DeleteChunk` contract/service/client、生产 `GarbageCollector`、metadata-driven GC safety check、pending/abort cleanup 和 restart 后继续清理，再关闭该风险。
 
-- 任务编号：T052
-  问题：T050 已用 `storage_delete_chunk_contract_test` 固定 `DeleteChunk` / `BatchDeleteChunks` 的 contract，T051 已补齐删除 proto/schema，T052 也已实现生产 `StorageNodeService::DeleteChunk` / `BatchDeleteChunks` 并通过 service 层验证。但当前仍没有生产 `StorageNodeClient::DeleteChunk` / `BatchDeleteChunks`、生产 `GarbageCollector`、restart 后继续 cleanup 或 Windows 实机删除验证。
-  影响：如果把当前 service adapter 通过当成删除闭环已完成，后续会高估真正的 client 调用、后台 cleanup 和跨平台删除能力；批删 retryable/non-retryable 分类虽然已在 contract、schema 和 service 映射层固定，但还没有经过真实 client 重试路径验证。
-  建议后续在哪类任务处理：在 T053-T057 中继续实现 `StorageNodeClient` 删除路径、生产 `GarbageCollector`、metadata-driven cleanup/restart cleanup，并保留 Windows 待验证和批删重试语义的后续验证。
+- 任务编号：T053
+  问题：T050 已用 `storage_delete_chunk_contract_test` 固定 `DeleteChunk` / `BatchDeleteChunks` 的 contract，T051 已补齐删除 proto/schema，T052/T053 也已完成生产 `StorageNodeService` / `StorageNodeClient` 删除 RPC 适配并通过定向验证。但当前仍没有生产 `GarbageCollector`、restart 后继续 cleanup、Windows 实机删除验证，`best_effort_cancel` 也仍只是字段透传，未形成 service/store 运行中取消传播。
+  影响：如果把当前 client+service adapter 通过当成删除闭环和后台清理都已完成，后续会高估 metadata tombstone 之后的真实 chunk 回收、跨平台删除以及运行中取消能力；批删 retryable/non-retryable 分类虽然已能经过 client/service 端到端映射观察到，但还没有后台调度器消费这些结果。
+  建议后续在哪类任务处理：在 T054-T057 中继续实现 `GarbageCollector`、metadata-driven cleanup/restart cleanup，并保留 Windows 待验证和 timeout/cancellation 运行中传播的后续验证。

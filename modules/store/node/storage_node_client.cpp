@@ -305,6 +305,95 @@ namespace storedemo
             proto_request->set_verify_checksum(request.verify_checksum);
         }
 
+        StorageNodeClientDeleteChunkRequest ToClientDeleteRequest(
+            const DeleteChunkRequest &request)
+        {
+            StorageNodeClientDeleteChunkRequest client_request;
+            client_request.request_id = request.request_id;
+            client_request.chunk_id = request.chunk_id;
+            client_request.expected_checksum = request.expected_checksum;
+            client_request.reason = request.reason;
+            client_request.metadata_boundary = request.metadata_boundary;
+            return client_request;
+        }
+
+        StorageNodeClientDeleteChunkRequest ToClientDeleteRequest(
+            const std::string &request_id,
+            const StorageNodeClientBatchDeleteChunkRequest &request)
+        {
+            StorageNodeClientDeleteChunkRequest client_request;
+            client_request.request_id = request_id;
+            client_request.chunk_id = request.chunk_id;
+            client_request.object_id = request.object_id;
+            client_request.version = request.version;
+            client_request.chunk_index = request.chunk_index;
+            client_request.expected_checksum = request.expected_checksum;
+            client_request.reason = request.reason;
+            client_request.metadata_boundary = request.metadata_boundary;
+            return client_request;
+        }
+
+        void FillProtoDeleteRequest(
+            const StorageNodeClientDeleteChunkRequest &request,
+            const StorageNodeClientDeleteChunkOptions &options,
+            storage::DeleteChunkRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_chunk_id(request.chunk_id);
+            proto_request->set_object_id(request.object_id);
+            proto_request->set_version(request.version);
+            proto_request->set_chunk_index(request.chunk_index);
+            FillProtoChecksum(request.expected_checksum,
+                              proto_request->mutable_expected_checksum());
+            proto_request->set_reason(request.reason);
+            proto_request->set_metadata_boundary(request.metadata_boundary);
+            proto_request->set_timeout_ms(options.context.timeout_ms);
+            proto_request->set_best_effort_cancel(options.context.best_effort_cancel);
+        }
+
+        void FillProtoBatchDeleteChunkRequest(
+            const StorageNodeClientBatchDeleteChunkRequest &request,
+            storage::BatchDeleteChunkRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_chunk_id(request.chunk_id);
+            proto_request->set_object_id(request.object_id);
+            proto_request->set_version(request.version);
+            proto_request->set_chunk_index(request.chunk_index);
+            FillProtoChecksum(request.expected_checksum,
+                              proto_request->mutable_expected_checksum());
+            proto_request->set_reason(request.reason);
+            proto_request->set_metadata_boundary(request.metadata_boundary);
+        }
+
+        void FillProtoBatchDeleteRequest(
+            const StorageNodeClientBatchDeleteChunksRequest &request,
+            const StorageNodeClientDeleteChunkOptions &options,
+            storage::BatchDeleteChunksRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_timeout_ms(options.context.timeout_ms);
+            proto_request->set_best_effort_cancel(options.context.best_effort_cancel);
+            for (const auto &chunk : request.chunks)
+            {
+                FillProtoBatchDeleteChunkRequest(chunk, proto_request->add_chunks());
+            }
+        }
+
         StorageNodeStatusCode ResolveResponseIdentity(
             const WriteChunkRequest &request,
             const storage::WriteChunkResponse &proto_response,
@@ -477,6 +566,87 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
+        StorageNodeStatusCode ResolveDeleteResponseIdentity(
+            const std::string_view requested_chunk_id,
+            const std::string_view requested_object_id,
+            const std::uint64_t requested_version,
+            const std::uint32_t requested_chunk_index,
+            const std::string_view summary_chunk_id,
+            const std::string_view response_chunk_id,
+            ChunkIdentity *out_identity,
+            std::string *error_detail)
+        {
+            if (out_identity == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "identity output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            const std::string candidate_chunk_id =
+                !response_chunk_id.empty()
+                    ? std::string(response_chunk_id)
+                    : std::string(summary_chunk_id);
+
+            if (!candidate_chunk_id.empty())
+            {
+                ChunkIdentity parsed_identity;
+                const auto parse_status =
+                    ParseChunkId(candidate_chunk_id, &parsed_identity, error_detail);
+                if (parse_status != StorageNodeStatusCode::kOk)
+                {
+                    return parse_status;
+                }
+
+                *out_identity = std::move(parsed_identity);
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (!requested_chunk_id.empty())
+            {
+                ChunkIdentity identity;
+                identity.chunk_id = std::string(requested_chunk_id);
+
+                ChunkIdentity parsed_identity;
+                const auto parse_status =
+                    ParseChunkId(requested_chunk_id, &parsed_identity, error_detail);
+                if (parse_status == StorageNodeStatusCode::kOk)
+                {
+                    identity = std::move(parsed_identity);
+                }
+
+                *out_identity = std::move(identity);
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (!requested_object_id.empty() && requested_version != 0)
+            {
+                ChunkId derived_chunk_id;
+                const auto make_status = MakeChunkId(requested_object_id,
+                                                     requested_version,
+                                                     requested_chunk_index,
+                                                     &derived_chunk_id,
+                                                     error_detail);
+                if (make_status != StorageNodeStatusCode::kOk)
+                {
+                    return make_status;
+                }
+
+                ChunkIdentity identity;
+                identity.chunk_id = std::move(derived_chunk_id);
+                identity.object_id = std::string(requested_object_id);
+                identity.version = requested_version;
+                identity.chunk_index = requested_chunk_index;
+                *out_identity = std::move(identity);
+                return StorageNodeStatusCode::kOk;
+            }
+
+            *out_identity = ChunkIdentity{};
+            return StorageNodeStatusCode::kOk;
+        }
+
         ReadChunkResponse TranslateProtoReadResponse(
             const ReadChunkRequest &request,
             const storage::ReadChunkResponse &proto_response)
@@ -579,6 +749,214 @@ namespace storedemo
             return response;
         }
 
+        StorageNodeClientDeleteChunkResponse TranslateProtoDeleteResponse(
+            const StorageNodeClientDeleteChunkRequest &request,
+            const storage::DeleteChunkResponse &proto_response)
+        {
+            StorageNodeClientDeleteChunkResponse response;
+            response.status = FromProtoStatusCode(proto_response.summary().code());
+            response.error_detail = proto_response.summary().message();
+            response.retry_after_ms = proto_response.summary().retry_after_ms();
+            response.deleted = proto_response.deleted();
+            response.already_missing = proto_response.already_missing();
+
+            response.metadata.node_id = proto_response.summary().node_id();
+            response.metadata.size = proto_response.size();
+            response.metadata.state = ToStoreChunkState(proto_response.state());
+            response.metadata.last_error = response.status;
+
+            if (response.status == StorageNodeStatusCode::kIoError &&
+                proto_response.summary().code() ==
+                    storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED &&
+                response.error_detail.empty())
+            {
+                response.error_detail = "DeleteChunk response status is unspecified";
+            }
+
+            std::string error_detail;
+            const auto identity_status = ResolveDeleteResponseIdentity(
+                request.chunk_id,
+                request.object_id,
+                request.version,
+                request.chunk_index,
+                proto_response.summary().chunk_id(),
+                proto_response.chunk_id(),
+                &response.metadata.identity,
+                &error_detail);
+            if (identity_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid DeleteChunk response chunk identity: " +
+                                        error_detail;
+                response.retryable = false;
+                return response;
+            }
+
+            const auto checksum_status =
+                FillChecksumFromProto(proto_response.checksum(),
+                                      &response.metadata.checksum,
+                                      &error_detail);
+            if (checksum_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid DeleteChunk response checksum: " +
+                                        error_detail;
+                response.retryable = false;
+                return response;
+            }
+
+            const auto state_status = FromProtoChunkState(proto_response.state());
+            if (state_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail = "invalid DeleteChunk response chunk state";
+                response.retryable = false;
+                return response;
+            }
+
+            response.already_deleted =
+                proto_response.already_deleted() ||
+                (response.already_missing &&
+                 response.metadata.state == ChunkState::kDeleted);
+            response.retryable =
+                response.status != StorageNodeStatusCode::kOk &&
+                (proto_response.retryable() || IsRetriableStatus(response.status));
+            return response;
+        }
+
+        StorageNodeClientBatchDeleteChunkResult TranslateProtoBatchDeleteResult(
+            const StorageNodeClientBatchDeleteChunksRequest &request,
+            const std::size_t index,
+            const storage::BatchDeleteChunkResult &proto_result)
+        {
+            storage::DeleteChunkResponse single_response;
+            *single_response.mutable_summary() = proto_result.summary();
+            single_response.set_chunk_id(proto_result.chunk_id());
+            single_response.set_size(proto_result.size());
+            *single_response.mutable_checksum() = proto_result.checksum();
+            single_response.set_state(proto_result.state());
+            single_response.set_deleted(proto_result.deleted());
+            single_response.set_already_missing(proto_result.already_missing());
+            single_response.set_already_deleted(proto_result.already_deleted());
+            single_response.set_retryable(proto_result.retryable());
+
+            return TranslateProtoDeleteResponse(
+                ToClientDeleteRequest(request.request_id + "/item/" +
+                                          std::to_string(index),
+                                      request.chunks[index]),
+                single_response);
+        }
+
+        bool IsDeleteIdempotentSuccess(
+            const StorageNodeClientBatchDeleteChunkResult &result)
+        {
+            return result.status == StorageNodeStatusCode::kOk &&
+                   result.already_missing;
+        }
+
+        bool IsDeleteRetryableFailure(
+            const StorageNodeClientBatchDeleteChunkResult &result)
+        {
+            return result.status != StorageNodeStatusCode::kOk &&
+                   (result.retryable || IsRetriableStatus(result.status));
+        }
+
+        StorageNodeClientBatchDeleteChunksResponse TranslateProtoBatchDeleteResponse(
+            const StorageNodeClientBatchDeleteChunksRequest &request,
+            const storage::BatchDeleteChunksResponse &proto_response)
+        {
+            StorageNodeClientBatchDeleteChunksResponse response;
+            response.status = FromProtoStatusCode(proto_response.summary().code());
+            response.error_detail = proto_response.summary().message();
+            response.retry_after_ms = proto_response.summary().retry_after_ms();
+            response.success_count = proto_response.success_count();
+            response.idempotent_count = proto_response.idempotent_count();
+            response.retryable_failure_count =
+                proto_response.retryable_failure_count();
+            response.non_retryable_failure_count =
+                proto_response.non_retryable_failure_count();
+            response.partial_failure = proto_response.partial_failure();
+
+            if (response.status == StorageNodeStatusCode::kIoError &&
+                proto_response.summary().code() ==
+                    storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED &&
+                response.error_detail.empty())
+            {
+                response.error_detail = "BatchDeleteChunks response status is unspecified";
+            }
+
+            if (proto_response.results_size() !=
+                static_cast<int>(request.chunks.size()))
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail =
+                    "invalid BatchDeleteChunks response result count";
+                return response;
+            }
+
+            response.results.reserve(request.chunks.size());
+            for (int index = 0; index < proto_response.results_size(); ++index)
+            {
+                response.results.push_back(TranslateProtoBatchDeleteResult(
+                    request,
+                    static_cast<std::size_t>(index),
+                    proto_response.results(index)));
+            }
+
+            if (response.status != StorageNodeStatusCode::kOk)
+            {
+                return response;
+            }
+
+            std::uint32_t computed_success_count = 0;
+            std::uint32_t computed_idempotent_count = 0;
+            std::uint32_t computed_retryable_failure_count = 0;
+            std::uint32_t computed_non_retryable_failure_count = 0;
+            for (const auto &result : response.results)
+            {
+                if (result.status == StorageNodeStatusCode::kOk)
+                {
+                    if (IsDeleteIdempotentSuccess(result))
+                    {
+                        ++computed_idempotent_count;
+                    }
+                    else
+                    {
+                        ++computed_success_count;
+                    }
+                    continue;
+                }
+
+                if (IsDeleteRetryableFailure(result))
+                {
+                    ++computed_retryable_failure_count;
+                }
+                else
+                {
+                    ++computed_non_retryable_failure_count;
+                }
+            }
+
+            const bool computed_partial_failure =
+                (computed_retryable_failure_count != 0 ||
+                 computed_non_retryable_failure_count != 0) &&
+                (computed_success_count != 0 || computed_idempotent_count != 0);
+            if (computed_success_count != response.success_count ||
+                computed_idempotent_count != response.idempotent_count ||
+                computed_retryable_failure_count !=
+                    response.retryable_failure_count ||
+                computed_non_retryable_failure_count !=
+                    response.non_retryable_failure_count ||
+                computed_partial_failure != response.partial_failure)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail =
+                    "invalid BatchDeleteChunks response aggregate facts";
+            }
+
+            return response;
+        }
+
         WriteChunkResponse MakeGrpcFailureResponse(const grpc::Status &status)
         {
             WriteChunkResponse response;
@@ -590,6 +968,27 @@ namespace storedemo
         ReadChunkResponse MakeGrpcReadFailureResponse(const grpc::Status &status)
         {
             ReadChunkResponse response;
+            response.status = MapGrpcStatusCode(status.error_code());
+            response.error_detail = status.error_message();
+            return response;
+        }
+
+        StorageNodeClientDeleteChunkResponse MakeGrpcDeleteFailureResponse(
+            const grpc::Status &status)
+        {
+            StorageNodeClientDeleteChunkResponse response;
+            response.status = MapGrpcStatusCode(status.error_code());
+            response.error_detail = status.error_message();
+            response.retryable =
+                response.status != StorageNodeStatusCode::kOk &&
+                IsRetriableStatus(response.status);
+            return response;
+        }
+
+        StorageNodeClientBatchDeleteChunksResponse MakeGrpcBatchDeleteFailureResponse(
+            const grpc::Status &status)
+        {
+            StorageNodeClientBatchDeleteChunksResponse response;
             response.status = MapGrpcStatusCode(status.error_code());
             response.error_detail = status.error_message();
             return response;
@@ -879,6 +1278,83 @@ namespace storedemo
         }
 
         return TranslateProtoReadResponse(request, proto_response);
+    }
+
+    StorageNodeClientDeleteChunkResponse StorageNodeClient::DeleteChunk(
+        const StorageNodeClientDeleteChunkRequest &request,
+        StorageNodeClientDeleteChunkOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientDeleteChunkResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail = "DeleteChunk client-side deadline expired";
+            response.retryable = true;
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::DeleteChunkRequest proto_request;
+        FillProtoDeleteRequest(request, options, &proto_request);
+
+        storage::DeleteChunkResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->DeleteChunk(&context, proto_request, &proto_response);
+
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcDeleteFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoDeleteResponse(request, proto_response);
+    }
+
+    StorageNodeClientDeleteChunkResponse StorageNodeClient::DeleteChunk(
+        const DeleteChunkRequest &request,
+        StorageNodeClientDeleteChunkOptions options)
+    {
+        return DeleteChunk(ToClientDeleteRequest(request), options);
+    }
+
+    StorageNodeClientBatchDeleteChunksResponse StorageNodeClient::BatchDeleteChunks(
+        const StorageNodeClientBatchDeleteChunksRequest &request,
+        StorageNodeClientDeleteChunkOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientBatchDeleteChunksResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail =
+                "BatchDeleteChunks client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::BatchDeleteChunksRequest proto_request;
+        FillProtoBatchDeleteRequest(request, options, &proto_request);
+
+        storage::BatchDeleteChunksResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->BatchDeleteChunks(&context, proto_request, &proto_response);
+
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcBatchDeleteFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoBatchDeleteResponse(request, proto_response);
     }
 
     const StorageNodeClientConfig &StorageNodeClient::config() const

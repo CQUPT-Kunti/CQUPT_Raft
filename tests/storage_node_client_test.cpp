@@ -61,6 +61,29 @@ namespace
             .source_path = fixture_path};
     }
 
+    FixtureBinaryPayload LoadDeleteFixtureBinaryPayload()
+    {
+        const std::filesystem::path fixture_path =
+            RepoRoot() / "tests" / "test_file" / "test_file.zip";
+        if (!std::filesystem::exists(fixture_path))
+        {
+            throw std::runtime_error("missing delete binary fixture: " +
+                                     fixture_path.string());
+        }
+
+        std::ifstream input(fixture_path, std::ios::binary);
+        if (!input.is_open())
+        {
+            throw std::runtime_error("failed to open delete binary fixture: " +
+                                     fixture_path.string());
+        }
+
+        return FixtureBinaryPayload{
+            .payload = std::string(std::istreambuf_iterator<char>(input),
+                                   std::istreambuf_iterator<char>()),
+            .source_path = fixture_path};
+    }
+
     storedemo::ChunkChecksum ComputeStoreChecksumOrThrow(const std::string_view payload)
     {
         storedemo::ChunkChecksum checksum;
@@ -120,6 +143,34 @@ namespace
             .chunk_id = chunk_id};
     }
 
+    storedemo::StorageNodeClientDeleteChunkRequest MakeDeleteRequest(
+        const storedemo::ChunkIdentity &identity,
+        const std::string &request_id)
+    {
+        storedemo::StorageNodeClientDeleteChunkRequest request;
+        request.request_id = request_id;
+        request.chunk_id = identity.chunk_id;
+        request.object_id = identity.object_id;
+        request.version = identity.version;
+        request.chunk_index = identity.chunk_index;
+        request.reason = "client delete test";
+        request.metadata_boundary = "metadata-first-boundary";
+        return request;
+    }
+
+    storedemo::StorageNodeClientBatchDeleteChunkRequest MakeBatchDeleteChunkRequest(
+        const storedemo::ChunkIdentity &identity)
+    {
+        storedemo::StorageNodeClientBatchDeleteChunkRequest request;
+        request.chunk_id = identity.chunk_id;
+        request.object_id = identity.object_id;
+        request.version = identity.version;
+        request.chunk_index = identity.chunk_index;
+        request.reason = "client batch delete test";
+        request.metadata_boundary = "metadata-first-boundary";
+        return request;
+    }
+
     raftdemo::MetadataCommand MakeCreateObjectCommandWithSize(
         const std::string &bucket,
         const std::string &object_key,
@@ -152,6 +203,40 @@ namespace
             "accepted",
             0,
             create_time,
+            std::nullopt};
+        return command;
+    }
+
+    raftdemo::MetadataCommand MakeCommitObjectCommandWithChunks(
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        const std::string &request_id,
+        const std::uint64_t size,
+        const std::string &etag,
+        std::vector<raftdemo::ChunkRef> chunks,
+        const std::uint64_t commit_time = 1712000002)
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kCommitObject;
+        command.request_id = request_id;
+        command.commit_object = raftdemo::CommitObjectCommandPayload{
+            bucket,
+            object_key,
+            object_id,
+            1,
+            size,
+            etag,
+            std::move(chunks),
+            commit_time};
+        command.request_context = raftdemo::RequestRecord{
+            request_id,
+            raftdemo::MetadataRequestType::kCommitObject,
+            bucket,
+            object_key,
+            "accepted",
+            0,
+            commit_time,
             std::nullopt};
         return command;
     }
@@ -345,6 +430,129 @@ namespace
         return response;
     }
 
+    storage::DeleteChunkResponse MakeProtoDeleteResponse(
+        const storedemo::StorageNodeStatusCode status,
+        const storedemo::ChunkIdentity &identity,
+        const std::string &node_id,
+        const storedemo::ChunkChecksum &checksum,
+        const std::uint64_t size,
+        const storedemo::ChunkState state,
+        const bool deleted,
+        const bool already_missing,
+        const bool already_deleted,
+        const bool retryable,
+        const std::string &message = {},
+        const std::uint64_t retry_after_ms = 0)
+    {
+        storage::DeleteChunkResponse response;
+
+        storage::StorageNodeStatusCode proto_status =
+            storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
+        switch (status)
+        {
+        case storedemo::StorageNodeStatusCode::kOk:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_OK;
+            break;
+        case storedemo::StorageNodeStatusCode::kChecksumMismatch:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
+            break;
+        case storedemo::StorageNodeStatusCode::kTimeout:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_TIMEOUT;
+            break;
+        case storedemo::StorageNodeStatusCode::kInvalidArgument:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
+            break;
+        case storedemo::StorageNodeStatusCode::kNotFound:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_NOT_FOUND;
+            break;
+        default:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_IO_ERROR;
+            break;
+        }
+
+        response.mutable_summary()->set_code(proto_status);
+        response.mutable_summary()->set_message(message);
+        response.mutable_summary()->set_request_id("proto-delete-request-id");
+        response.mutable_summary()->set_node_id(node_id);
+        response.mutable_summary()->set_chunk_id(identity.chunk_id);
+        response.mutable_summary()->set_retry_after_ms(retry_after_ms);
+        response.set_chunk_id(identity.chunk_id);
+        response.set_size(size);
+        FillProtoChecksum(checksum, response.mutable_checksum());
+
+        switch (state)
+        {
+        case storedemo::ChunkState::kStaging:
+            response.set_state(storage::STORAGE_CHUNK_STATE_STAGING);
+            break;
+        case storedemo::ChunkState::kLive:
+            response.set_state(storage::STORAGE_CHUNK_STATE_LIVE);
+            break;
+        case storedemo::ChunkState::kDeleting:
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETING);
+            break;
+        case storedemo::ChunkState::kDeleted:
+            response.set_state(storage::STORAGE_CHUNK_STATE_DELETED);
+            break;
+        case storedemo::ChunkState::kQuarantined:
+            response.set_state(storage::STORAGE_CHUNK_STATE_QUARANTINED);
+            break;
+        case storedemo::ChunkState::kCorrupted:
+            response.set_state(storage::STORAGE_CHUNK_STATE_CORRUPTED);
+            break;
+        case storedemo::ChunkState::kMissing:
+        default:
+            response.set_state(storage::STORAGE_CHUNK_STATE_MISSING);
+            break;
+        }
+
+        response.set_deleted(deleted);
+        response.set_already_missing(already_missing);
+        response.set_already_deleted(already_deleted);
+        response.set_retryable(retryable);
+        return response;
+    }
+
+    storage::BatchDeleteChunkResult MakeProtoBatchDeleteResult(
+        const storedemo::StorageNodeStatusCode status,
+        const storedemo::ChunkIdentity &identity,
+        const std::string &node_id,
+        const storedemo::ChunkChecksum &checksum,
+        const std::uint64_t size,
+        const storedemo::ChunkState state,
+        const bool deleted,
+        const bool already_missing,
+        const bool already_deleted,
+        const bool retryable,
+        const std::string &message = {},
+        const std::uint64_t retry_after_ms = 0)
+    {
+        const auto single_response = MakeProtoDeleteResponse(status,
+                                                             identity,
+                                                             node_id,
+                                                             checksum,
+                                                             size,
+                                                             state,
+                                                             deleted,
+                                                             already_missing,
+                                                             already_deleted,
+                                                             retryable,
+                                                             message,
+                                                             retry_after_ms);
+
+        storage::BatchDeleteChunkResult result;
+        *result.mutable_summary() = single_response.summary();
+        result.set_chunk_id(single_response.chunk_id());
+        result.set_size(single_response.size());
+        *result.mutable_checksum() = single_response.checksum();
+        result.set_state(single_response.state());
+        result.set_deleted(single_response.deleted());
+        result.set_already_missing(single_response.already_missing());
+        result.set_already_deleted(single_response.already_deleted());
+        result.set_retryable(single_response.retryable());
+        return result;
+    }
+
     class FakeStorageNodeStub final : public storage::StorageNodeService::StubInterface
     {
     public:
@@ -383,18 +591,38 @@ namespace
                                 "ReadChunk is not implemented in this fake stub");
         }
 
-        grpc::Status DeleteChunk(grpc::ClientContext *,
-                                 const storage::DeleteChunkRequest &,
-                                 storage::DeleteChunkResponse *) override
+        grpc::Status DeleteChunk(grpc::ClientContext *context,
+                                 const storage::DeleteChunkRequest &request,
+                                 storage::DeleteChunkResponse *response) override
         {
+            ++delete_calls;
+            last_delete_request = request;
+            delete_call_observed_at = std::chrono::system_clock::now();
+            delete_observed_deadline = context->deadline();
+
+            if (delete_handler)
+            {
+                return delete_handler(context, request, response);
+            }
+
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
                                 "DeleteChunk is not implemented in this fake stub");
         }
 
-        grpc::Status BatchDeleteChunks(grpc::ClientContext *,
-                                       const storage::BatchDeleteChunksRequest &,
-                                       storage::BatchDeleteChunksResponse *) override
+        grpc::Status BatchDeleteChunks(grpc::ClientContext *context,
+                                       const storage::BatchDeleteChunksRequest &request,
+                                       storage::BatchDeleteChunksResponse *response) override
         {
+            ++batch_delete_calls;
+            last_batch_delete_request = request;
+            batch_delete_call_observed_at = std::chrono::system_clock::now();
+            batch_delete_observed_deadline = context->deadline();
+
+            if (batch_delete_handler)
+            {
+                return batch_delete_handler(context, request, response);
+            }
+
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
                                 "BatchDeleteChunks is not implemented in this fake stub");
         }
@@ -407,14 +635,30 @@ namespace
                                    const storage::ReadChunkRequest &,
                                    storage::ReadChunkResponse *)>
             read_handler;
+        std::function<grpc::Status(grpc::ClientContext *,
+                                   const storage::DeleteChunkRequest &,
+                                   storage::DeleteChunkResponse *)>
+            delete_handler;
+        std::function<grpc::Status(grpc::ClientContext *,
+                                   const storage::BatchDeleteChunksRequest &,
+                                   storage::BatchDeleteChunksResponse *)>
+            batch_delete_handler;
         storage::WriteChunkRequest last_request;
         storage::ReadChunkRequest last_read_request;
+        storage::DeleteChunkRequest last_delete_request;
+        storage::BatchDeleteChunksRequest last_batch_delete_request;
         std::size_t write_calls{0};
         std::size_t read_calls{0};
+        std::size_t delete_calls{0};
+        std::size_t batch_delete_calls{0};
         std::chrono::system_clock::time_point call_observed_at{};
         std::chrono::system_clock::time_point observed_deadline{};
         std::chrono::system_clock::time_point read_call_observed_at{};
         std::chrono::system_clock::time_point read_observed_deadline{};
+        std::chrono::system_clock::time_point delete_call_observed_at{};
+        std::chrono::system_clock::time_point delete_observed_deadline{};
+        std::chrono::system_clock::time_point batch_delete_call_observed_at{};
+        std::chrono::system_clock::time_point batch_delete_observed_deadline{};
 
     private:
         grpc::ClientAsyncResponseReaderInterface<storage::WriteChunkResponse> *
@@ -1400,5 +1644,519 @@ namespace
             {.bucket = "bucket-t044-read", .object_key = "objects/test_file.deb"});
         EXPECT_EQ(head.result.code, raftdemo::MetadataStatusCode::kNotFound);
         EXPECT_FALSE(head.record.has_value());
+    }
+
+    TEST_F(StorageNodeClientTest, DeleteChunkMapsRequestFieldsAndSuccessResponse)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t053-success", 9, 2, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(180, "t053-success");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        stub_ptr->delete_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::DeleteChunkRequest &,
+                                 storage::DeleteChunkResponse *response)
+        {
+            *response = MakeProtoDeleteResponse(storedemo::StorageNodeStatusCode::kOk,
+                                                identity,
+                                                "client-node-t053",
+                                                checksum,
+                                                checksum.size_bytes,
+                                                storedemo::ChunkState::kDeleted,
+                                                true,
+                                                false,
+                                                false,
+                                                false);
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+
+        auto request = MakeDeleteRequest(identity, "delete-success-t053");
+        request.expected_checksum = checksum;
+        const auto response = client.DeleteChunk(
+            request,
+            {.context = {.timeout_ms = 1200, .best_effort_cancel = true}});
+
+        ASSERT_EQ(stub_ptr->delete_calls, 1U);
+        EXPECT_EQ(stub_ptr->last_delete_request.request_id(), "delete-success-t053");
+        EXPECT_EQ(stub_ptr->last_delete_request.chunk_id(), identity.chunk_id);
+        EXPECT_EQ(stub_ptr->last_delete_request.object_id(), identity.object_id);
+        EXPECT_EQ(stub_ptr->last_delete_request.version(), identity.version);
+        EXPECT_EQ(stub_ptr->last_delete_request.chunk_index(), identity.chunk_index);
+        EXPECT_EQ(stub_ptr->last_delete_request.expected_checksum().value(),
+                  checksum.value);
+        EXPECT_EQ(stub_ptr->last_delete_request.reason(), "client delete test");
+        EXPECT_EQ(stub_ptr->last_delete_request.metadata_boundary(),
+                  "metadata-first-boundary");
+        EXPECT_EQ(stub_ptr->last_delete_request.timeout_ms(), 1200U);
+        EXPECT_TRUE(stub_ptr->last_delete_request.best_effort_cancel());
+
+        const auto deadline_delta =
+            stub_ptr->delete_observed_deadline - stub_ptr->delete_call_observed_at;
+        EXPECT_GT(deadline_delta, 0ms);
+        EXPECT_LE(deadline_delta, 1500ms);
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(response.deleted);
+        EXPECT_FALSE(response.already_missing);
+        EXPECT_FALSE(response.already_deleted);
+        EXPECT_FALSE(response.retryable);
+        EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(response.metadata.identity.object_id, identity.object_id);
+        EXPECT_EQ(response.metadata.identity.version, identity.version);
+        EXPECT_EQ(response.metadata.identity.chunk_index, identity.chunk_index);
+        EXPECT_EQ(response.metadata.node_id, "client-node-t053");
+        EXPECT_EQ(response.metadata.size, checksum.size_bytes);
+        EXPECT_EQ(response.metadata.checksum.value, checksum.value);
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kDeleted);
+    }
+
+    TEST_F(StorageNodeClientTest, DeleteChunkMapsMissingAndDeletedIdempotentResponses)
+    {
+        const auto missing_identity = MakeStoreIdentityOrThrow("obj-t053-missing", 1, 0, 0);
+        const auto deleted_identity = MakeStoreIdentityOrThrow("obj-t053-deleted", 1, 0, 0);
+        const auto checksum =
+            ComputeStoreChecksumOrThrow(storedemo::test::MakeChunkPayload(96, "t053-delete"));
+
+        {
+            auto *stub_ptr = new FakeStorageNodeStub();
+            stub_ptr->delete_handler =
+                [missing_identity](grpc::ClientContext *,
+                                   const storage::DeleteChunkRequest &,
+                                   storage::DeleteChunkResponse *response)
+            {
+                *response = MakeProtoDeleteResponse(
+                    storedemo::StorageNodeStatusCode::kOk,
+                    missing_identity,
+                    "client-node-t053",
+                    {},
+                    0,
+                    storedemo::ChunkState::kMissing,
+                    false,
+                    true,
+                    false,
+                    false,
+                    "already missing");
+                return grpc::Status::OK;
+            };
+
+            storedemo::StorageNodeClient client{
+                std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+            const auto response =
+                client.DeleteChunk(MakeDeleteRequest(missing_identity, "delete-missing-t053"));
+
+            EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+            EXPECT_FALSE(response.deleted);
+            EXPECT_TRUE(response.already_missing);
+            EXPECT_FALSE(response.already_deleted);
+            EXPECT_FALSE(response.retryable);
+            EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kMissing);
+        }
+
+        {
+            auto *stub_ptr = new FakeStorageNodeStub();
+            stub_ptr->delete_handler =
+                [deleted_identity, checksum](grpc::ClientContext *,
+                                             const storage::DeleteChunkRequest &,
+                                             storage::DeleteChunkResponse *response)
+            {
+                *response = MakeProtoDeleteResponse(
+                    storedemo::StorageNodeStatusCode::kOk,
+                    deleted_identity,
+                    "client-node-t053",
+                    checksum,
+                    checksum.size_bytes,
+                    storedemo::ChunkState::kDeleted,
+                    false,
+                    true,
+                    false,
+                    false,
+                    "already deleted");
+                return grpc::Status::OK;
+            };
+
+            storedemo::StorageNodeClient client{
+                std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+            auto request = MakeDeleteRequest(deleted_identity, "delete-deleted-t053");
+            request.expected_checksum = checksum;
+            const auto response = client.DeleteChunk(request);
+
+            EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+            EXPECT_FALSE(response.deleted);
+            EXPECT_TRUE(response.already_missing);
+            EXPECT_TRUE(response.already_deleted);
+            EXPECT_FALSE(response.retryable);
+            EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kDeleted);
+        }
+    }
+
+    TEST_F(StorageNodeClientTest, DeleteChunkMapsGrpcFailureStatuses)
+    {
+        struct Case
+        {
+            grpc::StatusCode grpc_code;
+            storedemo::StorageNodeStatusCode expected_status;
+            bool expected_retryable;
+        };
+
+        const std::vector<Case> cases{
+            {grpc::StatusCode::DEADLINE_EXCEEDED,
+             storedemo::StorageNodeStatusCode::kTimeout,
+             true},
+            {grpc::StatusCode::CANCELLED,
+             storedemo::StorageNodeStatusCode::kCancelled,
+             false},
+            {grpc::StatusCode::UNAVAILABLE,
+             storedemo::StorageNodeStatusCode::kNodeUnavailable,
+             true},
+            {grpc::StatusCode::INVALID_ARGUMENT,
+             storedemo::StorageNodeStatusCode::kInvalidArgument,
+             false},
+            {grpc::StatusCode::INTERNAL,
+             storedemo::StorageNodeStatusCode::kIoError,
+             true}};
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t053-grpc", 1, 0, 0);
+        for (const auto &test_case : cases)
+        {
+            auto *stub_ptr = new FakeStorageNodeStub();
+            stub_ptr->delete_handler =
+                [test_case](grpc::ClientContext *,
+                            const storage::DeleteChunkRequest &,
+                            storage::DeleteChunkResponse *)
+            {
+                return grpc::Status(test_case.grpc_code, "delete grpc failure");
+            };
+
+            storedemo::StorageNodeClient client{
+                std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+            const auto response =
+                client.DeleteChunk(MakeDeleteRequest(identity, "delete-grpc-t053"));
+
+            EXPECT_EQ(response.status, test_case.expected_status);
+            EXPECT_EQ(response.error_detail, "delete grpc failure");
+            EXPECT_EQ(response.retryable, test_case.expected_retryable);
+        }
+    }
+
+    TEST_F(StorageNodeClientTest, DeleteChunkChecksumMismatchDoesNotRemoveLiveChunk)
+    {
+        const auto fixture = LoadDeleteFixtureBinaryPayload();
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.zip");
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_client_delete_checksum");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 53));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t053-checksum", 1, 0, 0);
+        const auto checksum = ComputeStoreChecksumOrThrow(fixture.payload);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-delete-checksum-t053",
+                          .identity = identity,
+                          .expected_size =
+                              static_cast<std::uint64_t>(fixture.payload.size()),
+                          .expected_checksum = checksum,
+                          .payload = fixture.payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        storedemo::StorageNodeClient client{server.channel()};
+        auto request = MakeDeleteRequest(identity, "delete-checksum-t053");
+        request.expected_checksum =
+            ComputeStoreChecksumOrThrow("different-delete-payload");
+        const auto response = client.DeleteChunk(
+            request,
+            {.context = {.timeout_ms = 1500, .best_effort_cancel = true}});
+
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        EXPECT_FALSE(response.deleted);
+        EXPECT_FALSE(response.already_missing);
+        EXPECT_FALSE(response.already_deleted);
+        EXPECT_FALSE(response.retryable);
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kLive);
+
+        const auto read_response = store->ReadChunk(
+            MakeReadRequest(identity.chunk_id, "read-delete-checksum-t053"));
+        ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk)
+            << read_response.error_detail;
+        EXPECT_EQ(read_response.payload, fixture.payload);
+    }
+
+    TEST_F(StorageNodeClientTest,
+           DeleteChunkUsesZipFixtureThroughRealServiceAndKeepsMetadataVisibility)
+    {
+        const auto fixture = LoadDeleteFixtureBinaryPayload();
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.zip");
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t053-delete",
+                            "create-bucket-t053-delete"))
+                        .Ok);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t053-delete", 1, 0, 0);
+        const auto checksum = ComputeStoreChecksumOrThrow(fixture.payload);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        MakeCreateObjectCommandWithSize("bucket-t053-delete",
+                                                        "objects/test_file.zip",
+                                                        identity.object_id,
+                                                        "create-object-t053-delete",
+                                                        fixture.payload.size(),
+                                                        "etag-t053-delete"))
+                        .Ok);
+
+        std::vector<raftdemo::ChunkRef> chunks{
+            raftdemo::ChunkRef{.chunk_id = identity.chunk_id,
+                               .offset = identity.offset,
+                               .size = static_cast<std::uint64_t>(fixture.payload.size()),
+                               .replica_nodes = {storedemo::test::MakeStorageNodeIdFixture(54)},
+                               .checksum = checksum.value}};
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        MakeCommitObjectCommandWithChunks("bucket-t053-delete",
+                                                          "objects/test_file.zip",
+                                                          identity.object_id,
+                                                          "commit-object-t053-delete",
+                                                          fixture.payload.size(),
+                                                          "etag-t053-delete",
+                                                          std::move(chunks)))
+                        .Ok);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_client_delete_live");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 54));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-delete-live-t053",
+                          .identity = identity,
+                          .expected_size =
+                              static_cast<std::uint64_t>(fixture.payload.size()),
+                          .expected_checksum = checksum,
+                          .payload = fixture.payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        storedemo::StorageNodeClient client{server.channel()};
+        auto request = MakeDeleteRequest(identity, "delete-live-t053");
+        request.expected_checksum = checksum;
+        const auto response = client.DeleteChunk(
+            request,
+            {.context = {.timeout_ms = 1500, .best_effort_cancel = true}});
+
+        ASSERT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk)
+            << response.error_detail;
+        EXPECT_TRUE(response.deleted);
+        EXPECT_FALSE(response.already_missing);
+        EXPECT_FALSE(response.already_deleted);
+        EXPECT_FALSE(response.retryable);
+        EXPECT_EQ(response.metadata.node_id, store->config().node_id);
+        EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kDeleted);
+
+        const auto read_after_delete =
+            store->ReadChunk(MakeReadRequest(identity.chunk_id, "read-delete-live-t053"));
+        EXPECT_NE(read_after_delete.status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto head = machine.HeadObject(
+            {.bucket = "bucket-t053-delete", .object_key = "objects/test_file.zip"});
+        ASSERT_EQ(head.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_TRUE(head.record.has_value());
+        EXPECT_TRUE(head.record->IsCommitted());
+
+        const auto listed = machine.ListObjects(
+            {.bucket = "bucket-t053-delete", .prefix = "objects/"});
+        ASSERT_EQ(listed.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_EQ(listed.records.size(), 1U);
+        EXPECT_EQ(listed.records.front().object_key, "objects/test_file.zip");
+    }
+
+    TEST_F(StorageNodeClientTest, BatchDeleteChunksMapsIndependentResultsAndAggregateFacts)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto success_identity = MakeStoreIdentityOrThrow("obj-t053-batch-success", 1, 0, 0);
+        const auto missing_identity = MakeStoreIdentityOrThrow("obj-t053-batch-missing", 1, 0, 0);
+        const auto deleted_identity = MakeStoreIdentityOrThrow("obj-t053-batch-deleted", 1, 0, 0);
+        const auto retry_identity = MakeStoreIdentityOrThrow("obj-t053-batch-retry", 1, 0, 0);
+        const auto nonretry_identity = MakeStoreIdentityOrThrow("obj-t053-batch-nonretry", 1, 0, 0);
+        const auto checksum =
+            ComputeStoreChecksumOrThrow(storedemo::test::MakeChunkPayload(128, "t053-batch"));
+
+        stub_ptr->batch_delete_handler =
+            [success_identity,
+             missing_identity,
+             deleted_identity,
+             retry_identity,
+             nonretry_identity,
+             checksum](grpc::ClientContext *,
+                       const storage::BatchDeleteChunksRequest &,
+                       storage::BatchDeleteChunksResponse *response)
+        {
+            response->mutable_summary()->set_code(storage::STORAGE_NODE_STATUS_CODE_OK);
+            response->mutable_summary()->set_message(
+                "BatchDeleteChunks completed with partial failures");
+            response->mutable_summary()->set_request_id("batch-delete-t053");
+            response->mutable_summary()->set_node_id("client-node-t053");
+            response->mutable_summary()->set_retry_after_ms(25);
+            response->set_success_count(1);
+            response->set_idempotent_count(2);
+            response->set_retryable_failure_count(1);
+            response->set_non_retryable_failure_count(1);
+            response->set_partial_failure(true);
+            *response->add_results() = MakeProtoBatchDeleteResult(
+                storedemo::StorageNodeStatusCode::kOk,
+                success_identity,
+                "client-node-t053",
+                checksum,
+                checksum.size_bytes,
+                storedemo::ChunkState::kDeleted,
+                true,
+                false,
+                false,
+                false);
+            *response->add_results() = MakeProtoBatchDeleteResult(
+                storedemo::StorageNodeStatusCode::kOk,
+                missing_identity,
+                "client-node-t053",
+                {},
+                0,
+                storedemo::ChunkState::kMissing,
+                false,
+                true,
+                false,
+                false);
+            *response->add_results() = MakeProtoBatchDeleteResult(
+                storedemo::StorageNodeStatusCode::kOk,
+                deleted_identity,
+                "client-node-t053",
+                checksum,
+                checksum.size_bytes,
+                storedemo::ChunkState::kDeleted,
+                false,
+                true,
+                false,
+                false);
+            *response->add_results() = MakeProtoBatchDeleteResult(
+                storedemo::StorageNodeStatusCode::kTimeout,
+                retry_identity,
+                "client-node-t053",
+                checksum,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                false,
+                false,
+                false,
+                true,
+                "retry later",
+                25);
+            *response->add_results() = MakeProtoBatchDeleteResult(
+                storedemo::StorageNodeStatusCode::kInvalidArgument,
+                nonretry_identity,
+                "client-node-t053",
+                checksum,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                false,
+                false,
+                false,
+                false,
+                "non-retryable invalid");
+            return grpc::Status::OK;
+        };
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+
+        storedemo::StorageNodeClientBatchDeleteChunksRequest request;
+        request.request_id = "batch-delete-t053";
+        request.chunks = {MakeBatchDeleteChunkRequest(success_identity),
+                          MakeBatchDeleteChunkRequest(missing_identity),
+                          MakeBatchDeleteChunkRequest(deleted_identity),
+                          MakeBatchDeleteChunkRequest(retry_identity),
+                          MakeBatchDeleteChunkRequest(nonretry_identity)};
+        for (auto &item : request.chunks)
+        {
+            item.expected_checksum = checksum;
+        }
+        request.chunks[1].expected_checksum = {};
+
+        const auto response = client.BatchDeleteChunks(
+            request,
+            {.context = {.timeout_ms = 2400, .best_effort_cancel = true}});
+
+        ASSERT_EQ(stub_ptr->batch_delete_calls, 1U);
+        EXPECT_EQ(stub_ptr->last_batch_delete_request.request_id(), "batch-delete-t053");
+        EXPECT_EQ(stub_ptr->last_batch_delete_request.timeout_ms(), 2400U);
+        EXPECT_TRUE(stub_ptr->last_batch_delete_request.best_effort_cancel());
+        ASSERT_EQ(stub_ptr->last_batch_delete_request.chunks_size(), 5);
+        EXPECT_EQ(stub_ptr->last_batch_delete_request.chunks(0).chunk_id(),
+                  success_identity.chunk_id);
+        EXPECT_EQ(stub_ptr->last_batch_delete_request.chunks(0).object_id(),
+                  success_identity.object_id);
+        EXPECT_EQ(stub_ptr->last_batch_delete_request.chunks(3).expected_checksum().value(),
+                  checksum.value);
+
+        const auto deadline_delta = stub_ptr->batch_delete_observed_deadline -
+                                    stub_ptr->batch_delete_call_observed_at;
+        EXPECT_GT(deadline_delta, 0ms);
+        EXPECT_LE(deadline_delta, 2700ms);
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(response.error_detail,
+                  "BatchDeleteChunks completed with partial failures");
+        EXPECT_EQ(response.retry_after_ms, 25U);
+        EXPECT_EQ(response.success_count, 1U);
+        EXPECT_EQ(response.idempotent_count, 2U);
+        EXPECT_EQ(response.retryable_failure_count, 1U);
+        EXPECT_EQ(response.non_retryable_failure_count, 1U);
+        EXPECT_TRUE(response.partial_failure);
+        ASSERT_EQ(response.results.size(), 5U);
+
+        EXPECT_EQ(response.results[0].status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(response.results[0].deleted);
+        EXPECT_FALSE(response.results[0].already_missing);
+        EXPECT_FALSE(response.results[0].retryable);
+
+        EXPECT_EQ(response.results[1].status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(response.results[1].already_missing);
+        EXPECT_FALSE(response.results[1].already_deleted);
+        EXPECT_EQ(response.results[1].metadata.state, storedemo::ChunkState::kMissing);
+
+        EXPECT_EQ(response.results[2].status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(response.results[2].already_missing);
+        EXPECT_TRUE(response.results[2].already_deleted);
+        EXPECT_EQ(response.results[2].metadata.state, storedemo::ChunkState::kDeleted);
+
+        EXPECT_EQ(response.results[3].status, storedemo::StorageNodeStatusCode::kTimeout);
+        EXPECT_TRUE(response.results[3].retryable);
+        EXPECT_EQ(response.results[3].retry_after_ms, 25U);
+
+        EXPECT_EQ(response.results[4].status,
+                  storedemo::StorageNodeStatusCode::kInvalidArgument);
+        EXPECT_FALSE(response.results[4].retryable);
     }
 } // namespace
