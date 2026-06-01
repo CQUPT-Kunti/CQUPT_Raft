@@ -12,6 +12,7 @@
   - `node/`：StorageNode data-plane 的 gRPC service / client 适配层
   - `placement/`：副本策略和副本候选节点选择
   - `upload/`：上传协调层和 upload helper
+  - `maintenance/`：GC / scrub / repair / rebalance 等后台维护任务基础设施
 
 ## 阅读顺序
 
@@ -36,3 +37,4 @@
 - `node/` 只负责 RPC 适配，不负责 metadata commit、upload coordinator 或 Raft control-plane。
 - `placement/` 只负责候选节点选择和副本策略计算，不负责真正发起写入或提交 metadata。
 - `upload/` 只负责 upload 顺序协调，不负责 metadata 底层实现、StorageNode RPC server 或后台 GC。
+- `maintenance/` 只负责后台任务模型、队列、重试和调度边界，不直接决定 metadata safety 或 object 可见性。
