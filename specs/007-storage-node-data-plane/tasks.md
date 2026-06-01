@@ -139,7 +139,7 @@
 - [x] T055 [US3] 实现 metadata-driven GC safety check；允许修改：`modules/store/maintenance/garbage_collector.cpp`、`tests/storage_delete_gc_test.cpp`；验收：任何 committed live manifest 引用的 chunk 不会被 GC 删除；依赖：T054
 - [x] T056 [US3] 覆盖 pending timeout、failed upload cleanup、AbortObject cleanup 的 GC candidate 生成；允许修改：`modules/store/maintenance/garbage_collector.h`、`modules/store/maintenance/garbage_collector.cpp`、`modules/store/maintenance/module-notes.md`、`tests/storage_garbage_collector_test.cpp`、`tests/storage_delete_gc_test.cpp`、`tests/storage_upload_coordinator_test.cpp`；验收：未 committed 的 durable orphan 可清理，已 committed live chunk 受保护；依赖：T055
 - [x] T057 [US3] 覆盖 StorageNode 删除过程中重启后的继续清理；允许修改：`modules/store/maintenance/garbage_collector.h`、`modules/store/maintenance/garbage_collector.cpp`、`modules/store/maintenance/gc_task_store.h`、`modules/store/maintenance/gc_task_store.cpp`、`modules/store/maintenance/module-notes.md`、`modules/store/maintenance/AGENTS.md`、`tests/storage_garbage_collector_test.cpp`、`CMakeLists.txt`；验收：重复 delete、missing、deleting 状态均幂等；依赖：T056
-- [ ] T058 [US3] 运行 US3 低并发验证命令；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ctest -R "storage_delete_gc|storage_node_service" --output-on-failure`；验收：PASS；依赖：T049-T057
+- [x] T058 [US3] 运行 US3 低并发验证命令；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ctest -R "storage_delete_gc|storage_node_service" --output-on-failure`；验收：PASS；依赖：T049-T057
 
 ## Phase 6: User Story 4 - 查看 StorageNode 容量、健康和负载 (Priority: P4)
 
