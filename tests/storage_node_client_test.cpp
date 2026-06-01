@@ -627,6 +627,49 @@ namespace
                                 "BatchDeleteChunks is not implemented in this fake stub");
         }
 
+        grpc::Status RegisterStorageNode(
+            grpc::ClientContext *,
+            const storage::RegisterStorageNodeRequest &,
+            storage::RegisterStorageNodeResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "RegisterStorageNode is not implemented in this fake stub");
+        }
+
+        grpc::Status UpdateStorageNodeHeartbeat(
+            grpc::ClientContext *,
+            const storage::UpdateStorageNodeHeartbeatRequest &,
+            storage::StorageNodeFactUpdateResponse *) override
+        {
+            return grpc::Status(
+                grpc::StatusCode::UNIMPLEMENTED,
+                "UpdateStorageNodeHeartbeat is not implemented in this fake stub");
+        }
+
+        grpc::Status ReportHealth(grpc::ClientContext *,
+                                  const storage::ReportHealthRequest &,
+                                  storage::StorageNodeFactUpdateResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "ReportHealth is not implemented in this fake stub");
+        }
+
+        grpc::Status ReportCapacity(grpc::ClientContext *,
+                                    const storage::ReportCapacityRequest &,
+                                    storage::StorageNodeFactUpdateResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "ReportCapacity is not implemented in this fake stub");
+        }
+
+        grpc::Status ReportLoad(grpc::ClientContext *,
+                                const storage::ReportLoadRequest &,
+                                storage::StorageNodeFactUpdateResponse *) override
+        {
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "ReportLoad is not implemented in this fake stub");
+        }
+
         std::function<grpc::Status(grpc::ClientContext *,
                                    const storage::WriteChunkRequest &,
                                    storage::WriteChunkResponse *)>
@@ -721,6 +764,89 @@ namespace
         PrepareAsyncBatchDeleteChunksRaw(grpc::ClientContext *,
                                          const storage::BatchDeleteChunksRequest &,
                                          grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::RegisterStorageNodeResponse> *
+        AsyncRegisterStorageNodeRaw(grpc::ClientContext *,
+                                    const storage::RegisterStorageNodeRequest &,
+                                    grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::RegisterStorageNodeResponse> *
+        PrepareAsyncRegisterStorageNodeRaw(
+            grpc::ClientContext *,
+            const storage::RegisterStorageNodeRequest &,
+            grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        AsyncUpdateStorageNodeHeartbeatRaw(
+            grpc::ClientContext *,
+            const storage::UpdateStorageNodeHeartbeatRequest &,
+            grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        PrepareAsyncUpdateStorageNodeHeartbeatRaw(
+            grpc::ClientContext *,
+            const storage::UpdateStorageNodeHeartbeatRequest &,
+            grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        AsyncReportHealthRaw(grpc::ClientContext *,
+                             const storage::ReportHealthRequest &,
+                             grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        PrepareAsyncReportHealthRaw(grpc::ClientContext *,
+                                    const storage::ReportHealthRequest &,
+                                    grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        AsyncReportCapacityRaw(grpc::ClientContext *,
+                               const storage::ReportCapacityRequest &,
+                               grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        PrepareAsyncReportCapacityRaw(grpc::ClientContext *,
+                                      const storage::ReportCapacityRequest &,
+                                      grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        AsyncReportLoadRaw(grpc::ClientContext *,
+                           const storage::ReportLoadRequest &,
+                           grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::StorageNodeFactUpdateResponse> *
+        PrepareAsyncReportLoadRaw(grpc::ClientContext *,
+                                  const storage::ReportLoadRequest &,
+                                  grpc::CompletionQueue *) override
         {
             return nullptr;
         }

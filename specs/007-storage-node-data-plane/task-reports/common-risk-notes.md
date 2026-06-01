@@ -91,11 +91,16 @@
   建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
 
 - 任务编号：T059
-  问题：T059 已用 `storage_heartbeat_registry_test` 固定 test-only heartbeat / registry contract，包括注册幂等、endpoint conflict、heartbeat sequence 去重、stale heartbeat 忽略和基于 `last_seen + timeout` 的 liveness；但当前仍没有生产 `StorageNodeRegistry`、proto、service、client 或 Placement/read-side 的真实接线，clock source 与 sequence 新鲜度也仍依赖后续生产实现统一收口。
-  影响：如果把当前 test-only adapter 的通过当成真实 registry 已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在生产路径里的完备性。
-  建议后续在哪类任务处理：在 T061-T066 中继续把 proto/schema、生产 registry、service/client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
+  问题：T059 已用 `storage_heartbeat_registry_test` 固定 test-only heartbeat / registry contract，包括注册幂等、endpoint conflict、heartbeat sequence 去重、stale heartbeat 忽略和基于 `last_seen + timeout` 的 liveness；T061 已补齐 proto/schema，但当前仍没有生产 `StorageNodeRegistry`、service、client 或 Placement/read-side 的真实接线，clock source 与 sequence 新鲜度也仍依赖后续生产实现统一收口。
+  影响：如果把当前 test-only adapter 和 schema 的通过当成真实 registry 已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在生产路径里的完备性。
+  建议后续在哪类任务处理：在 T062-T066 中继续把生产 registry、service/client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
 
 - 任务编号：T060
   问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中用 test-only registry facts 固定 health-aware placement contract，包括 stale heartbeat 事实降级、unhealthy/readonly/draining/overloaded/high-disk-pressure/insufficient-capacity 排除、healthy 低负载节点优先和 duplicate node_id 去重；但当前仍没有生产 registry -> PlacementManager 的真实接线，也还没有最终的 overload/disk-pressure/hotspot 生产打分来源。
   影响：如果把当前 contract 测试的通过当成真实 placement eligibility 已完成，后续可能高估 registry facts 在生产路径中的新鲜度、一致性和最终排序来源。
   建议后续在哪类任务处理：在 T062/T065 中继续把生产 registry、liveness clock、capacity/load/disk-pressure facts 和 manager 接线收口，并保持 T060 固定下来的稳定选择与排除语义。
+
+- 任务编号：T061
+  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema，并同步了 `storage_node_client_test` 的 fake stub；但当前 schema 只固定了字段表达和 codegen 边界，尚未固定生产 registry 如何合并“全量 heartbeat”和“局部 report”更新、如何推导最终 liveness，以及如何把 overload/failure-domain 事实接入 placement/read selection。
+  影响：如果把当前 proto/schema 通过当成完整生产语义已收口，后续可能在 T062-T066 暴露 partial update merge、sequence 单调性、response snapshot 新鲜度或 fake stub 跟随新 RPC 演进的兼容风险。
+  建议后续在哪类任务处理：在 T062/T063/T064/T065/T066 中继续收紧 report merge 规则、liveness 推导、service/client 接线和 placement/read-side 消费语义，并保持 fake stub 与生成接口同步。

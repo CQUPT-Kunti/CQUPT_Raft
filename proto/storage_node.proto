@@ -42,6 +42,31 @@ enum WriteChunkDurability {
   WRITE_CHUNK_DURABILITY_PUBLISH = 1;
 }
 
+enum StorageNodeHealth {
+  STORAGE_NODE_HEALTH_UNSPECIFIED = 0;
+  STORAGE_NODE_HEALTH_HEALTHY = 1;
+  STORAGE_NODE_HEALTH_DEGRADED = 2;
+  STORAGE_NODE_HEALTH_READ_ONLY = 3;
+  STORAGE_NODE_HEALTH_UNAVAILABLE = 4;
+  STORAGE_NODE_HEALTH_DRAINING = 5;
+}
+
+enum StorageNodeDiskPressure {
+  STORAGE_NODE_DISK_PRESSURE_UNSPECIFIED = 0;
+  STORAGE_NODE_DISK_PRESSURE_LOW = 1;
+  STORAGE_NODE_DISK_PRESSURE_MEDIUM = 2;
+  STORAGE_NODE_DISK_PRESSURE_HIGH = 3;
+  STORAGE_NODE_DISK_PRESSURE_FULL = 4;
+}
+
+enum StorageNodeLivenessState {
+  STORAGE_NODE_LIVENESS_STATE_UNSPECIFIED = 0;
+  STORAGE_NODE_LIVENESS_STATE_LIVE = 1;
+  STORAGE_NODE_LIVENESS_STATE_STALE = 2;
+  STORAGE_NODE_LIVENESS_STATE_SUSPECT = 3;
+  STORAGE_NODE_LIVENESS_STATE_DEAD = 4;
+}
+
 message StorageChunkChecksum {
   StorageChecksumAlgorithm algorithm = 1;
   string value = 2;
@@ -56,6 +81,112 @@ message StorageNodeResponseSummary {
   string node_id = 4;
   string chunk_id = 5;
   uint64 retry_after_ms = 6;
+}
+
+message StorageNodeFailureDomain {
+  string zone = 1;
+  string rack = 2;
+}
+
+message StorageNodeCapacityReport {
+  uint64 total_capacity_bytes = 1;
+  uint64 used_capacity_bytes = 2;
+  uint64 available_capacity_bytes = 3;
+  uint64 chunk_count = 4;
+}
+
+message StorageNodeHealthReport {
+  StorageNodeHealth health = 1;
+  StorageNodeDiskPressure disk_pressure = 2;
+  uint64 io_error_count = 3;
+}
+
+message StorageNodeLoadReport {
+  uint32 active_reads = 1;
+  uint32 active_writes = 2;
+  uint32 queued_ops = 3;
+  bool write_admission_overloaded = 4;
+  bool read_admission_overloaded = 5;
+}
+
+message StorageNodeFacts {
+  StorageNodeCapacityReport capacity = 1;
+  StorageNodeHealthReport health = 2;
+  StorageNodeLoadReport load = 3;
+  StorageNodeFailureDomain failure_domain = 4;
+}
+
+message StorageNodeHeartbeat {
+  string node_id = 1;
+  string endpoint = 2;
+  uint64 sequence = 3;
+  uint64 observed_at_unix_ms = 4;
+  StorageNodeFacts facts = 5;
+}
+
+message StorageNodeRegistrySnapshot {
+  string node_id = 1;
+  string endpoint = 2;
+  uint64 last_sequence = 3;
+  uint64 last_seen_unix_ms = 4;
+  StorageNodeLivenessState liveness = 5;
+  StorageNodeFacts facts = 6;
+}
+
+message RegisterStorageNodeRequest {
+  string request_id = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  uint64 observed_at_unix_ms = 4;
+  StorageNodeFacts facts = 5;
+}
+
+message RegisterStorageNodeResponse {
+  StorageNodeResponseSummary summary = 1;
+  bool created = 2;
+  bool idempotent = 3;
+  StorageNodeRegistrySnapshot snapshot = 4;
+}
+
+message UpdateStorageNodeHeartbeatRequest {
+  string request_id = 1;
+  StorageNodeHeartbeat heartbeat = 2;
+}
+
+message StorageNodeFactUpdateResponse {
+  StorageNodeResponseSummary summary = 1;
+  uint64 accepted_sequence = 2;
+  bool applied = 3;
+  bool idempotent = 4;
+  bool stale_ignored = 5;
+  StorageNodeRegistrySnapshot snapshot = 6;
+}
+
+message ReportHealthRequest {
+  string request_id = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  uint64 sequence = 4;
+  uint64 observed_at_unix_ms = 5;
+  StorageNodeHealthReport health = 6;
+}
+
+message ReportCapacityRequest {
+  string request_id = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  uint64 sequence = 4;
+  uint64 observed_at_unix_ms = 5;
+  StorageNodeCapacityReport capacity = 6;
+}
+
+message ReportLoadRequest {
+  string request_id = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  uint64 sequence = 4;
+  uint64 observed_at_unix_ms = 5;
+  StorageNodeLoadReport load = 6;
 }
 
 message WriteChunkRequest {
@@ -177,4 +308,9 @@ service StorageNodeService {
   rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
   rpc BatchDeleteChunks(BatchDeleteChunksRequest) returns (BatchDeleteChunksResponse);
+  rpc RegisterStorageNode(RegisterStorageNodeRequest) returns (RegisterStorageNodeResponse);
+  rpc UpdateStorageNodeHeartbeat(UpdateStorageNodeHeartbeatRequest) returns (StorageNodeFactUpdateResponse);
+  rpc ReportHealth(ReportHealthRequest) returns (StorageNodeFactUpdateResponse);
+  rpc ReportCapacity(ReportCapacityRequest) returns (StorageNodeFactUpdateResponse);
+  rpc ReportLoad(ReportLoadRequest) returns (StorageNodeFactUpdateResponse);
 }

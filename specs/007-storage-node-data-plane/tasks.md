@@ -153,7 +153,7 @@
 
 ### Implementation for User Story 4
 
-- [ ] T061 [US4] 在 `proto/storage_node.proto` 中补齐 `ReportHealth`、`ReportCapacity`、`ReportLoad`、`RegisterStorageNode`、`UpdateStorageNodeHeartbeat` 字段；允许修改：`proto/storage_node.proto`、`CMakeLists.txt`；验收：heartbeat 独立于 Raft heartbeat，不修改 `raft.proto`；依赖：T030
+- [x] T061 [US4] 在 `proto/storage_node.proto` 中补齐 `ReportHealth`、`ReportCapacity`、`ReportLoad`、`RegisterStorageNode`、`UpdateStorageNodeHeartbeat` 字段；实际修改：`proto/storage_node.proto`、`tests/storage_node_client_test.cpp`；验收：heartbeat 独立于 Raft heartbeat，不修改 `raft.proto`，并完成必要的 generated stub fake 同步；依赖：T030
 - [ ] T062 [US4] 定义 `StorageNodeHeartbeat`、`StorageNodeRegistry` 和 liveness 状态；允许修改：`modules/store/node/storage_node_registry.h`、`modules/store/node/storage_node_registry.cpp`、`CMakeLists.txt`；验收：字段包含 node_id、capacity、used、available、chunk_count、health、disk_pressure、io_error_count、load、last_seen、node_liveness；依赖：T061
 - [ ] T063 [US4] 实现 `StorageNodeService` heartbeat/report/register 入口；允许修改：`modules/store/node/storage_node_service.cpp`、`modules/store/node/storage_node_service.h`；验收：同 sequence 幂等，stale heartbeat 不覆盖新 facts；依赖：T062
 - [ ] T064 [US4] 实现 `StorageNodeClient` heartbeat/report/register 调用；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：control-plane unavailable/timeout 可重试，duplicate sequence 安全；依赖：T063
