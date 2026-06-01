@@ -89,3 +89,8 @@
   问题：T057 已补最小 GC task snapshot persistence 和 restart resume，并通过 `DurableFile` staging/publish/sync 收口 Linux 当前路径；T057-FIX 已把保存阶段从“先拼完整 payload”改成 streaming append，降低了保存时的内存峰值，但当前 persistence 仍是 whole-snapshot rewrite，没有 schema migration 机制，也没有多进程并发访问协议。Windows 下 `SyncDirectory()` 仍是 explicit unsupported，真实持久化语义需要单独验证。
   影响：保存时不再额外构造整份 snapshot 字符串，但后续如果在 schema 演进、跨版本兼容、多进程共享同一 persistence root，或真实 Windows durability 语义上继续扩展，当前实现仍可能暴露 snapshot 覆盖、磁盘写放大、兼容性或 directory durability 边界。
   建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
+
+- 任务编号：T059
+  问题：T059 已用 `storage_heartbeat_registry_test` 固定 test-only heartbeat / registry contract，包括注册幂等、endpoint conflict、heartbeat sequence 去重、stale heartbeat 忽略和基于 `last_seen + timeout` 的 liveness；但当前仍没有生产 `StorageNodeRegistry`、proto、service、client 或 Placement/read-side 的真实接线，clock source 与 sequence 新鲜度也仍依赖后续生产实现统一收口。
+  影响：如果把当前 test-only adapter 的通过当成真实 registry 已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在生产路径里的完备性。
+  建议后续在哪类任务处理：在 T061-T066 中继续把 proto/schema、生产 registry、service/client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。

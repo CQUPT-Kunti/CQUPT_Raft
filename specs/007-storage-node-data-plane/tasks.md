@@ -148,7 +148,7 @@
 
 ### Tests for User Story 4
 
-- [ ] T059 [P] [US4] 添加 heartbeat/registry 单元测试；允许修改：`tests/storage_heartbeat_registry_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖注册、重复注册、stale heartbeat、node liveness；依赖：T058
+- [x] T059 [P] [US4] 添加 heartbeat/registry 单元测试；允许修改：`tests/storage_heartbeat_registry_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖注册、重复注册、stale heartbeat、node liveness；依赖：T058
 - [ ] T060 [P] [US4] 添加 health-aware placement 测试；允许修改：`tests/storage_placement_test.cpp`；验收：unhealthy/overloaded/disk-pressure/insufficient-capacity 节点被跳过或降权；依赖：T034
 
 ### Implementation for User Story 4

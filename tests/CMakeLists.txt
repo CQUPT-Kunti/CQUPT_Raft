@@ -634,6 +634,28 @@ else()
   message(STATUS "Skip test_store_placement_manager: store_placement_manager_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_heartbeat_registry_test.cpp")
+  add_executable(test_storage_heartbeat_registry
+    storage_heartbeat_registry_test.cpp
+  )
+
+  target_link_libraries(test_storage_heartbeat_registry
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_heartbeat_registry
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_heartbeat_registry test_storage_heartbeat_registry
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_heartbeat_registry: storage_heartbeat_registry_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")
   add_executable(test_store_concurrency_stress
     store_concurrency_stress_test.cpp
