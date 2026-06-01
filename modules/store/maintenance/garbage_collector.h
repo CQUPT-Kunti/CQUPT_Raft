@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "store/chunk/chunk_store.h"
 
@@ -46,10 +47,29 @@ namespace storedemo
         kCancelPending = 1,
     };
 
+    enum class CleanupCandidateSource : std::uint8_t
+    {
+        kDeletedObject = 0,
+        kPendingTimeout = 1,
+        kFailedUpload = 2,
+        kAbortCleanup = 3,
+    };
+
+    enum class CleanupObjectState : std::uint8_t
+    {
+        kUnspecified = 0,
+        kPending = 1,
+        kCommitted = 2,
+        kDeleted = 3,
+        kAborted = 4,
+    };
+
     const char *ToString(GarbageCollectionReason reason);
     const char *ToString(GarbageCollectorTaskState state);
     const char *ToString(GarbageCollectorSubmitCode code);
     const char *ToString(GarbageCollectorStopMode mode);
+    const char *ToString(CleanupCandidateSource source);
+    const char *ToString(CleanupObjectState state);
 
     struct GarbageCollectorConfig
     {
@@ -88,10 +108,91 @@ namespace storedemo
         }
     };
 
+    struct CleanupChunkFact
+    {
+        ChunkIdentity identity;
+        std::uint64_t size{0};
+        ChunkChecksum checksum;
+        std::vector<StorageNodeId> replica_nodes;
+    };
+
+    struct CleanupCandidate
+    {
+        CleanupCandidateSource source{CleanupCandidateSource::kDeletedObject};
+        CleanupObjectState object_state{CleanupObjectState::kUnspecified};
+        GarbageCollectionReason reason{GarbageCollectionReason::kUnspecified};
+        std::string bucket;
+        std::string object_key;
+        ChunkIdentity identity;
+        std::uint64_t size{0};
+        ChunkChecksum checksum;
+        std::vector<StorageNodeId> replica_nodes;
+        std::string metadata_boundary;
+        std::uint64_t created_at_unix_ms{0};
+        std::uint64_t deadline_unix_ms{0};
+    };
+
+    struct PendingTimeoutCleanupRequest
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        std::uint64_t version{0};
+        CleanupObjectState object_state{CleanupObjectState::kPending};
+        std::uint64_t created_at_unix_ms{0};
+        std::uint64_t now_unix_ms{0};
+        std::uint64_t timeout_ms{0};
+        std::vector<CleanupChunkFact> durable_chunks;
+    };
+
+    struct FailedUploadCleanupRequest
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        std::uint64_t version{0};
+        CleanupObjectState object_state{CleanupObjectState::kPending};
+        std::uint64_t created_at_unix_ms{0};
+        std::vector<CleanupChunkFact> durable_chunks;
+    };
+
+    struct AbortCleanupRequest
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        std::uint64_t version{0};
+        CleanupObjectState object_state{CleanupObjectState::kAborted};
+        std::uint64_t created_at_unix_ms{0};
+        std::vector<CleanupChunkFact> durable_chunks;
+    };
+
+    struct DeletedObjectCleanupRequest
+    {
+        std::string bucket;
+        std::string object_key;
+        std::string object_id;
+        std::uint64_t version{0};
+        CleanupObjectState object_state{CleanupObjectState::kDeleted};
+        std::uint64_t created_at_unix_ms{0};
+        std::vector<CleanupChunkFact> durable_chunks;
+    };
+
     using GarbageCollectorDeleteHandler =
         std::function<DeleteChunkResponse(const GarbageCollectorTask &)>;
     using GarbageCollectorSafetyChecker =
         std::function<GarbageCollectorSafetyCheckResult(const GarbageCollectorTask &)>;
+
+    std::vector<CleanupCandidate> BuildPendingTimeoutCleanupCandidates(
+        const PendingTimeoutCleanupRequest &request);
+    std::vector<CleanupCandidate> BuildFailedUploadCleanupCandidates(
+        const FailedUploadCleanupRequest &request);
+    std::vector<CleanupCandidate> BuildAbortCleanupCandidates(
+        const AbortCleanupRequest &request);
+    std::vector<CleanupCandidate> BuildDeletedObjectCleanupCandidates(
+        const DeletedObjectCleanupRequest &request);
+    GarbageCollectorTask CleanupCandidateToGarbageCollectorTask(
+        const CleanupCandidate &candidate);
 
     struct GarbageCollectorSubmitResult
     {

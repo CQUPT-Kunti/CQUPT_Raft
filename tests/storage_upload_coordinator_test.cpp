@@ -8,6 +8,7 @@
 #include "raft/metadata/metadata_query.h"
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
+#include "store/maintenance/garbage_collector.h"
 #include "store/placement/replica_policy.h"
 #include "store/upload/upload_coordinator.h"
 #include "support/store_test_utils.h"
@@ -394,5 +395,100 @@ namespace
         EXPECT_EQ(read.payload, fixture.payload);
         EXPECT_EQ(cleanup_candidate.chunk.checksum.value,
                   read.metadata.checksum.value);
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           FailedUploadCleanupFactsCanGenerateGenericCleanupCandidates)
+    {
+        const auto payload = storedemo::test::MakeChunkPayload(1024, "t056-upload-failed");
+
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_upload_coordinator_t056_failed_cleanup");
+        auto store1 = MakeStore(temp_dir.Path("stores"), 1);
+
+        storedemo::WriteChunkResponse forced_overloaded;
+        forced_overloaded.status = storedemo::StorageNodeStatusCode::kOverloaded;
+        forced_overloaded.error_detail = "forced overloaded replica";
+        forced_overloaded.retry_after_ms = 25;
+        chunk_writer_->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(2),
+                                     forced_overloaded);
+
+        storedemo::WriteChunkResponse forced_unavailable;
+        forced_unavailable.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+        forced_unavailable.error_detail = "forced unavailable replica";
+        chunk_writer_->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(3),
+                                     forced_unavailable);
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeRequestWithPolicy(payload, 3, 2);
+        request.request_id = "upload-t056";
+        request.bucket = "bucket-t056-upload";
+        request.object_key = "objects/test_file.zip";
+        request.object_id = "obj-t056-upload";
+        request.version = 4;
+        request.client_time_unix_ms = 1712005600;
+
+        const auto result = coordinator.UploadObject(request);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOverloaded);
+        ASSERT_TRUE(result.create_succeeded);
+        ASSERT_FALSE(result.committed);
+        ASSERT_TRUE(result.pending_object_possible);
+        ASSERT_TRUE(result.orphan_chunk_possible);
+        ASSERT_EQ(result.cleanup_candidates.size(), 1U);
+
+        std::vector<storedemo::CleanupChunkFact> durable_chunks;
+        durable_chunks.reserve(result.cleanup_candidates.size());
+        for (const auto &cleanup_candidate : result.cleanup_candidates)
+        {
+            durable_chunks.push_back(storedemo::CleanupChunkFact{
+                .identity = cleanup_candidate.chunk.identity,
+                .size = cleanup_candidate.chunk.size,
+                .checksum = cleanup_candidate.chunk.checksum,
+                .replica_nodes = cleanup_candidate.chunk.replica_nodes});
+        }
+
+        storedemo::FailedUploadCleanupRequest cleanup_request;
+        cleanup_request.bucket = request.bucket;
+        cleanup_request.object_key = request.object_key;
+        cleanup_request.object_id = request.object_id;
+        cleanup_request.version = request.version;
+        cleanup_request.object_state = storedemo::CleanupObjectState::kPending;
+        cleanup_request.created_at_unix_ms = request.client_time_unix_ms;
+        cleanup_request.durable_chunks = std::move(durable_chunks);
+
+        const auto candidates =
+            storedemo::BuildFailedUploadCleanupCandidates(cleanup_request);
+        ASSERT_EQ(candidates.size(), 1U);
+        EXPECT_EQ(candidates.front().source, storedemo::CleanupCandidateSource::kFailedUpload);
+        EXPECT_EQ(candidates.front().reason,
+                  storedemo::GarbageCollectionReason::kFailedUploadCleanup);
+        EXPECT_EQ(candidates.front().identity.chunk_id,
+                  result.cleanup_candidates.front().chunk.identity.chunk_id);
+        EXPECT_EQ(candidates.front().identity.object_id, request.object_id);
+        EXPECT_EQ(candidates.front().identity.version, request.version);
+        EXPECT_EQ(candidates.front().replica_nodes,
+                  result.cleanup_candidates.front().chunk.replica_nodes);
+        EXPECT_NE(candidates.front().metadata_boundary.find("metadata-fact:failed-upload"),
+                  std::string::npos);
+        EXPECT_NE(candidates.front().metadata_boundary.find("bucket=bucket-t056-upload"),
+                  std::string::npos);
+        EXPECT_NE(candidates.front().metadata_boundary.find("object=objects/test_file.zip"),
+                  std::string::npos);
+
+        const auto task = storedemo::CleanupCandidateToGarbageCollectorTask(
+            candidates.front());
+        EXPECT_EQ(task.chunk_id, candidates.front().identity.chunk_id);
+        EXPECT_EQ(task.object_id, request.object_id);
+        EXPECT_EQ(task.version, request.version);
+        EXPECT_EQ(task.reason, storedemo::GarbageCollectionReason::kFailedUploadCleanup);
+        EXPECT_EQ(task.metadata_boundary, candidates.front().metadata_boundary);
+
+        const auto read = store1->ReadChunk(storedemo::ReadChunkRequest{
+            .request_id = "read-store-t056-failed-upload",
+            .chunk_id = task.chunk_id});
+        ASSERT_EQ(read.status, storedemo::StorageNodeStatusCode::kOk)
+            << read.error_detail;
+        EXPECT_EQ(read.payload, payload);
     }
 }

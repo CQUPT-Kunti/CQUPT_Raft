@@ -9,20 +9,20 @@
 - `GarbageCollector` task model
 - bounded 后台队列
 - metadata-driven safety checker gate
+- cleanup candidate generation
 - task submit / retry / stop / drain / stats
 - 注入式 delete handler 调用边界
 
 当前不负责：
 
-- pending timeout / failed upload / abort cleanup candidate generation
 - restart 后继续 cleanup / task persistence / resume
 - scrub / repair / rebalance
 - metadata / Raft 调用
 
 ## 主要文件
 
-- `garbage_collector.h`：GC 任务模型、状态、配置、提交/停机/统计接口
-- `garbage_collector.cpp`：任务校验、状态迁移、bounded queue 调度、handler 调用、重试和统计聚合
+- `garbage_collector.h`：GC 任务模型、cleanup candidate 模型、状态、配置、提交/停机/统计接口
+- `garbage_collector.cpp`：任务校验、状态迁移、bounded queue 调度、candidate 生成、handler 调用、重试和统计聚合
 
 ## T055 固定边界
 
@@ -30,9 +30,19 @@
 - `GarbageCollector` 自身不直接持有 `LocalDiskChunkStore`、`StorageNodeClient`、`MetadataStateMachine` 或 metadata service；metadata facts 和删除执行都必须通过注入 checker / handler 间接完成。
 - GC task 必须带 `metadata_boundary`，防止任务模型层无条件表达“直接删除 live chunk”。
 - T055 在 delete handler 前增加 metadata-driven safety gate；chunk 仍被 committed live manifest 引用时，不允许调用 delete handler。
-- T054 不实现 candidate generation；pending timeout / failed upload / abort cleanup 候选生成留给 T056。
 - T054 不实现 restart 后继续 cleanup；任务持久化和 resume 留给 T057。
 - retryable failure 当前只做任务状态与 attempts 演进，不做延迟调度器；`next_retry_after_ms` 只保留为扩展点和可观察事实。
+
+## T056 fixed boundary
+
+- T056 为 pending timeout、failed upload、abort cleanup、deleted object cleanup 新增 generic `CleanupCandidate` 生产 helper。
+- candidate generation 只负责把已有 metadata facts / durable chunk facts 规范化为待清理候选，不直接提交 GC task，也不直接删除 chunk。
+- candidate 生成后仍必须经过：
+  - `CleanupCandidateToGarbageCollectorTask(...)`
+  - `GarbageCollector` submit / worker loop
+  - metadata-driven safety checker
+  - 注入式 delete handler
+- T056 不实现 restart resume、cleanup persistence、延迟调度器，也不让 maintenance 层自己扫描 metadata / Raft。
 
 ## metadata-driven safety check 语义
 
@@ -58,6 +68,69 @@
 - 输入：待提交 task、collector config
 - 输出：合法时返回 `kOk`，非法时返回明确错误并填充错误详情
 - 边界：要求 `task_id`、`reason`、`metadata_boundary` 有效，且必须能确定 `chunk_id`
+
+### `BuildMetadataBoundary(CleanupCandidateSource, ...)`
+
+- 责任：根据 candidate source、bucket/object/object_id/version/deadline 生成稳定 `metadata_boundary`
+- 输入：candidate 来源和生成时的 metadata 事实
+- 输出：供 safety checker / task snapshot 继续传递的边界字符串
+- 边界：只表达生成时的 metadata fact，不等价于 restart persistence 或实时 metadata snapshot
+
+### `NormalizeCleanupChunkFact(CleanupChunkFact*, const std::string&, std::uint64_t)`
+
+- 责任：校验和补齐单个 durable chunk fact 的 `object_id/version/chunk_id`
+- 输入：原始 chunk fact、目标 object identity
+- 输出：规范化后的 chunk fact
+- 边界：显式 `chunk_id` 与 object identity 不一致时直接丢弃，避免把错误 candidate 送入 GC
+
+### `NormalizeCleanupCandidates(std::vector<CleanupCandidate>)`
+
+- 责任：对生成好的 cleanup candidates 做稳定排序和去重
+- 输入：同一轮生成的 candidate 列表
+- 输出：按 `chunk_index -> offset -> chunk_id -> bucket -> object_key -> source` 排序后的唯一列表
+- 边界：当前去重 key 只覆盖 `bucket/object_key/chunk_id/source`，不做跨轮次持久化去重
+
+### `BuildCleanupCandidates(...)`
+
+- 责任：把统一输入事实转换成 `CleanupCandidate`
+- 输入：candidate source、object state、cleanup reason、metadata 基本事实、durable chunks
+- 输出：携带 `reason/object identity/chunk identity/metadata_boundary` 的 generic cleanup candidates
+- 边界：这里只做生成，不决定是否允许删除 live chunk
+
+### `BuildPendingTimeoutCleanupCandidates(const PendingTimeoutCleanupRequest&)`
+
+- 责任：为超时 `PENDING` object 生成 orphan cleanup candidates
+- 输入：pending object metadata facts、`created_at`、`now`、`timeout_ms`、durable chunks
+- 输出：超时后可提交 GC 的 candidate 列表
+- 边界：未超时、`timeout_ms == 0`、非 `PENDING` object 一律不生成
+
+### `BuildFailedUploadCleanupCandidates(const FailedUploadCleanupRequest&)`
+
+- 责任：为 failed upload 的 durable chunks 生成 cleanup candidates
+- 输入：object metadata facts 和失败后残留的 durable chunk facts
+- 输出：`kFailedUploadCleanup` candidates
+- 边界：已 committed object 不生成 failed-upload cleanup candidates
+
+### `BuildAbortCleanupCandidates(const AbortCleanupRequest&)`
+
+- 责任：为 abort cleanup 生成 candidates
+- 输入：aborted/deleted object facts 和 durable chunk facts
+- 输出：`kAbortCleanup` candidates
+- 边界：只接受 `Aborted` 或 `Deleted` object state，不把 committed object 误当作 abort cleanup
+
+### `BuildDeletedObjectCleanupCandidates(const DeletedObjectCleanupRequest&)`
+
+- 责任：为 metadata tombstone / deleted object 生成 deleted-object cleanup candidates
+- 输入：deleted object facts 和 durable chunk facts
+- 输出：`kDeletedObjectCleanup` candidates
+- 边界：只接受 `Deleted` object state；live object manifest 保护仍由 safety checker 决定
+
+### `CleanupCandidateToGarbageCollectorTask(const CleanupCandidate&)`
+
+- 责任：把 generic cleanup candidate 转成 GC task
+- 输入：规范化后的 `CleanupCandidate`
+- 输出：携带 `task_id/chunk_id/object_id/version/chunk_index/reason/metadata_boundary` 的 `GarbageCollectorTask`
+- 边界：只做字段映射，不做提交、持久化或 safety decision
 
 ### `ResolveTaskChunkId(GarbageCollectorTask*, std::string*)`
 

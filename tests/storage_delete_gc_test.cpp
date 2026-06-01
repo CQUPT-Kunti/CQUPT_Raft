@@ -97,6 +97,29 @@ namespace
             .checksum = metadata.checksum.value};
     }
 
+    storedemo::CleanupChunkFact MakeCleanupChunkFactFromChunkRef(
+        const raftdemo::ChunkRef &chunk_ref)
+    {
+        storedemo::ChunkIdentity identity;
+        std::string error_detail;
+        const auto status =
+            storedemo::ParseChunkId(chunk_ref.chunk_id, &identity, &error_detail);
+        if (status != storedemo::StorageNodeStatusCode::kOk)
+        {
+            throw std::runtime_error("failed to parse cleanup chunk id: " + error_detail);
+        }
+
+        storedemo::CleanupChunkFact fact;
+        fact.identity = std::move(identity);
+        fact.identity.offset = chunk_ref.offset;
+        fact.size = chunk_ref.size;
+        fact.checksum.algorithm = storedemo::ChunkChecksumAlgorithm::kSha256;
+        fact.checksum.value = chunk_ref.checksum;
+        fact.checksum.size_bytes = chunk_ref.size;
+        fact.replica_nodes = chunk_ref.replica_nodes;
+        return fact;
+    }
+
     std::vector<std::string> CandidateChunkIds(
         const std::vector<TestCleanupCandidate> &candidates)
     {
@@ -786,6 +809,163 @@ namespace
             .request_id = "read-after-cleanup-t055-allowed",
             .chunk_id = identity.chunk_id});
         EXPECT_EQ(read_after_cleanup.status, storedemo::StorageNodeStatusCode::kNotFound);
+#endif
+    }
+
+    TEST_F(StorageDeleteGcTest,
+           DeletedCleanupCandidateTaskStillRespectsLiveManifestSafetyGate)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "T056 cleanup candidate tests are currently validated on Linux";
+#else
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_delete_gc_t056_deleted_candidate");
+        storedemo::LocalDiskChunkStore store(MakeStoreConfig(temp_dir.root(), 57));
+        ASSERT_EQ(store.Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 140;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t056-deleted",
+                            "create-bucket-t056-deleted"))
+                        .Ok);
+
+        const auto payload = storedemo::test::MakeChunkPayload(896, "t056-deleted-candidate");
+        const auto shared_identity = MakeStoreIdentityOrThrow("obj-t056-shared-a", 1, 0, 0);
+        const auto write = store.WriteChunk(
+            MakeWriteRequest(shared_identity, payload, "write-t056-shared"));
+        ASSERT_EQ(write.status, storedemo::StorageNodeStatusCode::kOk)
+            << write.error_detail;
+
+        const auto shared_chunk_ref = MakeChunkRefFromMetadata(write.metadata);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t056-deleted",
+                            "objects/shared-a",
+                            "obj-t056-shared-a",
+                            1,
+                            "create-object-t056-shared-a",
+                            payload.size(),
+                            "etag-t056-shared-a"))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t056-deleted",
+                            "objects/shared-a",
+                            "obj-t056-shared-a",
+                            1,
+                            "commit-object-t056-shared-a",
+                            payload.size(),
+                            "etag-t056-shared-a",
+                            {shared_chunk_ref}))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t056-deleted",
+                            "objects/shared-b",
+                            "obj-t056-shared-b",
+                            1,
+                            "create-object-t056-shared-b",
+                            payload.size(),
+                            "etag-t056-shared-b"))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t056-deleted",
+                            "objects/shared-b",
+                            "obj-t056-shared-b",
+                            1,
+                            "commit-object-t056-shared-b",
+                            payload.size(),
+                            "etag-t056-shared-b",
+                            {shared_chunk_ref}))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeDeleteObjectCommand(
+                            "bucket-t056-deleted",
+                            "objects/shared-a",
+                            "obj-t056-shared-a",
+                            "delete-object-t056-shared-a"))
+                        .Ok);
+
+        storedemo::DeletedObjectCleanupRequest cleanup_request;
+        cleanup_request.bucket = "bucket-t056-deleted";
+        cleanup_request.object_key = "objects/shared-a";
+        cleanup_request.object_id = "obj-t056-shared-a";
+        cleanup_request.version = 1;
+        cleanup_request.object_state = storedemo::CleanupObjectState::kDeleted;
+        cleanup_request.created_at_unix_ms = 1712005600;
+        cleanup_request.durable_chunks = {
+            MakeCleanupChunkFactFromChunkRef(shared_chunk_ref)};
+
+        const auto candidates =
+            storedemo::BuildDeletedObjectCleanupCandidates(cleanup_request);
+        ASSERT_EQ(candidates.size(), 1U);
+        EXPECT_EQ(candidates.front().source, storedemo::CleanupCandidateSource::kDeletedObject);
+        EXPECT_EQ(candidates.front().reason,
+                  storedemo::GarbageCollectionReason::kDeletedObjectCleanup);
+        EXPECT_NE(candidates.front().metadata_boundary.find("metadata-fact:deleted-object"),
+                  std::string::npos);
+
+        auto task = storedemo::CleanupCandidateToGarbageCollectorTask(candidates.front());
+        EXPECT_EQ(task.chunk_id, shared_identity.chunk_id);
+        EXPECT_EQ(task.object_id, "obj-t056-shared-a");
+        EXPECT_EQ(task.chunk_index, 0U);
+        EXPECT_EQ(task.metadata_boundary, candidates.front().metadata_boundary);
+
+        std::atomic<int> handler_runs{0};
+        storedemo::GarbageCollector collector(
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                handler_runs.fetch_add(1, std::memory_order_relaxed);
+                storedemo::DeleteChunkRequest request;
+                request.request_id = "delete-handler-" + collector_task.task_id;
+                request.chunk_id = collector_task.chunk_id;
+                request.reason = "gc deleted object cleanup";
+                request.metadata_boundary = collector_task.metadata_boundary;
+                return store.DeleteChunk(request);
+            },
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                return EvaluateMetadataDrivenSafety(machine,
+                                                    {"bucket-t056-deleted"},
+                                                    collector_task);
+            },
+            {.worker_count = 1, .queue_capacity = 4, .default_max_attempts = 2});
+
+        ASSERT_TRUE(collector.SubmitTask(std::move(task)).accepted());
+        ASSERT_TRUE(collector.Drain().drained);
+
+        const auto snapshot =
+            collector.FindTask("gc-candidate/DeletedObject/" + shared_identity.chunk_id);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->state, storedemo::GarbageCollectorTaskState::kFailed);
+        EXPECT_EQ(snapshot->attempts, 1U);
+        EXPECT_EQ(snapshot->last_error, storedemo::StorageNodeStatusCode::kConflict);
+        EXPECT_NE(snapshot->last_error_detail.find("committed live manifest"),
+                  std::string::npos);
+        EXPECT_EQ(snapshot->metadata_boundary, candidates.front().metadata_boundary);
+        EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
+
+        const auto read = store.ReadChunk(storedemo::ReadChunkRequest{
+            .request_id = "read-t056-live-manifest-protected",
+            .chunk_id = shared_identity.chunk_id});
+        ASSERT_EQ(read.status, storedemo::StorageNodeStatusCode::kOk)
+            << read.error_detail;
+        EXPECT_EQ(read.payload, payload);
 #endif
     }
 

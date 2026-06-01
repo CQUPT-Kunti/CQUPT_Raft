@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -21,6 +22,34 @@ namespace storedemo
         {
             (void)task;
             return {};
+        }
+
+        CleanupChunkFact MakeCleanupChunkFact(const std::string &object_id,
+                                              const std::uint64_t version,
+                                              const std::uint32_t chunk_index,
+                                              const std::uint64_t offset,
+                                              const std::uint64_t size)
+        {
+            ChunkId chunk_id;
+            std::string error_detail;
+            if (MakeChunkId(object_id, version, chunk_index, &chunk_id, &error_detail) !=
+                StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to build cleanup chunk id: " + error_detail);
+            }
+
+            CleanupChunkFact fact;
+            fact.identity.chunk_id = std::move(chunk_id);
+            fact.identity.object_id = object_id;
+            fact.identity.version = version;
+            fact.identity.chunk_index = chunk_index;
+            fact.identity.offset = offset;
+            fact.size = size;
+            fact.checksum.algorithm = ChunkChecksumAlgorithm::kSha256;
+            fact.checksum.value = "checksum-" + object_id + "-" + std::to_string(chunk_index);
+            fact.checksum.size_bytes = size;
+            fact.replica_nodes = {"node-a", "node-b"};
+            return fact;
         }
 
         class StorageGarbageCollectorTest : public ::testing::Test
@@ -466,6 +495,143 @@ namespace storedemo
             EXPECT_FALSE(cancelled_task->retryable);
 
             EXPECT_EQ(stop_result.stats.cancelled_tasks, 1U);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               PendingTimeoutGeneratesSortedDeduplicatedCleanupCandidates)
+        {
+            PendingTimeoutCleanupRequest request;
+            request.bucket = "bucket-t056";
+            request.object_key = "objects/pending-timeout";
+            request.object_id = "obj-t056-pending";
+            request.version = 7;
+            request.object_state = CleanupObjectState::kPending;
+            request.created_at_unix_ms = 1000;
+            request.now_unix_ms = 2500;
+            request.timeout_ms = 1000;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-pending", 7, 2, 1024, 256),
+                MakeCleanupChunkFact("obj-t056-pending", 7, 0, 0, 512),
+                MakeCleanupChunkFact("obj-t056-pending", 7, 2, 1024, 256)};
+
+            const auto candidates = BuildPendingTimeoutCleanupCandidates(request);
+
+            ASSERT_EQ(candidates.size(), 2U);
+            EXPECT_EQ(candidates[0].identity.chunk_index, 0U);
+            EXPECT_EQ(candidates[1].identity.chunk_index, 2U);
+            EXPECT_EQ(candidates[0].source, CleanupCandidateSource::kPendingTimeout);
+            EXPECT_EQ(candidates[0].reason, GarbageCollectionReason::kOrphanChunkCleanup);
+            EXPECT_EQ(candidates[0].object_state, CleanupObjectState::kPending);
+            EXPECT_EQ(candidates[0].deadline_unix_ms, 2000U);
+            EXPECT_NE(candidates[0].metadata_boundary.find("metadata-fact:pending-timeout"),
+                      std::string::npos);
+            EXPECT_NE(candidates[0].metadata_boundary.find("deadline_ms=2000"),
+                      std::string::npos);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               PendingTimeoutBeforeDeadlineDoesNotGenerateCleanupCandidates)
+        {
+            PendingTimeoutCleanupRequest request;
+            request.bucket = "bucket-t056";
+            request.object_key = "objects/pending-live";
+            request.object_id = "obj-t056-pending-live";
+            request.version = 3;
+            request.object_state = CleanupObjectState::kPending;
+            request.created_at_unix_ms = 1000;
+            request.now_unix_ms = 1500;
+            request.timeout_ms = 1000;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-pending-live", 3, 0, 0, 128)};
+
+            EXPECT_TRUE(BuildPendingTimeoutCleanupCandidates(request).empty());
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               FailedUploadCleanupCandidateConvertsToGarbageCollectorTask)
+        {
+            FailedUploadCleanupRequest request;
+            request.bucket = "bucket-t056";
+            request.object_key = "objects/failed-upload";
+            request.object_id = "obj-t056-failed";
+            request.version = 9;
+            request.object_state = CleanupObjectState::kPending;
+            request.created_at_unix_ms = 777;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-failed", 9, 1, 256, 256)};
+
+            const auto candidates = BuildFailedUploadCleanupCandidates(request);
+
+            ASSERT_EQ(candidates.size(), 1U);
+            EXPECT_EQ(candidates.front().source, CleanupCandidateSource::kFailedUpload);
+            EXPECT_EQ(candidates.front().reason, GarbageCollectionReason::kFailedUploadCleanup);
+            EXPECT_NE(candidates.front().metadata_boundary.find("metadata-fact:failed-upload"),
+                      std::string::npos);
+
+            const auto task = CleanupCandidateToGarbageCollectorTask(candidates.front());
+            EXPECT_EQ(task.chunk_id, candidates.front().identity.chunk_id);
+            EXPECT_EQ(task.object_id, candidates.front().identity.object_id);
+            EXPECT_EQ(task.version, candidates.front().identity.version);
+            EXPECT_EQ(task.chunk_index, candidates.front().identity.chunk_index);
+            EXPECT_EQ(task.reason, GarbageCollectionReason::kFailedUploadCleanup);
+            EXPECT_EQ(task.metadata_boundary, candidates.front().metadata_boundary);
+            EXPECT_NE(task.task_id.find(candidates.front().identity.chunk_id), std::string::npos);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               AbortAndDeletedCleanupCandidatesRespectObjectStateBoundaries)
+        {
+            AbortCleanupRequest abort_request;
+            abort_request.bucket = "bucket-t056";
+            abort_request.object_key = "objects/abort";
+            abort_request.object_id = "obj-t056-abort";
+            abort_request.version = 5;
+            abort_request.object_state = CleanupObjectState::kAborted;
+            abort_request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-abort", 5, 0, 0, 64)};
+
+            DeletedObjectCleanupRequest deleted_request;
+            deleted_request.bucket = "bucket-t056";
+            deleted_request.object_key = "objects/deleted";
+            deleted_request.object_id = "obj-t056-deleted";
+            deleted_request.version = 6;
+            deleted_request.object_state = CleanupObjectState::kDeleted;
+            deleted_request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-deleted", 6, 0, 0, 96)};
+
+            const auto abort_candidates = BuildAbortCleanupCandidates(abort_request);
+            const auto deleted_candidates = BuildDeletedObjectCleanupCandidates(deleted_request);
+
+            ASSERT_EQ(abort_candidates.size(), 1U);
+            ASSERT_EQ(deleted_candidates.size(), 1U);
+            EXPECT_EQ(abort_candidates.front().reason, GarbageCollectionReason::kAbortCleanup);
+            EXPECT_EQ(deleted_candidates.front().reason,
+                      GarbageCollectionReason::kDeletedObjectCleanup);
+            EXPECT_NE(abort_candidates.front().metadata_boundary.find("metadata-fact:abort-cleanup"),
+                      std::string::npos);
+            EXPECT_NE(
+                deleted_candidates.front().metadata_boundary.find("metadata-fact:deleted-object"),
+                std::string::npos);
+
+            abort_request.object_state = CleanupObjectState::kCommitted;
+            deleted_request.object_state = CleanupObjectState::kCommitted;
+            EXPECT_TRUE(BuildAbortCleanupCandidates(abort_request).empty());
+            EXPECT_TRUE(BuildDeletedObjectCleanupCandidates(deleted_request).empty());
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               CommittedObjectDoesNotGenerateFailedUploadCleanupCandidates)
+        {
+            FailedUploadCleanupRequest request;
+            request.bucket = "bucket-t056";
+            request.object_key = "objects/committed";
+            request.object_id = "obj-t056-committed";
+            request.version = 11;
+            request.object_state = CleanupObjectState::kCommitted;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t056-committed", 11, 0, 0, 128)};
+
+            EXPECT_TRUE(BuildFailedUploadCleanupCandidates(request).empty());
         }
 
         TEST_F(StorageGarbageCollectorTest,

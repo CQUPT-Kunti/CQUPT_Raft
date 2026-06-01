@@ -3,7 +3,9 @@
 #include <condition_variable>
 #include <exception>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <unordered_map>
 #include <utility>
 
@@ -202,6 +204,179 @@ namespace storedemo
             return ResolveTaskChunkId(task, error_detail);
         }
 
+        std::string BuildMetadataBoundary(const CleanupCandidateSource source,
+                                          const std::string &bucket,
+                                          const std::string &object_key,
+                                          const std::string &object_id,
+                                          const std::uint64_t version,
+                                          const std::uint64_t deadline_unix_ms)
+        {
+            std::ostringstream oss;
+            switch (source)
+            {
+            case CleanupCandidateSource::kDeletedObject:
+                oss << "metadata-fact:deleted-object";
+                break;
+            case CleanupCandidateSource::kPendingTimeout:
+                oss << "metadata-fact:pending-timeout";
+                break;
+            case CleanupCandidateSource::kFailedUpload:
+                oss << "metadata-fact:failed-upload";
+                break;
+            case CleanupCandidateSource::kAbortCleanup:
+                oss << "metadata-fact:abort-cleanup";
+                break;
+            }
+            oss << " bucket=" << bucket
+                << " object=" << object_key
+                << " object_id=" << object_id
+                << " version=" << version;
+            if (deadline_unix_ms != 0)
+            {
+                oss << " deadline_ms=" << deadline_unix_ms;
+            }
+            return oss.str();
+        }
+
+        bool NormalizeCleanupChunkFact(CleanupChunkFact *fact,
+                                       const std::string &object_id,
+                                       const std::uint64_t version)
+        {
+            if (fact == nullptr)
+            {
+                return false;
+            }
+
+            if (fact->identity.object_id.empty())
+            {
+                fact->identity.object_id = object_id;
+            }
+            if (fact->identity.version == 0)
+            {
+                fact->identity.version = version;
+            }
+            if (fact->identity.chunk_id.empty())
+            {
+                std::string error_detail;
+                if (MakeChunkId(fact->identity.object_id,
+                                fact->identity.version,
+                                fact->identity.chunk_index,
+                                &fact->identity.chunk_id,
+                                &error_detail) != StorageNodeStatusCode::kOk)
+                {
+                    return false;
+                }
+            }
+
+            std::string error_detail;
+            if (ValidateChunkId(fact->identity.chunk_id, &error_detail) !=
+                StorageNodeStatusCode::kOk)
+            {
+                return false;
+            }
+
+            if (fact->identity.object_id != object_id || fact->identity.version != version)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        std::vector<CleanupCandidate> NormalizeCleanupCandidates(
+            std::vector<CleanupCandidate> candidates)
+        {
+            std::stable_sort(candidates.begin(),
+                             candidates.end(),
+                             [](const CleanupCandidate &lhs,
+                                const CleanupCandidate &rhs)
+                             {
+                                 if (lhs.identity.chunk_index != rhs.identity.chunk_index)
+                                 {
+                                     return lhs.identity.chunk_index < rhs.identity.chunk_index;
+                                 }
+                                 if (lhs.identity.offset != rhs.identity.offset)
+                                 {
+                                     return lhs.identity.offset < rhs.identity.offset;
+                                 }
+                                 if (lhs.identity.chunk_id != rhs.identity.chunk_id)
+                                 {
+                                     return lhs.identity.chunk_id < rhs.identity.chunk_id;
+                                 }
+                                 if (lhs.bucket != rhs.bucket)
+                                 {
+                                     return lhs.bucket < rhs.bucket;
+                                 }
+                                 if (lhs.object_key != rhs.object_key)
+                                 {
+                                     return lhs.object_key < rhs.object_key;
+                                 }
+                                 return static_cast<std::uint8_t>(lhs.source) <
+                                        static_cast<std::uint8_t>(rhs.source);
+                             });
+
+            std::unordered_set<std::string> seen;
+            std::vector<CleanupCandidate> normalized;
+            normalized.reserve(candidates.size());
+            for (auto &candidate : candidates)
+            {
+                const std::string dedupe_key = candidate.bucket + "\n" +
+                                               candidate.object_key + "\n" +
+                                               candidate.identity.chunk_id + "\n" +
+                                               std::to_string(static_cast<std::uint8_t>(
+                                                   candidate.source));
+                if (!seen.insert(dedupe_key).second)
+                {
+                    continue;
+                }
+                normalized.push_back(std::move(candidate));
+            }
+            return normalized;
+        }
+
+        std::vector<CleanupCandidate> BuildCleanupCandidates(
+            const CleanupCandidateSource source,
+            const CleanupObjectState object_state,
+            const GarbageCollectionReason reason,
+            const std::string &bucket,
+            const std::string &object_key,
+            const std::string &object_id,
+            const std::uint64_t version,
+            const std::uint64_t created_at_unix_ms,
+            const std::uint64_t deadline_unix_ms,
+            std::vector<CleanupChunkFact> durable_chunks)
+        {
+            std::vector<CleanupCandidate> candidates;
+            candidates.reserve(durable_chunks.size());
+            for (auto &fact : durable_chunks)
+            {
+                if (!NormalizeCleanupChunkFact(&fact, object_id, version))
+                {
+                    continue;
+                }
+
+                candidates.push_back(CleanupCandidate{
+                    .source = source,
+                    .object_state = object_state,
+                    .reason = reason,
+                    .bucket = bucket,
+                    .object_key = object_key,
+                    .identity = fact.identity,
+                    .size = fact.size,
+                    .checksum = fact.checksum,
+                    .replica_nodes = fact.replica_nodes,
+                    .metadata_boundary = BuildMetadataBoundary(source,
+                                                               bucket,
+                                                               object_key,
+                                                               object_id,
+                                                               version,
+                                                               deadline_unix_ms),
+                    .created_at_unix_ms = created_at_unix_ms,
+                    .deadline_unix_ms = deadline_unix_ms});
+            }
+
+            return NormalizeCleanupCandidates(std::move(candidates));
+        }
+
         GarbageCollectorAttemptResult MakeAttemptResultFromSafetyCheck(
             GarbageCollectorSafetyCheckResult check_result)
         {
@@ -358,6 +533,138 @@ namespace storedemo
             return "CancelPending";
         }
         return "UnknownGarbageCollectorStopMode";
+    }
+
+    const char *ToString(const CleanupCandidateSource source)
+    {
+        switch (source)
+        {
+        case CleanupCandidateSource::kDeletedObject:
+            return "DeletedObject";
+        case CleanupCandidateSource::kPendingTimeout:
+            return "PendingTimeout";
+        case CleanupCandidateSource::kFailedUpload:
+            return "FailedUpload";
+        case CleanupCandidateSource::kAbortCleanup:
+            return "AbortCleanup";
+        }
+        return "UnknownCleanupCandidateSource";
+    }
+
+    const char *ToString(const CleanupObjectState state)
+    {
+        switch (state)
+        {
+        case CleanupObjectState::kUnspecified:
+            return "Unspecified";
+        case CleanupObjectState::kPending:
+            return "Pending";
+        case CleanupObjectState::kCommitted:
+            return "Committed";
+        case CleanupObjectState::kDeleted:
+            return "Deleted";
+        case CleanupObjectState::kAborted:
+            return "Aborted";
+        }
+        return "UnknownCleanupObjectState";
+    }
+
+    std::vector<CleanupCandidate> BuildPendingTimeoutCleanupCandidates(
+        const PendingTimeoutCleanupRequest &request)
+    {
+        if (request.object_state != CleanupObjectState::kPending ||
+            request.timeout_ms == 0 || request.now_unix_ms == 0 ||
+            request.now_unix_ms < request.created_at_unix_ms + request.timeout_ms)
+        {
+            return {};
+        }
+
+        return BuildCleanupCandidates(CleanupCandidateSource::kPendingTimeout,
+                                      request.object_state,
+                                      GarbageCollectionReason::kOrphanChunkCleanup,
+                                      request.bucket,
+                                      request.object_key,
+                                      request.object_id,
+                                      request.version,
+                                      request.created_at_unix_ms,
+                                      request.created_at_unix_ms + request.timeout_ms,
+                                      request.durable_chunks);
+    }
+
+    std::vector<CleanupCandidate> BuildFailedUploadCleanupCandidates(
+        const FailedUploadCleanupRequest &request)
+    {
+        if (request.object_state == CleanupObjectState::kCommitted)
+        {
+            return {};
+        }
+
+        return BuildCleanupCandidates(CleanupCandidateSource::kFailedUpload,
+                                      request.object_state,
+                                      GarbageCollectionReason::kFailedUploadCleanup,
+                                      request.bucket,
+                                      request.object_key,
+                                      request.object_id,
+                                      request.version,
+                                      request.created_at_unix_ms,
+                                      0,
+                                      request.durable_chunks);
+    }
+
+    std::vector<CleanupCandidate> BuildAbortCleanupCandidates(
+        const AbortCleanupRequest &request)
+    {
+        if (request.object_state != CleanupObjectState::kAborted &&
+            request.object_state != CleanupObjectState::kDeleted)
+        {
+            return {};
+        }
+
+        return BuildCleanupCandidates(CleanupCandidateSource::kAbortCleanup,
+                                      request.object_state,
+                                      GarbageCollectionReason::kAbortCleanup,
+                                      request.bucket,
+                                      request.object_key,
+                                      request.object_id,
+                                      request.version,
+                                      request.created_at_unix_ms,
+                                      0,
+                                      request.durable_chunks);
+    }
+
+    std::vector<CleanupCandidate> BuildDeletedObjectCleanupCandidates(
+        const DeletedObjectCleanupRequest &request)
+    {
+        if (request.object_state != CleanupObjectState::kDeleted)
+        {
+            return {};
+        }
+
+        return BuildCleanupCandidates(CleanupCandidateSource::kDeletedObject,
+                                      request.object_state,
+                                      GarbageCollectionReason::kDeletedObjectCleanup,
+                                      request.bucket,
+                                      request.object_key,
+                                      request.object_id,
+                                      request.version,
+                                      request.created_at_unix_ms,
+                                      0,
+                                      request.durable_chunks);
+    }
+
+    GarbageCollectorTask CleanupCandidateToGarbageCollectorTask(
+        const CleanupCandidate &candidate)
+    {
+        GarbageCollectorTask task;
+        task.task_id = std::string("gc-candidate/") + ToString(candidate.source) + "/" +
+                       candidate.identity.chunk_id;
+        task.chunk_id = candidate.identity.chunk_id;
+        task.object_id = candidate.identity.object_id;
+        task.version = candidate.identity.version;
+        task.chunk_index = candidate.identity.chunk_index;
+        task.reason = candidate.reason;
+        task.metadata_boundary = candidate.metadata_boundary;
+        return task;
     }
 
     StorageNodeStatusCode GarbageCollectorSubmitResult::status_code() const
