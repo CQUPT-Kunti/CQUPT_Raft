@@ -149,7 +149,7 @@
 ### Tests for User Story 4
 
 - [x] T059 [P] [US4] 添加 heartbeat/registry 单元测试；允许修改：`tests/storage_heartbeat_registry_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖注册、重复注册、stale heartbeat、node liveness；依赖：T058
-- [ ] T060 [P] [US4] 添加 health-aware placement 测试；允许修改：`tests/storage_placement_test.cpp`；验收：unhealthy/overloaded/disk-pressure/insufficient-capacity 节点被跳过或降权；依赖：T034
+- [x] T060 [P] [US4] 添加 health-aware placement 测试；实际修改：`tests/store_placement_policy_test.cpp`、`tests/store_placement_manager_test.cpp`；验收：unhealthy/readonly/draining/overloaded/disk-pressure/insufficient-capacity/stale-heartbeat 节点被跳过或降权，healthy 且容量足够/负载较低节点优先，duplicate node_id 不重复进入副本结果；依赖：T034
 
 ### Implementation for User Story 4
 
@@ -159,7 +159,7 @@
 - [ ] T064 [US4] 实现 `StorageNodeClient` heartbeat/report/register 调用；允许修改：`modules/store/node/storage_node_client.cpp`、`modules/store/node/storage_node_client.h`；验收：control-plane unavailable/timeout 可重试，duplicate sequence 安全；依赖：T063
 - [ ] T065 [US4] 将 registry facts 接入 `PlacementManager` eligibility；允许修改：`modules/store/placement/placement_manager.cpp`、`modules/store/placement/placement_manager.h`；验收：Placement 使用 capacity、health、load、disk pressure、failure-domain placeholder、hotspot signal；依赖：T060、T062
 - [ ] T066 [US4] 将 registry facts 接入 read replica selection；允许修改：`modules/store/placement/replica_policy.cpp`、`modules/store/placement/replica_policy.h`；验收：read selection 降权 stale/unhealthy/overloaded replica；依赖：T045、T062
-- [ ] T067 [US4] 运行 US4 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_heartbeat_registry|storage_placement" --output-on-failure`；验收：PASS；依赖：T059-T066
+- [ ] T067 [US4] 运行 US4 验证命令；允许修改：无生产文件，仅运行 `ctest -R "storage_heartbeat_registry|store_placement_policy|store_placement_manager" --output-on-failure`；验收：PASS；依赖：T059-T066
 
 ## Phase 7: User Story 5 - StorageNode 重启后恢复本地 chunk 状态 (Priority: P5)
 
@@ -275,7 +275,7 @@ T060 health-aware placement tests
 | Upload | `tests/storage_upload_integration_test.cpp` | `ctest -R storage_upload --output-on-failure` | low to moderate |
 | Read | `tests/storage_read_integration_test.cpp` | `ctest -R storage_read --output-on-failure` | parallel reads ok |
 | Delete/GC | `tests/storage_delete_gc_test.cpp` | `CTEST_PARALLEL_LEVEL=1 ctest -R storage_delete_gc --output-on-failure` | low concurrency |
-| Heartbeat/Placement | `tests/storage_heartbeat_registry_test.cpp`, `tests/storage_placement_test.cpp` | `ctest -R "storage_heartbeat_registry|storage_placement" --output-on-failure` | parallel ok |
+| Heartbeat/Placement | `tests/storage_heartbeat_registry_test.cpp`, `tests/store_placement_policy_test.cpp`, `tests/store_placement_manager_test.cpp` | `ctest -R "storage_heartbeat_registry|store_placement_policy|store_placement_manager" --output-on-failure` | parallel ok |
 | Restart recovery | `tests/store_recovery_test.cpp` | `CTEST_PARALLEL_LEVEL=1 ctest -R store_recovery --output-on-failure` | low concurrency |
 | Cross-platform durability | `tests/storage_cross_platform_durability_test.cpp` | platform-specific CTest filters | low concurrency |
 | Concurrency stress | `tests/store_concurrency_stress_test.cpp` | `ctest -L storage-node-concurrency --output-on-failure` | parallel ok |

@@ -94,3 +94,8 @@
   问题：T059 已用 `storage_heartbeat_registry_test` 固定 test-only heartbeat / registry contract，包括注册幂等、endpoint conflict、heartbeat sequence 去重、stale heartbeat 忽略和基于 `last_seen + timeout` 的 liveness；但当前仍没有生产 `StorageNodeRegistry`、proto、service、client 或 Placement/read-side 的真实接线，clock source 与 sequence 新鲜度也仍依赖后续生产实现统一收口。
   影响：如果把当前 test-only adapter 的通过当成真实 registry 已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在生产路径里的完备性。
   建议后续在哪类任务处理：在 T061-T066 中继续把 proto/schema、生产 registry、service/client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
+
+- 任务编号：T060
+  问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中用 test-only registry facts 固定 health-aware placement contract，包括 stale heartbeat 事实降级、unhealthy/readonly/draining/overloaded/high-disk-pressure/insufficient-capacity 排除、healthy 低负载节点优先和 duplicate node_id 去重；但当前仍没有生产 registry -> PlacementManager 的真实接线，也还没有最终的 overload/disk-pressure/hotspot 生产打分来源。
+  影响：如果把当前 contract 测试的通过当成真实 placement eligibility 已完成，后续可能高估 registry facts 在生产路径中的新鲜度、一致性和最终排序来源。
+  建议后续在哪类任务处理：在 T062/T065 中继续把生产 registry、liveness clock、capacity/load/disk-pressure facts 和 manager 接线收口，并保持 T060 固定下来的稳定选择与排除语义。

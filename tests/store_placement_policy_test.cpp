@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -58,6 +59,22 @@ namespace
         candidate.load.active_reads = active_reads;
         candidate.has_observed_facts = true;
         return candidate;
+    }
+
+    const storedemo::PlacementNodeExclusion *FindExclusion(
+        const std::vector<storedemo::PlacementNodeExclusion> &excluded_nodes,
+        const std::string &node_id)
+    {
+        const auto it = std::find_if(
+            excluded_nodes.begin(),
+            excluded_nodes.end(),
+            [&node_id](const storedemo::PlacementNodeExclusion &exclusion)
+            { return exclusion.node_id == node_id; });
+        if (it == excluded_nodes.end())
+        {
+            return nullptr;
+        }
+        return &(*it);
     }
 
     TEST(StorePlacementPolicyTest, ReplicaCountOneSelectsHealthyNode)
@@ -243,6 +260,140 @@ namespace
         ASSERT_EQ(result.decision.replica_nodes.size(), 2U);
         EXPECT_EQ(result.decision.replica_nodes[0].zone, "zone-a");
         EXPECT_EQ(result.decision.replica_nodes[1].zone, "zone-b");
+    }
+
+    TEST(StorePlacementPolicyTest,
+         HealthAwarePlacementSkipsReadonlyHighPressureAndReserveShortfallNodes)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        auto request = MakeRequest(2, 1, 512);
+        request.policy.reserve_capacity_bytes = 256;
+
+        auto readonly = MakeCandidate(1,
+                                      8192,
+                                      0,
+                                      storedemo::StorageNodeHealth::kReadOnly);
+        auto draining = MakeCandidate(2,
+                                      8192,
+                                      0,
+                                      storedemo::StorageNodeHealth::kDraining);
+        auto high_pressure = MakeCandidate(3,
+                                           8192,
+                                           0,
+                                           storedemo::StorageNodeHealth::kHealthy,
+                                           storedemo::StorageNodeDiskPressure::kHigh);
+        auto full_pressure = MakeCandidate(4,
+                                           8192,
+                                           0,
+                                           storedemo::StorageNodeHealth::kHealthy,
+                                           storedemo::StorageNodeDiskPressure::kFull);
+        auto insufficient = MakeCandidate(5, 700);
+        auto healthy_lower_load = MakeCandidate(6, 4096);
+        healthy_lower_load.load.active_reads = 1;
+        healthy_lower_load.load.active_writes = 1;
+        healthy_lower_load.load.queued_ops = 0;
+        auto healthy_higher_load = MakeCandidate(7, 4096);
+        healthy_higher_load.load.active_reads = 2;
+        healthy_higher_load.load.active_writes = 2;
+        healthy_higher_load.load.queued_ops = 1;
+
+        const std::vector<storedemo::StorageNodePlacementCandidate> candidates = {
+            readonly,
+            draining,
+            high_pressure,
+            full_pressure,
+            insufficient,
+            healthy_higher_load,
+            healthy_lower_load};
+
+        const auto result = selector.SelectReplicas(request, candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.replica_nodes.size(), 2U);
+        EXPECT_EQ(result.decision.replica_nodes[0].node_id,
+                  healthy_lower_load.node_id);
+        EXPECT_EQ(result.decision.replica_nodes[1].node_id,
+                  healthy_higher_load.node_id);
+
+        const auto *readonly_exclusion =
+            FindExclusion(result.decision.excluded_nodes, readonly.node_id);
+        ASSERT_NE(readonly_exclusion, nullptr);
+        EXPECT_EQ(readonly_exclusion->reason,
+                  "node health is not writable: ReadOnly");
+
+        const auto *draining_exclusion =
+            FindExclusion(result.decision.excluded_nodes, draining.node_id);
+        ASSERT_NE(draining_exclusion, nullptr);
+        EXPECT_EQ(draining_exclusion->reason,
+                  "node health is not writable: Draining");
+
+        const auto *high_pressure_exclusion =
+            FindExclusion(result.decision.excluded_nodes, high_pressure.node_id);
+        ASSERT_NE(high_pressure_exclusion, nullptr);
+        EXPECT_EQ(high_pressure_exclusion->reason,
+                  "node disk pressure is too high: High");
+
+        const auto *full_pressure_exclusion =
+            FindExclusion(result.decision.excluded_nodes, full_pressure.node_id);
+        ASSERT_NE(full_pressure_exclusion, nullptr);
+        EXPECT_EQ(full_pressure_exclusion->reason,
+                  "node disk pressure is too high: Full");
+
+        const auto *insufficient_exclusion =
+            FindExclusion(result.decision.excluded_nodes, insufficient.node_id);
+        ASSERT_NE(insufficient_exclusion, nullptr);
+        EXPECT_EQ(insufficient_exclusion->reason,
+                  "node capacity is insufficient for requested chunk");
+    }
+
+    TEST(StorePlacementPolicyTest,
+         HealthAwarePlacementKeepsStableOrderingForHealthyLowLoadNodes)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        auto request = MakeRequest(3, 2, 256);
+
+        auto medium_pressure_low_load = MakeCandidate(
+            5,
+            4096,
+            0,
+            storedemo::StorageNodeHealth::kHealthy,
+            storedemo::StorageNodeDiskPressure::kMedium);
+        medium_pressure_low_load.load.active_reads = 0;
+        medium_pressure_low_load.load.active_writes = 1;
+        medium_pressure_low_load.load.queued_ops = 0;
+
+        auto low_load = MakeCandidate(2, 4096);
+        low_load.load.active_reads = 1;
+        low_load.load.active_writes = 1;
+        low_load.load.queued_ops = 0;
+
+        auto tie_node_id_first = MakeCandidate(1, 4096);
+        tie_node_id_first.load.active_reads = 2;
+        tie_node_id_first.load.active_writes = 1;
+        tie_node_id_first.load.queued_ops = 0;
+
+        auto tie_node_id_second = MakeCandidate(3, 4096);
+        tie_node_id_second.load.active_reads = 2;
+        tie_node_id_second.load.active_writes = 1;
+        tie_node_id_second.load.queued_ops = 0;
+
+        const std::vector<storedemo::StorageNodePlacementCandidate> candidates = {
+            tie_node_id_second,
+            low_load,
+            medium_pressure_low_load,
+            tie_node_id_first};
+
+        const auto result = selector.SelectReplicas(request, candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.replica_nodes.size(), 3U);
+        EXPECT_EQ(result.decision.replica_nodes[0].node_id,
+                  medium_pressure_low_load.node_id);
+        EXPECT_EQ(result.decision.replica_nodes[1].node_id, low_load.node_id);
+        EXPECT_EQ(result.decision.replica_nodes[2].node_id,
+                  tie_node_id_first.node_id);
     }
 
     TEST(StorePlacementPolicyTest, ReadReplicaSelectionPreservesManifestOrderWhenFactsAreNeutral)
