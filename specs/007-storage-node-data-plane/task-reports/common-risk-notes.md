@@ -73,9 +73,9 @@
 - 任务编号：T049
   问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍没有生产 `DeleteChunk` / `BatchDeleteChunks` RPC、生产 `GarbageCollector`、restart 后继续 cleanup 或后台调度执行。
   影响：如果把 T049 的测试 helper 和定向验证当成 US3 生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实 chunk 回收能力；当前通过的只是 metadata-first 和 metadata-driven safety contract，不是后台 GC 功能落地。
-  建议后续在哪类任务处理：在 T050-T057 中继续实现 `DeleteChunk` contract/service/client、生产 `GarbageCollector`、metadata-driven GC safety check、pending/abort cleanup 和 restart 后继续清理，再关闭该风险。
+  建议后续在哪类任务处理：在 T056-T057 中继续实现 pending/abort cleanup candidate generation、restart 后继续清理，并保留 Windows 删除语义和 timeout/cancellation 运行中传播的后续验证，再关闭该风险。
 
-- 任务编号：T054
-  问题：T054 已实现生产 `GarbageCollector` 的 task model、bounded queue、state transition、attempts/last_error/retryable 边界，以及 submit/drain/stop/stats 和注入式 delete handler；但当前仍没有 metadata-driven safety check、candidate generation、restart 后继续 cleanup、Windows 实机删除验证。`next_retry_after_ms` 目前也只是任务模型扩展点，尚未形成真正的延迟重试调度器；`best_effort_cancel` / timeout 运行中传播同样未打通到 service/store 删除执行。
-  影响：如果把当前 GC task model 通过当成完整后台清理已完成，后续会高估 live manifest 保护、候选生成、重启恢复和延迟重试能力；当前队列和任务状态已经可观察，但是否允许真实删除仍需要 T055 的 metadata-driven safety gate，retry/backoff 也仍停留在最小 bounded worker 内部重试。
-  建议后续在哪类任务处理：在 T055-T057 中继续实现 metadata-driven GC safety check、pending/failed upload/abort cleanup candidate generation、restart cleanup/resume，并保留 Windows 待验证和 timeout/cancellation 运行中传播的后续验证。
+- 任务编号：T055
+  问题：T055 已在生产 `GarbageCollector` 中加入必需的 metadata-driven safety checker gate，并固定“live manifest 引用时不调用 delete handler、checker 暂时不可用时按 retryable 失败处理”的边界；但当前 safety checker 仍依赖调用方注入外部 metadata 事实源，尚未实现 pending/failed upload/abort candidate generation、restart 后继续 cleanup、Windows 实机删除验证。`next_retry_after_ms` 也仍只是任务模型扩展点，尚未形成真正的延迟重试调度器；`best_effort_cancel` / timeout 运行中传播同样未打通到 service/store 删除执行。
+  影响：如果把当前 safety gate 通过当成完整生产 GC 已完成，后续会高估 cleanup candidate 覆盖面、重启恢复、延迟重试和跨平台删除验证能力；另外 live-manifest 保护的正确性仍取决于调用方提供的 metadata 事实源是否新鲜且完整。
+  建议后续在哪类任务处理：在 T056-T057 中继续实现 pending/failed upload/abort cleanup candidate generation、restart cleanup/resume 和真实 metadata fact source 接线，并保留 Windows 待验证和 timeout/cancellation 运行中传播的后续验证。

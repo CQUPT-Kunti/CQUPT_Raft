@@ -16,6 +16,13 @@ namespace storedemo
     {
         using namespace std::chrono_literals;
 
+        GarbageCollectorSafetyCheckResult AllowDeleteByMetadataSafety(
+            const GarbageCollectorTask &task)
+        {
+            (void)task;
+            return {};
+        }
+
         class StorageGarbageCollectorTest : public ::testing::Test
         {
         protected:
@@ -64,6 +71,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             const auto submit_result =
@@ -106,6 +114,7 @@ namespace storedemo
                     response.status = StorageNodeStatusCode::kOk;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             auto invalid_task = MakeTask("", "");
@@ -144,6 +153,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig(1));
 
             ASSERT_TRUE(collector.SubmitTask(
@@ -193,6 +203,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig(4, 3));
 
             const auto submit_result =
@@ -228,6 +239,7 @@ namespace storedemo
                     response.error_detail = "identity mismatch";
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             ASSERT_TRUE(collector.SubmitTask(
@@ -262,6 +274,7 @@ namespace storedemo
                     response.retry_after_ms = 10;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig(4, 2));
 
             auto task = MakeTask("gc-task-max-attempts", "obj-gc-max-attempts~1~0");
@@ -308,6 +321,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             ASSERT_TRUE(collector.SubmitTask(
@@ -366,6 +380,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             ASSERT_TRUE(collector.SubmitTask(
@@ -419,6 +434,7 @@ namespace storedemo
                     response.deleted = true;
                     return response;
                 },
+                AllowDeleteByMetadataSafety,
                 SingleWorkerConfig());
 
             ASSERT_TRUE(collector.SubmitTask(
@@ -450,6 +466,218 @@ namespace storedemo
             EXPECT_FALSE(cancelled_task->retryable);
 
             EXPECT_EQ(stop_result.stats.cancelled_tasks, 1U);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               LiveManifestSafetyViolationBlocksDeleteHandlerAndFailsTask)
+        {
+            std::atomic<int> handler_runs{0};
+            std::string observed_metadata_boundary;
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                [&](const GarbageCollectorTask &task)
+                {
+                    observed_metadata_boundary = task.metadata_boundary;
+                    GarbageCollectorSafetyCheckResult result;
+                    result.status = StorageNodeStatusCode::kConflict;
+                    result.error_detail =
+                        "chunk still referenced by committed live manifest";
+                    return result;
+                },
+                SingleWorkerConfig());
+
+            ASSERT_TRUE(collector.SubmitTask(
+                            MakeTask("gc-task-safety-blocked", "obj-gc-safety~1~0"))
+                            .accepted());
+            ASSERT_TRUE(collector.Drain().drained);
+
+            const auto task = collector.FindTask("gc-task-safety-blocked");
+            ASSERT_TRUE(task.has_value());
+            EXPECT_EQ(task->state, GarbageCollectorTaskState::kFailed);
+            EXPECT_EQ(task->attempts, 1U);
+            EXPECT_EQ(task->last_error, StorageNodeStatusCode::kConflict);
+            EXPECT_EQ(task->last_error_detail,
+                      "chunk still referenced by committed live manifest");
+            EXPECT_FALSE(task->retryable);
+            EXPECT_EQ(task->next_retry_after_ms, 0U);
+            EXPECT_EQ(observed_metadata_boundary, "metadata-fact:deleted-object");
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               DeletedObjectOrphanAndFailedUploadTasksPassSafetyCheck)
+        {
+            std::atomic<int> handler_runs{0};
+            std::atomic<int> safety_runs{0};
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                [&](const GarbageCollectorTask &task)
+                {
+                    safety_runs.fetch_add(1, std::memory_order_relaxed);
+                    EXPECT_FALSE(task.metadata_boundary.empty());
+                    switch (task.reason)
+                    {
+                    case GarbageCollectionReason::kDeletedObjectCleanup:
+                    case GarbageCollectionReason::kOrphanChunkCleanup:
+                    case GarbageCollectionReason::kFailedUploadCleanup:
+                        return GarbageCollectorSafetyCheckResult{};
+                    case GarbageCollectionReason::kAbortCleanup:
+                    case GarbageCollectionReason::kUnspecified:
+                    default:
+                        break;
+                    }
+
+                    GarbageCollectorSafetyCheckResult result;
+                    result.status = StorageNodeStatusCode::kInvalidArgument;
+                    result.error_detail = "unexpected cleanup reason";
+                    return result;
+                },
+                SingleWorkerConfig());
+
+            auto deleted_task =
+                MakeTask("gc-task-deleted-safe", "obj-gc-safe-deleted~1~0");
+
+            auto orphan_task =
+                MakeTask("gc-task-orphan-safe", "obj-gc-safe-orphan~1~0");
+            orphan_task.reason = GarbageCollectionReason::kOrphanChunkCleanup;
+            orphan_task.metadata_boundary = "metadata-fact:orphan-chunk";
+
+            auto failed_upload_task =
+                MakeTask("gc-task-failed-upload-safe", "obj-gc-safe-failed~1~0");
+            failed_upload_task.reason = GarbageCollectionReason::kFailedUploadCleanup;
+            failed_upload_task.metadata_boundary = "metadata-fact:failed-upload";
+
+            ASSERT_TRUE(collector.SubmitTask(std::move(deleted_task)).accepted());
+            ASSERT_TRUE(collector.SubmitTask(std::move(orphan_task)).accepted());
+            ASSERT_TRUE(collector.SubmitTask(std::move(failed_upload_task)).accepted());
+            ASSERT_TRUE(collector.Drain().drained);
+
+            for (const std::string task_id : {"gc-task-deleted-safe",
+                                              "gc-task-orphan-safe",
+                                              "gc-task-failed-upload-safe"})
+            {
+                const auto task = collector.FindTask(task_id);
+                ASSERT_TRUE(task.has_value());
+                EXPECT_EQ(task->state, GarbageCollectorTaskState::kCompleted);
+                EXPECT_EQ(task->attempts, 1U);
+            }
+            EXPECT_EQ(safety_runs.load(std::memory_order_relaxed), 3);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 3);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               RetryableSafetyCheckerFailureRetriesBeforeCallingDeleteHandler)
+        {
+            std::atomic<int> safety_attempts{0};
+            std::atomic<int> handler_runs{0};
+            std::string observed_metadata_boundary;
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &task)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    observed_metadata_boundary = task.metadata_boundary;
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                [&](const GarbageCollectorTask &task)
+                {
+                    observed_metadata_boundary = task.metadata_boundary;
+                    const int current_attempt =
+                        safety_attempts.fetch_add(1, std::memory_order_relaxed);
+                    if (current_attempt == 0)
+                    {
+                        GarbageCollectorSafetyCheckResult result;
+                        result.status = StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "metadata safety checker unavailable";
+                        result.retry_after_ms = 15;
+                        return result;
+                    }
+
+                    return GarbageCollectorSafetyCheckResult{};
+                },
+                SingleWorkerConfig(4, 3));
+
+            ASSERT_TRUE(collector.SubmitTask(
+                            MakeTask("gc-task-safety-retry", "obj-gc-safety-retry~1~0"))
+                            .accepted());
+            ASSERT_TRUE(collector.Drain().drained);
+
+            const auto task = collector.FindTask("gc-task-safety-retry");
+            ASSERT_TRUE(task.has_value());
+            EXPECT_EQ(task->state, GarbageCollectorTaskState::kCompleted);
+            EXPECT_EQ(task->attempts, 2U);
+            EXPECT_EQ(task->last_error, StorageNodeStatusCode::kNodeUnavailable);
+            EXPECT_EQ(task->last_error_detail, "metadata safety checker unavailable");
+            EXPECT_FALSE(task->retryable);
+            EXPECT_EQ(task->next_retry_after_ms, 0U);
+            EXPECT_EQ(safety_attempts.load(std::memory_order_relaxed), 2);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 1);
+            EXPECT_EQ(observed_metadata_boundary, "metadata-fact:deleted-object");
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               RepeatedSafetyBlockedTasksNeverCallDeleteHandler)
+        {
+            std::atomic<int> handler_runs{0};
+            std::atomic<int> safety_runs{0};
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                [&](const GarbageCollectorTask &)
+                {
+                    safety_runs.fetch_add(1, std::memory_order_relaxed);
+                    GarbageCollectorSafetyCheckResult result;
+                    result.status = StorageNodeStatusCode::kConflict;
+                    result.error_detail =
+                        "chunk still referenced by committed live manifest";
+                    return result;
+                },
+                SingleWorkerConfig());
+
+            ASSERT_TRUE(collector.SubmitTask(
+                            MakeTask("gc-task-safety-blocked-a", "obj-gc-safety-repeat~1~0"))
+                            .accepted());
+            ASSERT_TRUE(collector.SubmitTask(
+                            MakeTask("gc-task-safety-blocked-b", "obj-gc-safety-repeat~1~0"))
+                            .accepted());
+            ASSERT_TRUE(collector.Drain().drained);
+
+            for (const std::string task_id : {"gc-task-safety-blocked-a",
+                                              "gc-task-safety-blocked-b"})
+            {
+                const auto task = collector.FindTask(task_id);
+                ASSERT_TRUE(task.has_value());
+                EXPECT_EQ(task->state, GarbageCollectorTaskState::kFailed);
+                EXPECT_EQ(task->last_error, StorageNodeStatusCode::kConflict);
+            }
+            EXPECT_EQ(safety_runs.load(std::memory_order_relaxed), 2);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
         }
     }
 }

@@ -76,8 +76,22 @@ namespace storedemo
         std::uint64_t next_retry_after_ms{0};
     };
 
+    struct GarbageCollectorSafetyCheckResult
+    {
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        std::uint64_t retry_after_ms{0};
+
+        [[nodiscard]] bool allowed() const
+        {
+            return status == StorageNodeStatusCode::kOk;
+        }
+    };
+
     using GarbageCollectorDeleteHandler =
         std::function<DeleteChunkResponse(const GarbageCollectorTask &)>;
+    using GarbageCollectorSafetyChecker =
+        std::function<GarbageCollectorSafetyCheckResult(const GarbageCollectorTask &)>;
 
     struct GarbageCollectorSubmitResult
     {
@@ -135,6 +149,7 @@ namespace storedemo
     {
     public:
         explicit GarbageCollector(GarbageCollectorDeleteHandler delete_handler,
+                                  GarbageCollectorSafetyChecker safety_checker,
                                   GarbageCollectorConfig config = {});
         ~GarbageCollector();
 

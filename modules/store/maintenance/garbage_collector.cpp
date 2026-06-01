@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -48,6 +49,13 @@ namespace storedemo
             }
             return false;
         }
+
+        struct GarbageCollectorAttemptResult
+        {
+            StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+            std::string error_detail;
+            std::uint64_t retry_after_ms{0};
+        };
 
         StorageNodeStatusCode ResolveTaskChunkId(GarbageCollectorTask *task,
                                                  std::string *error_detail)
@@ -193,13 +201,33 @@ namespace storedemo
 
             return ResolveTaskChunkId(task, error_detail);
         }
+
+        GarbageCollectorAttemptResult MakeAttemptResultFromSafetyCheck(
+            GarbageCollectorSafetyCheckResult check_result)
+        {
+            return GarbageCollectorAttemptResult{
+                .status = check_result.status,
+                .error_detail = std::move(check_result.error_detail),
+                .retry_after_ms = check_result.retry_after_ms};
+        }
+
+        GarbageCollectorAttemptResult MakeAttemptResultFromDeleteResponse(
+            DeleteChunkResponse delete_response)
+        {
+            return GarbageCollectorAttemptResult{
+                .status = delete_response.status,
+                .error_detail = std::move(delete_response.error_detail),
+                .retry_after_ms = delete_response.retry_after_ms};
+        }
     }
 
     struct GarbageCollector::Impl
     {
         explicit Impl(GarbageCollectorDeleteHandler handler,
+                      GarbageCollectorSafetyChecker checker,
                       const GarbageCollectorConfig &collector_config)
             : delete_handler(std::move(handler))
+            , safety_checker(std::move(checker))
             , config(collector_config)
             , executor(StorageExecutorConfig{
                   .worker_count = collector_config.worker_count,
@@ -210,6 +238,7 @@ namespace storedemo
         mutable std::mutex mutex;
         std::condition_variable cv;
         GarbageCollectorDeleteHandler delete_handler;
+        GarbageCollectorSafetyChecker safety_checker;
         GarbageCollectorConfig config;
         BoundedStorageExecutor executor;
         bool accepting_new_tasks{true};
@@ -383,8 +412,10 @@ namespace storedemo
     }
 
     GarbageCollector::GarbageCollector(GarbageCollectorDeleteHandler delete_handler,
+                                       GarbageCollectorSafetyChecker safety_checker,
                                        GarbageCollectorConfig config)
         : impl_(std::make_unique<Impl>(std::move(delete_handler),
+                                       std::move(safety_checker),
                                        SanitizeGarbageCollectorConfig(config)))
         , config_(SanitizeGarbageCollectorConfig(config))
     {
@@ -392,6 +423,11 @@ namespace storedemo
         {
             throw std::invalid_argument(
                 "GarbageCollector requires a non-null delete handler");
+        }
+        if (!impl_->safety_checker)
+        {
+            throw std::invalid_argument(
+                "GarbageCollector requires a non-null metadata safety checker");
         }
     }
 
@@ -472,21 +508,42 @@ namespace storedemo
                         }
                         impl_->cv.notify_all();
 
-                        DeleteChunkResponse handler_response;
+                        GarbageCollectorAttemptResult attempt_result;
                         try
                         {
-                            handler_response = impl_->delete_handler(task_snapshot);
+                            attempt_result = MakeAttemptResultFromSafetyCheck(
+                                impl_->safety_checker(task_snapshot));
                         }
                         catch (const std::exception &ex)
                         {
-                            handler_response.status = StorageNodeStatusCode::kIoError;
-                            handler_response.error_detail = ex.what();
+                            attempt_result.status = StorageNodeStatusCode::kIoError;
+                            attempt_result.error_detail = ex.what();
                         }
                         catch (...)
                         {
-                            handler_response.status = StorageNodeStatusCode::kIoError;
-                            handler_response.error_detail =
-                                "unknown garbage collector handler exception";
+                            attempt_result.status = StorageNodeStatusCode::kIoError;
+                            attempt_result.error_detail =
+                                "unknown garbage collector safety checker exception";
+                        }
+
+                        if (attempt_result.status == StorageNodeStatusCode::kOk)
+                        {
+                            try
+                            {
+                                attempt_result = MakeAttemptResultFromDeleteResponse(
+                                    impl_->delete_handler(task_snapshot));
+                            }
+                            catch (const std::exception &ex)
+                            {
+                                attempt_result.status = StorageNodeStatusCode::kIoError;
+                                attempt_result.error_detail = ex.what();
+                            }
+                            catch (...)
+                            {
+                                attempt_result.status = StorageNodeStatusCode::kIoError;
+                                attempt_result.error_detail =
+                                    "unknown garbage collector handler exception";
+                            }
                         }
 
                         bool should_retry = false;
@@ -502,18 +559,18 @@ namespace storedemo
                             ++task_it->second.attempts;
                             ++impl_->total_attempts;
 
-                            if (handler_response.status != StorageNodeStatusCode::kOk)
+                            if (attempt_result.status != StorageNodeStatusCode::kOk)
                             {
-                                task_it->second.last_error = handler_response.status;
+                                task_it->second.last_error = attempt_result.status;
                                 task_it->second.last_error_detail =
-                                    handler_response.error_detail;
+                                    attempt_result.error_detail;
                                 task_it->second.next_retry_after_ms =
-                                    handler_response.retry_after_ms;
+                                    attempt_result.retry_after_ms;
                                 impl_->last_error_detail =
-                                    handler_response.error_detail;
+                                    attempt_result.error_detail;
                             }
 
-                            if (handler_response.status == StorageNodeStatusCode::kOk)
+                            if (attempt_result.status == StorageNodeStatusCode::kOk)
                             {
                                 task_it->second.state =
                                     GarbageCollectorTaskState::kCompleted;
@@ -527,7 +584,7 @@ namespace storedemo
                                 impl_->stop_requested &&
                                 impl_->stop_mode == GarbageCollectorStopMode::kCancelPending;
                             const bool retryable_failure =
-                                IsRetriableStatus(handler_response.status) &&
+                                IsRetriableStatus(attempt_result.status) &&
                                 task_it->second.attempts < task_it->second.max_attempts &&
                                 !stop_blocks_retry;
                             if (retryable_failure)
