@@ -69,6 +69,7 @@
   - `Running` 恢复后规范化为可重新执行状态，不永久卡死
   - `Completed` / `Failed` / `Cancelled` 恢复后只保留状态，不自动重跑
 - snapshot 写入通过 `DurableFile` staging + publish + directory sync 完成，避免半写文件直接污染恢复。
+- T057-FIX 把 snapshot 保存改成 streaming append writer：先排序，再写 header/count，随后逐 task 生成单行并立即 `Append`，不再先在内存中拼整份 payload。
 - T057 不实现 delayed retry scheduler、repair / rebalance / scrub，也不让 persistence 层调用 metadata / Raft。
 
 ## metadata-driven safety check 语义
@@ -209,14 +210,14 @@
 - 责任：读写整份 GC task snapshot
 - 输入：task 列表或 snapshot 文件
 - 输出：`LoadResult` / `DurableFileResult`
-- 边界：当前采用 whole-snapshot 重写，不做增量 WAL 或多版本保留
+- 边界：当前采用 whole-snapshot 重写，不做增量 WAL 或多版本保留；保存路径已改成 streaming append，但最终磁盘上仍只保留一份完整 `gc/tasks.snapshot`
 
 ### task serialization / deserialization helper（`gc_task_store.cpp`）
 
 - 责任：把 task snapshot 编码/解码成带 schema header 的稳定文本格式
 - 输入：task 字段与原始 snapshot 行
 - 输出：序列化字符串或反序列化后的 task
-- 边界：字符串字段采用 hex 编码，空串使用显式占位，避免空字段破坏解析
+- 边界：字符串字段采用 hex 编码，空串使用显式占位，避免空字段破坏解析；单 task 行仍保持 `GC_TASK_STORE_V1` 兼容格式
 
 ### task state normalization helper（`NormalizeRecoveredTaskState`）
 
@@ -227,8 +228,8 @@
 
 ### atomic write / publish helper（`GarbageCollectorTaskStore::SaveSnapshot`）
 
-- 责任：通过 `OpenStagingWriter -> Flush -> Close -> PublishStagedFile -> SyncDirectory` 原子更新 snapshot
-- 输入：完整 task snapshot payload
+- 责任：通过 `OpenStagingWriter -> Append(header/count/task-line) -> Flush -> Close -> PublishStagedFile -> SyncDirectory` 原子更新 snapshot
+- 输入：按稳定排序遍历的 task snapshot 数据流
 - 输出：到 durable boundary 的 snapshot 文件
 - 边界：Windows directory sync 仍可能返回 explicit unsupported，需要后续 Windows 实机验证
 

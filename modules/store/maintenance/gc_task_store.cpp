@@ -261,7 +261,8 @@ namespace storedemo
             return false;
         }
 
-        std::string SerializeSnapshot(const std::vector<GarbageCollectorTask> &tasks)
+        std::vector<GarbageCollectorTask> BuildSortedTasks(
+            const std::vector<GarbageCollectorTask> &tasks)
         {
             std::vector<GarbageCollectorTask> sorted_tasks = tasks;
             std::sort(sorted_tasks.begin(),
@@ -271,29 +272,45 @@ namespace storedemo
                       {
                           return lhs.task_id < rhs.task_id;
                       });
+            return sorted_tasks;
+        }
 
+        std::string SerializeTaskLine(const GarbageCollectorTask &task)
+        {
             std::ostringstream output;
-            output << kSnapshotMagic << "\n";
-            output << "count " << sorted_tasks.size() << "\n";
-            for (const auto &task : sorted_tasks)
-            {
-                output << "task "
-                       << EncodeHex(task.task_id) << ' '
-                       << EncodeHex(task.chunk_id) << ' '
-                       << EncodeHex(task.object_id) << ' '
-                       << task.version << ' '
-                       << task.chunk_index << ' '
-                       << static_cast<std::uint32_t>(task.reason) << ' '
-                       << EncodeHex(task.metadata_boundary) << ' '
-                       << task.attempts << ' '
-                       << task.max_attempts << ' '
-                       << static_cast<std::uint32_t>(task.last_error) << ' '
-                       << EncodeHex(task.last_error_detail) << ' '
-                       << static_cast<std::uint32_t>(task.state) << ' '
-                       << (task.retryable ? 1 : 0) << ' '
-                       << task.next_retry_after_ms << "\n";
-            }
+            output << "task "
+                   << EncodeHex(task.task_id) << ' '
+                   << EncodeHex(task.chunk_id) << ' '
+                   << EncodeHex(task.object_id) << ' '
+                   << task.version << ' '
+                   << task.chunk_index << ' '
+                   << static_cast<std::uint32_t>(task.reason) << ' '
+                   << EncodeHex(task.metadata_boundary) << ' '
+                   << task.attempts << ' '
+                   << task.max_attempts << ' '
+                   << static_cast<std::uint32_t>(task.last_error) << ' '
+                   << EncodeHex(task.last_error_detail) << ' '
+                   << static_cast<std::uint32_t>(task.state) << ' '
+                   << (task.retryable ? 1 : 0) << ' '
+                   << task.next_retry_after_ms << "\n";
             return output.str();
+        }
+
+        DurableFileResult AppendStringToWriter(DurableFileWriter *writer,
+                                               const std::string_view payload)
+        {
+            DurableFileResult result;
+            if (writer == nullptr)
+            {
+                result.error = DurableFileErrorCode::kIoError;
+                result.error_detail = "durable writer must not be null";
+                return result;
+            }
+
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            return writer->Append(DurableAppendRequest{
+                .buffer = std::span<const std::byte>(payload_bytes, payload.size())});
         }
 
         bool ParseTaskLine(const std::string &line,
@@ -436,14 +453,13 @@ namespace storedemo
             return result;
         }
 
-        const std::string payload = SerializeSnapshot(tasks);
+        const auto sorted_tasks = BuildSortedTasks(tasks);
         const auto staging_relative_path = SnapshotStagingRelativePath();
         const auto final_relative_path = SnapshotRelativePath();
 
         auto open_response =
             config_.durable_file->OpenStagingWriter(OpenStagingWriterRequest{
-                .relative_path = staging_relative_path,
-                .expected_size = static_cast<std::uint64_t>(payload.size())});
+                .relative_path = staging_relative_path});
         if (!open_response.ok())
         {
             result = open_response;
@@ -457,14 +473,36 @@ namespace storedemo
             return result;
         }
 
-        const auto *payload_bytes =
-            reinterpret_cast<const std::byte *>(payload.data());
-        const auto append_result = open_response.writer->Append(DurableAppendRequest{
-            .buffer = std::span<const std::byte>(payload_bytes, payload.size())});
+        std::size_t bytes_written = 0;
+        const std::string header = std::string(kSnapshotMagic) + "\n";
+        auto append_result = AppendStringToWriter(open_response.writer.get(), header);
         if (!append_result.ok())
         {
             (void)open_response.writer->Close(DurableCloseRequest{});
             return append_result;
+        }
+        bytes_written += header.size();
+
+        const std::string count_line =
+            "count " + std::to_string(sorted_tasks.size()) + "\n";
+        append_result = AppendStringToWriter(open_response.writer.get(), count_line);
+        if (!append_result.ok())
+        {
+            (void)open_response.writer->Close(DurableCloseRequest{});
+            return append_result;
+        }
+        bytes_written += count_line.size();
+
+        for (const auto &task : sorted_tasks)
+        {
+            const std::string task_line = SerializeTaskLine(task);
+            append_result = AppendStringToWriter(open_response.writer.get(), task_line);
+            if (!append_result.ok())
+            {
+                (void)open_response.writer->Close(DurableCloseRequest{});
+                return append_result;
+            }
+            bytes_written += task_line.size();
         }
 
         const auto flush_result = open_response.writer->Flush(DurableFlushRequest{
@@ -499,7 +537,7 @@ namespace storedemo
             return sync_result;
         }
 
-        result.bytes_transferred = payload.size();
+        result.bytes_transferred = bytes_written;
         result.durable_boundary_reached = true;
         return result;
     }

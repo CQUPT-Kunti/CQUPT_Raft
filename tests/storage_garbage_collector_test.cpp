@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "store/common/store_types.h"
 #include "store/maintenance/garbage_collector.h"
@@ -571,6 +573,105 @@ namespace storedemo
 
             release_task_promise.set_value();
             EXPECT_TRUE(collector.Drain().drained);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               SaveSnapshotPreservesV1FormatSortedOrderAndLargeTaskRecovery)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_streaming_snapshot_save");
+            auto task_store = MakeTaskStore(temp_dir.root());
+
+            std::vector<GarbageCollectorTask> tasks;
+            tasks.reserve(128);
+            std::vector<std::string> expected_task_ids;
+            expected_task_ids.reserve(128);
+            for (int index = 127; index >= 0; --index)
+            {
+                const std::string task_id = "gc-task-stream-" + std::to_string(index);
+                const std::string object_id =
+                    "obj-gc-stream-" + std::to_string(index % 11);
+                auto task = MakeTask(
+                    task_id,
+                    object_id + "~" + std::to_string((index % 5) + 1) + "~" +
+                        std::to_string(index % 7));
+                task.object_id = object_id;
+                task.version = static_cast<std::uint64_t>((index % 5) + 1);
+                task.chunk_index = static_cast<std::uint32_t>(index % 7);
+                task.reason =
+                    (index % 2 == 0)
+                        ? GarbageCollectionReason::kDeletedObjectCleanup
+                        : GarbageCollectionReason::kFailedUploadCleanup;
+                task.metadata_boundary =
+                    "metadata-fact:streaming-save-" + std::to_string(index);
+                task.attempts = static_cast<std::uint32_t>(index % 3);
+                task.max_attempts = 5;
+                task.last_error = (index % 4 == 0)
+                                      ? StorageNodeStatusCode::kTimeout
+                                      : StorageNodeStatusCode::kOk;
+                task.last_error_detail =
+                    (index % 4 == 0) ? "timeout-" + std::to_string(index) : "";
+                task.state = (index % 3 == 0) ? GarbageCollectorTaskState::kRetryPending
+                                              : GarbageCollectorTaskState::kQueued;
+                task.retryable = (index % 3) == 0;
+                task.next_retry_after_ms =
+                    task.retryable ? static_cast<std::uint64_t>(index + 10) : 0U;
+                expected_task_ids.push_back(task_id);
+                tasks.push_back(std::move(task));
+            }
+            std::sort(expected_task_ids.begin(), expected_task_ids.end());
+
+            const auto save_result = task_store.SaveSnapshot(tasks);
+            ASSERT_TRUE(save_result.ok()) << save_result.error_detail;
+            EXPECT_TRUE(std::filesystem::exists(task_store.snapshot_path()));
+
+            std::ifstream input(task_store.snapshot_path(), std::ios::binary);
+            ASSERT_TRUE(input.is_open());
+            std::string header;
+            std::string count_line;
+            ASSERT_TRUE(std::getline(input, header));
+            ASSERT_TRUE(std::getline(input, count_line));
+            EXPECT_EQ(header, "GC_TASK_STORE_V1");
+            EXPECT_EQ(count_line, "count 128");
+
+            std::vector<std::string> raw_task_lines;
+            std::string line;
+            while (std::getline(input, line))
+            {
+                if (!line.empty())
+                {
+                    raw_task_lines.push_back(line);
+                }
+            }
+            ASSERT_EQ(raw_task_lines.size(), 128U);
+            EXPECT_EQ(raw_task_lines.front().rfind("task ", 0), 0U);
+            EXPECT_EQ(raw_task_lines.back().rfind("task ", 0), 0U);
+
+            const auto load_result = task_store.LoadSnapshot();
+            ASSERT_TRUE(load_result.ok()) << load_result.error_detail;
+            ASSERT_TRUE(load_result.snapshot_found);
+            ASSERT_EQ(load_result.tasks.size(), 128U);
+
+            for (std::size_t index = 0; index < load_result.tasks.size(); ++index)
+            {
+                const auto &task = load_result.tasks[index];
+                EXPECT_EQ(task.task_id, expected_task_ids[index]);
+                EXPECT_FALSE(task.chunk_id.empty());
+                EXPECT_FALSE(task.metadata_boundary.empty());
+                EXPECT_LE(task.attempts, task.max_attempts);
+                if ((index % 2) == 0)
+                {
+                    EXPECT_TRUE(task.reason == GarbageCollectionReason::kDeletedObjectCleanup ||
+                                task.reason == GarbageCollectionReason::kFailedUploadCleanup);
+                }
+            }
+
+            const auto &sample_task = load_result.tasks.at(37);
+            EXPECT_FALSE(sample_task.object_id.empty());
+            EXPECT_FALSE(sample_task.chunk_id.empty());
+            EXPECT_FALSE(sample_task.metadata_boundary.empty());
+            EXPECT_LE(sample_task.attempts, sample_task.max_attempts);
+            EXPECT_TRUE(sample_task.state == GarbageCollectorTaskState::kQueued ||
+                        sample_task.state == GarbageCollectorTaskState::kRetryPending);
         }
 
         TEST_F(StorageGarbageCollectorTest, RestartResumesQueuedAndRunningTasks)
