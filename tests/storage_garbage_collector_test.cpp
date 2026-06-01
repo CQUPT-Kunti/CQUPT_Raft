@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <optional>
 #include <stdexcept>
@@ -10,6 +12,8 @@
 
 #include "store/common/store_types.h"
 #include "store/maintenance/garbage_collector.h"
+#include "store/maintenance/gc_task_store.h"
+#include "support/store_test_utils.h"
 
 namespace storedemo
 {
@@ -65,6 +69,18 @@ namespace storedemo
                     .default_max_attempts = default_max_attempts};
             }
 
+            static GarbageCollectorConfig PersistentSingleWorkerConfig(
+                const std::filesystem::path &root_path,
+                const std::size_t queue_capacity = 4,
+                const std::uint32_t default_max_attempts = 3)
+            {
+                return GarbageCollectorConfig{
+                    .worker_count = 1,
+                    .queue_capacity = queue_capacity,
+                    .default_max_attempts = default_max_attempts,
+                    .persistence_root = root_path};
+            }
+
             static GarbageCollectorTask MakeTask(const std::string &task_id,
                                                  const std::string &chunk_id)
             {
@@ -74,6 +90,13 @@ namespace storedemo
                 task.reason = GarbageCollectionReason::kDeletedObjectCleanup;
                 task.metadata_boundary = "metadata-fact:deleted-object";
                 return task;
+            }
+
+            static GarbageCollectorTaskStore MakeTaskStore(
+                const std::filesystem::path &root_path)
+            {
+                return GarbageCollectorTaskStore(GarbageCollectorTaskStoreConfig{
+                    .root_path = root_path});
             }
         };
 
@@ -495,6 +518,289 @@ namespace storedemo
             EXPECT_FALSE(cancelled_task->retryable);
 
             EXPECT_EQ(stop_result.stats.cancelled_tasks, 1U);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               SubmitTaskPersistsSnapshotFileAndRetainsCriticalFields)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_task_snapshot_submit");
+            std::promise<void> task_started_promise;
+            std::future<void> task_started = task_started_promise.get_future();
+            std::promise<void> release_task_promise;
+            std::shared_future<void> release_task =
+                release_task_promise.get_future().share();
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    task_started_promise.set_value();
+                    release_task.wait();
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            auto task = MakeTask("gc-task-persisted-submit", "obj-gc-persisted~1~0");
+            task.object_id = "obj-gc-persisted";
+            task.version = 1;
+            task.chunk_index = 0;
+            task.max_attempts = 5;
+            ASSERT_TRUE(collector.SubmitTask(task).accepted());
+            ASSERT_EQ(task_started.wait_for(1s), std::future_status::ready);
+
+            const auto task_store = MakeTaskStore(temp_dir.root());
+            EXPECT_TRUE(std::filesystem::exists(task_store.snapshot_path()));
+
+            const auto load_result = task_store.LoadSnapshot();
+            ASSERT_TRUE(load_result.ok()) << load_result.error_detail;
+            ASSERT_TRUE(load_result.snapshot_found);
+            ASSERT_EQ(load_result.tasks.size(), 1U);
+            EXPECT_EQ(load_result.tasks.front().task_id, task.task_id);
+            EXPECT_EQ(load_result.tasks.front().chunk_id, task.chunk_id);
+            EXPECT_EQ(load_result.tasks.front().object_id, task.object_id);
+            EXPECT_EQ(load_result.tasks.front().version, task.version);
+            EXPECT_EQ(load_result.tasks.front().chunk_index, task.chunk_index);
+            EXPECT_EQ(load_result.tasks.front().reason, task.reason);
+            EXPECT_EQ(load_result.tasks.front().metadata_boundary, task.metadata_boundary);
+            EXPECT_EQ(load_result.tasks.front().state, GarbageCollectorTaskState::kRunning);
+            EXPECT_EQ(load_result.tasks.front().attempts, 0U);
+            EXPECT_EQ(load_result.tasks.front().max_attempts, 5U);
+
+            release_task_promise.set_value();
+            EXPECT_TRUE(collector.Drain().drained);
+        }
+
+        TEST_F(StorageGarbageCollectorTest, RestartResumesQueuedAndRunningTasks)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_restart_resume_basic");
+            auto task_store = MakeTaskStore(temp_dir.root());
+
+            auto queued_task = MakeTask("gc-task-resume-queued", "obj-gc-resume~1~0");
+            queued_task.state = GarbageCollectorTaskState::kQueued;
+            queued_task.max_attempts = 3;
+
+            auto running_task = MakeTask("gc-task-resume-running", "obj-gc-resume~1~1");
+            running_task.state = GarbageCollectorTaskState::kRunning;
+            running_task.max_attempts = 3;
+
+            const auto save_result =
+                task_store.SaveSnapshot({queued_task, running_task});
+            ASSERT_TRUE(save_result.ok()) << save_result.error_detail;
+
+            std::atomic<int> handler_runs{0};
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &task)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            ASSERT_TRUE(collector.Drain().drained);
+
+            const auto queued_snapshot = collector.FindTask("gc-task-resume-queued");
+            const auto running_snapshot = collector.FindTask("gc-task-resume-running");
+            ASSERT_TRUE(queued_snapshot.has_value());
+            ASSERT_TRUE(running_snapshot.has_value());
+            EXPECT_EQ(queued_snapshot->state, GarbageCollectorTaskState::kCompleted);
+            EXPECT_EQ(running_snapshot->state, GarbageCollectorTaskState::kCompleted);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 2);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               RestartResumesRetryPendingTaskWithoutLosingErrorFacts)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_restart_resume_retry_pending");
+            auto task_store = MakeTaskStore(temp_dir.root());
+
+            auto retry_pending_task = MakeTask("gc-task-retry-persisted",
+                                               "obj-gc-retry-persisted~1~0");
+            retry_pending_task.state = GarbageCollectorTaskState::kRetryPending;
+            retry_pending_task.attempts = 1;
+            retry_pending_task.max_attempts = 3;
+            retry_pending_task.last_error = StorageNodeStatusCode::kTimeout;
+            retry_pending_task.last_error_detail = "persisted timeout";
+            retry_pending_task.retryable = true;
+            retry_pending_task.next_retry_after_ms = 25;
+
+            const auto save_result = task_store.SaveSnapshot({retry_pending_task});
+            ASSERT_TRUE(save_result.ok()) << save_result.error_detail;
+
+            std::atomic<int> handler_runs{0};
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &task)
+                {
+                    EXPECT_EQ(task.metadata_boundary, "metadata-fact:deleted-object");
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            ASSERT_TRUE(collector.Drain().drained);
+
+            const auto snapshot = collector.FindTask("gc-task-retry-persisted");
+            ASSERT_TRUE(snapshot.has_value());
+            EXPECT_EQ(snapshot->state, GarbageCollectorTaskState::kCompleted);
+            EXPECT_EQ(snapshot->attempts, 2U);
+            EXPECT_EQ(snapshot->last_error, StorageNodeStatusCode::kTimeout);
+            EXPECT_EQ(snapshot->last_error_detail, "persisted timeout");
+            EXPECT_EQ(snapshot->reason, GarbageCollectionReason::kDeletedObjectCleanup);
+            EXPECT_EQ(snapshot->chunk_id, "obj-gc-retry-persisted~1~0");
+            EXPECT_EQ(snapshot->metadata_boundary, "metadata-fact:deleted-object");
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 1);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               RestartDoesNotReexecuteCompletedOrFailedTasks)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_restart_terminal_states");
+            auto task_store = MakeTaskStore(temp_dir.root());
+
+            auto completed_task = MakeTask("gc-task-completed-persisted",
+                                           "obj-gc-terminal~1~0");
+            completed_task.state = GarbageCollectorTaskState::kCompleted;
+            completed_task.attempts = 1;
+            completed_task.max_attempts = 3;
+
+            auto failed_task = MakeTask("gc-task-failed-persisted",
+                                        "obj-gc-terminal~1~1");
+            failed_task.state = GarbageCollectorTaskState::kFailed;
+            failed_task.attempts = 3;
+            failed_task.max_attempts = 3;
+            failed_task.last_error = StorageNodeStatusCode::kConflict;
+            failed_task.last_error_detail = "live manifest blocked";
+            failed_task.retryable = false;
+
+            auto cancelled_task = MakeTask("gc-task-cancelled-persisted",
+                                           "obj-gc-terminal~1~2");
+            cancelled_task.state = GarbageCollectorTaskState::kCancelled;
+            cancelled_task.max_attempts = 3;
+            cancelled_task.last_error = StorageNodeStatusCode::kCancelled;
+            cancelled_task.last_error_detail = "cancelled before restart";
+
+            const auto save_result =
+                task_store.SaveSnapshot({completed_task, failed_task, cancelled_task});
+            ASSERT_TRUE(save_result.ok()) << save_result.error_detail;
+
+            std::atomic<int> handler_runs{0};
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            std::this_thread::sleep_for(100ms);
+            const auto stop_result = collector.Stop();
+            EXPECT_TRUE(stop_result.stopped);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
+
+            const auto completed_snapshot =
+                collector.FindTask("gc-task-completed-persisted");
+            const auto failed_snapshot =
+                collector.FindTask("gc-task-failed-persisted");
+            const auto cancelled_snapshot =
+                collector.FindTask("gc-task-cancelled-persisted");
+            ASSERT_TRUE(completed_snapshot.has_value());
+            ASSERT_TRUE(failed_snapshot.has_value());
+            ASSERT_TRUE(cancelled_snapshot.has_value());
+            EXPECT_EQ(completed_snapshot->state, GarbageCollectorTaskState::kCompleted);
+            EXPECT_EQ(failed_snapshot->state, GarbageCollectorTaskState::kFailed);
+            EXPECT_EQ(cancelled_snapshot->state, GarbageCollectorTaskState::kCancelled);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               CorruptedPersistenceSnapshotDoesNotCrashCollector)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_restart_corrupted_snapshot");
+            auto task_store = MakeTaskStore(temp_dir.root());
+
+            std::filesystem::create_directories(task_store.snapshot_path().parent_path());
+            {
+                std::ofstream output(task_store.snapshot_path(), std::ios::binary);
+                ASSERT_TRUE(output.is_open());
+                output << "not-a-valid-gc-snapshot\n";
+            }
+
+            std::atomic<int> handler_runs{0};
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            EXPECT_NE(collector.SnapshotStats().last_error_detail.find(
+                          "failed to load persisted garbage collector tasks"),
+                      std::string::npos);
+
+            ASSERT_TRUE(collector.SubmitTask(
+                            MakeTask("gc-task-after-corruption", "obj-gc-after~1~0"))
+                            .accepted());
+            ASSERT_TRUE(collector.Drain().drained);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 1);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               RestoredTasksStillPassThroughMetadataSafetyChecker)
+        {
+            storedemo::test::ScopedStoreTestDir temp_dir("gc_restart_safety_checker");
+            auto task_store = MakeTaskStore(temp_dir.root());
+            auto blocked_task = MakeTask("gc-task-persisted-blocked",
+                                         "obj-gc-persisted-blocked~1~0");
+            blocked_task.state = GarbageCollectorTaskState::kQueued;
+            blocked_task.max_attempts = 3;
+            const auto save_result = task_store.SaveSnapshot({blocked_task});
+            ASSERT_TRUE(save_result.ok()) << save_result.error_detail;
+
+            std::atomic<int> handler_runs{0};
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                [&](const GarbageCollectorTask &task)
+                {
+                    EXPECT_EQ(task.metadata_boundary, "metadata-fact:deleted-object");
+                    GarbageCollectorSafetyCheckResult result;
+                    result.status = StorageNodeStatusCode::kConflict;
+                    result.error_detail = "persisted live manifest block";
+                    return result;
+                },
+                PersistentSingleWorkerConfig(temp_dir.root()));
+
+            ASSERT_TRUE(collector.Drain().drained);
+            const auto snapshot = collector.FindTask("gc-task-persisted-blocked");
+            ASSERT_TRUE(snapshot.has_value());
+            EXPECT_EQ(snapshot->state, GarbageCollectorTaskState::kFailed);
+            EXPECT_EQ(snapshot->last_error, StorageNodeStatusCode::kConflict);
+            EXPECT_EQ(snapshot->last_error_detail, "persisted live manifest block");
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
         }
 
         TEST_F(StorageGarbageCollectorTest,

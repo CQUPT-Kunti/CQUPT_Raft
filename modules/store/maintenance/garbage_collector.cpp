@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "store/maintenance/gc_task_store.h"
 #include "store/runtime/storage_executor.h"
 
 namespace storedemo
@@ -39,6 +40,13 @@ namespace storedemo
                    state == GarbageCollectorTaskState::kCancelled;
         }
 
+        bool IsRecoverableTaskState(const GarbageCollectorTaskState state)
+        {
+            return state == GarbageCollectorTaskState::kQueued ||
+                   state == GarbageCollectorTaskState::kRunning ||
+                   state == GarbageCollectorTaskState::kRetryPending;
+        }
+
         bool HasPendingWork(const std::unordered_map<std::string, GarbageCollectorTask> &tasks)
         {
             for (const auto &[task_id, task] : tasks)
@@ -58,6 +66,108 @@ namespace storedemo
             std::string error_detail;
             std::uint64_t retry_after_ms{0};
         };
+
+        StorageNodeStatusCode ResolveTaskChunkId(GarbageCollectorTask *task,
+                                                 std::string *error_detail);
+
+        StorageNodeStatusCode ValidateRecoveredTask(GarbageCollectorTask *task,
+                                                    std::string *error_detail)
+        {
+            if (task == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "recovered garbage collector task must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (task->task_id.empty())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "recovered garbage collector task_id must not be empty";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (task->metadata_boundary.empty())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "recovered garbage collector metadata_boundary must not be empty";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (task->reason == GarbageCollectionReason::kUnspecified)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "recovered garbage collector reason must not be unspecified";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (task->max_attempts == 0)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "recovered garbage collector max_attempts must not be zero";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (task->attempts > task->max_attempts)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "recovered garbage collector attempts must not exceed max_attempts";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            return ResolveTaskChunkId(task, error_detail);
+        }
+
+        void NormalizeRecoveredTaskState(GarbageCollectorTask *task)
+        {
+            if (task == nullptr)
+            {
+                return;
+            }
+
+            switch (task->state)
+            {
+            case GarbageCollectorTaskState::kRunning:
+                task->state = GarbageCollectorTaskState::kQueued;
+                task->retryable = false;
+                task->next_retry_after_ms = 0;
+                break;
+            case GarbageCollectorTaskState::kQueued:
+                task->retryable = false;
+                task->next_retry_after_ms = 0;
+                break;
+            case GarbageCollectorTaskState::kRetryPending:
+                if (task->attempts >= task->max_attempts)
+                {
+                    task->state = GarbageCollectorTaskState::kFailed;
+                    task->retryable = false;
+                }
+                else
+                {
+                    task->retryable = true;
+                }
+                break;
+            case GarbageCollectorTaskState::kCompleted:
+            case GarbageCollectorTaskState::kFailed:
+            case GarbageCollectorTaskState::kCancelled:
+                task->retryable = false;
+                if (task->state != GarbageCollectorTaskState::kFailed)
+                {
+                    task->next_retry_after_ms = 0;
+                }
+                break;
+            }
+        }
 
         StorageNodeStatusCode ResolveTaskChunkId(GarbageCollectorTask *task,
                                                  std::string *error_detail)
@@ -407,6 +517,11 @@ namespace storedemo
             , executor(StorageExecutorConfig{
                   .worker_count = collector_config.worker_count,
                   .queue_capacity = collector_config.queue_capacity})
+            , task_store(collector_config.persistence_root.empty()
+                             ? nullptr
+                             : std::make_shared<GarbageCollectorTaskStore>(
+                                   GarbageCollectorTaskStoreConfig{
+                                       .root_path = collector_config.persistence_root}))
         {
         }
 
@@ -416,6 +531,7 @@ namespace storedemo
         GarbageCollectorSafetyChecker safety_checker;
         GarbageCollectorConfig config;
         BoundedStorageExecutor executor;
+        std::shared_ptr<GarbageCollectorTaskStore> task_store;
         bool accepting_new_tasks{true};
         bool stop_requested{false};
         GarbageCollectorStopMode stop_mode{GarbageCollectorStopMode::kDrain};
@@ -424,6 +540,214 @@ namespace storedemo
         std::uint64_t total_attempts{0};
         std::string last_error_detail;
         std::unordered_map<std::string, GarbageCollectorTask> tasks;
+
+        [[nodiscard]] bool PersistenceEnabled() const
+        {
+            return task_store != nullptr;
+        }
+
+        [[nodiscard]] std::vector<GarbageCollectorTask> SnapshotTasksForPersistenceLocked()
+            const
+        {
+            std::vector<GarbageCollectorTask> snapshot;
+            snapshot.reserve(tasks.size());
+            for (const auto &[task_id, task] : tasks)
+            {
+                (void)task_id;
+                snapshot.push_back(task);
+            }
+            return snapshot;
+        }
+
+        StorageNodeStatusCode PersistTasksLocked(std::string *error_detail)
+        {
+            if (!PersistenceEnabled())
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            const auto save_result =
+                task_store->SaveSnapshot(SnapshotTasksForPersistenceLocked());
+            if (!save_result.ok())
+            {
+                const std::string message =
+                    "failed to persist garbage collector task snapshot: " +
+                    save_result.error_detail;
+                last_error_detail = message;
+                if (error_detail != nullptr)
+                {
+                    *error_detail = message;
+                }
+                return save_result.status_code();
+            }
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageExecutorSubmitResult ScheduleTaskExecution(const std::string &task_id)
+        {
+            return executor.Submit(StorageExecutorSubmitRequest{
+                .task_name = "garbage-collector/" + task_id,
+                .task =
+                    [this, task_id]()
+                    {
+                        for (;;)
+                        {
+                            GarbageCollectorTask task_snapshot;
+                            {
+                                std::lock_guard<std::mutex> lock(mutex);
+                                auto task_it = tasks.find(task_id);
+                                if (task_it == tasks.end())
+                                {
+                                    cv.notify_all();
+                                    return;
+                                }
+
+                                if (task_it->second.state ==
+                                    GarbageCollectorTaskState::kCancelled)
+                                {
+                                    cv.notify_all();
+                                    return;
+                                }
+
+                                task_it->second.state = GarbageCollectorTaskState::kRunning;
+                                task_it->second.retryable = false;
+                                task_it->second.next_retry_after_ms = 0;
+                                std::string persist_error;
+                                const auto persist_status =
+                                    PersistTasksLocked(&persist_error);
+                                if (persist_status != StorageNodeStatusCode::kOk)
+                                {
+                                    task_it->second.state = GarbageCollectorTaskState::kFailed;
+                                    task_it->second.retryable = false;
+                                    task_it->second.last_error = persist_status;
+                                    task_it->second.last_error_detail = persist_error;
+                                    task_it->second.next_retry_after_ms = 0;
+                                    (void)PersistTasksLocked(nullptr);
+                                    cv.notify_all();
+                                    return;
+                                }
+                                task_snapshot = task_it->second;
+                            }
+                            cv.notify_all();
+
+                            GarbageCollectorAttemptResult attempt_result;
+                            try
+                            {
+                                attempt_result = MakeAttemptResultFromSafetyCheck(
+                                    safety_checker(task_snapshot));
+                            }
+                            catch (const std::exception &ex)
+                            {
+                                attempt_result.status = StorageNodeStatusCode::kIoError;
+                                attempt_result.error_detail = ex.what();
+                            }
+                            catch (...)
+                            {
+                                attempt_result.status = StorageNodeStatusCode::kIoError;
+                                attempt_result.error_detail =
+                                    "unknown garbage collector safety checker exception";
+                            }
+
+                            if (attempt_result.status == StorageNodeStatusCode::kOk)
+                            {
+                                try
+                                {
+                                    attempt_result = MakeAttemptResultFromDeleteResponse(
+                                        delete_handler(task_snapshot));
+                                }
+                                catch (const std::exception &ex)
+                                {
+                                    attempt_result.status = StorageNodeStatusCode::kIoError;
+                                    attempt_result.error_detail = ex.what();
+                                }
+                                catch (...)
+                                {
+                                    attempt_result.status = StorageNodeStatusCode::kIoError;
+                                    attempt_result.error_detail =
+                                        "unknown garbage collector handler exception";
+                                }
+                            }
+
+                            bool should_retry = false;
+                            {
+                                std::lock_guard<std::mutex> lock(mutex);
+                                auto task_it = tasks.find(task_id);
+                                if (task_it == tasks.end())
+                                {
+                                    cv.notify_all();
+                                    return;
+                                }
+
+                                ++task_it->second.attempts;
+                                ++total_attempts;
+
+                                if (attempt_result.status != StorageNodeStatusCode::kOk)
+                                {
+                                    task_it->second.last_error = attempt_result.status;
+                                    task_it->second.last_error_detail =
+                                        attempt_result.error_detail;
+                                    task_it->second.next_retry_after_ms =
+                                        attempt_result.retry_after_ms;
+                                    last_error_detail = attempt_result.error_detail;
+                                }
+
+                                if (attempt_result.status == StorageNodeStatusCode::kOk)
+                                {
+                                    task_it->second.state =
+                                        GarbageCollectorTaskState::kCompleted;
+                                    task_it->second.retryable = false;
+                                    task_it->second.next_retry_after_ms = 0;
+                                }
+                                else
+                                {
+                                    const bool stop_blocks_retry =
+                                        stop_requested &&
+                                        stop_mode ==
+                                            GarbageCollectorStopMode::kCancelPending;
+                                    const bool retryable_failure =
+                                        IsRetriableStatus(attempt_result.status) &&
+                                        task_it->second.attempts <
+                                            task_it->second.max_attempts &&
+                                        !stop_blocks_retry;
+                                    if (retryable_failure)
+                                    {
+                                        task_it->second.state =
+                                            GarbageCollectorTaskState::kRetryPending;
+                                        task_it->second.retryable = true;
+                                        should_retry = true;
+                                    }
+                                    else
+                                    {
+                                        task_it->second.state =
+                                            GarbageCollectorTaskState::kFailed;
+                                        task_it->second.retryable = false;
+                                    }
+                                }
+
+                                std::string persist_error;
+                                const auto persist_status =
+                                    PersistTasksLocked(&persist_error);
+                                if (persist_status != StorageNodeStatusCode::kOk)
+                                {
+                                    task_it->second.state =
+                                        GarbageCollectorTaskState::kFailed;
+                                    task_it->second.retryable = false;
+                                    task_it->second.last_error = persist_status;
+                                    task_it->second.last_error_detail = persist_error;
+                                    task_it->second.next_retry_after_ms = 0;
+                                    should_retry = false;
+                                    (void)PersistTasksLocked(nullptr);
+                                }
+                            }
+                            cv.notify_all();
+
+                            if (!should_retry)
+                            {
+                                return;
+                            }
+                        }
+                    }});
+        }
 
         [[nodiscard]] GarbageCollectorStats SnapshotStatsLocked() const
         {
@@ -736,6 +1060,95 @@ namespace storedemo
             throw std::invalid_argument(
                 "GarbageCollector requires a non-null metadata safety checker");
         }
+
+        if (impl_->PersistenceEnabled())
+        {
+            const auto load_result = impl_->task_store->LoadSnapshot();
+            if (!load_result.ok())
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                impl_->last_error_detail =
+                    "failed to load persisted garbage collector tasks: " +
+                    load_result.error_detail;
+            }
+            else if (load_result.snapshot_found)
+            {
+                std::vector<std::string> resumable_task_ids;
+                bool load_valid = true;
+                {
+                    std::lock_guard<std::mutex> lock(impl_->mutex);
+                    for (const auto &loaded_task : load_result.tasks)
+                    {
+                        GarbageCollectorTask task = loaded_task;
+                        std::string validation_error;
+                        if (ValidateRecoveredTask(&task, &validation_error) !=
+                            StorageNodeStatusCode::kOk)
+                        {
+                            impl_->last_error_detail =
+                                "failed to validate persisted garbage collector task: " +
+                                validation_error;
+                            impl_->tasks.clear();
+                            load_valid = false;
+                            break;
+                        }
+
+                        NormalizeRecoveredTaskState(&task);
+                        const auto [it, inserted] =
+                            impl_->tasks.emplace(task.task_id, std::move(task));
+                        if (!inserted)
+                        {
+                            impl_->last_error_detail =
+                                "failed to load persisted garbage collector tasks: duplicate task_id";
+                            impl_->tasks.clear();
+                            load_valid = false;
+                            break;
+                        }
+                        if (IsRecoverableTaskState(it->second.state))
+                        {
+                            resumable_task_ids.push_back(it->second.task_id);
+                        }
+                    }
+
+                    if (load_valid)
+                    {
+                        std::string persist_error;
+                        if (impl_->PersistTasksLocked(&persist_error) !=
+                            StorageNodeStatusCode::kOk)
+                        {
+                            impl_->last_error_detail = persist_error;
+                        }
+                    }
+                }
+
+                if (load_valid)
+                {
+                    for (const auto &task_id : resumable_task_ids)
+                    {
+                        const auto executor_result = impl_->ScheduleTaskExecution(task_id);
+                        if (!executor_result.accepted())
+                        {
+                            std::lock_guard<std::mutex> lock(impl_->mutex);
+                            auto task_it = impl_->tasks.find(task_id);
+                            if (task_it != impl_->tasks.end())
+                            {
+                                task_it->second.state =
+                                    GarbageCollectorTaskState::kFailed;
+                                task_it->second.retryable = false;
+                                task_it->second.last_error =
+                                    StorageNodeStatusCode::kOverloaded;
+                                task_it->second.last_error_detail =
+                                    "failed to resume persisted garbage collector task: " +
+                                    executor_result.error_detail;
+                                task_it->second.next_retry_after_ms = 0;
+                                impl_->last_error_detail =
+                                    task_it->second.last_error_detail;
+                                (void)impl_->PersistTasksLocked(nullptr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     GarbageCollector::~GarbageCollector()
@@ -782,140 +1195,21 @@ namespace storedemo
             }
 
             impl_->tasks.emplace(task.task_id, task);
+            std::string persist_error;
+            const auto persist_status = impl_->PersistTasksLocked(&persist_error);
+            if (persist_status != StorageNodeStatusCode::kOk)
+            {
+                impl_->tasks.erase(task.task_id);
+                result.code = GarbageCollectorSubmitCode::kStopped;
+                result.error_detail = std::move(persist_error);
+                ++impl_->rejected_tasks;
+                result.queue_depth = impl_->SnapshotStatsLocked().queued_tasks;
+                return result;
+            }
         }
 
         const std::string task_id = task.task_id;
-        const auto executor_result = impl_->executor.Submit(StorageExecutorSubmitRequest{
-            .task_name = "garbage-collector/" + task_id,
-            .task =
-                [this, task_id]()
-                {
-                    for (;;)
-                    {
-                        GarbageCollectorTask task_snapshot;
-                        {
-                            std::lock_guard<std::mutex> lock(impl_->mutex);
-                            auto task_it = impl_->tasks.find(task_id);
-                            if (task_it == impl_->tasks.end())
-                            {
-                                impl_->cv.notify_all();
-                                return;
-                            }
-
-                            if (task_it->second.state == GarbageCollectorTaskState::kCancelled)
-                            {
-                                impl_->cv.notify_all();
-                                return;
-                            }
-
-                            task_it->second.state = GarbageCollectorTaskState::kRunning;
-                            task_it->second.retryable = false;
-                            task_it->second.next_retry_after_ms = 0;
-                            task_snapshot = task_it->second;
-                        }
-                        impl_->cv.notify_all();
-
-                        GarbageCollectorAttemptResult attempt_result;
-                        try
-                        {
-                            attempt_result = MakeAttemptResultFromSafetyCheck(
-                                impl_->safety_checker(task_snapshot));
-                        }
-                        catch (const std::exception &ex)
-                        {
-                            attempt_result.status = StorageNodeStatusCode::kIoError;
-                            attempt_result.error_detail = ex.what();
-                        }
-                        catch (...)
-                        {
-                            attempt_result.status = StorageNodeStatusCode::kIoError;
-                            attempt_result.error_detail =
-                                "unknown garbage collector safety checker exception";
-                        }
-
-                        if (attempt_result.status == StorageNodeStatusCode::kOk)
-                        {
-                            try
-                            {
-                                attempt_result = MakeAttemptResultFromDeleteResponse(
-                                    impl_->delete_handler(task_snapshot));
-                            }
-                            catch (const std::exception &ex)
-                            {
-                                attempt_result.status = StorageNodeStatusCode::kIoError;
-                                attempt_result.error_detail = ex.what();
-                            }
-                            catch (...)
-                            {
-                                attempt_result.status = StorageNodeStatusCode::kIoError;
-                                attempt_result.error_detail =
-                                    "unknown garbage collector handler exception";
-                            }
-                        }
-
-                        bool should_retry = false;
-                        {
-                            std::lock_guard<std::mutex> lock(impl_->mutex);
-                            auto task_it = impl_->tasks.find(task_id);
-                            if (task_it == impl_->tasks.end())
-                            {
-                                impl_->cv.notify_all();
-                                return;
-                            }
-
-                            ++task_it->second.attempts;
-                            ++impl_->total_attempts;
-
-                            if (attempt_result.status != StorageNodeStatusCode::kOk)
-                            {
-                                task_it->second.last_error = attempt_result.status;
-                                task_it->second.last_error_detail =
-                                    attempt_result.error_detail;
-                                task_it->second.next_retry_after_ms =
-                                    attempt_result.retry_after_ms;
-                                impl_->last_error_detail =
-                                    attempt_result.error_detail;
-                            }
-
-                            if (attempt_result.status == StorageNodeStatusCode::kOk)
-                            {
-                                task_it->second.state =
-                                    GarbageCollectorTaskState::kCompleted;
-                                task_it->second.retryable = false;
-                                task_it->second.next_retry_after_ms = 0;
-                                impl_->cv.notify_all();
-                                return;
-                            }
-
-                            const bool stop_blocks_retry =
-                                impl_->stop_requested &&
-                                impl_->stop_mode == GarbageCollectorStopMode::kCancelPending;
-                            const bool retryable_failure =
-                                IsRetriableStatus(attempt_result.status) &&
-                                task_it->second.attempts < task_it->second.max_attempts &&
-                                !stop_blocks_retry;
-                            if (retryable_failure)
-                            {
-                                task_it->second.state =
-                                    GarbageCollectorTaskState::kRetryPending;
-                                task_it->second.retryable = true;
-                                should_retry = true;
-                            }
-                            else
-                            {
-                                task_it->second.state =
-                                    GarbageCollectorTaskState::kFailed;
-                                task_it->second.retryable = false;
-                            }
-                        }
-                        impl_->cv.notify_all();
-
-                        if (!should_retry)
-                        {
-                            return;
-                        }
-                    }
-                }});
+        const auto executor_result = impl_->ScheduleTaskExecution(task_id);
 
         result.code = TranslateSubmitCode(executor_result.code);
         result.error_detail = executor_result.error_detail;
@@ -926,6 +1220,7 @@ namespace storedemo
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             impl_->tasks.erase(task_id);
+            (void)impl_->PersistTasksLocked(nullptr);
             ++impl_->rejected_tasks;
             return result;
         }
@@ -974,6 +1269,7 @@ namespace storedemo
                         impl_->last_error_detail = task.last_error_detail;
                     }
                 }
+                (void)impl_->PersistTasksLocked(nullptr);
             }
         }
         impl_->cv.notify_all();

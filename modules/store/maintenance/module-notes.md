@@ -10,19 +10,21 @@
 - bounded 后台队列
 - metadata-driven safety checker gate
 - cleanup candidate generation
+- GC task persistence / restart resume
 - task submit / retry / stop / drain / stats
 - 注入式 delete handler 调用边界
 
 当前不负责：
 
-- restart 后继续 cleanup / task persistence / resume
 - scrub / repair / rebalance
 - metadata / Raft 调用
 
 ## 主要文件
 
 - `garbage_collector.h`：GC 任务模型、cleanup candidate 模型、状态、配置、提交/停机/统计接口
-- `garbage_collector.cpp`：任务校验、状态迁移、bounded queue 调度、candidate 生成、handler 调用、重试和统计聚合
+- `garbage_collector.cpp`：任务校验、状态迁移、bounded queue 调度、candidate 生成、handler 调用、重试、restart resume 聚合
+- `gc_task_store.h`：GC task snapshot 持久化组件接口和 load/save 结果类型
+- `gc_task_store.cpp`：GC task snapshot 序列化、反序列化、原子写入和损坏文件处理
 
 ## T055 固定边界
 
@@ -43,6 +45,31 @@
   - metadata-driven safety checker
   - 注入式 delete handler
 - T056 不实现 restart resume、cleanup persistence、延迟调度器，也不让 maintenance 层自己扫描 metadata / Raft。
+
+## T057 fixed boundary
+
+- T057 为 `GarbageCollector` 新增最小 snapshot persistence 和 restart resume。
+- 持久化内容覆盖：
+  - `task_id`
+  - `chunk_id`
+  - `object_id`
+  - `version`
+  - `chunk_index`
+  - `reason`
+  - `metadata_boundary`
+  - `attempts`
+  - `max_attempts`
+  - `last_error`
+  - `last_error_detail`
+  - `state`
+  - `retryable`
+  - `next_retry_after_ms`
+- 恢复策略固定为：
+  - `Queued` / `RetryPending` 恢复后继续可执行
+  - `Running` 恢复后规范化为可重新执行状态，不永久卡死
+  - `Completed` / `Failed` / `Cancelled` 恢复后只保留状态，不自动重跑
+- snapshot 写入通过 `DurableFile` staging + publish + directory sync 完成，避免半写文件直接污染恢复。
+- T057 不实现 delayed retry scheduler、repair / rebalance / scrub，也不让 persistence 层调用 metadata / Raft。
 
 ## metadata-driven safety check 语义
 
@@ -132,6 +159,20 @@
 - 输出：携带 `task_id/chunk_id/object_id/version/chunk_index/reason/metadata_boundary` 的 `GarbageCollectorTask`
 - 边界：只做字段映射，不做提交、持久化或 safety decision
 
+### `ValidateRecoveredTask(GarbageCollectorTask*, std::string*)`
+
+- 责任：校验从持久化 snapshot 读回的 task 是否具备恢复所需的最小字段
+- 输入：已反序列化 task
+- 输出：合法时返回 `kOk`
+- 边界：允许 terminal task 的 `attempts == max_attempts`，但禁止缺失 `task_id/metadata_boundary/reason/max_attempts/chunk identity`
+
+### `NormalizeRecoveredTaskState(GarbageCollectorTask*)`
+
+- 责任：把持久化前的 task state 规范化成 restart 后的可执行或终态
+- 输入：恢复出的 task
+- 输出：规范化后的 `state/retryable/next_retry_after_ms`
+- 边界：`Running` 不会被原样保留，避免 restart 后永久卡死
+
 ### `ResolveTaskChunkId(GarbageCollectorTask*, std::string*)`
 
 - 责任：统一收口 task 的 `chunk_id` / object identity 解析
@@ -144,7 +185,59 @@
 - 责任：提交一个 GC task，登记任务状态并进入 bounded 后台队列
 - 输入：调用方提供的 task
 - 输出：`GarbageCollectorSubmitResult`
-- 边界：队列满返回 overloaded，stop 后返回 stopped，重复 `task_id` 返回 already exists
+- 边界：队列满返回 overloaded，stop 后返回 stopped，重复 `task_id` 返回 already exists；启用 persistence 时，只有 snapshot 落盘成功后才算真正接收 task
+
+### restart resume helper（构造阶段 load + resume）
+
+- 责任：启动时加载 persisted snapshot、规范化状态并重新调度可恢复任务
+- 输入：`GarbageCollectorTaskStore::LoadSnapshot()` 结果
+- 输出：内存 `tasks` map 和待恢复执行的 task 列表
+- 边界：load 失败不会让进程崩溃；恢复后的 task 仍必须重新经过 safety checker 和 delete handler
+
+### completed / failed / retry pending 恢复策略 helper
+
+- 责任：固定不同 task state 的恢复语义
+- 输入：persisted task state
+- 输出：是否重跑、是否保留终态
+- 边界：
+  - `Completed/Failed/Cancelled`：仅恢复事实，不自动重跑
+  - `RetryPending`：保留上一次错误事实并继续可执行
+  - `Running`：转换为可重新调度状态
+
+### persistence load / save helper（`GarbageCollectorTaskStore::LoadSnapshot/SaveSnapshot`）
+
+- 责任：读写整份 GC task snapshot
+- 输入：task 列表或 snapshot 文件
+- 输出：`LoadResult` / `DurableFileResult`
+- 边界：当前采用 whole-snapshot 重写，不做增量 WAL 或多版本保留
+
+### task serialization / deserialization helper（`gc_task_store.cpp`）
+
+- 责任：把 task snapshot 编码/解码成带 schema header 的稳定文本格式
+- 输入：task 字段与原始 snapshot 行
+- 输出：序列化字符串或反序列化后的 task
+- 边界：字符串字段采用 hex 编码，空串使用显式占位，避免空字段破坏解析
+
+### task state normalization helper（`NormalizeRecoveredTaskState`）
+
+- 责任：统一 restart 后 `Queued/Running/RetryPending/Completed/Failed/Cancelled` 的行为
+- 输入：恢复出的 task state
+- 输出：可提交调度的状态或终态
+- 边界：不实现 delayed retry scheduler，只决定“能不能立刻恢复执行”
+
+### atomic write / publish helper（`GarbageCollectorTaskStore::SaveSnapshot`）
+
+- 责任：通过 `OpenStagingWriter -> Flush -> Close -> PublishStagedFile -> SyncDirectory` 原子更新 snapshot
+- 输入：完整 task snapshot payload
+- 输出：到 durable boundary 的 snapshot 文件
+- 边界：Windows directory sync 仍可能返回 explicit unsupported，需要后续 Windows 实机验证
+
+### corrupted persistence file 处理 helper（`GarbageCollectorTaskStore::LoadSnapshot`）
+
+- 责任：识别 magic/count/task-line 损坏并返回明确错误
+- 输入：snapshot 文件内容
+- 输出：`kCorrupted` 或明确 `error_detail`
+- 边界：损坏 snapshot 不导致 collector 崩溃；当前策略是报告错误并放弃恢复该 snapshot
 
 ### `StorageExecutorSubmitCode -> GarbageCollectorSubmitCode` 转换 helper
 

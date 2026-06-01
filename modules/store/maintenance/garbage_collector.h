@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -76,6 +77,7 @@ namespace storedemo
         std::size_t worker_count{1};
         std::size_t queue_capacity{64};
         std::uint32_t default_max_attempts{3};
+        std::filesystem::path persistence_root;
     };
 
     struct GarbageCollectorTask

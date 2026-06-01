@@ -71,16 +71,21 @@
   建议后续在哪类任务处理：在 T048/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/后续 recovery-scrub 任务统一处理。
 
 - 任务编号：T049
-  问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍没有 restart 后继续 cleanup 或后台调度持久化执行。
-  影响：如果把 T049 的测试 helper 和定向验证当成 US3 全量生产删除/GC 已完成，后续会高估 metadata tombstone 之后的持久 cleanup / restart 收口能力；当前通过的是 metadata-first、candidate generation 和 metadata-driven safety contract，不是完整后台 GC 生命周期闭环。
-  建议后续在哪类任务处理：在 T057 继续实现 restart 后继续清理，并保留 Windows 删除语义和 timeout/cancellation 运行中传播的后续验证，再关闭该风险。
+  问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍不是完整后台 GC 生命周期闭环。
+  影响：如果把 T049 的测试 helper 和定向验证当成 US3 全量生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实后台回收能力；当前通过的是 metadata-first、candidate generation、metadata-driven safety 和最小 restart resume contract，不是 repair/rebalance/scrub 或全平台删除语义落地。
+  建议后续在哪类任务处理：在后续 Windows 删除语义、timeout/cancellation 运行中传播和更完整后台维护任务中继续收口。
 
 - 任务编号：T055
-  问题：T055 已在生产 `GarbageCollector` 中加入必需的 metadata-driven safety checker gate，并固定“live manifest 引用时不调用 delete handler、checker 暂时不可用时按 retryable 失败处理”的边界；但当前 safety checker 仍依赖调用方注入外部 metadata 事实源，尚未实现 restart 后继续 cleanup、Windows 实机删除验证。`next_retry_after_ms` 也仍只是任务模型扩展点，尚未形成真正的延迟重试调度器；`best_effort_cancel` / timeout 运行中传播同样未打通到 service/store 删除执行。
-  影响：如果把当前 safety gate 通过当成完整生产 GC 已完成，后续会高估重启恢复、延迟重试和跨平台删除验证能力；另外 live-manifest 保护的正确性仍取决于调用方提供的 metadata 事实源是否新鲜且完整。
-  建议后续在哪类任务处理：在 T057 继续实现 restart cleanup/resume 和真实 metadata fact source 接线，并保留 Windows 待验证和 timeout/cancellation 运行中传播的后续验证。
+  问题：T055 已在生产 `GarbageCollector` 中加入必需的 metadata-driven safety checker gate，并固定“live manifest 引用时不调用 delete handler、checker 暂时不可用时按 retryable 失败处理”的边界；但当前 safety checker 仍依赖调用方注入外部 metadata 事实源，Windows 实机删除验证也未完成。`next_retry_after_ms` 仍只是任务模型扩展点，尚未形成真正的延迟重试调度器；`best_effort_cancel` / timeout 运行中传播同样未打通到 service/store 删除执行。
+  影响：如果把当前 safety gate 通过当成完整生产 GC 已完成，后续会高估延迟重试、跨平台删除验证和 metadata fact freshness 保证能力；另外 live-manifest 保护的正确性仍取决于调用方提供的 metadata 事实源是否新鲜且完整。
+  建议后续在哪类任务处理：在后续真实 metadata fact source 接线、Windows 验证和 timeout/cancellation 运行中传播任务中继续收口。
 
 - 任务编号：T056
-  问题：T056 已补 pending timeout、failed upload、abort cleanup、deleted object cleanup 的 generic candidate generation，并固定 candidate -> `GarbageCollectorTask` 转换、排序和去重边界；但当前 candidate 仍是进程内生成事实，没有 cleanup persistence / restart resume，也依赖调用方提供足够新鲜的 metadata snapshot、object state 和 timeout 事实。
-  影响：如果调用方在过期 metadata 视图或不稳定时间基准上生成 candidate，可能产生重复候选、延迟候选或需要在 safety gate 阶段再被拒绝；重启后未持久化的候选也不会自动恢复。
-  建议后续在哪类任务处理：在 T057 中补 cleanup persistence / restart resume，并在后续真实 metadata fact source 接线任务中继续收紧 candidate 生成的快照新鲜度边界。
+  问题：T056 已补 pending timeout、failed upload、abort cleanup、deleted object cleanup 的 generic candidate generation，并固定 candidate -> `GarbageCollectorTask` 转换、排序和去重边界；但当前 candidate 正确性仍依赖调用方提供足够新鲜的 metadata snapshot、object state 和 timeout 事实。
+  影响：如果调用方在过期 metadata 视图或不稳定时间基准上生成 candidate，仍可能产生重复候选、延迟候选或在 safety gate 阶段再被拒绝。
+  建议后续在哪类任务处理：在后续真实 metadata fact source 接线任务中继续收紧 candidate 生成的快照新鲜度边界。
+
+- 任务编号：T057
+  问题：T057 已补最小 GC task snapshot persistence 和 restart resume，并通过 `DurableFile` staging/publish/sync 收口 Linux 当前路径；但当前 persistence 仍是 whole-snapshot rewrite，没有 schema migration 机制，也没有多进程并发访问协议。Windows 下 `SyncDirectory()` 仍是 explicit unsupported，真实持久化语义需要单独验证。
+  影响：如果后续在 schema 演进、跨版本兼容、多进程共享同一 persistence root，或真实 Windows durability 语义上继续扩展，当前实现可能暴露 snapshot 覆盖、兼容性或 directory durability 边界。
+  建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
