@@ -12,6 +12,7 @@
 
 #include "storage_node.grpc.pb.h"
 #include "store/chunk/chunk_store.h"
+#include "store/node/storage_node_registry.h"
 #include "store/runtime/storage_executor.h"
 
 namespace storedemo
@@ -39,6 +40,11 @@ namespace storedemo
     };
 
     struct StorageNodeClientDeleteChunkOptions
+    {
+        StorageTaskContext context;
+    };
+
+    struct StorageNodeClientRegistryOptions
     {
         StorageTaskContext context;
     };
@@ -92,6 +98,77 @@ namespace storedemo
         std::uint32_t retryable_failure_count{0};
         std::uint32_t non_retryable_failure_count{0};
         bool partial_failure{false};
+    };
+
+    struct StorageNodeClientRegisterStorageNodeRequest
+    {
+        std::string request_id;
+        StorageNodeId node_id;
+        std::string endpoint;
+        std::uint64_t observed_at_unix_ms{0};
+        StorageNodeRegistryFacts facts;
+    };
+
+    struct StorageNodeClientRegisterStorageNodeResponse
+    {
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        std::uint64_t retry_after_ms{0};
+        bool created{false};
+        bool idempotent{false};
+        StorageNodeRegistryNodeSnapshot snapshot;
+    };
+
+    struct StorageNodeClientHeartbeatRequest
+    {
+        std::string request_id;
+        StorageNodeId node_id;
+        std::string endpoint;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+        StorageNodeRegistryFacts facts;
+    };
+
+    struct StorageNodeClientHealthReportRequest
+    {
+        std::string request_id;
+        StorageNodeId node_id;
+        std::string endpoint;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+        StorageNodeRegistryHealthFacts health;
+    };
+
+    struct StorageNodeClientCapacityReportRequest
+    {
+        std::string request_id;
+        StorageNodeId node_id;
+        std::string endpoint;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+        StorageNodeRegistryCapacityFacts capacity;
+    };
+
+    struct StorageNodeClientLoadReportRequest
+    {
+        std::string request_id;
+        StorageNodeId node_id;
+        std::string endpoint;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+        StorageNodeRegistryLoadFacts load;
+    };
+
+    struct StorageNodeClientFactUpdateResponse
+    {
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        std::uint64_t retry_after_ms{0};
+        std::uint64_t accepted_sequence{0};
+        bool applied{false};
+        bool idempotent{false};
+        bool stale_ignored{false};
+        StorageNodeRegistryNodeSnapshot snapshot;
     };
 
     enum class ReadReplicaFailureAction : std::uint8_t
@@ -168,6 +245,26 @@ namespace storedemo
         StorageNodeClientBatchDeleteChunksResponse BatchDeleteChunks(
             const StorageNodeClientBatchDeleteChunksRequest &request,
             StorageNodeClientDeleteChunkOptions options = {});
+
+        StorageNodeClientRegisterStorageNodeResponse RegisterStorageNode(
+            const StorageNodeClientRegisterStorageNodeRequest &request,
+            StorageNodeClientRegistryOptions options = {});
+
+        StorageNodeClientFactUpdateResponse UpdateStorageNodeHeartbeat(
+            const StorageNodeClientHeartbeatRequest &request,
+            StorageNodeClientRegistryOptions options = {});
+
+        StorageNodeClientFactUpdateResponse ReportHealth(
+            const StorageNodeClientHealthReportRequest &request,
+            StorageNodeClientRegistryOptions options = {});
+
+        StorageNodeClientFactUpdateResponse ReportCapacity(
+            const StorageNodeClientCapacityReportRequest &request,
+            StorageNodeClientRegistryOptions options = {});
+
+        StorageNodeClientFactUpdateResponse ReportLoad(
+            const StorageNodeClientLoadReportRequest &request,
+            StorageNodeClientRegistryOptions options = {});
 
         [[nodiscard]] const StorageNodeClientConfig &config() const;
 

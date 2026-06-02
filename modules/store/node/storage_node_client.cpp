@@ -257,6 +257,478 @@ namespace storedemo
             grpc_context->set_deadline(absolute_deadline);
         }
 
+        storage::StorageNodeHealth ToProtoNodeHealth(const StorageNodeHealth health)
+        {
+            switch (health)
+            {
+            case StorageNodeHealth::kHealthy:
+                return storage::STORAGE_NODE_HEALTH_HEALTHY;
+            case StorageNodeHealth::kDegraded:
+                return storage::STORAGE_NODE_HEALTH_DEGRADED;
+            case StorageNodeHealth::kReadOnly:
+                return storage::STORAGE_NODE_HEALTH_READ_ONLY;
+            case StorageNodeHealth::kUnavailable:
+                return storage::STORAGE_NODE_HEALTH_UNAVAILABLE;
+            case StorageNodeHealth::kDraining:
+                return storage::STORAGE_NODE_HEALTH_DRAINING;
+            default:
+                return storage::STORAGE_NODE_HEALTH_UNSPECIFIED;
+            }
+        }
+
+        storage::StorageNodeDiskPressure ToProtoDiskPressure(
+            const StorageNodeDiskPressure pressure)
+        {
+            switch (pressure)
+            {
+            case StorageNodeDiskPressure::kLow:
+                return storage::STORAGE_NODE_DISK_PRESSURE_LOW;
+            case StorageNodeDiskPressure::kMedium:
+                return storage::STORAGE_NODE_DISK_PRESSURE_MEDIUM;
+            case StorageNodeDiskPressure::kHigh:
+                return storage::STORAGE_NODE_DISK_PRESSURE_HIGH;
+            case StorageNodeDiskPressure::kFull:
+                return storage::STORAGE_NODE_DISK_PRESSURE_FULL;
+            default:
+                return storage::STORAGE_NODE_DISK_PRESSURE_UNSPECIFIED;
+            }
+        }
+
+        storage::StorageNodeLivenessState ToProtoLiveness(
+            const StorageNodeRegistryLiveness liveness)
+        {
+            switch (liveness)
+            {
+            case StorageNodeRegistryLiveness::kLive:
+                return storage::STORAGE_NODE_LIVENESS_STATE_LIVE;
+            case StorageNodeRegistryLiveness::kStale:
+                return storage::STORAGE_NODE_LIVENESS_STATE_STALE;
+            case StorageNodeRegistryLiveness::kDead:
+                return storage::STORAGE_NODE_LIVENESS_STATE_DEAD;
+            default:
+                return storage::STORAGE_NODE_LIVENESS_STATE_UNSPECIFIED;
+            }
+        }
+
+        StorageNodeStatusCode FromProtoNodeHealth(const storage::StorageNodeHealth health,
+                                                  StorageNodeHealth *out_health,
+                                                  std::string *error_detail)
+        {
+            if (out_health == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "health output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            switch (health)
+            {
+            case storage::STORAGE_NODE_HEALTH_UNSPECIFIED:
+            case storage::STORAGE_NODE_HEALTH_HEALTHY:
+                *out_health = StorageNodeHealth::kHealthy;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_HEALTH_DEGRADED:
+                *out_health = StorageNodeHealth::kDegraded;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_HEALTH_READ_ONLY:
+                *out_health = StorageNodeHealth::kReadOnly;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_HEALTH_UNAVAILABLE:
+                *out_health = StorageNodeHealth::kUnavailable;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_HEALTH_DRAINING:
+                *out_health = StorageNodeHealth::kDraining;
+                return StorageNodeStatusCode::kOk;
+            default:
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "storage node health is not supported";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+        }
+
+        StorageNodeStatusCode FromProtoDiskPressure(
+            const storage::StorageNodeDiskPressure pressure,
+            StorageNodeDiskPressure *out_pressure,
+            std::string *error_detail)
+        {
+            if (out_pressure == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "disk pressure output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            switch (pressure)
+            {
+            case storage::STORAGE_NODE_DISK_PRESSURE_UNSPECIFIED:
+            case storage::STORAGE_NODE_DISK_PRESSURE_LOW:
+                *out_pressure = StorageNodeDiskPressure::kLow;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_DISK_PRESSURE_MEDIUM:
+                *out_pressure = StorageNodeDiskPressure::kMedium;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_DISK_PRESSURE_HIGH:
+                *out_pressure = StorageNodeDiskPressure::kHigh;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_DISK_PRESSURE_FULL:
+                *out_pressure = StorageNodeDiskPressure::kFull;
+                return StorageNodeStatusCode::kOk;
+            default:
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "storage node disk pressure is not supported";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+        }
+
+        StorageNodeStatusCode FromProtoLiveness(
+            const storage::StorageNodeLivenessState liveness,
+            StorageNodeRegistryLiveness *out_liveness,
+            std::string *error_detail)
+        {
+            if (out_liveness == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "liveness output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            switch (liveness)
+            {
+            case storage::STORAGE_NODE_LIVENESS_STATE_UNSPECIFIED:
+            case storage::STORAGE_NODE_LIVENESS_STATE_LIVE:
+                *out_liveness = StorageNodeRegistryLiveness::kLive;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_LIVENESS_STATE_STALE:
+            case storage::STORAGE_NODE_LIVENESS_STATE_SUSPECT:
+                *out_liveness = StorageNodeRegistryLiveness::kStale;
+                return StorageNodeStatusCode::kOk;
+            case storage::STORAGE_NODE_LIVENESS_STATE_DEAD:
+                *out_liveness = StorageNodeRegistryLiveness::kDead;
+                return StorageNodeStatusCode::kOk;
+            default:
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "storage node liveness is not supported";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+        }
+
+        void FillProtoCapacityReport(
+            const StorageNodeRegistryCapacityFacts &capacity,
+            storage::StorageNodeCapacityReport *out_capacity)
+        {
+            if (out_capacity == nullptr)
+            {
+                return;
+            }
+
+            out_capacity->set_total_capacity_bytes(capacity.total_capacity_bytes);
+            out_capacity->set_used_capacity_bytes(capacity.used_capacity_bytes);
+            out_capacity->set_available_capacity_bytes(capacity.available_capacity_bytes);
+            out_capacity->set_chunk_count(capacity.chunk_count);
+        }
+
+        void FillProtoHealthReport(
+            const StorageNodeRegistryHealthFacts &health,
+            storage::StorageNodeHealthReport *out_health)
+        {
+            if (out_health == nullptr)
+            {
+                return;
+            }
+
+            out_health->set_health(ToProtoNodeHealth(health.health));
+            out_health->set_disk_pressure(ToProtoDiskPressure(health.disk_pressure));
+            out_health->set_io_error_count(health.io_error_count);
+        }
+
+        void FillProtoLoadReport(
+            const StorageNodeRegistryLoadFacts &load,
+            storage::StorageNodeLoadReport *out_load)
+        {
+            if (out_load == nullptr)
+            {
+                return;
+            }
+
+            out_load->set_active_reads(load.load.active_reads);
+            out_load->set_active_writes(load.load.active_writes);
+            out_load->set_queued_ops(load.load.queued_ops);
+            out_load->set_write_admission_overloaded(load.write_admission_overloaded);
+            out_load->set_read_admission_overloaded(load.read_admission_overloaded);
+        }
+
+        void FillProtoFacts(const StorageNodeRegistryFacts &facts,
+                            storage::StorageNodeFacts *out_facts)
+        {
+            if (out_facts == nullptr)
+            {
+                return;
+            }
+
+            FillProtoCapacityReport(facts.capacity, out_facts->mutable_capacity());
+            FillProtoHealthReport(facts.health, out_facts->mutable_health());
+            FillProtoLoadReport(facts.load, out_facts->mutable_load());
+            out_facts->mutable_failure_domain()->set_zone(facts.failure_domain.zone);
+            out_facts->mutable_failure_domain()->set_rack(facts.failure_domain.rack);
+        }
+
+        StorageNodeStatusCode FillCapacityFromProto(
+            const storage::StorageNodeCapacityReport &proto_capacity,
+            StorageNodeRegistryCapacityFacts *out_capacity,
+            std::string *error_detail)
+        {
+            if (out_capacity == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "capacity output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            out_capacity->total_capacity_bytes = proto_capacity.total_capacity_bytes();
+            out_capacity->used_capacity_bytes = proto_capacity.used_capacity_bytes();
+            out_capacity->available_capacity_bytes = proto_capacity.available_capacity_bytes();
+            out_capacity->chunk_count = proto_capacity.chunk_count();
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode FillHealthFromProto(
+            const storage::StorageNodeHealthReport &proto_health,
+            StorageNodeRegistryHealthFacts *out_health,
+            std::string *error_detail)
+        {
+            if (out_health == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "health output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            auto status = FromProtoNodeHealth(proto_health.health(),
+                                              &out_health->health,
+                                              error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = FromProtoDiskPressure(proto_health.disk_pressure(),
+                                           &out_health->disk_pressure,
+                                           error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            out_health->io_error_count = proto_health.io_error_count();
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode FillLoadFromProto(
+            const storage::StorageNodeLoadReport &proto_load,
+            StorageNodeRegistryLoadFacts *out_load,
+            std::string *error_detail)
+        {
+            if (out_load == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "load output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            out_load->load.active_reads = proto_load.active_reads();
+            out_load->load.active_writes = proto_load.active_writes();
+            out_load->load.queued_ops = proto_load.queued_ops();
+            out_load->write_admission_overloaded = proto_load.write_admission_overloaded();
+            out_load->read_admission_overloaded = proto_load.read_admission_overloaded();
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode FillFactsFromProto(const storage::StorageNodeFacts &proto_facts,
+                                                 StorageNodeRegistryFacts *out_facts,
+                                                 std::string *error_detail)
+        {
+            if (out_facts == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "facts output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            auto status = FillCapacityFromProto(proto_facts.capacity(),
+                                                &out_facts->capacity,
+                                                error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = FillHealthFromProto(proto_facts.health(),
+                                         &out_facts->health,
+                                         error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = FillLoadFromProto(proto_facts.load(), &out_facts->load, error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            out_facts->failure_domain.zone = proto_facts.failure_domain().zone();
+            out_facts->failure_domain.rack = proto_facts.failure_domain().rack();
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode FillSnapshotFromProto(
+            const storage::StorageNodeRegistrySnapshot &proto_snapshot,
+            StorageNodeRegistryNodeSnapshot *out_snapshot,
+            std::string *error_detail)
+        {
+            if (out_snapshot == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "snapshot output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            StorageNodeRegistryNodeSnapshot snapshot;
+            snapshot.node_id = proto_snapshot.node_id();
+            snapshot.endpoint = proto_snapshot.endpoint();
+            snapshot.last_sequence = proto_snapshot.last_sequence();
+            snapshot.last_seen_unix_ms = proto_snapshot.last_seen_unix_ms();
+
+            auto status = FromProtoLiveness(proto_snapshot.liveness(),
+                                            &snapshot.liveness,
+                                            error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = FillFactsFromProto(proto_snapshot.facts(), &snapshot.facts, error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            *out_snapshot = std::move(snapshot);
+            return StorageNodeStatusCode::kOk;
+        }
+
+        void FillProtoRegisterRequest(
+            const StorageNodeClientRegisterStorageNodeRequest &request,
+            const StorageNodeClientRegistryOptions & /*options*/,
+            storage::RegisterStorageNodeRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_node_id(request.node_id);
+            proto_request->set_endpoint(request.endpoint);
+            proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
+            FillProtoFacts(request.facts, proto_request->mutable_facts());
+        }
+
+        void FillProtoHeartbeatRequest(
+            const StorageNodeClientHeartbeatRequest &request,
+            const StorageNodeClientRegistryOptions & /*options*/,
+            storage::UpdateStorageNodeHeartbeatRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            auto *heartbeat = proto_request->mutable_heartbeat();
+            heartbeat->set_node_id(request.node_id);
+            heartbeat->set_endpoint(request.endpoint);
+            heartbeat->set_sequence(request.sequence);
+            heartbeat->set_observed_at_unix_ms(request.observed_at_unix_ms);
+            FillProtoFacts(request.facts, heartbeat->mutable_facts());
+        }
+
+        void FillProtoHealthReportRequest(
+            const StorageNodeClientHealthReportRequest &request,
+            const StorageNodeClientRegistryOptions & /*options*/,
+            storage::ReportHealthRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_node_id(request.node_id);
+            proto_request->set_endpoint(request.endpoint);
+            proto_request->set_sequence(request.sequence);
+            proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
+            FillProtoHealthReport(request.health, proto_request->mutable_health());
+        }
+
+        void FillProtoCapacityReportRequest(
+            const StorageNodeClientCapacityReportRequest &request,
+            const StorageNodeClientRegistryOptions & /*options*/,
+            storage::ReportCapacityRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_node_id(request.node_id);
+            proto_request->set_endpoint(request.endpoint);
+            proto_request->set_sequence(request.sequence);
+            proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
+            FillProtoCapacityReport(request.capacity, proto_request->mutable_capacity());
+        }
+
+        void FillProtoLoadReportRequest(
+            const StorageNodeClientLoadReportRequest &request,
+            const StorageNodeClientRegistryOptions & /*options*/,
+            storage::ReportLoadRequest *proto_request)
+        {
+            if (proto_request == nullptr)
+            {
+                return;
+            }
+
+            proto_request->set_request_id(request.request_id);
+            proto_request->set_node_id(request.node_id);
+            proto_request->set_endpoint(request.endpoint);
+            proto_request->set_sequence(request.sequence);
+            proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
+            FillProtoLoadReport(request.load, proto_request->mutable_load());
+        }
+
         void FillProtoWriteRequest(const WriteChunkRequest &request,
                                    const StorageNodeClientWriteChunkOptions &options,
                                    storage::WriteChunkRequest *proto_request)
@@ -957,6 +1429,82 @@ namespace storedemo
             return response;
         }
 
+        StorageNodeClientRegisterStorageNodeResponse TranslateProtoRegisterResponse(
+            const storage::RegisterStorageNodeResponse &proto_response)
+        {
+            StorageNodeClientRegisterStorageNodeResponse response;
+            response.status = FromProtoStatusCode(proto_response.summary().code());
+            response.error_detail = proto_response.summary().message();
+            response.retry_after_ms = proto_response.summary().retry_after_ms();
+            response.created = proto_response.created();
+            response.idempotent = proto_response.idempotent();
+
+            if (response.status == StorageNodeStatusCode::kIoError &&
+                proto_response.summary().code() ==
+                    storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED &&
+                response.error_detail.empty())
+            {
+                response.error_detail =
+                    "RegisterStorageNode response status is unspecified";
+            }
+
+            std::string error_detail;
+            const auto snapshot_status = FillSnapshotFromProto(proto_response.snapshot(),
+                                                              &response.snapshot,
+                                                              &error_detail);
+            if (snapshot_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail =
+                    "invalid RegisterStorageNode response snapshot: " + error_detail;
+                response.created = false;
+                response.idempotent = false;
+            }
+
+            return response;
+        }
+
+        StorageNodeClientFactUpdateResponse TranslateProtoFactUpdateResponse(
+            const storage::StorageNodeFactUpdateResponse &proto_response,
+            const std::string_view operation_name)
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = FromProtoStatusCode(proto_response.summary().code());
+            response.error_detail = proto_response.summary().message();
+            response.retry_after_ms = proto_response.summary().retry_after_ms();
+            response.accepted_sequence = proto_response.accepted_sequence();
+            response.applied = proto_response.applied();
+            response.idempotent = proto_response.idempotent();
+            response.stale_ignored = proto_response.stale_ignored();
+
+            if (response.status == StorageNodeStatusCode::kIoError &&
+                proto_response.summary().code() ==
+                    storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED &&
+                response.error_detail.empty())
+            {
+                response.error_detail =
+                    std::string(operation_name) + " response status is unspecified";
+            }
+
+            std::string error_detail;
+            const auto snapshot_status = FillSnapshotFromProto(proto_response.snapshot(),
+                                                              &response.snapshot,
+                                                              &error_detail);
+            if (snapshot_status != StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kIoError;
+                response.error_detail =
+                    std::string("invalid ") + std::string(operation_name) +
+                    " response snapshot: " + error_detail;
+                response.applied = false;
+                response.idempotent = false;
+                response.stale_ignored = false;
+                response.accepted_sequence = 0;
+            }
+
+            return response;
+        }
+
         WriteChunkResponse MakeGrpcFailureResponse(const grpc::Status &status)
         {
             WriteChunkResponse response;
@@ -982,6 +1530,24 @@ namespace storedemo
             response.retryable =
                 response.status != StorageNodeStatusCode::kOk &&
                 IsRetriableStatus(response.status);
+            return response;
+        }
+
+        StorageNodeClientRegisterStorageNodeResponse MakeGrpcRegisterFailureResponse(
+            const grpc::Status &status)
+        {
+            StorageNodeClientRegisterStorageNodeResponse response;
+            response.status = MapGrpcStatusCode(status.error_code());
+            response.error_detail = status.error_message();
+            return response;
+        }
+
+        StorageNodeClientFactUpdateResponse MakeGrpcFactUpdateFailureResponse(
+            const grpc::Status &status)
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = MapGrpcStatusCode(status.error_code());
+            response.error_detail = status.error_message();
             return response;
         }
 
@@ -1355,6 +1921,175 @@ namespace storedemo
         }
 
         return TranslateProtoBatchDeleteResponse(request, proto_response);
+    }
+
+    StorageNodeClientRegisterStorageNodeResponse StorageNodeClient::RegisterStorageNode(
+        const StorageNodeClientRegisterStorageNodeRequest &request,
+        StorageNodeClientRegistryOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientRegisterStorageNodeResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail =
+                "RegisterStorageNode client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::RegisterStorageNodeRequest proto_request;
+        FillProtoRegisterRequest(request, options, &proto_request);
+
+        storage::RegisterStorageNodeResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->RegisterStorageNode(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcRegisterFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoRegisterResponse(proto_response);
+    }
+
+    StorageNodeClientFactUpdateResponse StorageNodeClient::UpdateStorageNodeHeartbeat(
+        const StorageNodeClientHeartbeatRequest &request,
+        StorageNodeClientRegistryOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail =
+                "UpdateStorageNodeHeartbeat client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::UpdateStorageNodeHeartbeatRequest proto_request;
+        FillProtoHeartbeatRequest(request, options, &proto_request);
+
+        storage::StorageNodeFactUpdateResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->UpdateStorageNodeHeartbeat(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcFactUpdateFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoFactUpdateResponse(proto_response,
+                                               "UpdateStorageNodeHeartbeat");
+    }
+
+    StorageNodeClientFactUpdateResponse StorageNodeClient::ReportHealth(
+        const StorageNodeClientHealthReportRequest &request,
+        StorageNodeClientRegistryOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail = "ReportHealth client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::ReportHealthRequest proto_request;
+        FillProtoHealthReportRequest(request, options, &proto_request);
+
+        storage::StorageNodeFactUpdateResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->ReportHealth(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcFactUpdateFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoFactUpdateResponse(proto_response, "ReportHealth");
+    }
+
+    StorageNodeClientFactUpdateResponse StorageNodeClient::ReportCapacity(
+        const StorageNodeClientCapacityReportRequest &request,
+        StorageNodeClientRegistryOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail =
+                "ReportCapacity client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::ReportCapacityRequest proto_request;
+        FillProtoCapacityReportRequest(request, options, &proto_request);
+
+        storage::StorageNodeFactUpdateResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->ReportCapacity(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcFactUpdateFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoFactUpdateResponse(proto_response, "ReportCapacity");
+    }
+
+    StorageNodeClientFactUpdateResponse StorageNodeClient::ReportLoad(
+        const StorageNodeClientLoadReportRequest &request,
+        StorageNodeClientRegistryOptions options)
+    {
+        const auto start_time = std::chrono::system_clock::now();
+        const auto absolute_deadline =
+            ResolveAbsoluteDeadline(options.context, start_time);
+
+        if (HasDeadlineExpired(options.context, absolute_deadline))
+        {
+            StorageNodeClientFactUpdateResponse response;
+            response.status = StorageNodeStatusCode::kTimeout;
+            response.error_detail = "ReportLoad client-side deadline expired";
+            return response;
+        }
+
+        grpc::ClientContext context;
+        ApplyDeadlineToContext(options.context, absolute_deadline, &context);
+
+        storage::ReportLoadRequest proto_request;
+        FillProtoLoadReportRequest(request, options, &proto_request);
+
+        storage::StorageNodeFactUpdateResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->ReportLoad(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            return MakeGrpcFactUpdateFailureResponse(grpc_status);
+        }
+
+        return TranslateProtoFactUpdateResponse(proto_response, "ReportLoad");
     }
 
     const StorageNodeClientConfig &StorageNodeClient::config() const
