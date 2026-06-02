@@ -9,7 +9,7 @@
   - `io/`：durable file 抽象接口和平台实现边界
   - `index/`：本地 chunk 索引接口和 sharded map 结构
   - `runtime/`：有界执行器和有界任务队列
-  - `node/`：StorageNode data-plane 的 gRPC service / client 适配层
+  - `node/`：StorageNode data-plane 的 gRPC service / client 适配层，以及 heartbeat/health/capacity/load 的 in-memory registry
   - `placement/`：副本策略和副本候选节点选择
   - `upload/`：上传协调层和 upload helper
   - `maintenance/`：GC / scrub / repair / rebalance 等后台维护任务基础设施
@@ -34,7 +34,7 @@
 - `io/` 只处理 durable file 语义，不承接 chunk 业务编排。
 - `index/` 只维护本地索引，不负责磁盘扫描和上层对象可见性。
 - `runtime/` 只负责本地任务调度，不绑定具体 chunk / IO 业务。
-- `node/` 只负责 RPC 适配，不负责 metadata commit、upload coordinator 或 Raft control-plane。
+- `node/` 负责 RPC 适配和 in-memory registry facts，不负责 metadata commit、upload coordinator 或 Raft control-plane，也不在此阶段接 placement/read-side 真实消费链路。
 - `placement/` 只负责候选节点选择和副本策略计算，不负责真正发起写入或提交 metadata。
 - `upload/` 只负责 upload 顺序协调，不负责 metadata 底层实现、StorageNode RPC server 或后台 GC。
 - `maintenance/` 只负责后台任务模型、队列、重试和调度边界，不直接决定 metadata safety 或 object 可见性。

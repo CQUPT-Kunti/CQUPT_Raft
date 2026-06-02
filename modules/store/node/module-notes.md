@@ -2,10 +2,11 @@
 
 ## 模块职责
 
-`modules/store/node` 承载 StorageNode data-plane 的 RPC 适配层。
+`modules/store/node` 承载 StorageNode data-plane 的 RPC 适配层，以及供后续 heartbeat / placement / read-side 消费的 in-memory `StorageNodeRegistry`。
 
 当前只负责：
 
+- `StorageNodeRegistry` 的 in-memory register / heartbeat / partial report merge / lookup / list / snapshot
 - `StorageNodeService::WriteChunk` 的 gRPC `WriteChunk` 入口
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeService::DeleteChunk` 的 gRPC `DeleteChunk` 入口
@@ -32,6 +33,7 @@
 - metadata `CreateObject` / `CommitObject` / `AbortObject`
 - `RaftNode::ProposeMetadata()`
 - upload coordinator
+- heartbeat/report/register 的 gRPC service / client 入口
 - gRPC server 启动与进程生命周期管理
 
 ## 主要文件
@@ -40,6 +42,59 @@
 - `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` 适配实现和 proto/store 映射 helper
 - `storage_node_client.h`：client 类声明以及 write/read/delete/batch-delete 选项与本地请求/响应结构
 - `storage_node_client.cpp`：同步 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` 调用、deadline 设置和响应映射
+- `storage_node_registry.h`：registry 请求/结果结构、liveness 枚举和 `StorageNodeRegistry` 接口
+- `storage_node_registry.cpp`：registry 注册、sequence/stale 保护、partial merge、liveness 与稳定快照实现
+
+## T062 StorageNodeRegistry 边界
+
+- `StorageNodeRegistry` 只保存 StorageNode data-plane facts：capacity、health、disk pressure、io_error_count、load、failure domain、last_sequence、last_seen。
+- register / heartbeat / report 只维护内存态 registry，不写 metadata，不写 Raft，不保存 object payload。
+- liveness 由 registry 侧 `last_seen + timeout` 推导，不接受节点自报 committed/deleted/object visibility 决策。
+- 当前 registry 还没有接入 gRPC service/client、`PlacementManager` 或 read replica selection；这些接线分别留给 T063-T066。
+
+## storage_node_registry.cpp 关键 helper
+
+### `InitializeRegisteredRecord(Record*, std::string, const StorageNodeRegistryFacts&, std::uint64_t)`
+
+- 责任：初始化新注册节点的 endpoint、初始 facts 和 `last_seen`
+- 输入：注册 endpoint、注册 facts、`observed_at_unix_ms`
+- 输出：填充好的内存记录
+- 边界：只用于新注册路径；`last_sequence` 保持 0，等待后续 heartbeat/report 推进
+
+### `EvaluateSequenceDecision(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)`
+
+- 责任：统一判断 sequenced update 是 apply、idempotent 还是 stale
+- 输入：当前 `last_sequence/last_seen` 与传入 `sequence/observed_at`
+- 输出：`kApply`、`kIdempotent` 或 `kStale`
+- 边界：sequence 变大但 `observed_at` 回退时仍按 stale 处理，避免旧 heartbeat/report 覆盖新 facts
+
+### `MergeHealthFacts(...)` / `MergeCapacityFacts(...)` / `MergeLoadFacts(...)`
+
+- 责任：把局部 health/capacity/load report 合并进已有节点 facts
+- 输入：目标记录、局部 report、sequence、observed time
+- 输出：更新后的记录和 `last_sequence/last_seen`
+- 边界：只覆盖对应分组，不清掉未上报的其它 facts
+
+### `DetermineLiveness(std::uint64_t, std::uint64_t, const StorageNodeRegistryConfig&)`
+
+- 责任：根据 `last_seen` 和配置的 stale/dead timeout 推导节点 liveness
+- 输入：`last_seen_unix_ms`、当前时间、registry config
+- 输出：`kLive`、`kStale` 或 `kDead`
+- 边界：当前时间早于或等于 `last_seen` 时按 `kLive` 处理，不在 registry 内引入额外时钟校正
+
+### `AppendSortedSnapshots(const Records&, std::uint64_t, const StorageNodeRegistryConfig&, std::vector<StorageNodeRegistryNodeSnapshot>*)`
+
+- 责任：为 `ListNodes()` / `Snapshot()` 构造稳定排序的节点快照
+- 输入：registry 当前记录、查询时间、config
+- 输出：按 `node_id` 稳定排序的 snapshot 列表
+- 边界：排序依赖 `records_` 的 `std::map<StorageNodeId, ...>` 键序，不额外发明热点或健康排序
+
+### `ValidateNodeIdentity(...)` / `ValidateObservedAt(...)` / `ValidateSequence(...)` / `ValidateCapacityFacts(...)`
+
+- 责任：集中校验 node identity、时间戳、sequence 和容量 facts
+- 输入：请求字段与错误输出指针
+- 输出：`StorageNodeStatusCode`
+- 边界：当前只对 node_id、endpoint、observed_at、sequence、capacity 做显式校验；load/health 的业务打分仍留给后续 placement/read-side 消费
 
 ## T031/T032 固定边界
 

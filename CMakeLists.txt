@@ -244,6 +244,7 @@ add_library(raft_core
   modules/store/maintenance/garbage_collector.cpp
   modules/store/maintenance/gc_task_store.cpp
   modules/store/node/storage_node_client.cpp
+  modules/store/node/storage_node_registry.cpp
   modules/store/node/storage_node_service.cpp
   modules/store/placement/placement_manager.cpp
   modules/store/placement/replica_policy.cpp
