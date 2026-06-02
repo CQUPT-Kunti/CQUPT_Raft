@@ -11,12 +11,12 @@
 - `ReplicaPolicy` 副本数量和最小成功数约束
 - `PlacementRequest` 到 `PlacementDecisionResult` 的纯策略计算
 - `ReadReplicaSelectionRequest` 到 `ReadReplicaSelectionResult` 的纯策略计算
-- `PlacementManager` 对静态候选集的最小协调
+- `PlacementManager` 对静态候选集和生产 `StorageNodeRegistry` snapshot 的最小协调
 - 节点筛除原因记录、确定性排序和最小 zone spread 语义
 
 当前不负责：
 
-- 真实 heartbeat / node registry / 容量上报
+- heartbeat/report/register 的 service/client 实现
 - 上传协调器
 - `StorageNodeClient::WriteChunk`
 - metadata `CommitObject`
@@ -273,13 +273,75 @@
   - 不写 chunk
   - 不调用 `StorageNodeClient::WriteChunk`
   - 不调用 metadata commit
-  - 不接 Raft / heartbeat / registry
+  - 不接 Raft
   - 不维护失败缓存或动态热点事实
 - 与 `ReplicaPolicySelector` 的职责边界：
   - `PlacementManager`
     - 负责承接上层输入、组织一次 placement 调用、补充 manager 视角的 `decision reasons`
   - `ReplicaPolicySelector`
     - 负责资格检查、排序、zone spread、去重和最终副本节点选择
+
+### `PlacementManager::SelectPlacement(const PlacementRequest&, const StorageNodeRegistry&, std::uint64_t)`
+
+- 作用：
+  - 从生产 `StorageNodeRegistry` 拉取 snapshot，并把 registry facts 转成 placement candidates 后交给 `ReplicaPolicySelector`
+- 输入：
+  - `request`
+  - `registry`
+    - 生产 in-memory `StorageNodeRegistry`
+  - `now_unix_ms`
+    - 传给 registry snapshot 的当前时间，用于 registry 内部 liveness 推导
+- 输出：
+  - 返回 `PlacementDecisionResult`
+  - `decision.excluded_nodes`
+    - 除 selector 产生的健康/容量/过载/磁盘压力原因外，还会保留 registry snapshot 的 liveness / facts 缺失过滤原因
+  - `decision.reasons`
+    - 会追加“评估了多少 registry snapshot 节点”和“当前 snapshot 保留了多少 live candidates”等 manager 摘要
+- 边界：
+  - 只消费 registry snapshot/facts，不写 registry、不写 chunk、不接 metadata / Raft
+
+### `PlacementManager::SelectPlacement(const PlacementRequest&, const StorageNodeRegistrySnapshotResult&)`
+
+- 作用：
+  - 直接消费一份 registry snapshot 结果，便于测试固定 partial facts / duplicate node_id / stale facts contract
+- 输入：
+  - `request`
+  - `registry_snapshot`
+    - 已生成的 snapshot 结果
+- 输出：
+  - 返回 `PlacementDecisionResult`
+- 边界：
+  - 如果 snapshot 本身不是 `ok()`，会保守地直接返回 snapshot 状态，不伪造成功
+
+## placement_manager.cpp 关键 helper
+
+### `HasValidCapacityFacts(const StorageNodeRegistryCapacityFacts&)`
+
+- 责任：校验 registry capacity facts 是否完整且自洽
+- 输入：registry capacity facts
+- 输出：`true/false`
+- 边界：当前要求 `total_capacity_bytes > 0`，且 `used/available` 不得越界或超过 `total`
+
+### `EvaluateRegistrySnapshotEligibility(const StorageNodeRegistryNodeSnapshot&)`
+
+- 责任：在 manager 层对 registry snapshot 做最小保守过滤
+- 输入：单个 registry node snapshot
+- 输出：可选 rejection reason
+- 边界：当前只在 manager 层处理 `liveness != Live` 和 capacity facts 不完整/不合法；健康、磁盘压力、写过载和容量阈值仍交给 selector
+
+### `BuildPlacementCandidateFromSnapshot(const StorageNodeRegistryNodeSnapshot&)`
+
+- 责任：把 registry snapshot 映射成 placement candidate
+- 输入：registry node snapshot
+- 输出：`StorageNodePlacementCandidate`
+- 边界：直接映射 `health`、`disk_pressure`、`capacity`、`load`、`failure_domain.zone/rack`；不发明 metadata / payload 字段
+
+### `SelectPlacementFromRegistrySnapshot(...)`
+
+- 责任：统一承接 registry snapshot 路径的过滤、candidate 构造、selector 调用和 exclusion/reasons 合并
+- 输入：`ReplicaPolicySelector`、placement request、registry snapshot result
+- 输出：`PlacementDecisionResult`
+- 边界：只做 registry-specific 协调，不复制 selector 的排序和副本挑选逻辑
 
 ### `ReplicaPolicySelector::SelectReplicas(const PlacementRequest&, std::span<const StorageNodePlacementCandidate>)`
 
