@@ -11,6 +11,11 @@
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeService::DeleteChunk` 的 gRPC `DeleteChunk` 入口
 - `StorageNodeService::BatchDeleteChunks` 的 gRPC `BatchDeleteChunks` 入口
+- `StorageNodeService::RegisterStorageNode` 的 gRPC `RegisterStorageNode` 入口
+- `StorageNodeService::UpdateStorageNodeHeartbeat` 的 gRPC `UpdateStorageNodeHeartbeat` 入口
+- `StorageNodeService::ReportHealth` 的 gRPC `ReportHealth` 入口
+- `StorageNodeService::ReportCapacity` 的 gRPC `ReportCapacity` 入口
+- `StorageNodeService::ReportLoad` 的 gRPC `ReportLoad` 入口
 - `StorageNodeClient::WriteChunk` 的本地请求到 gRPC `WriteChunk` 调用
 - `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
 - `StorageNodeClient::DeleteChunk` 的本地请求到 gRPC `DeleteChunk` 调用
@@ -33,13 +38,13 @@
 - metadata `CreateObject` / `CommitObject` / `AbortObject`
 - `RaftNode::ProposeMetadata()`
 - upload coordinator
-- heartbeat/report/register 的 gRPC service / client 入口
+- heartbeat/report/register 的 gRPC client 入口
 - gRPC server 启动与进程生命周期管理
 
 ## 主要文件
 
 - `storage_node_service.h`：service 类声明
-- `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` 适配实现和 proto/store 映射 helper
+- `storage_node_service.cpp`：`WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` / `RegisterStorageNode` / `UpdateStorageNodeHeartbeat` / `ReportHealth` / `ReportCapacity` / `ReportLoad` 适配实现和 proto/store/registry 映射 helper
 - `storage_node_client.h`：client 类声明以及 write/read/delete/batch-delete 选项与本地请求/响应结构
 - `storage_node_client.cpp`：同步 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `BatchDeleteChunks` 调用、deadline 设置和响应映射
 - `storage_node_registry.h`：registry 请求/结果结构、liveness 枚举和 `StorageNodeRegistry` 接口
@@ -50,7 +55,7 @@
 - `StorageNodeRegistry` 只保存 StorageNode data-plane facts：capacity、health、disk pressure、io_error_count、load、failure domain、last_sequence、last_seen。
 - register / heartbeat / report 只维护内存态 registry，不写 metadata，不写 Raft，不保存 object payload。
 - liveness 由 registry 侧 `last_seen + timeout` 推导，不接受节点自报 committed/deleted/object visibility 决策。
-- 当前 registry 还没有接入 gRPC service/client、`PlacementManager` 或 read replica selection；这些接线分别留给 T063-T066。
+- 当前 registry 已接入 gRPC service 适配层；heartbeat/report/register 的 gRPC client、`PlacementManager` 和 read replica selection 接线分别留给 T064-T066。
 
 ## storage_node_registry.cpp 关键 helper
 
@@ -145,6 +150,69 @@
 - client 的 `DeleteChunk` / `BatchDeleteChunks` 会把 `timeout_ms` 同时写入 proto request，并映射成 gRPC `ClientContext` deadline；`best_effort_cancel` 仍只做字段透传，不伪装成已经具备 service/store 运行中取消传播
 
 ## storage_node_service.cpp 关键 helper
+
+### `ToProtoStatusCode(StorageNodeStatusCode)`
+
+- 责任：统一把本地 `StorageNodeStatusCode` 映射成 `storage::StorageNodeStatusCode`
+- 输入：本地状态码
+- 输出：proto 状态码
+- 边界：service 侧 write/read/delete/heartbeat/report/register 都复用同一状态体系，不额外发明新错误码
+
+### `TranslateRegisterRequest(const storage::RegisterStorageNodeRequest&, RegisterStorageNodeRequest*)`
+
+- 责任：把 proto `RegisterStorageNodeRequest` 转成 `StorageNodeRegistry` 的本地注册请求
+- 输入：proto register request、本地 registry request 输出指针
+- 输出：成功时填充 `node_id`、`endpoint`、`observed_at_unix_ms` 和初始 facts
+- 边界：`request_id` 只保留在 proto summary，不进入 registry；facts 字段转换失败时返回显式 `INVALID_ARGUMENT`
+
+### `TranslateHeartbeatRequest(const storage::UpdateStorageNodeHeartbeatRequest&, UpdateStorageNodeHeartbeatRequest*)`
+
+- 责任：把 proto heartbeat request 转成 `StorageNodeRegistry` 的全量 heartbeat 请求
+- 输入：proto heartbeat request、本地 registry request 输出指针
+- 输出：成功时填充 `node_id`、`endpoint`、`sequence`、`observed_at_unix_ms` 和全量 facts
+- 边界：要求请求内存在 heartbeat message；当前不在 service 层发明独立时间源或 sequence
+
+### `TranslateHealthReportRequest(...)` / `TranslateCapacityReportRequest(...)` / `TranslateLoadReportRequest(...)`
+
+- 责任：把 proto 局部 report 请求转成 `StorageNodeRegistry` 的 partial report 请求
+- 输入：proto health/capacity/load request、本地 registry request 输出指针
+- 输出：成功时填充 identity、`sequence`、`observed_at_unix_ms` 和对应 facts 分组
+- 边界：只转换各自负责的 facts；partial merge 规则仍由 `StorageNodeRegistry` 决定
+
+### `FillRegisterResponse(const storage::RegisterStorageNodeRequest&, const RegisterStorageNodeResult&, storage::RegisterStorageNodeResponse*)`
+
+- 责任：把 registry register 结果映射回 proto `RegisterStorageNodeResponse`
+- 输入：proto register request、registry register result、proto response 输出指针
+- 输出：`summary`、`created`、`idempotent`、`snapshot`
+- 边界：summary 的 `request_id` 来自 proto request；`chunk_id` 保持空；snapshot 只反映 registry 事实
+
+### `FillFactUpdateResponse(std::string_view, std::string_view, const StorageNodeRegistryUpdateResult&, storage::StorageNodeFactUpdateResponse*)`
+
+- 责任：把 registry heartbeat/report 结果映射回 proto `StorageNodeFactUpdateResponse`
+- 输入：proto request_id / node_id、registry update result、proto response 输出指针
+- 输出：`summary`、`accepted_sequence`、`applied`、`idempotent`、`stale_ignored`、`snapshot`
+- 边界：service 不重新解释 stale/idempotent 语义，直接复用 registry 结果
+
+### `StorageNodeService::RegisterStorageNode(...)`
+
+- 责任：承接 gRPC `RegisterStorageNode` RPC，请求转换后调用注入的 `StorageNodeRegistry::RegisterStorageNode()`
+- 输入：gRPC context、proto register request
+- 输出：proto `RegisterStorageNodeResponse`
+- 边界：只做字段和状态映射；不调用 metadata / Raft；不保存 payload
+
+### `StorageNodeService::UpdateStorageNodeHeartbeat(...)`
+
+- 责任：承接 gRPC `UpdateStorageNodeHeartbeat` RPC，请求转换后调用注入的 `StorageNodeRegistry::UpdateStorageNodeHeartbeat()`
+- 输入：gRPC context、proto heartbeat request
+- 输出：proto `StorageNodeFactUpdateResponse`
+- 边界：same-sequence / stale / accepted-sequence 语义完全跟随 registry，不在 service 层重新发明判定
+
+### `StorageNodeService::ReportHealth(...)` / `StorageNodeService::ReportCapacity(...)` / `StorageNodeService::ReportLoad(...)`
+
+- 责任：承接 gRPC partial report RPC，请求转换后调用注入的 `StorageNodeRegistry` partial merge 接口
+- 输入：gRPC context、对应 proto report request
+- 输出：proto `StorageNodeFactUpdateResponse`
+- 边界：只表达 data-plane facts update，不接 metadata commit、不接 PlacementManager、不接 read replica selection
 
 ### `ResolveResponseChunkId(const storage::ReadChunkRequest&, const ReadChunkResponse&)`
 

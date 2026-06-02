@@ -91,9 +91,9 @@
   建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
 
 - 任务编号：T059
-  问题：T059 已用 `storage_heartbeat_registry_test` 固定 heartbeat / registry contract；T062 现已落地生产 in-memory `StorageNodeRegistry`，但 service、client、Placement/read-side 仍未接线，clock source 与 sequence 新鲜度也仍依赖后续生产路径统一收口。
-  影响：如果把当前 registry 单测通过当成整个 heartbeat 生产链路已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在真实 RPC/placement/read-side 路径里的完备性。
-  建议后续在哪类任务处理：在 T063-T066 中继续把 service/client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
+  问题：T059 已用 `storage_heartbeat_registry_test` 固定 heartbeat / registry contract；T062/T063 现已落地生产 registry 和 service 适配，但 client、Placement/read-side 仍未接线，clock source 与 sequence 新鲜度也仍依赖后续生产路径统一收口。
+  影响：如果把当前 registry + service 单测通过当成整个 heartbeat 生产链路已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在真实 client/placement/read-side 路径里的完备性。
+  建议后续在哪类任务处理：在 T064-T066 中继续把 client、Placement eligibility 和 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
 
 - 任务编号：T060
   问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中用 test-only registry facts 固定 health-aware placement contract，包括 stale heartbeat 事实降级、unhealthy/readonly/draining/overloaded/high-disk-pressure/insufficient-capacity 排除、healthy 低负载节点优先和 duplicate node_id 去重；但当前仍没有生产 registry -> PlacementManager 的真实接线，也还没有最终的 overload/disk-pressure/hotspot 生产打分来源。
@@ -101,11 +101,16 @@
   建议后续在哪类任务处理：在 T062/T065 中继续把生产 registry、liveness clock、capacity/load/disk-pressure facts 和 manager 接线收口，并保持 T060 固定下来的稳定选择与排除语义。
 
 - 任务编号：T061
-  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema；T062 已把全量 heartbeat、局部 report merge 和基础 liveness 落到生产 registry，但 service/client 接线、placement/read-side 消费和 fake stub 后续同步风险仍存在。
-  影响：如果把当前 proto/schema 与 registry 单测通过当成 US4 全量完成，后续仍可能在 T063-T066 暴露 RPC 接线、snapshot 新鲜度、time source 或 fake stub 跟随新接口演进的兼容风险。
-  建议后续在哪类任务处理：在 T063/T064/T065/T066 中继续收紧 service/client 接线、placement/read-side 消费语义，并保持 fake stub 与生成接口同步。
+  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema；T062/T063 已把 registry 与 service 接到生产路径，但 client 接线、placement/read-side 消费和 fake stub 后续同步风险仍存在。
+  影响：如果把当前 proto/schema、registry 和 service 单测通过当成 US4 全量完成，后续仍可能在 T064-T066 暴露 client 接线、snapshot 新鲜度、time source 或 fake stub 跟随新接口演进的兼容风险。
+  建议后续在哪类任务处理：在 T064/T065/T066 中继续收紧 client 接线、placement/read-side 消费语义，并保持 fake stub 与生成接口同步。
 
 - 任务编号：T062
-  问题：T062 已实现生产 in-memory `StorageNodeRegistry`，覆盖 register、heartbeat、partial report merge、sequence/stale 保护、liveness 和稳定 snapshot/list；但当前时钟来源仍是调用方传入的 `observed_at/now`，service/client 尚未把真实 RPC 时间源与 sequence 约束统一收口，placement/read-side 也还没有消费这些 facts。
-  影响：如果调用方使用漂移较大的时钟、乱序 sequence 或不一致的 report/heartbeat 源，registry 仍可能把“新鲜度”判断建立在不可靠输入上；另外当前 load facts 只是结构化保存，还没有变成统一的 overload 生产打分。
-  建议后续在哪类任务处理：在 T063/T064 中收口 service/client 时间源与 sequence 生成边界，在 T065/T066 中把 registry facts 正式接入 placement/read selection，并决定最终 overload/freshness 消费规则。
+  问题：T062 已实现生产 in-memory `StorageNodeRegistry`，覆盖 register、heartbeat、partial report merge、sequence/stale 保护、liveness 和稳定 snapshot/list；T063 已把这些语义接到 service 侧，但当前时钟来源仍是调用方传入的 `observed_at/now`，client 尚未把真实 RPC 时间源与 sequence 约束统一收口，placement/read-side 也还没有消费这些 facts。
+  影响：如果调用方使用漂移较大的时钟、乱序 sequence 或不一致的 report/heartbeat 源，registry + service 仍可能把“新鲜度”判断建立在不可靠输入上；另外当前 load facts 只是结构化保存，还没有变成统一的 overload 生产打分。
+  建议后续在哪类任务处理：在 T064 中收口 client 时间源与 sequence 生成边界，在 T065/T066 中把 registry facts 正式接入 placement/read selection，并决定最终 overload/freshness 消费规则。
+
+- 任务编号：T063
+  问题：T063 已实现 `StorageNodeService` 的 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` gRPC 适配，并把 proto request/response 映射到 `StorageNodeRegistry`；但当前 service 仍直接信任请求携带的 `observed_at_unix_ms`、health/disk/load facts 和 sequence，client 端也尚未收口统一的生成/重试/超时语义。
+  影响：如果后续 client 或调用方在不同时间基准、重复请求、乱序请求或事实缺省策略上不一致，service 虽然会复用 registry 的 stale/idempotent/merge 规则，但整体链路仍可能出现“语义看似一致、输入不够可信”的问题。
+  建议后续在哪类任务处理：在 T064 中统一 client 侧 request 构造、时间源、sequence 生成和重试边界；在 T065/T066 中继续验证 service 暴露出的 snapshot/facts 是否足够支撑 placement/read-side 消费。

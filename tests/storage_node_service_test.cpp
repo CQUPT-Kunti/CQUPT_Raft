@@ -23,6 +23,7 @@
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/index/chunk_index.h"
+#include "store/node/storage_node_registry.h"
 #include "store/node/storage_node_service.h"
 #include "support/metadata_test_utils.h"
 #include "support/store_test_utils.h"
@@ -350,6 +351,115 @@ namespace
         return request;
     }
 
+    storage::StorageNodeFacts MakeProtoStorageNodeFacts(
+        const std::size_t index,
+        const std::uint64_t total_capacity_bytes = 8'192,
+        const std::uint64_t used_capacity_bytes = 2'048,
+        const storage::StorageNodeHealth health =
+            storage::STORAGE_NODE_HEALTH_HEALTHY,
+        const storage::StorageNodeDiskPressure disk_pressure =
+            storage::STORAGE_NODE_DISK_PRESSURE_LOW)
+    {
+        storage::StorageNodeFacts facts;
+        facts.mutable_capacity()->set_total_capacity_bytes(total_capacity_bytes);
+        facts.mutable_capacity()->set_used_capacity_bytes(used_capacity_bytes);
+        facts.mutable_capacity()->set_available_capacity_bytes(
+            total_capacity_bytes >= used_capacity_bytes
+                ? total_capacity_bytes - used_capacity_bytes
+                : 0);
+        facts.mutable_capacity()->set_chunk_count(10 + index);
+        facts.mutable_health()->set_health(health);
+        facts.mutable_health()->set_disk_pressure(disk_pressure);
+        facts.mutable_health()->set_io_error_count(index);
+        facts.mutable_load()->set_active_reads(static_cast<std::uint32_t>(index));
+        facts.mutable_load()->set_active_writes(static_cast<std::uint32_t>(index + 1));
+        facts.mutable_load()->set_queued_ops(static_cast<std::uint32_t>(index + 2));
+        facts.mutable_load()->set_write_admission_overloaded(false);
+        facts.mutable_load()->set_read_admission_overloaded(false);
+        facts.mutable_failure_domain()->set_zone("zone-" + std::to_string(index % 2));
+        facts.mutable_failure_domain()->set_rack("rack-" + std::to_string(index));
+        return facts;
+    }
+
+    storage::RegisterStorageNodeRequest MakeProtoRegisterNodeRequest(
+        const std::size_t index,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        storage::RegisterStorageNodeRequest request;
+        request.set_request_id("register-" + std::to_string(index));
+        request.set_node_id(storedemo::test::MakeStorageNodeIdFixture(index));
+        request.set_endpoint("127.0.0.1:" + std::to_string(7000 + index));
+        request.set_observed_at_unix_ms(observed_at_unix_ms);
+        *request.mutable_facts() = MakeProtoStorageNodeFacts(index);
+        return request;
+    }
+
+    storage::UpdateStorageNodeHeartbeatRequest MakeProtoHeartbeatRequest(
+        const std::size_t index,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        storage::UpdateStorageNodeHeartbeatRequest request;
+        request.set_request_id("heartbeat-" + std::to_string(index) + "-" +
+                               std::to_string(sequence));
+        request.mutable_heartbeat()->set_node_id(
+            storedemo::test::MakeStorageNodeIdFixture(index));
+        request.mutable_heartbeat()->set_endpoint("127.0.0.1:" +
+                                                  std::to_string(7000 + index));
+        request.mutable_heartbeat()->set_sequence(sequence);
+        request.mutable_heartbeat()->set_observed_at_unix_ms(observed_at_unix_ms);
+        *request.mutable_heartbeat()->mutable_facts() = MakeProtoStorageNodeFacts(index);
+        return request;
+    }
+
+    storage::ReportHealthRequest MakeProtoHealthReportRequest(
+        const std::size_t index,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        storage::ReportHealthRequest request;
+        request.set_request_id("report-health-" + std::to_string(index) + "-" +
+                               std::to_string(sequence));
+        request.set_node_id(storedemo::test::MakeStorageNodeIdFixture(index));
+        request.set_endpoint("127.0.0.1:" + std::to_string(7000 + index));
+        request.set_sequence(sequence);
+        request.set_observed_at_unix_ms(observed_at_unix_ms);
+        *request.mutable_health() = MakeProtoStorageNodeFacts(index).health();
+        return request;
+    }
+
+    storage::ReportCapacityRequest MakeProtoCapacityReportRequest(
+        const std::size_t index,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        storage::ReportCapacityRequest request;
+        request.set_request_id("report-capacity-" + std::to_string(index) + "-" +
+                               std::to_string(sequence));
+        request.set_node_id(storedemo::test::MakeStorageNodeIdFixture(index));
+        request.set_endpoint("127.0.0.1:" + std::to_string(7000 + index));
+        request.set_sequence(sequence);
+        request.set_observed_at_unix_ms(observed_at_unix_ms);
+        *request.mutable_capacity() = MakeProtoStorageNodeFacts(index).capacity();
+        return request;
+    }
+
+    storage::ReportLoadRequest MakeProtoLoadReportRequest(
+        const std::size_t index,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        storage::ReportLoadRequest request;
+        request.set_request_id("report-load-" + std::to_string(index) + "-" +
+                               std::to_string(sequence));
+        request.set_node_id(storedemo::test::MakeStorageNodeIdFixture(index));
+        request.set_endpoint("127.0.0.1:" + std::to_string(7000 + index));
+        request.set_sequence(sequence);
+        request.set_observed_at_unix_ms(observed_at_unix_ms);
+        *request.mutable_load() = MakeProtoStorageNodeFacts(index).load();
+        return request;
+    }
+
     class RecordingChunkStore final : public storedemo::ChunkStore
     {
     public:
@@ -604,6 +714,87 @@ namespace
             return response;
         }
 
+        storage::RegisterStorageNodeResponse RegisterStorageNode(
+            const storage::RegisterStorageNodeRequest &request,
+            grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::RegisterStorageNodeResponse response;
+            grpc::Status status = stub_->RegisterStorageNode(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::StorageNodeFactUpdateResponse UpdateStorageNodeHeartbeat(
+            const storage::UpdateStorageNodeHeartbeatRequest &request,
+            grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::StorageNodeFactUpdateResponse response;
+            grpc::Status status =
+                stub_->UpdateStorageNodeHeartbeat(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::StorageNodeFactUpdateResponse ReportHealth(
+            const storage::ReportHealthRequest &request,
+            grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::StorageNodeFactUpdateResponse response;
+            grpc::Status status = stub_->ReportHealth(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::StorageNodeFactUpdateResponse ReportCapacity(
+            const storage::ReportCapacityRequest &request,
+            grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::StorageNodeFactUpdateResponse response;
+            grpc::Status status = stub_->ReportCapacity(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::StorageNodeFactUpdateResponse ReportLoad(
+            const storage::ReportLoadRequest &request,
+            grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::StorageNodeFactUpdateResponse response;
+            grpc::Status status = stub_->ReportLoad(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
     private:
         std::shared_ptr<storedemo::StorageNodeService> service_;
         std::unique_ptr<grpc::Server> server_;
@@ -628,6 +819,306 @@ namespace
     TEST_F(StorageNodeServiceTest, ConstructingWithoutChunkStoreThrows)
     {
         EXPECT_THROW(storedemo::StorageNodeService(nullptr), std::invalid_argument);
+    }
+
+    TEST_F(StorageNodeServiceTest, RegisterStorageNodeMapsFieldsAndStoresRegistryFacts)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        auto registry = std::make_shared<storedemo::StorageNodeRegistry>();
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            recording_store,
+            "service-node-t063",
+            registry);
+        RunningStorageNodeService server(service);
+
+        auto request = MakeProtoRegisterNodeRequest(63, 100);
+        request.set_request_id("register-service-t063");
+        grpc::Status grpc_status;
+        const auto response = server.RegisterStorageNode(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().request_id(), "register-service-t063");
+        EXPECT_EQ(response.summary().node_id(), request.node_id());
+        EXPECT_TRUE(response.created());
+        EXPECT_FALSE(response.idempotent());
+        EXPECT_EQ(response.snapshot().node_id(), request.node_id());
+        EXPECT_EQ(response.snapshot().endpoint(), request.endpoint());
+        EXPECT_EQ(response.snapshot().last_sequence(), 0U);
+        EXPECT_EQ(response.snapshot().last_seen_unix_ms(), 100U);
+        EXPECT_EQ(response.snapshot().liveness(),
+                  storage::STORAGE_NODE_LIVENESS_STATE_LIVE);
+        EXPECT_EQ(response.snapshot().facts().capacity().total_capacity_bytes(), 8192U);
+        EXPECT_EQ(response.snapshot().facts().capacity().chunk_count(), 73U);
+        EXPECT_EQ(response.snapshot().facts().health().health(),
+                  storage::STORAGE_NODE_HEALTH_HEALTHY);
+        EXPECT_EQ(response.snapshot().facts().health().disk_pressure(),
+                  storage::STORAGE_NODE_DISK_PRESSURE_LOW);
+        EXPECT_EQ(response.snapshot().facts().load().active_writes(), 64U);
+
+        const auto lookup = registry->LookupNode(request.node_id(), 100);
+        ASSERT_EQ(lookup.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup.snapshot.endpoint, request.endpoint());
+        EXPECT_EQ(lookup.snapshot.facts.capacity.total_capacity_bytes, 8192U);
+        EXPECT_EQ(lookup.snapshot.facts.capacity.chunk_count, 73U);
+        EXPECT_EQ(recording_store->write_calls, 0U);
+        EXPECT_EQ(recording_store->read_calls, 0U);
+        EXPECT_EQ(recording_store->delete_calls, 0U);
+    }
+
+    TEST_F(StorageNodeServiceTest,
+           RegisterStorageNodeKeepsIdempotentAndConflictSemantics)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        auto registry = std::make_shared<storedemo::StorageNodeRegistry>();
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            recording_store,
+            "service-node-t063",
+            registry);
+        RunningStorageNodeService server(service);
+
+        const auto original = MakeProtoRegisterNodeRequest(64, 100);
+        grpc::Status grpc_status;
+        ASSERT_EQ(server.RegisterStorageNode(original, &grpc_status).summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+
+        auto duplicate = original;
+        duplicate.set_request_id("register-duplicate-t063");
+        duplicate.mutable_facts()->mutable_capacity()->set_total_capacity_bytes(16'384);
+        duplicate.mutable_facts()->mutable_capacity()->set_available_capacity_bytes(14'336);
+        const auto duplicate_response = server.RegisterStorageNode(duplicate, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(duplicate_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_FALSE(duplicate_response.created());
+        EXPECT_TRUE(duplicate_response.idempotent());
+        EXPECT_EQ(duplicate_response.snapshot().facts().capacity().total_capacity_bytes(),
+                  original.facts().capacity().total_capacity_bytes());
+
+        auto conflict = original;
+        conflict.set_request_id("register-conflict-t063");
+        conflict.set_endpoint("127.0.0.1:7999");
+        const auto conflict_response = server.RegisterStorageNode(conflict, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(conflict_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CONFLICT);
+        EXPECT_FALSE(conflict_response.created());
+        EXPECT_FALSE(conflict_response.idempotent());
+    }
+
+    TEST_F(StorageNodeServiceTest,
+           UpdateStorageNodeHeartbeatMatchesRegistryApplyStaleAndIdempotentSemantics)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        auto registry = std::make_shared<storedemo::StorageNodeRegistry>();
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            recording_store,
+            "service-node-t063",
+            registry);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        ASSERT_EQ(server.RegisterStorageNode(MakeProtoRegisterNodeRequest(65, 100),
+                                             &grpc_status)
+                      .summary()
+                      .code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+
+        auto heartbeat = MakeProtoHeartbeatRequest(65, 7, 160);
+        heartbeat.set_request_id("heartbeat-apply-t063");
+        auto *facts = heartbeat.mutable_heartbeat()->mutable_facts();
+        facts->mutable_capacity()->set_total_capacity_bytes(32'768);
+        facts->mutable_capacity()->set_used_capacity_bytes(12'288);
+        facts->mutable_capacity()->set_available_capacity_bytes(20'480);
+        facts->mutable_capacity()->set_chunk_count(77);
+        facts->mutable_health()->set_health(storage::STORAGE_NODE_HEALTH_DEGRADED);
+        facts->mutable_health()->set_disk_pressure(
+            storage::STORAGE_NODE_DISK_PRESSURE_MEDIUM);
+        facts->mutable_health()->set_io_error_count(9);
+        facts->mutable_load()->set_active_reads(8);
+        facts->mutable_load()->set_active_writes(3);
+        facts->mutable_load()->set_queued_ops(11);
+        facts->mutable_load()->set_write_admission_overloaded(true);
+
+        const auto applied = server.UpdateStorageNodeHeartbeat(heartbeat, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(applied.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(applied.accepted_sequence(), 7U);
+        EXPECT_TRUE(applied.applied());
+        EXPECT_FALSE(applied.idempotent());
+        EXPECT_FALSE(applied.stale_ignored());
+        EXPECT_EQ(applied.snapshot().facts().capacity().total_capacity_bytes(), 32'768U);
+
+        auto stale = MakeProtoHeartbeatRequest(65, 6, 150);
+        stale.set_request_id("heartbeat-stale-t063");
+        *stale.mutable_heartbeat()->mutable_facts() = MakeProtoStorageNodeFacts(
+            65,
+            4'096,
+            1'024);
+        const auto stale_response = server.UpdateStorageNodeHeartbeat(stale, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(stale_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS);
+        EXPECT_EQ(stale_response.accepted_sequence(), 7U);
+        EXPECT_FALSE(stale_response.applied());
+        EXPECT_FALSE(stale_response.idempotent());
+        EXPECT_TRUE(stale_response.stale_ignored());
+
+        auto duplicate = heartbeat;
+        duplicate.set_request_id("heartbeat-idempotent-t063");
+        duplicate.mutable_heartbeat()->set_observed_at_unix_ms(180);
+        *duplicate.mutable_heartbeat()->mutable_facts() = MakeProtoStorageNodeFacts(
+            65,
+            65'536,
+            4'096);
+        const auto duplicate_response =
+            server.UpdateStorageNodeHeartbeat(duplicate, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(duplicate_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(duplicate_response.accepted_sequence(), 7U);
+        EXPECT_FALSE(duplicate_response.applied());
+        EXPECT_TRUE(duplicate_response.idempotent());
+        EXPECT_FALSE(duplicate_response.stale_ignored());
+
+        const auto lookup = registry->LookupNode(
+            storedemo::test::MakeStorageNodeIdFixture(65), 181);
+        ASSERT_EQ(lookup.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup.snapshot.last_sequence, 7U);
+        EXPECT_EQ(lookup.snapshot.last_seen_unix_ms, 160U);
+        EXPECT_EQ(lookup.snapshot.facts.capacity.total_capacity_bytes, 32'768U);
+        EXPECT_EQ(lookup.snapshot.facts.health.health,
+                  storedemo::StorageNodeHealth::kDegraded);
+        EXPECT_TRUE(lookup.snapshot.facts.load.write_admission_overloaded);
+        EXPECT_EQ(recording_store->write_calls, 0U);
+        EXPECT_EQ(recording_store->read_calls, 0U);
+        EXPECT_EQ(recording_store->delete_calls, 0U);
+    }
+
+    TEST_F(StorageNodeServiceTest, ReportHealthCapacityAndLoadMergeIntoRegistryFacts)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        auto registry = std::make_shared<storedemo::StorageNodeRegistry>();
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            recording_store,
+            "service-node-t063",
+            registry);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        ASSERT_EQ(server.RegisterStorageNode(MakeProtoRegisterNodeRequest(66, 100),
+                                             &grpc_status)
+                      .summary()
+                      .code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+
+        auto health_request = MakeProtoHealthReportRequest(66, 2, 120);
+        health_request.mutable_health()->set_health(storage::STORAGE_NODE_HEALTH_DEGRADED);
+        health_request.mutable_health()->set_disk_pressure(
+            storage::STORAGE_NODE_DISK_PRESSURE_HIGH);
+        health_request.mutable_health()->set_io_error_count(6);
+        const auto health_response = server.ReportHealth(health_request, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(health_response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_TRUE(health_response.applied());
+
+        auto capacity_request = MakeProtoCapacityReportRequest(66, 3, 130);
+        capacity_request.mutable_capacity()->set_total_capacity_bytes(16'384);
+        capacity_request.mutable_capacity()->set_used_capacity_bytes(4'096);
+        capacity_request.mutable_capacity()->set_available_capacity_bytes(12'288);
+        capacity_request.mutable_capacity()->set_chunk_count(99);
+        const auto capacity_response =
+            server.ReportCapacity(capacity_request, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(capacity_response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_TRUE(capacity_response.applied());
+
+        auto load_request = MakeProtoLoadReportRequest(66, 4, 140);
+        load_request.mutable_load()->set_active_reads(8);
+        load_request.mutable_load()->set_active_writes(3);
+        load_request.mutable_load()->set_queued_ops(11);
+        load_request.mutable_load()->set_write_admission_overloaded(true);
+        load_request.mutable_load()->set_read_admission_overloaded(true);
+        const auto load_response = server.ReportLoad(load_request, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(load_response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_TRUE(load_response.applied());
+        EXPECT_EQ(load_response.accepted_sequence(), 4U);
+        EXPECT_EQ(load_response.snapshot().last_sequence(), 4U);
+
+        const auto lookup = registry->LookupNode(
+            storedemo::test::MakeStorageNodeIdFixture(66), 150);
+        ASSERT_EQ(lookup.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup.snapshot.last_sequence, 4U);
+        EXPECT_EQ(lookup.snapshot.last_seen_unix_ms, 140U);
+        EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
+                  storedemo::StorageNodeDiskPressure::kHigh);
+        EXPECT_EQ(lookup.snapshot.facts.capacity.total_capacity_bytes, 16'384U);
+        EXPECT_EQ(lookup.snapshot.facts.capacity.chunk_count, 99U);
+        EXPECT_EQ(lookup.snapshot.facts.load.load.active_reads, 8U);
+        EXPECT_TRUE(lookup.snapshot.facts.load.write_admission_overloaded);
+        EXPECT_TRUE(lookup.snapshot.facts.load.read_admission_overloaded);
+        EXPECT_EQ(lookup.snapshot.facts.failure_domain.zone, "zone-0");
+        EXPECT_EQ(recording_store->write_calls, 0U);
+        EXPECT_EQ(recording_store->read_calls, 0U);
+        EXPECT_EQ(recording_store->delete_calls, 0U);
+    }
+
+    TEST_F(StorageNodeServiceTest, RegistryRpcInvalidRequestsReturnExplicitErrors)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        auto registry = std::make_shared<storedemo::StorageNodeRegistry>();
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            recording_store,
+            "service-node-t063",
+            registry);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+
+        auto invalid_register = MakeProtoRegisterNodeRequest(67, 100);
+        invalid_register.set_node_id("");
+        const auto register_response = server.RegisterStorageNode(invalid_register,
+                                                                  &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(register_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+        EXPECT_FALSE(register_response.created());
+        EXPECT_FALSE(register_response.idempotent());
+
+        ASSERT_EQ(server.RegisterStorageNode(MakeProtoRegisterNodeRequest(67, 100),
+                                             &grpc_status)
+                      .summary()
+                      .code(),
+                  storage::STORAGE_NODE_STATUS_CODE_OK);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+
+        auto invalid_heartbeat = MakeProtoHeartbeatRequest(67, 0, 120);
+        const auto heartbeat_response =
+            server.UpdateStorageNodeHeartbeat(invalid_heartbeat, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(heartbeat_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+        EXPECT_FALSE(heartbeat_response.applied());
+
+        auto invalid_capacity = MakeProtoCapacityReportRequest(67, 2, 121);
+        invalid_capacity.mutable_capacity()->set_total_capacity_bytes(4'096);
+        invalid_capacity.mutable_capacity()->set_used_capacity_bytes(3'000);
+        invalid_capacity.mutable_capacity()->set_available_capacity_bytes(2'000);
+        const auto capacity_response = server.ReportCapacity(invalid_capacity, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(capacity_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+
+        auto conflict_load = MakeProtoLoadReportRequest(67, 2, 122);
+        conflict_load.set_endpoint("127.0.0.1:7999");
+        const auto load_response = server.ReportLoad(conflict_load, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(load_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CONFLICT);
     }
 
     TEST_F(StorageNodeServiceTest, WriteChunkMapsFieldsAndResponseFacts)
