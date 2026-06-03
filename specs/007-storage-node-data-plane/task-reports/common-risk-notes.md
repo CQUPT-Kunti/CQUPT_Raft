@@ -179,3 +179,8 @@
   问题：T078 已新增 test-only ScrubManager contract 测试，固定了“background checksum validation 发现 corrupted replica -> quarantine / unhealthy fact -> 产出 repair candidate”的最小语义；但当前 repair candidate 仍只基于 test-only manifest、实时 registry snapshot 和本地 quarantine / missing 事实组合推导，尚未定义生产级 freshness boundary、registry failure cache 或 scrub-task persistence。
   影响：如果后续把 T078 的通过误读成“生产 ScrubManager 已完成”或“repair candidate 与 metadata manifest / registry facts / quarantine 状态天然一致”，仍会高估跨快照时间窗内 candidate 的可靠性；当前保证的是 contract 测试存在，不是生产后台 scrub / repair 编排已落地。
   建议后续在哪类任务处理：在 T079/T083 及后续 registry failure cache、ScrubChunk RPC、RepairManager、生产 scrub queue 任务中继续收口 candidate freshness、一致性边界和后台执行语义。
+
+- 任务编号：T079
+  问题：T079 已新增 test-only RepairManager contract 测试，固定了“选择 healthy source / healthy target、target durable success 后才更新 replica facts、durable 失败不更新 facts、already-exists 同 checksum 视为 idempotent success”的最小语义；但当前 repair source / target 选择仍依赖 test-only manifest、实时 registry snapshot 和现有 `PlacementManager`/`ReplicaPolicy` 规则，没有生产级 repair task persistence、failure cache 或 durable-after-write facts publish 协议。
+  影响：如果后续把 T079 的通过误读成“生产 RepairManager 已完成”或“repair facts 与 metadata manifest / registry facts / target durable 顺序天然一致”，仍会高估 repair source/target 选择在快照新鲜度漂移、重复失败 target 和记账时序上的可靠性；当前保证的是 contract 测试存在，不是生产 repair 编排、task persistence 和事实传播已落地。
+  建议后续在哪类任务处理：在 T080/T084/T085 及后续 registry failure cache、RepairChunk RPC、repair task persistence、生产 repair state/facts publish 任务中继续收口 source/target 选择新鲜度、durable-after-write facts 更新顺序和后台执行语义。

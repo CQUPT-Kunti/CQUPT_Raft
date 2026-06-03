@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -19,6 +20,7 @@
 #include "store/index/chunk_index.h"
 #include "store/io/durable_file.h"
 #include "store/node/storage_node_registry.h"
+#include "store/placement/placement_manager.h"
 #include "store/placement/replica_policy.h"
 #include "support/store_test_utils.h"
 
@@ -69,6 +71,157 @@ namespace
         std::function<void()> metadata_mutation_hook;
         std::function<void()> raft_call_hook;
         std::function<void(std::string_view)> payload_persist_hook;
+    };
+
+    struct RepairReplicaFactsLedger
+    {
+        bool MarkDurable(const storedemo::ChunkId &chunk_id,
+                         const storedemo::StorageNodeId &node_id)
+        {
+            return durable_replicas[chunk_id].insert(node_id).second;
+        }
+
+        [[nodiscard]] bool HasDurableReplica(
+            const storedemo::ChunkId &chunk_id,
+            const storedemo::StorageNodeId &node_id) const
+        {
+            const auto chunk_it = durable_replicas.find(chunk_id);
+            if (chunk_it == durable_replicas.end())
+            {
+                return false;
+            }
+            return chunk_it->second.contains(node_id);
+        }
+
+        [[nodiscard]] std::size_t DurableReplicaCount(
+            const storedemo::ChunkId &chunk_id) const
+        {
+            const auto chunk_it = durable_replicas.find(chunk_id);
+            return chunk_it == durable_replicas.end() ? 0U : chunk_it->second.size();
+        }
+
+        std::map<storedemo::ChunkId, std::set<storedemo::StorageNodeId>> durable_replicas;
+    };
+
+    struct RepairRunResult
+    {
+        storedemo::StorageNodeStatusCode status{
+            storedemo::StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        storedemo::StorageNodeId source_node;
+        storedemo::StorageNodeId target_node;
+        bool target_durable{false};
+        bool facts_updated{false};
+        bool idempotent_success{false};
+    };
+
+    struct RepairObserver
+    {
+        std::function<void()> metadata_mutation_hook;
+        std::function<void()> raft_call_hook;
+        std::function<void(std::string_view)> payload_persist_hook;
+    };
+
+    struct RecordingWriterState
+    {
+        storedemo::DurableFileResult append_result;
+        storedemo::DurableFileResult flush_result{
+            .durable_boundary_reached = true};
+        storedemo::DurableFileResult close_result;
+        std::string appended_payload;
+    };
+
+    class RecordingDurableFileWriter : public storedemo::DurableFileWriter
+    {
+    public:
+        RecordingDurableFileWriter(std::shared_ptr<RecordingWriterState> state,
+                                   std::filesystem::path path)
+            : state_(std::move(state))
+            , path_(std::move(path))
+        {
+        }
+
+        storedemo::DurableFileResult Append(
+            const storedemo::DurableAppendRequest &request) override
+        {
+            const auto *chars =
+                reinterpret_cast<const char *>(request.buffer.data());
+            state_->appended_payload.assign(chars, chars + request.buffer.size());
+            auto result = state_->append_result;
+            if (result.ok())
+            {
+                result.bytes_transferred = request.buffer.size();
+            }
+            return result;
+        }
+
+        storedemo::DurableFileResult Flush(
+            const storedemo::DurableFlushRequest &) override
+        {
+            return state_->flush_result;
+        }
+
+        storedemo::DurableFileResult Close(
+            const storedemo::DurableCloseRequest &) override
+        {
+            return state_->close_result;
+        }
+
+        [[nodiscard]] const std::filesystem::path &path() const override
+        {
+            return path_;
+        }
+
+    private:
+        std::shared_ptr<RecordingWriterState> state_;
+        std::filesystem::path path_;
+    };
+
+    class RecordingDurableFile : public storedemo::DurableFile
+    {
+    public:
+        explicit RecordingDurableFile(std::shared_ptr<RecordingWriterState> writer_state)
+            : writer_state_(std::move(writer_state))
+        {
+            publish_result.durable_boundary_reached = true;
+            sync_result.durable_boundary_reached = true;
+        }
+
+        storedemo::DurableFileResult publish_result;
+        storedemo::DurableFileResult sync_result;
+
+        storedemo::NormalizeDurablePathResponse NormalizePath(
+            const storedemo::NormalizeDurablePathRequest &request) override
+        {
+            storedemo::NormalizeDurablePathResponse response;
+            response.normalized_path = request.relative_path;
+            return response;
+        }
+
+        storedemo::OpenStagingWriterResponse OpenStagingWriter(
+            const storedemo::OpenStagingWriterRequest &request) override
+        {
+            storedemo::OpenStagingWriterResponse response;
+            response.normalized_path = request.relative_path;
+            response.writer = std::make_unique<RecordingDurableFileWriter>(
+                writer_state_, request.relative_path);
+            return response;
+        }
+
+        storedemo::DurableFileResult PublishStagedFile(
+            const storedemo::PublishDurableFileRequest &) override
+        {
+            return publish_result;
+        }
+
+        storedemo::DurableFileResult SyncDirectory(
+            const storedemo::SyncDurableDirectoryRequest &) override
+        {
+            return sync_result;
+        }
+
+    private:
+        std::shared_ptr<RecordingWriterState> writer_state_;
     };
 
     storedemo::ChunkChecksum ComputeChecksumOrThrow(const std::string_view payload)
@@ -238,6 +391,21 @@ namespace
         summary += candidate.under_replicated ? "|under" : "|full";
         summary += candidate.lost_or_unrecoverable ? "|lost" : "|repairable";
         return summary;
+    }
+
+    ScrubRepairCandidate MakeRepairCandidate(
+        const ScrubManifest &manifest,
+        std::vector<storedemo::StorageNodeId> healthy_source_replicas,
+        const bool under_replicated = true)
+    {
+        return ScrubRepairCandidate{
+            .chunk_id = manifest.identity.chunk_id,
+            .expected_size = manifest.expected_size,
+            .expected_checksum = manifest.expected_checksum,
+            .bad_replicas = {},
+            .healthy_source_replicas = std::move(healthy_source_replicas),
+            .under_replicated = under_replicated,
+            .lost_or_unrecoverable = false};
     }
 
     std::string FactSummary(const std::vector<ScrubReplicaFact> &facts)
@@ -533,6 +701,152 @@ namespace
         ScrubObserver observer_;
     };
 
+    class TestOnlyRepairRunner
+    {
+    public:
+        TestOnlyRepairRunner(
+            std::map<storedemo::StorageNodeId, storedemo::LocalDiskChunkStore *> stores,
+            const storedemo::StorageNodeRegistry *registry,
+            RepairReplicaFactsLedger *facts_ledger,
+            RepairObserver observer = {})
+            : stores_(std::move(stores))
+            , registry_(registry)
+            , facts_ledger_(facts_ledger)
+            , observer_(std::move(observer))
+        {
+        }
+
+        RepairRunResult Run(const ScrubManifest &manifest,
+                            const ScrubRepairCandidate &candidate,
+                            const std::uint64_t now_unix_ms) const
+        {
+            RepairRunResult result;
+            if (registry_ == nullptr || facts_ledger_ == nullptr)
+            {
+                result.status = storedemo::StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail = "repair runner requires registry and facts ledger";
+                return result;
+            }
+
+            const auto snapshot = registry_->Snapshot(now_unix_ms);
+            if (!snapshot.ok())
+            {
+                result.status = snapshot.status;
+                result.error_detail = snapshot.error_detail;
+                return result;
+            }
+
+            std::map<storedemo::StorageNodeId, storedemo::StorageNodeRegistryNodeSnapshot>
+                snapshot_by_node;
+            for (const auto &node : snapshot.nodes)
+            {
+                snapshot_by_node.emplace(node.node_id, node);
+            }
+
+            std::string source_payload;
+            for (const auto &node_id : candidate.healthy_source_replicas)
+            {
+                const auto snapshot_it = snapshot_by_node.find(node_id);
+                if (snapshot_it == snapshot_by_node.end())
+                {
+                    continue;
+                }
+
+                const auto &node_snapshot = snapshot_it->second;
+                if (node_snapshot.liveness !=
+                        storedemo::StorageNodeRegistryLiveness::kLive ||
+                    node_snapshot.facts.health.health !=
+                        storedemo::StorageNodeHealth::kHealthy)
+                {
+                    continue;
+                }
+
+                const auto store_it = stores_.find(node_id);
+                if (store_it == stores_.end() || store_it->second == nullptr)
+                {
+                    continue;
+                }
+
+                auto read_request = MakeReadRequest(
+                    manifest.identity.chunk_id,
+                    "repair-read-source-" + node_id);
+                read_request.expected_checksum = candidate.expected_checksum;
+                read_request.verify_checksum = true;
+                const auto read_response = store_it->second->ReadChunk(read_request);
+                if (!read_response.ok())
+                {
+                    continue;
+                }
+                if (read_response.metadata.size != candidate.expected_size ||
+                    !ChecksumEquals(read_response.actual_checksum,
+                                    candidate.expected_checksum))
+                {
+                    continue;
+                }
+
+                result.source_node = node_id;
+                source_payload = read_response.payload;
+                break;
+            }
+
+            if (result.source_node.empty())
+            {
+                result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                result.error_detail = "no healthy repair source is available";
+                return result;
+            }
+
+            storedemo::PlacementManager placement_manager;
+            storedemo::PlacementRequest placement_request;
+            placement_request.identity = manifest.identity;
+            placement_request.chunk_size_bytes = candidate.expected_size;
+            placement_request.policy.replica_count = 1;
+            placement_request.policy.minimum_successful_writes = 1;
+            placement_request.excluded_nodes = manifest.replica_nodes;
+
+            const auto placement = placement_manager.SelectPlacement(
+                placement_request, *registry_, now_unix_ms);
+            if (!placement.ok() || placement.decision.replica_nodes.empty())
+            {
+                result.status = placement.status;
+                result.error_detail = placement.error_detail;
+                return result;
+            }
+
+            result.target_node = placement.decision.replica_nodes.front().node_id;
+            const auto store_it = stores_.find(result.target_node);
+            if (store_it == stores_.end() || store_it->second == nullptr)
+            {
+                result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                result.error_detail = "selected repair target store is unavailable";
+                return result;
+            }
+
+            const auto write_response = store_it->second->WriteChunk(
+                MakeWriteRequest(manifest.identity,
+                                 source_payload,
+                                 "repair-write-target-" + result.target_node));
+            if (!write_response.ok())
+            {
+                result.status = write_response.status;
+                result.error_detail = write_response.error_detail;
+                return result;
+            }
+
+            result.target_durable = true;
+            result.idempotent_success = write_response.already_exists;
+            result.facts_updated = facts_ledger_->MarkDurable(manifest.identity.chunk_id,
+                                                              result.target_node);
+            return result;
+        }
+
+    private:
+        std::map<storedemo::StorageNodeId, storedemo::LocalDiskChunkStore *> stores_;
+        const storedemo::StorageNodeRegistry *registry_;
+        RepairReplicaFactsLedger *facts_ledger_;
+        RepairObserver observer_;
+    };
+
     class StorageScrubRepairTest : public ::testing::Test
     {
     protected:
@@ -544,13 +858,16 @@ namespace
         {
         }
 
-        storedemo::LocalDiskChunkStore &CreateStore(const std::size_t node_index)
+        storedemo::LocalDiskChunkStore &CreateStore(
+            const std::size_t node_index,
+            std::shared_ptr<storedemo::DurableFile> durable_file = {})
         {
             const auto node_id = storedemo::test::MakeStorageNodeIdFixture(node_index);
             auto store = std::make_unique<storedemo::LocalDiskChunkStore>(
                 storedemo::LocalDiskChunkStoreConfig{
                     .data_dir = temp_dir_.Path("store-" + std::to_string(node_index)),
                     .node_id = node_id,
+                    .durable_file = std::move(durable_file),
                     .chunk_index = std::make_shared<storedemo::ShardedChunkIndex>()});
             const auto init_result = store->Initialize();
             EXPECT_EQ(init_result.status, storedemo::StorageNodeStatusCode::kOk)
@@ -567,13 +884,23 @@ namespace
                 storedemo::StorageNodeHealth::kHealthy,
             const storedemo::StorageNodeDiskPressure disk_pressure =
                 storedemo::StorageNodeDiskPressure::kLow,
-            const std::uint32_t active_reads = 0)
+            const std::uint32_t active_reads = 0,
+            const bool write_overloaded = false,
+            const std::uint64_t total_capacity_bytes = 64 * 1024,
+            const std::uint64_t used_capacity_bytes = 8 * 1024)
         {
             storedemo::RegisterStorageNodeRequest request;
             request.node_id = storedemo::test::MakeStorageNodeIdFixture(node_index);
             request.endpoint = "127.0.0.1:" + std::to_string(7100 + node_index);
             request.observed_at_unix_ms = observed_at_unix_ms;
             request.facts = MakeRegistryFacts(health, disk_pressure, active_reads);
+            request.facts.capacity.total_capacity_bytes = total_capacity_bytes;
+            request.facts.capacity.used_capacity_bytes = used_capacity_bytes;
+            request.facts.capacity.available_capacity_bytes =
+                total_capacity_bytes >= used_capacity_bytes
+                    ? total_capacity_bytes - used_capacity_bytes
+                    : 0;
+            request.facts.load.write_admission_overloaded = write_overloaded;
             const auto result = registry_.RegisterStorageNode(request);
             ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
                 << result.error_detail;
@@ -625,6 +952,7 @@ namespace
 
         storedemo::test::ScopedStoreTestDir temp_dir_{"storage_scrub_repair"};
         storedemo::StorageNodeRegistry registry_;
+        RepairReplicaFactsLedger repair_facts_;
         std::map<storedemo::StorageNodeId,
                  std::unique_ptr<storedemo::LocalDiskChunkStore>>
             stores_;
@@ -890,5 +1218,413 @@ namespace
         EXPECT_EQ(result.repair_candidate->bad_replicas,
                   std::vector<storedemo::StorageNodeId>{
                       storedemo::test::MakeStorageNodeIdFixture(5)});
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepairSelectsHealthySourceAndHealthyTargetAndUpdatesFactsAfterDurableWrite)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &overloaded_target = CreateStore(3);
+        auto &high_pressure_target = CreateStore(4);
+        auto &low_capacity_target = CreateStore(5);
+        auto &stale_target = CreateStore(6);
+        auto &healthy_target = CreateStore(7);
+
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, true);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kHigh);
+        RegisterNode(5, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, false, 1024, 900);
+        RegisterNode(6, 60);
+        RegisterNode(7, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-success", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(2048, "repair-success");
+        WriteReplica(source_store, identity, payload, "repair-success-write-1");
+        WriteReplica(peer_store, identity, payload, "repair-success-write-2");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto original_manifest = manifest;
+
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest,
+                {storedemo::test::MakeStorageNodeIdFixture(1),
+                 storedemo::test::MakeStorageNodeIdFixture(2)}),
+            110);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.source_node, storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(result.target_node, storedemo::test::MakeStorageNodeIdFixture(7));
+        EXPECT_TRUE(result.target_durable);
+        EXPECT_TRUE(result.facts_updated);
+        EXPECT_FALSE(result.idempotent_success);
+        EXPECT_TRUE(repair_facts_.HasDurableReplica(identity.chunk_id, result.target_node));
+        EXPECT_EQ(repair_facts_.DurableReplicaCount(identity.chunk_id), 1U);
+
+        const auto target_stat = healthy_target.StatChunk(
+            MakeStatRequest(identity.chunk_id, "repair-success-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+        EXPECT_EQ(target_stat.metadata.size, manifest.expected_size);
+        EXPECT_TRUE(ChecksumEquals(target_stat.metadata.checksum,
+                                   manifest.expected_checksum));
+        ExpectManifestEq(manifest, original_manifest);
+
+        (void)overloaded_target;
+        (void)high_pressure_target;
+        (void)low_capacity_target;
+        (void)stale_target;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepairRejectsQuarantinedStaleUnavailableAndUnhealthySources)
+    {
+        auto &healthy_source = CreateStore(1);
+        auto &quarantined_source = CreateStore(2);
+        auto &stale_source = CreateStore(3);
+        auto &unavailable_source = CreateStore(4);
+        auto &degraded_source = CreateStore(5);
+        auto &target_store = CreateStore(6);
+
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 60);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(5, 100, storedemo::StorageNodeHealth::kDegraded);
+        RegisterNode(6, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-source-filter", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(64, "repair-source-filter");
+        WriteReplica(healthy_source, identity, payload, "repair-source-write-1");
+        WriteReplica(quarantined_source, identity, payload, "repair-source-write-2");
+        WriteReplica(stale_source, identity, payload, "repair-source-write-3");
+        WriteReplica(unavailable_source, identity, payload, "repair-source-write-4");
+        WriteReplica(degraded_source, identity, payload, "repair-source-write-5");
+
+        TamperReplica(quarantined_source,
+                      identity,
+                      storedemo::test::MakeChunkPayload(payload.size(), "tampered-source"));
+        auto quarantine_stat = MakeStatRequest(identity.chunk_id,
+                                               "repair-source-quarantine");
+        quarantine_stat.verify_checksum = true;
+        ASSERT_EQ(quarantined_source.StatChunk(quarantine_stat).status,
+                  storedemo::StorageNodeStatusCode::kCorrupted);
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2),
+             storedemo::test::MakeStorageNodeIdFixture(3),
+             storedemo::test::MakeStorageNodeIdFixture(4),
+             storedemo::test::MakeStorageNodeIdFixture(5)},
+            6);
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest,
+                {storedemo::test::MakeStorageNodeIdFixture(2),
+                 storedemo::test::MakeStorageNodeIdFixture(3),
+                 storedemo::test::MakeStorageNodeIdFixture(4),
+                 storedemo::test::MakeStorageNodeIdFixture(5),
+                 storedemo::test::MakeStorageNodeIdFixture(1)}),
+            110);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.source_node, storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(result.target_node, storedemo::test::MakeStorageNodeIdFixture(6));
+        EXPECT_TRUE(repair_facts_.HasDurableReplica(identity.chunk_id, result.target_node));
+
+        const auto source_state = quarantined_source.StatChunk(
+            MakeStatRequest(identity.chunk_id, "repair-source-quarantine-state"));
+        ASSERT_EQ(source_state.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(source_state.metadata.state, storedemo::ChunkState::kQuarantined);
+
+        const auto target_stat = target_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "repair-source-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepairFailsWhenSourceChecksumVerificationFailsAndDoesNotUpdateFacts)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(2);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-source-mismatch", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(48, "repair-source-mismatch");
+        WriteReplica(source_store, identity, payload, "repair-source-mismatch-write");
+        TamperReplica(source_store,
+                      identity,
+                      storedemo::test::MakeChunkPayload(payload.size(), "tampered-source"));
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest, {storedemo::test::MakeStorageNodeIdFixture(1)}),
+            110);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kNodeUnavailable);
+        EXPECT_FALSE(result.target_durable);
+        EXPECT_FALSE(result.facts_updated);
+        EXPECT_FALSE(repair_facts_.HasDurableReplica(identity.chunk_id,
+                                                     storedemo::test::MakeStorageNodeIdFixture(2)));
+
+        const auto source_state = source_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "repair-source-mismatch-state"));
+        ASSERT_EQ(source_state.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(source_state.metadata.state, storedemo::ChunkState::kQuarantined);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-source-mismatch-target"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepairDoesNotUpdateFactsWhenTargetDurableWriteFails)
+    {
+        auto &source_store = CreateStore(1);
+        auto writer_state = std::make_shared<RecordingWriterState>();
+        auto failing_durable_file = std::make_shared<RecordingDurableFile>(writer_state);
+        failing_durable_file->publish_result.error =
+            storedemo::DurableFileErrorCode::kAtomicPublishFailed;
+        failing_durable_file->publish_result.error_detail = "publish failed";
+        auto &target_store = CreateStore(2, failing_durable_file);
+
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-target-fail", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(40, "repair-target-fail");
+        WriteReplica(source_store, identity, payload, "repair-target-fail-write");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest, {storedemo::test::MakeStorageNodeIdFixture(1)}),
+            110);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kIoError);
+        EXPECT_EQ(result.target_node, storedemo::test::MakeStorageNodeIdFixture(2));
+        EXPECT_FALSE(result.target_durable);
+        EXPECT_FALSE(result.facts_updated);
+        EXPECT_FALSE(repair_facts_.HasDurableReplica(identity.chunk_id, result.target_node));
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-target-fail-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepairTreatsExistingMatchingTargetAsIdempotentSuccess)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(2);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-idempotent-target", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(56, "repair-idempotent-target");
+        WriteReplica(source_store, identity, payload, "repair-idempotent-source");
+        WriteReplica(target_store, identity, payload, "repair-idempotent-target");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest, {storedemo::test::MakeStorageNodeIdFixture(1)}),
+            110);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_TRUE(result.target_durable);
+        EXPECT_TRUE(result.idempotent_success);
+        EXPECT_TRUE(result.facts_updated);
+        EXPECT_TRUE(repair_facts_.HasDurableReplica(identity.chunk_id,
+                                                    storedemo::test::MakeStorageNodeIdFixture(2)));
+    }
+
+    TEST_F(StorageScrubRepairTest, RepairFailsWhenNoUsableSourceExists)
+    {
+        auto &stale_source = CreateStore(1);
+        auto &unavailable_source = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 60);
+        RegisterNode(2, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(3, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-no-source", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(32, "repair-no-source");
+        WriteReplica(stale_source, identity, payload, "repair-no-source-1");
+        WriteReplica(unavailable_source, identity, payload, "repair-no-source-2");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest,
+                {storedemo::test::MakeStorageNodeIdFixture(1),
+                 storedemo::test::MakeStorageNodeIdFixture(2)}),
+            110);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kNodeUnavailable);
+        EXPECT_FALSE(result.target_durable);
+        EXPECT_FALSE(result.facts_updated);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-no-source-target-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest, RepairFailsWhenNoUsableTargetExists)
+    {
+        auto &source_store = CreateStore(1);
+        auto &stale_target = CreateStore(2);
+        auto &unavailable_target = CreateStore(3);
+        auto &overloaded_target = CreateStore(4);
+        auto &high_disk_target = CreateStore(5);
+        auto &small_target = CreateStore(6);
+
+        RegisterNode(1, 100);
+        RegisterNode(2, 60);
+        RegisterNode(3, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, true);
+        RegisterNode(5, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kFull);
+        RegisterNode(6, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, false, 1024, 900);
+
+        const auto identity = MakeIdentityOrThrow("repair-no-target", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(2048, "repair-no-target");
+        WriteReplica(source_store, identity, payload, "repair-no-target-source");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        const auto original_manifest = manifest;
+
+        TestOnlyRepairRunner runner(RawStoreMap(), &registry_, &repair_facts_);
+        const auto result = runner.Run(
+            manifest,
+            MakeRepairCandidate(
+                manifest, {storedemo::test::MakeStorageNodeIdFixture(1)}),
+            110);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kNodeUnavailable);
+        EXPECT_FALSE(result.target_durable);
+        EXPECT_FALSE(result.facts_updated);
+        EXPECT_EQ(repair_facts_.DurableReplicaCount(identity.chunk_id), 0U);
+        ExpectManifestEq(manifest, original_manifest);
+
+        (void)stale_target;
+        (void)unavailable_target;
+        (void)overloaded_target;
+        (void)high_disk_target;
+        (void)small_target;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           RepeatedRepairIsIdempotentAndDoesNotDuplicateFactsOrTouchRaft)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(2);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-repeat", 1, 0, 0);
+        const auto payload = storedemo::test::MakeChunkPayload(72, "repair-repeat");
+        WriteReplica(source_store, identity, payload, "repair-repeat-source");
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        const auto original_manifest = manifest;
+
+        std::size_t metadata_mutation_calls = 0;
+        std::size_t raft_calls = 0;
+        std::size_t payload_persist_calls = 0;
+        TestOnlyRepairRunner runner(
+            RawStoreMap(),
+            &registry_,
+            &repair_facts_,
+            RepairObserver{
+                .metadata_mutation_hook = [&metadata_mutation_calls]()
+                { ++metadata_mutation_calls; },
+                .raft_call_hook = [&raft_calls]()
+                { ++raft_calls; },
+                .payload_persist_hook = [&payload_persist_calls](std::string_view)
+                { ++payload_persist_calls; }});
+
+        const auto candidate = MakeRepairCandidate(
+            manifest, {storedemo::test::MakeStorageNodeIdFixture(1)});
+        const auto first = runner.Run(manifest, candidate, 110);
+        const auto second = runner.Run(manifest, candidate, 120);
+
+        ASSERT_EQ(first.status, storedemo::StorageNodeStatusCode::kOk)
+            << first.error_detail;
+        ASSERT_EQ(second.status, storedemo::StorageNodeStatusCode::kOk)
+            << second.error_detail;
+        EXPECT_TRUE(first.target_durable);
+        EXPECT_TRUE(first.facts_updated);
+        EXPECT_TRUE(second.target_durable);
+        EXPECT_FALSE(second.facts_updated);
+        EXPECT_TRUE(second.idempotent_success);
+        EXPECT_EQ(first.target_node, storedemo::test::MakeStorageNodeIdFixture(2));
+        EXPECT_EQ(second.target_node, first.target_node);
+        EXPECT_EQ(repair_facts_.DurableReplicaCount(identity.chunk_id), 1U);
+        ExpectManifestEq(manifest, original_manifest);
+        EXPECT_EQ(metadata_mutation_calls, 0U);
+        EXPECT_EQ(raft_calls, 0U);
+        EXPECT_EQ(payload_persist_calls, 0U);
+
+        const auto target_stat = target_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "repair-repeat-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
     }
 } // namespace
