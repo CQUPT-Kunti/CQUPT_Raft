@@ -151,6 +151,7 @@ chunk data-plane 抽象接口。
 - `durable_file`
 - `chunk_index`
 - `executor`
+- `staging_cleanup_grace_period_ms`
 
 当前语义：
 
@@ -158,6 +159,7 @@ chunk data-plane 抽象接口。
 - `durable_file` 允许为空；为空时会按当前平台创建默认 durable file 实现
 - `chunk_index` 允许为空；为空时会创建默认 `ShardedChunkIndex`
 - `executor` 当前只是后续异步路径的扩展点，初始化阶段允许为空
+- `staging_cleanup_grace_period_ms` 控制 `chunks/staging/` 下 stale / partial staging 的清理阈值；默认 5 分钟，`0` 表示禁用 cleanup
 
 如果调用方自己注入 `durable_file`，它的 root 必须和 `data_dir` 对齐；当前骨架不会替调用方重写外部 durable file 的 root。
 
@@ -195,7 +197,6 @@ T023-T025 已实现：
 
 后续任务仍未实现：
 
-- stale staging cleanup
 - corruption / quarantine 状态自动回写
 - 后台 scrub / repair / rebalance
 
@@ -207,6 +208,7 @@ T023-T025 已实现：
 - `StatChunk` 已经走通 index lookup 和可选 checksum verify
 - `ListChunks` 已经走通基于 `ChunkIndex` 的过滤和分页
 - `RebuildIndexFromDisk` 已经走通 canonical `chunks/live/` 目录扫描、payload size/checksum 恢复和 live index 重建
+- `Initialize()` 已经走通 staging scan -> stale staging cleanup -> live index rebuild
 - T026 已用真实本地文件压力测试覆盖不同 chunk 并发写入、同 chunk 冲突写入，以及读/删/查/列交错边界
 
 当前并发边界补充：
@@ -225,6 +227,7 @@ T023-T025 已实现：
 - `LocalDiskChunkStore::~LocalDiskChunkStore()`
 - `LocalDiskChunkStorePaths::IsInitialized()`
 - `LocalDiskChunkStore::Initialize()`
+- `LocalDiskChunkStore::RebuildIndexFromDisk()`
 - `LocalDiskChunkStore::config()`
 - `LocalDiskChunkStore::paths()`
 - `LocalDiskChunkStore::initialized()`
@@ -241,7 +244,7 @@ T023-T025 已实现：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
 - `local_disk_chunk_store.cpp` 现在已经包含 `Initialize` / `RebuildIndexFromDisk` / `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地路径
-- restart live index rebuild 已实现，但 staging cleanup / corruption 治理 / 后台维护路径仍未实现
+- restart live index rebuild 和 stale staging cleanup 已实现，但 corruption 治理 / 后台维护路径仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -325,6 +328,120 @@ T023-T025 已实现：
 - 只负责 live 目录遍历
 - 非 regular 候选直接跳过
 - 目录不存在或遍历失败返回明确文件系统错误
+
+### `CollectStagingCleanupCandidates(...)`
+
+递归扫描 `chunks/staging/`，收集 staging file candidate 和待 prune 的目录列表，并固定稳定顺序。
+
+输入：
+
+- `staging_root`
+
+输出：
+
+- `file_candidates`
+- `directory_candidates`
+
+边界：
+
+- 只扫描 staging 目录
+- regular file 进入 cleanup 候选
+- 目录按“更深优先、同层字典序”排序，便于稳定 prune
+
+### `IsStagingCandidatePastGracePeriod(...)`
+
+基于 `last_write_time` 和 `staging_cleanup_grace_period_ms` 判断 staging 候选是否已经 stale。
+
+输入：
+
+- `path`
+- `grace_period_ms`
+
+输出：
+
+- `is_stale`
+
+边界：
+
+- `0` 表示禁用 cleanup
+- mtime 在未来时按 fresh 处理
+- mtime 读取失败返回明确文件系统错误
+
+### `RemovePathSafelyUnderRoot(...)`
+
+在确认目标仍位于 `staging_root` 之下后，删除单个 staging file 或空目录。
+
+输入：
+
+- `root_path`
+- `target_path`
+
+输出：
+
+- remove 结果状态
+
+边界：
+
+- 拒绝删除 root 本身或 root 外路径
+- 不存在视为幂等成功
+- 删除失败返回明确错误，不 silent success
+
+### `CleanupStaleStagingFiles(...)`
+
+遍历 staging file candidate，对超过 grace period 的 stale / partial staging 执行删除。
+
+输入：
+
+- `staging_root`
+- `grace_period_ms`
+- `scan_result`
+
+输出：
+
+- 文件 cleanup 结果状态
+
+边界：
+
+- fresh staging 不删除
+- malformed staging 文件只要在 staging 下且超过阈值，也按 staging 垃圾处理
+- cleanup 失败会中止初始化
+
+### `PruneEmptyStagingDirectories(...)`
+
+在 stale file 删除后，按稳定顺序清理已经变空的 staging 子目录。
+
+输入：
+
+- `staging_root`
+- `scan_result`
+
+输出：
+
+- 目录 prune 结果状态
+
+边界：
+
+- 只删除空目录
+- 非空目录保留，避免误删 fresh staging
+- 删除失败返回明确错误
+
+### `CleanupStaleStagingArtifacts(...)`
+
+这是 T071 的 recovery cleanup 主流程。
+
+主步骤：
+
+1. 扫描 `chunks/staging/`
+2. 用 grace period 判断 stale staging
+3. 删除 stale / partial staging file
+4. prune 删除后留下的空 staging 目录
+
+边界：
+
+- 不扫描或删除 `chunks/live/`
+- 不把 staging 事实加入 live index
+- cleanup 失败返回明确错误
+- 不调用 metadata / Raft
 
 ### `ParseChunkIdFromLiveFilename(...)`
 
@@ -472,7 +589,6 @@ T023-T025 已实现：
 边界：
 
 - 不扫描 staging 进入 live index
-- 不做 stale staging cleanup
 - 不做 corrupted quarantine
 - 不调用 metadata / Raft
 - 不决定 object committed/deleted 可见性
@@ -617,9 +733,11 @@ T023-T025 已实现：
    - `chunks_root`
    - `live_root`
    - `staging_root`
-7. 写回 `paths_` 和 `initialized_`
+7. 扫描并 cleanup stale staging / partial staging
+8. 重建 live ChunkIndex
+9. 写回 `initialized_`
 
-也就是说，`Initialize()` 当前只做“配置和目录边界落稳”，还没有进入后续的 chunk 生命周期逻辑。
+也就是说，`Initialize()` 现在除了目录落稳，还会先做 recovery cleanup，再做 live index rebuild。
 
 ## `WriteChunk()` 当前语义
 
@@ -668,11 +786,10 @@ T023-T025 已实现：
 
 T070 之后仍然没有解决这些恢复问题：
 
-- stale staging cleanup
 - corrupted / quarantine
 - published final file 的 tombstone / deleted / metadata freshness 判定
 
-也就是说，当前 `WriteChunk()` + `RebuildIndexFromDisk()` 已经保证 live final chunk 的本地重启可发现，但还没有把 staging 收尾、坏块隔离或 metadata 事实新鲜度一起收口。
+也就是说，当前 `WriteChunk()` + `Initialize()`/`RebuildIndexFromDisk()` 已经保证 stale staging cleanup 和 live final chunk 的本地重启可发现，但还没有把坏块隔离或 metadata 事实新鲜度一起收口。
 
 ## `ReadChunk()` 当前语义
 
@@ -762,7 +879,6 @@ T070 之后仍然没有解决这些恢复问题：
 
 ## 当前未实现内容
 
-- stale staging cleanup
 - 读路径发现损坏后的自动状态回写
 - quarantine / repair / GC / restart recovery
 - range read

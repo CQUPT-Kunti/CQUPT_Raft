@@ -800,6 +800,351 @@ namespace storedemo
             return entry;
         }
 
+        struct StagingCleanupScanResult
+        {
+            std::vector<std::filesystem::path> file_candidates;
+            std::vector<std::filesystem::path> directory_candidates;
+        };
+
+        StorageNodeStatusCode CollectStagingCleanupCandidates(
+            const std::filesystem::path &staging_root,
+            StagingCleanupScanResult *scan_result,
+            std::string *error_detail)
+        {
+            if (scan_result == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "staging cleanup scan output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            *scan_result = {};
+
+            std::error_code exists_error;
+            const bool exists = std::filesystem::exists(staging_root, exists_error);
+            if (exists_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = BuildFilesystemErrorDetail(
+                        "exists", staging_root, exists_error);
+                }
+                return MapFilesystemErrorToStatus(exists_error);
+            }
+            if (!exists)
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            std::error_code iter_error;
+            std::filesystem::recursive_directory_iterator iter(staging_root, iter_error);
+            if (iter_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "failed to iterate staging root: " +
+                                    iter_error.message();
+                }
+                return StorageNodeStatusCode::kIoError;
+            }
+
+            for (const auto end = std::filesystem::recursive_directory_iterator();
+                 iter != end;
+                 iter.increment(iter_error))
+            {
+                if (iter_error)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail = "failed while scanning staging root: " +
+                                        iter_error.message();
+                    }
+                    return StorageNodeStatusCode::kIoError;
+                }
+
+                std::error_code status_error;
+                const bool is_directory = iter->is_directory(status_error);
+                if (status_error)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail =
+                            "failed to inspect staging candidate directory type: " +
+                            status_error.message();
+                    }
+                    return StorageNodeStatusCode::kIoError;
+                }
+
+                if (is_directory)
+                {
+                    scan_result->directory_candidates.push_back(iter->path());
+                    continue;
+                }
+
+                const bool is_regular = iter->is_regular_file(status_error);
+                if (status_error)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail =
+                            "failed to inspect staging candidate file type: " +
+                            status_error.message();
+                    }
+                    return StorageNodeStatusCode::kIoError;
+                }
+
+                if (is_regular)
+                {
+                    scan_result->file_candidates.push_back(iter->path());
+                }
+            }
+
+            std::sort(scan_result->file_candidates.begin(),
+                      scan_result->file_candidates.end());
+            std::sort(scan_result->directory_candidates.begin(),
+                      scan_result->directory_candidates.end(),
+                      [](const std::filesystem::path &lhs,
+                         const std::filesystem::path &rhs)
+                      {
+                          const auto lhs_depth =
+                              std::distance(lhs.begin(), lhs.end());
+                          const auto rhs_depth =
+                              std::distance(rhs.begin(), rhs.end());
+                          if (lhs_depth != rhs_depth)
+                          {
+                              return lhs_depth > rhs_depth;
+                          }
+                          return lhs < rhs;
+                      });
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode IsStagingCandidatePastGracePeriod(
+            const std::filesystem::path &path,
+            const std::uint64_t grace_period_ms,
+            bool *is_stale,
+            std::string *error_detail)
+        {
+            if (is_stale == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "staging staleness output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            *is_stale = false;
+            if (grace_period_ms == 0)
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            std::error_code write_time_error;
+            const auto last_write_time =
+                std::filesystem::last_write_time(path, write_time_error);
+            if (write_time_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = BuildFilesystemErrorDetail(
+                        "last_write_time", path, write_time_error);
+                }
+                return MapFilesystemErrorToStatus(write_time_error);
+            }
+
+            const auto now = std::filesystem::file_time_type::clock::now();
+            if (last_write_time > now)
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            const auto age =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                      last_write_time);
+            *is_stale = age >= std::chrono::milliseconds(grace_period_ms);
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode RemovePathSafelyUnderRoot(
+            const std::filesystem::path &root_path,
+            const std::filesystem::path &target_path,
+            std::string *error_detail)
+        {
+            const auto normalized_root = root_path.lexically_normal();
+            const auto normalized_target = target_path.lexically_normal();
+            const auto relative = normalized_target.lexically_relative(normalized_root);
+            if (relative.empty() || relative == "." ||
+                relative.native().starts_with(".."))
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "refusing to remove path outside staging root: " +
+                                    normalized_target.string();
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            std::error_code exists_error;
+            const bool exists = std::filesystem::exists(normalized_target, exists_error);
+            if (exists_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = BuildFilesystemErrorDetail(
+                        "exists", normalized_target, exists_error);
+                }
+                return MapFilesystemErrorToStatus(exists_error);
+            }
+            if (!exists)
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            std::error_code remove_error;
+            const bool removed = std::filesystem::remove(normalized_target, remove_error);
+            if (remove_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = BuildFilesystemErrorDetail(
+                        "remove", normalized_target, remove_error);
+                }
+                return MapFilesystemErrorToStatus(remove_error);
+            }
+
+            if (!removed)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "failed to remove staging path: " +
+                                    normalized_target.string();
+                }
+                return StorageNodeStatusCode::kIoError;
+            }
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode CleanupStaleStagingFiles(
+            const std::filesystem::path &staging_root,
+            const std::uint64_t grace_period_ms,
+            const StagingCleanupScanResult &scan_result,
+            std::string *error_detail)
+        {
+            for (const auto &path : scan_result.file_candidates)
+            {
+                bool is_stale = false;
+                auto status = IsStagingCandidatePastGracePeriod(path,
+                                                                grace_period_ms,
+                                                                &is_stale,
+                                                                error_detail);
+                if (status != StorageNodeStatusCode::kOk)
+                {
+                    return status;
+                }
+
+                if (!is_stale)
+                {
+                    continue;
+                }
+
+                status = RemovePathSafelyUnderRoot(staging_root, path, error_detail);
+                if (status != StorageNodeStatusCode::kOk)
+                {
+                    return status;
+                }
+            }
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode PruneEmptyStagingDirectories(
+            const std::filesystem::path &staging_root,
+            const StagingCleanupScanResult &scan_result,
+            std::string *error_detail)
+        {
+            for (const auto &directory_path : scan_result.directory_candidates)
+            {
+                std::error_code empty_error;
+                const bool is_empty =
+                    std::filesystem::is_empty(directory_path, empty_error);
+                if (empty_error)
+                {
+                    if (empty_error == std::errc::no_such_file_or_directory)
+                    {
+                        continue;
+                    }
+
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail = BuildFilesystemErrorDetail(
+                            "is_empty", directory_path, empty_error);
+                    }
+                    return MapFilesystemErrorToStatus(empty_error);
+                }
+
+                if (!is_empty)
+                {
+                    continue;
+                }
+
+                const auto status =
+                    RemovePathSafelyUnderRoot(staging_root, directory_path, error_detail);
+                if (status != StorageNodeStatusCode::kOk)
+                {
+                    return status;
+                }
+            }
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode CleanupStaleStagingArtifacts(
+            const LocalDiskChunkStorePaths &paths,
+            const std::uint64_t grace_period_ms,
+            std::string *error_detail)
+        {
+            if (!paths.IsInitialized())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "staging cleanup requires initialized store paths";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            if (grace_period_ms == 0)
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            StagingCleanupScanResult scan_result;
+            auto status = CollectStagingCleanupCandidates(paths.staging_root,
+                                                          &scan_result,
+                                                          error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = CleanupStaleStagingFiles(paths.staging_root,
+                                              grace_period_ms,
+                                              scan_result,
+                                              error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            return PruneEmptyStagingDirectories(paths.staging_root,
+                                                scan_result,
+                                                error_detail);
+        }
+
         StorageNodeStatusCode ClearChunkIndexEntries(ChunkIndex *chunk_index,
                                                      std::string *error_detail)
         {
@@ -1025,6 +1370,17 @@ namespace storedemo
         }
 
         paths_ = std::move(candidate_paths);
+        const auto staging_cleanup_status =
+            CleanupStaleStagingArtifacts(paths_,
+                                         config_.staging_cleanup_grace_period_ms,
+                                         &result.error_detail);
+        if (staging_cleanup_status != StorageNodeStatusCode::kOk)
+        {
+            result.status = staging_cleanup_status;
+            paths_ = {};
+            return result;
+        }
+
         const auto rebuild_result = RebuildIndexFromDisk();
         if (!rebuild_result.ok())
         {

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -266,15 +267,33 @@ namespace storedemo
             }
         }
 
+        void SetLastWriteTimeOrThrow(
+            const std::filesystem::path &path,
+            const std::filesystem::file_time_type write_time)
+        {
+            std::error_code error;
+            std::filesystem::last_write_time(path, write_time, error);
+            if (error)
+            {
+                throw std::runtime_error("failed to set last_write_time for " +
+                                         path.string() + ": " +
+                                         error.message());
+            }
+        }
+
         LocalDiskChunkStore MakeStore(const std::filesystem::path &data_dir,
-                                      std::shared_ptr<ChunkIndex> chunk_index)
+                                      std::shared_ptr<ChunkIndex> chunk_index,
+                                      const std::uint64_t staging_cleanup_grace_period_ms =
+                                          5U * 60U * 1000U)
         {
             return LocalDiskChunkStore(LocalDiskChunkStoreConfig{
                 .data_dir = data_dir,
                 .node_id = "store-node-recovery",
                 .durable_file = nullptr,
                 .chunk_index = std::move(chunk_index),
-                .executor = nullptr});
+                .executor = nullptr,
+                .staging_cleanup_grace_period_ms =
+                    staging_cleanup_grace_period_ms});
         }
 
         void ExpectChecksumEq(const ChunkChecksum &actual,
@@ -582,5 +601,140 @@ namespace storedemo
                   static_cast<std::uint64_t>(live_payload.size()));
         ExpectChecksumEq(live_entry.entry.checksum,
                          ComputeChecksumOrThrow(live_payload));
+    }
+
+    TEST(StorageNodeRecoveryTest, InitializeCleansUpStaleAndPartialStagingWithoutAffectingLiveChunks)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_cleans_stale_staging");
+
+        auto original_index = std::make_shared<ShardedChunkIndex>();
+        auto original_store = MakeStore(temp_dir.root(), original_index);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
+
+        const auto live_identity = MakeIdentityOrThrow("restart-live-cleanup", 6, 0, 0);
+        const auto live_payload = test::MakeChunkPayload(21, "restart-live-cleanup");
+        ASSERT_EQ(original_store.WriteChunk(
+                      MakeWriteRequest(live_identity,
+                                       live_payload,
+                                       "restart-live-cleanup-write"))
+                      .status,
+                  StorageNodeStatusCode::kOk);
+
+        const auto stale_staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      MakeIdentityOrThrow("restart-stale-staging", 6, 1, 64)
+                                          .chunk_id,
+                                      "stale-stage");
+        const auto partial_staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      MakeIdentityOrThrow("restart-partial-staging-cleanup", 6, 2, 128)
+                                          .chunk_id,
+                                      "partial-stage");
+        const auto fresh_staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      MakeIdentityOrThrow("restart-fresh-staging", 6, 3, 192)
+                                          .chunk_id,
+                                      "fresh-stage");
+        const auto malformed_staging_path =
+            temp_dir.root() / "chunks" / "staging" / "zz" / "zz" / "garbage.partial";
+
+        WriteBinaryFileOrThrow(stale_staging_path, test::MakeChunkPayload(9, "stale"));
+        WriteBinaryFileOrThrow(partial_staging_path, "partial");
+        WriteBinaryFileOrThrow(fresh_staging_path, test::MakeChunkPayload(9, "fresh"));
+        WriteBinaryFileOrThrow(malformed_staging_path, "garbage");
+
+        const auto stale_time =
+            std::filesystem::file_time_type::clock::now() - std::chrono::minutes(10);
+        SetLastWriteTimeOrThrow(stale_staging_path, stale_time);
+        SetLastWriteTimeOrThrow(partial_staging_path, stale_time);
+        SetLastWriteTimeOrThrow(malformed_staging_path, stale_time);
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index, 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        EXPECT_FALSE(std::filesystem::exists(stale_staging_path));
+        EXPECT_FALSE(std::filesystem::exists(partial_staging_path));
+        EXPECT_FALSE(std::filesystem::exists(malformed_staging_path));
+        EXPECT_TRUE(std::filesystem::exists(fresh_staging_path));
+        EXPECT_TRUE(std::filesystem::exists(ResolveFinalPathOrThrow(temp_dir.root(),
+                                                                    live_identity.chunk_id)));
+
+        const auto read_response =
+            restarted_store.ReadChunk(MakeReadRequest(live_identity.chunk_id,
+                                                      "restart-live-cleanup-read"));
+        ASSERT_EQ(read_response.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(read_response.payload, live_payload);
+    }
+
+    TEST(StorageNodeRecoveryTest, InitializePreservesFreshStagingWithinGracePeriod)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_preserves_fresh_staging");
+
+        const auto fresh_identity =
+            MakeIdentityOrThrow("restart-keep-fresh-staging", 7, 0, 0);
+        const auto fresh_staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      fresh_identity.chunk_id,
+                                      "fresh-stage");
+        WriteBinaryFileOrThrow(fresh_staging_path, test::MakeChunkPayload(7, "fresh"));
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index, 60U * 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        EXPECT_TRUE(std::filesystem::exists(fresh_staging_path));
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(fresh_identity.chunk_id,
+                                      "restart-keep-fresh-staging-stat"))
+                      .status,
+                  StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST(StorageNodeRecoveryTest, InitializeReturnsExplicitErrorWhenStaleStagingCleanupFails)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_stale_staging_cleanup_failure");
+
+        const auto first_stale_path =
+            temp_dir.root() / "chunks" / "staging" / "00" / "00" / "aaa.tmp";
+        const auto second_stale_path =
+            temp_dir.root() / "chunks" / "staging" / "ff" / "ff" / "zzz.tmp";
+        WriteBinaryFileOrThrow(first_stale_path, "first");
+        WriteBinaryFileOrThrow(second_stale_path, "second");
+
+        const auto stale_time =
+            std::filesystem::file_time_type::clock::now() - std::chrono::minutes(10);
+        SetLastWriteTimeOrThrow(first_stale_path, stale_time);
+        SetLastWriteTimeOrThrow(second_stale_path, stale_time);
+
+        std::error_code permission_error;
+        std::filesystem::permissions(first_stale_path.parent_path(),
+                                     std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::remove,
+                                     permission_error);
+        ASSERT_FALSE(permission_error) << permission_error.message();
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index, 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+
+        std::filesystem::permissions(first_stale_path.parent_path(),
+                                     std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::add,
+                                     permission_error);
+        ASSERT_FALSE(permission_error) << permission_error.message();
+
+        EXPECT_EQ(init_result.status, StorageNodeStatusCode::kPermissionDenied);
+        EXPECT_FALSE(init_result.initialized);
+        EXPECT_NE(init_result.error_detail.find("aaa.tmp"), std::string::npos);
+        EXPECT_TRUE(std::filesystem::exists(first_stale_path));
+        EXPECT_TRUE(std::filesystem::exists(second_stale_path));
     }
 } // namespace storedemo

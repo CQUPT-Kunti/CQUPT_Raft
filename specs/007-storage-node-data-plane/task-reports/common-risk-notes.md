@@ -36,9 +36,9 @@
   建议后续在哪类任务处理：在后续 store runtime / LocalDiskChunkStore 接入任务中，继续按 owner 线程停机模型使用；如确实需要 worker 内触发停机，再单独演进生命周期协议。
 
 - 任务编号：T021
-  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()` 和 `Initialize()` 自动 live index rebuild，但 stale staging cleanup、partial write 收尾和非 live 状态目录治理仍未实现。
-  影响：重启后现在能重新发现 canonical live final chunk；但遗留 staging、半写入或需要隔离的坏块仍不会自动清理或迁移，后续恢复语义依然不完整。
-  建议后续在哪类任务处理：在 T071/T072 及相关恢复任务中继续补齐 stale staging cleanup、partial write detection 和 corrupted/quarantine 治理。
+  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()`、`Initialize()` 自动 live index rebuild，以及基于 grace period 的 stale staging cleanup；但 corrupted/quarantine 状态治理和更强的 metadata freshness 判定仍未实现。
+  影响：重启后现在能重新发现 canonical live final chunk，并清理超过阈值的 stale/partial staging；但坏块隔离、deleted/quarantined 持久状态恢复和 metadata 事实新鲜度仍未收口。
+  建议后续在哪类任务处理：在 T072 及相关恢复任务中继续补齐 corrupted/quarantine 治理，并在后续 metadata fact source 任务里收紧 freshness 边界。
 
 - 任务编号：T023
   问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
@@ -144,3 +144,8 @@
   问题：T070 已实现生产 `RebuildIndexFromDisk()`，但当前恢复仍只依据 canonical `chunks/live/*.chunk` payload facts 重建 `LIVE` index；`deleted/deleting/quarantined/corrupted` 的持久状态、stale staging cleanup，以及 Windows `std::filesystem` 目录遍历/路径编码实机行为仍未完成。
   影响：如果后续把 T070 的通过误解成“所有重启恢复语义都已收口”，就会高估非 live 状态恢复、坏块隔离和 Windows 路径语义的完备性；当前保证的是 live final chunk 可重建，不是全状态恢复。
   建议后续在哪类任务处理：在 T071/T072 继续补齐 staging cleanup 与 corrupted/quarantine 语义，在 `T014-WIN` / `T023-WIN` 或后续 Windows 恢复验证任务中补 live directory traversal / path behavior 的实机验证。
+
+- 任务编号：T071
+  问题：T071 已实现基于 `last_write_time + staging_cleanup_grace_period_ms` 的 stale staging cleanup，但 mtime 精度、未来时间戳、Windows sharing violation / directory delete 行为，以及“阈值内 fresh staging 是否一定代表可保留”仍是后续运行时边界。
+  影响：如果后续把 T071 的通过误解成“所有 staging 恢复和跨平台删除语义都已收口”，就会高估 mtime 判定的稳定性，以及 Windows 上 stale file/empty directory 删除的实机一致性；当前保证的是超过阈值的 staging 能显式清理或显式报错，不是全平台 crash matrix 已完成。
+  建议后续在哪类任务处理：在 T072-T074 和后续 Windows 恢复验证任务中继续补 sharing violation、mtime 精度、path encoding 与 crash window 语义；如需要更强的新鲜度判定，再单独演进 staging sidecar 或更明确的 recovery facts。

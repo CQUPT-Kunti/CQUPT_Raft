@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 
@@ -28,6 +29,7 @@ namespace storedemo
         std::shared_ptr<DurableFile> durable_file;
         std::shared_ptr<ChunkIndex> chunk_index;
         std::shared_ptr<BoundedStorageExecutor> executor;
+        std::uint64_t staging_cleanup_grace_period_ms{5U * 60U * 1000U};
     };
 
     struct LocalDiskChunkStoreInitResult : ChunkStoreResult
