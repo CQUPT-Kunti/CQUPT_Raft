@@ -148,9 +148,14 @@
 - 任务编号：T071
   问题：T071 已实现基于 `last_write_time + staging_cleanup_grace_period_ms` 的 stale staging cleanup，但 mtime 精度、未来时间戳、Windows sharing violation / directory delete 行为，以及“阈值内 fresh staging 是否一定代表可保留”仍是后续运行时边界。
   影响：如果后续把 T071 的通过误解成“所有 staging 恢复和跨平台删除语义都已收口”，就会高估 mtime 判定的稳定性，以及 Windows 上 stale file/empty directory 删除的实机一致性；当前保证的是超过阈值的 staging 能显式清理或显式报错，不是全平台 crash matrix 已完成。
-  建议后续在哪类任务处理：在 T072-T074 和后续 Windows 恢复验证任务中继续补 sharing violation、mtime 精度、path encoding 与 crash window 语义；如需要更强的新鲜度判定，再单独演进 staging sidecar 或更明确的 recovery facts。
+  建议后续在哪类任务处理：在 T074 和后续 Windows 恢复验证任务中继续补 sharing violation、mtime 精度、path encoding 与 crash window 语义；如需要更强的新鲜度判定，再单独演进 staging sidecar 或更明确的 recovery facts。
 
 - 任务编号：T072
   问题：T072 已实现 read/stat 发现坏块后的 quarantine，以及 `RebuildIndexFromDisk()` 对 `chunks/quarantine/` 的恢复；但当前 quarantine 仍依赖前台读/查显式触发，Windows rename/delete/sharing violation 实机行为也未验证。
   影响：如果后续把 T072 的通过误读成“所有损坏 final chunk 都能在纯重启扫描阶段自动发现并稳定隔离”，就会高估当前主动发现能力和跨平台文件移动语义；当前保证的是坏块一旦被前台发现，会显式隔离且重启后保持不可读。
-  建议后续在哪类任务处理：在 T073/T074、Windows 实机验证和后续 scrub/repair 任务中继续补 crash window、rename/delete 语义与主动巡检发现能力。
+  建议后续在哪类任务处理：在 T074、Windows 实机验证和后续 scrub/repair 任务中继续补 crash window、rename/delete 语义与主动巡检发现能力。
+
+- 任务编号：T073
+  问题：T073 已用 test-only crash / recovery matrix 固定了 staging-only、visible live final、stale staging cleanup 顺序、quarantine 恢复等本地目录事实驱动的重启 contract；但当前仍不是 `kill -9` / 断电级 durability 验证，也没有 Windows publish/rename/directory durability 的实机 crash matrix。
+  影响：如果后续把 T073 的测试通过误读成“真实断电级 crash recovery 已完全验证”，就会高估 Linux parent directory sync 与 Windows rename/delete/sharing violation 在真实故障中的运行语义；当前保证的是给定重启后可观察到的本地文件事实，`LocalDiskChunkStore` 如何重建可见性。
+  建议后续在哪类任务处理：在 T074、`T014-WIN`、`T023-WIN` 及后续 Windows/断电级恢复验证任务中继续补真实 durability crash seam 与平台差异。

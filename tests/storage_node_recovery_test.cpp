@@ -626,6 +626,94 @@ namespace storedemo
                          ComputeChecksumOrThrow(live_payload));
     }
 
+    TEST(StorageNodeRecoveryTest, CrashMatrixRestartDoesNotExposeFreshStagingOnlyChunk)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_crash_staging_only");
+
+        const auto identity =
+            MakeIdentityOrThrow("crash-staging-only", 6, 0, 0);
+        const auto staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      identity.chunk_id,
+                                      "crash-stage");
+        WriteBinaryFileOrThrow(staging_path,
+                               test::MakeChunkPayload(15, "crash-staging-only"));
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store =
+            MakeStore(temp_dir.root(), rebuilt_index, 60U * 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        EXPECT_TRUE(std::filesystem::exists(staging_path));
+
+        const auto list_response =
+            restarted_store.ListChunks(MakeListRequest("crash-staging-only-list"));
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(list_response.chunks.empty());
+
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id,
+                                      "crash-staging-only-stat"))
+                      .status,
+                  StorageNodeStatusCode::kNotFound);
+        EXPECT_EQ(restarted_store.ReadChunk(
+                      MakeReadRequest(identity.chunk_id,
+                                      "crash-staging-only-read"))
+                      .status,
+                  StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST(StorageNodeRecoveryTest, CrashMatrixRestartUsesVisibleFinalFileFactsToRecoverChunk)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_crash_visible_final");
+
+        const auto live_identity =
+            MakeIdentityOrThrow("crash-visible-final", 6, 1, 64);
+        const auto staging_identity =
+            MakeIdentityOrThrow("crash-staging-hidden", 6, 2, 128);
+        const auto live_payload =
+            test::MakeChunkPayload(19, "crash-visible-final");
+
+        WriteBinaryFileOrThrow(
+            ResolveFinalPathOrThrow(temp_dir.root(), live_identity.chunk_id),
+            live_payload);
+        WriteBinaryFileOrThrow(
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      staging_identity.chunk_id,
+                                      "crash-hidden-stage"),
+            test::MakeChunkPayload(11, "crash-hidden-stage"));
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store =
+            MakeStore(temp_dir.root(), rebuilt_index, 60U * 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        const auto list_response =
+            restarted_store.ListChunks(MakeListRequest("crash-visible-final-list"));
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(list_response.chunks.size(), 1U);
+        EXPECT_EQ(list_response.chunks[0].identity.chunk_id, live_identity.chunk_id);
+        EXPECT_EQ(list_response.chunks[0].state, ChunkState::kLive);
+
+        const auto read_response =
+            restarted_store.ReadChunk(MakeReadRequest(live_identity.chunk_id,
+                                                      "crash-visible-final-read"));
+        ASSERT_EQ(read_response.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(read_response.payload, live_payload);
+
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(staging_identity.chunk_id,
+                                      "crash-hidden-stage-stat"))
+                      .status,
+                  StorageNodeStatusCode::kNotFound);
+    }
+
     TEST(StorageNodeRecoveryTest, RestartPreservesQuarantinedChunkFactsAfterReadTimeDetection)
     {
 #if !defined(__linux__)
@@ -683,6 +771,51 @@ namespace storedemo
                                                       "restart-quarantine-read-after"));
         EXPECT_EQ(restarted_read.status, StorageNodeStatusCode::kCorrupted);
 #endif
+    }
+
+    TEST(StorageNodeRecoveryTest, CrashMatrixCleanupRunsBeforeRebuildForMatchingChunkFacts)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_crash_cleanup_before_rebuild");
+
+        const auto identity =
+            MakeIdentityOrThrow("crash-cleanup-before-rebuild", 6, 3, 192);
+        const auto live_payload =
+            test::MakeChunkPayload(25, "crash-cleanup-before-rebuild-live");
+        const auto stale_staging_payload =
+            test::MakeChunkPayload(9, "stale-copy");
+
+        const auto final_path =
+            ResolveFinalPathOrThrow(temp_dir.root(), identity.chunk_id);
+        const auto staging_path =
+            ResolveStagingPathOrThrow(temp_dir.root(),
+                                      identity.chunk_id,
+                                      "crash-stale-stage");
+        WriteBinaryFileOrThrow(final_path, live_payload);
+        WriteBinaryFileOrThrow(staging_path, stale_staging_payload);
+
+        const auto stale_time =
+            std::filesystem::file_time_type::clock::now() - std::chrono::minutes(10);
+        SetLastWriteTimeOrThrow(staging_path, stale_time);
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index, 60U * 1000U);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        EXPECT_FALSE(std::filesystem::exists(staging_path));
+        EXPECT_TRUE(std::filesystem::exists(final_path));
+
+        const auto stat_response =
+            restarted_store.StatChunk(MakeStatRequest(identity.chunk_id,
+                                                      "crash-cleanup-before-rebuild-stat"));
+        ASSERT_EQ(stat_response.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(stat_response.metadata.state, ChunkState::kLive);
+        EXPECT_EQ(stat_response.metadata.size,
+                  static_cast<std::uint64_t>(live_payload.size()));
+        ExpectChecksumEq(stat_response.metadata.checksum,
+                         ComputeChecksumOrThrow(live_payload));
     }
 
     TEST(StorageNodeRecoveryTest, InitializeCleansUpStaleAndPartialStagingWithoutAffectingLiveChunks)
