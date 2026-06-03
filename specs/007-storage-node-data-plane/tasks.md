@@ -173,7 +173,7 @@
 
 ### Implementation for User Story 5
 
-- [ ] T070 [US5] 实现 `LocalDiskChunkStore::RebuildIndexFromDisk`；允许修改：`modules/store/chunk/local_disk_chunk_store.h`、`modules/store/chunk/local_disk_chunk_store.cpp`；验收：扫描 final/staging/quarantine/deleting 并重建 ChunkIndex；依赖：T025
+- [x] T070 [US5] 实现 `LocalDiskChunkStore::RebuildIndexFromDisk`；实际修改：`modules/store/chunk/local_disk_chunk_store.h`、`modules/store/chunk/local_disk_chunk_store.cpp`、`modules/store/chunk/module-notes.md`、`tests/storage_node_recovery_test.cpp`、`specs/007-storage-node-data-plane/task-reports/t070-local-disk-rebuild-index.md`、`specs/007-storage-node-data-plane/task-reports/common-risk-notes.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：只扫描 canonical `chunks/live/` final chunk，重建 `chunk_id/size/checksum/state/object identity` 等当前可恢复事实；staging/partial staging/非 live 状态目录不进入 live index，duplicate live chunk id 返回明确冲突，`Initialize()` 自动恢复后的 `ReadChunk` / `StatChunk` / `ListChunks` 基于重建 index 工作；依赖：T025
 - [ ] T071 [US5] 实现 stale staging cleanup 和 partial write detection；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/storage_node_recovery_test.cpp`；验收：incomplete staging 删除或隔离，size/checksum 不一致不进入 live index；依赖：T070
 - [ ] T072 [US5] 实现 corrupted chunk quarantine；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/storage_node_recovery_test.cpp`；验收：扫描或读取 checksum mismatch 后进入 quarantine/corrupted，不作为健康副本返回；依赖：T071
 - [ ] T073 [US5] 覆盖 crash before fsync 和 crash after fsync before rename；允许修改：`tests/storage_node_recovery_test.cpp`、`tests/support/store_test_utils.h`；验收：低并发运行，重启后无 partial live chunk；依赖：T071

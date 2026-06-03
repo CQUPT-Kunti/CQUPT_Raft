@@ -1,18 +1,13 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
-#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <utility>
-#include <vector>
 
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
@@ -24,19 +19,6 @@ namespace storedemo
 {
     namespace
     {
-        struct TestOnlyRebuildResult
-        {
-            StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
-            std::string error_detail;
-            std::vector<ChunkIndexEntry> recovered_entries;
-            std::vector<std::filesystem::path> skipped_candidates;
-
-            [[nodiscard]] bool ok() const
-            {
-                return status == StorageNodeStatusCode::kOk;
-            }
-        };
-
         ChunkChecksum ComputeChecksumOrThrow(const std::string_view payload)
         {
             ChunkChecksum checksum;
@@ -102,6 +84,12 @@ namespace storedemo
             return StatChunkRequest{
                 .request_id = request_id,
                 .chunk_id = chunk_id};
+        }
+
+        ListChunksRequest MakeListRequest(const std::string &request_id)
+        {
+            return ListChunksRequest{
+                .request_id = request_id};
         }
 
         std::filesystem::path ResolveFinalPathOrThrow(const std::filesystem::path &data_root,
@@ -278,249 +266,6 @@ namespace storedemo
             }
         }
 
-        StorageNodeStatusCode ReadBinaryFile(const std::filesystem::path &path,
-                                             std::string *payload,
-                                             std::string *error_detail)
-        {
-            if (payload == nullptr)
-            {
-                if (error_detail != nullptr)
-                {
-                    *error_detail = "payload output must not be null";
-                }
-                return StorageNodeStatusCode::kInvalidArgument;
-            }
-
-            std::ifstream input(path, std::ios::binary);
-            if (!input.is_open())
-            {
-                if (error_detail != nullptr)
-                {
-                    *error_detail = "failed to open live chunk payload: " +
-                                    path.string();
-                }
-                return StorageNodeStatusCode::kIoError;
-            }
-
-            payload->assign(std::istreambuf_iterator<char>(input),
-                            std::istreambuf_iterator<char>());
-            if (!input.good() && !input.eof())
-            {
-                if (error_detail != nullptr)
-                {
-                    *error_detail = "failed while reading live chunk payload: " +
-                                    path.string();
-                }
-                return StorageNodeStatusCode::kIoError;
-            }
-
-            return StorageNodeStatusCode::kOk;
-        }
-
-        TestOnlyRebuildResult TestOnlyRebuildLiveIndexFromDisk(
-            const std::filesystem::path &data_root,
-            ChunkIndex *chunk_index)
-        {
-            TestOnlyRebuildResult result;
-            if (chunk_index == nullptr)
-            {
-                result.status = StorageNodeStatusCode::kInvalidArgument;
-                result.error_detail = "chunk_index must not be null";
-                return result;
-            }
-
-            const auto live_root = data_root / "chunks" / "live";
-            std::error_code exists_error;
-            const bool live_root_exists =
-                std::filesystem::exists(live_root, exists_error);
-            if (exists_error)
-            {
-                result.status = StorageNodeStatusCode::kIoError;
-                result.error_detail = "failed to inspect live root: " +
-                                      exists_error.message();
-                return result;
-            }
-            if (!live_root_exists)
-            {
-                return result;
-            }
-
-            std::vector<std::filesystem::path> regular_candidate_paths;
-            std::error_code iter_error;
-            std::filesystem::recursive_directory_iterator iter(live_root, iter_error);
-            if (iter_error)
-            {
-                result.status = StorageNodeStatusCode::kIoError;
-                result.error_detail = "failed to iterate live root: " +
-                                      iter_error.message();
-                return result;
-            }
-
-            for (const auto end = std::filesystem::recursive_directory_iterator();
-                 iter != end;
-                 iter.increment(iter_error))
-            {
-                if (iter_error)
-                {
-                    result.status = StorageNodeStatusCode::kIoError;
-                    result.error_detail = "failed while scanning live root: " +
-                                          iter_error.message();
-                    return result;
-                }
-
-                std::error_code status_error;
-                const bool is_regular = iter->is_regular_file(status_error);
-                if (status_error)
-                {
-                    result.status = StorageNodeStatusCode::kIoError;
-                    result.error_detail =
-                        "failed to inspect recovery candidate type: " +
-                        status_error.message();
-                    return result;
-                }
-
-                const auto relative_path =
-                    iter->path().lexically_relative(data_root).lexically_normal();
-                if (!is_regular)
-                {
-                    if (relative_path.extension() == ".chunk")
-                    {
-                        result.skipped_candidates.push_back(relative_path);
-                    }
-                    continue;
-                }
-
-                regular_candidate_paths.push_back(relative_path);
-            }
-
-            std::sort(regular_candidate_paths.begin(), regular_candidate_paths.end());
-
-            std::map<ChunkId, std::vector<std::filesystem::path>> live_candidates_by_chunk_id;
-            for (const auto &relative_path : regular_candidate_paths)
-            {
-                if (relative_path.extension() != ".chunk")
-                {
-                    result.skipped_candidates.push_back(relative_path);
-                    continue;
-                }
-
-                const ChunkId chunk_id = relative_path.stem().string();
-                std::string validation_error;
-                if (ValidateChunkId(chunk_id, &validation_error) !=
-                    StorageNodeStatusCode::kOk)
-                {
-                    result.skipped_candidates.push_back(relative_path);
-                    continue;
-                }
-
-                live_candidates_by_chunk_id[chunk_id].push_back(relative_path);
-            }
-
-            for (const auto &[chunk_id, relative_paths] : live_candidates_by_chunk_id)
-            {
-                if (relative_paths.size() > 1U)
-                {
-                    result.status = StorageNodeStatusCode::kConflict;
-                    result.error_detail =
-                        "duplicate live chunk candidates found for chunk_id " +
-                        chunk_id;
-                    return result;
-                }
-
-                ChunkPathLayout layout;
-                std::string layout_error;
-                const auto layout_status =
-                    BuildChunkPathLayout(chunk_id, "rebuild", &layout, &layout_error);
-                if (layout_status != StorageNodeStatusCode::kOk)
-                {
-                    result.status = layout_status;
-                    result.error_detail = layout_error;
-                    return result;
-                }
-
-                if (relative_paths.front() != layout.final_relative_path)
-                {
-                    result.skipped_candidates.push_back(relative_paths.front());
-                }
-            }
-
-            for (const auto &[chunk_id, relative_paths] : live_candidates_by_chunk_id)
-            {
-                ChunkPathLayout layout;
-                std::string layout_error;
-                const auto layout_status =
-                    BuildChunkPathLayout(chunk_id, "rebuild", &layout, &layout_error);
-                if (layout_status != StorageNodeStatusCode::kOk)
-                {
-                    result.status = layout_status;
-                    result.error_detail = layout_error;
-                    return result;
-                }
-
-                const auto &relative_path = relative_paths.front();
-                if (relative_path != layout.final_relative_path)
-                {
-                    continue;
-                }
-
-                std::filesystem::path final_path;
-                std::string resolve_error;
-                const auto resolve_status = ResolveDurablePathUnderRoot(data_root,
-                                                                        relative_path,
-                                                                        &final_path,
-                                                                        &resolve_error);
-                if (resolve_status != StorageNodeStatusCode::kOk)
-                {
-                    result.status = resolve_status;
-                    result.error_detail = resolve_error;
-                    return result;
-                }
-
-                std::string payload;
-                result.status =
-                    ReadBinaryFile(final_path, &payload, &result.error_detail);
-                if (!result.ok())
-                {
-                    return result;
-                }
-
-                ChunkChecksum checksum;
-                result.status =
-                    ComputeChunkChecksum(payload, &checksum, &result.error_detail);
-                if (!result.ok())
-                {
-                    return result;
-                }
-
-                ChunkIdentity identity;
-                result.status =
-                    ParseChunkId(chunk_id, &identity, &result.error_detail);
-                if (!result.ok())
-                {
-                    return result;
-                }
-
-                ChunkIndexEntry entry;
-                entry.identity = std::move(identity);
-                entry.state = ChunkState::kLive;
-                entry.size = static_cast<std::uint64_t>(payload.size());
-                entry.checksum = checksum;
-                entry.final_path = final_path;
-
-                const auto insert_response = chunk_index->Insert(entry);
-                if (!insert_response.ok())
-                {
-                    result.status = insert_response.status;
-                    result.error_detail = insert_response.error_detail;
-                    return result;
-                }
-
-                result.recovered_entries.push_back(insert_response.entry);
-            }
-
-            return result;
-        }
-
         LocalDiskChunkStore MakeStore(const std::filesystem::path &data_dir,
                                       std::shared_ptr<ChunkIndex> chunk_index)
         {
@@ -541,14 +286,13 @@ namespace storedemo
         }
     }
 
-    TEST(StorageNodeRecoveryTest, RebuildsPublishedLiveChunksIntoFreshIndexInStableOrder)
+    TEST(StorageNodeRecoveryTest, InitializeRebuildsPublishedLiveChunksIntoFreshIndexInStableOrder)
     {
         test::ScopedStoreTestDir temp_dir("storage_node_recovery_rebuilds_live_chunks");
 
         auto original_index = std::make_shared<ShardedChunkIndex>();
         auto original_store = MakeStore(temp_dir.root(), original_index);
-        const auto init_result = original_store.Initialize();
-        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
 
         const auto first_identity = MakeIdentityOrThrow("restart-live-a", 1, 0, 0);
         const auto second_identity = MakeIdentityOrThrow("restart-live-b", 1, 0, 128);
@@ -569,39 +313,29 @@ namespace storedemo
                   StorageNodeStatusCode::kOk);
 
         auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
-        const auto rebuild_result =
-            TestOnlyRebuildLiveIndexFromDisk(temp_dir.root(), rebuilt_index.get());
-        ASSERT_EQ(rebuild_result.status, StorageNodeStatusCode::kOk)
-            << rebuild_result.error_detail;
-        ASSERT_EQ(rebuild_result.recovered_entries.size(), 2U);
-
-        EXPECT_EQ(rebuild_result.recovered_entries[0].identity.chunk_id,
-                  first_identity.chunk_id);
-        EXPECT_EQ(rebuild_result.recovered_entries[0].size,
-                  static_cast<std::uint64_t>(first_payload.size()));
-        ExpectChecksumEq(rebuild_result.recovered_entries[0].checksum,
-                         ComputeChecksumOrThrow(first_payload));
-        EXPECT_EQ(rebuild_result.recovered_entries[0].state, ChunkState::kLive);
-
-        EXPECT_EQ(rebuild_result.recovered_entries[1].identity.chunk_id,
-                  second_identity.chunk_id);
-        EXPECT_EQ(rebuild_result.recovered_entries[1].size,
-                  static_cast<std::uint64_t>(second_payload.size()));
-        ExpectChecksumEq(rebuild_result.recovered_entries[1].checksum,
-                         ComputeChecksumOrThrow(second_payload));
-        EXPECT_EQ(rebuild_result.recovered_entries[1].state, ChunkState::kLive);
-
         auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index);
         const auto restarted_init = restarted_store.Initialize();
-        ASSERT_EQ(restarted_init.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(restarted_init.status, StorageNodeStatusCode::kOk)
+            << restarted_init.error_detail;
+
+        const auto list_response =
+            restarted_store.ListChunks(MakeListRequest("restart-live-list"));
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(list_response.chunks.size(), 2U);
+        EXPECT_EQ(list_response.chunks[0].identity.chunk_id, first_identity.chunk_id);
+        EXPECT_EQ(list_response.chunks[1].identity.chunk_id, second_identity.chunk_id);
 
         const auto first_stat =
             restarted_store.StatChunk(MakeStatRequest(first_identity.chunk_id,
                                                       "restart-live-stat-a"));
         ASSERT_EQ(first_stat.status, StorageNodeStatusCode::kOk);
-        EXPECT_EQ(first_stat.metadata.state, ChunkState::kLive);
+        EXPECT_EQ(first_stat.metadata.identity.chunk_id, first_identity.chunk_id);
+        EXPECT_EQ(first_stat.metadata.identity.object_id, first_identity.object_id);
+        EXPECT_EQ(first_stat.metadata.identity.version, first_identity.version);
+        EXPECT_EQ(first_stat.metadata.identity.chunk_index, first_identity.chunk_index);
         EXPECT_EQ(first_stat.metadata.size,
                   static_cast<std::uint64_t>(first_payload.size()));
+        EXPECT_EQ(first_stat.metadata.state, ChunkState::kLive);
         ExpectChecksumEq(first_stat.metadata.checksum,
                          ComputeChecksumOrThrow(first_payload));
 
@@ -615,14 +349,13 @@ namespace storedemo
                          ComputeChecksumOrThrow(second_payload));
     }
 
-    TEST(StorageNodeRecoveryTest, RebuildSkipsStagingPartialAndNonLiveStatusFacts)
+    TEST(StorageNodeRecoveryTest, InitializeSkipsStagingPartialAndNonLiveStatusFacts)
     {
         test::ScopedStoreTestDir temp_dir("storage_node_recovery_skips_non_live_facts");
 
         auto original_index = std::make_shared<ShardedChunkIndex>();
         auto original_store = MakeStore(temp_dir.root(), original_index);
-        const auto init_result = original_store.Initialize();
-        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
 
         const auto live_identity = MakeIdentityOrThrow("restart-live-main", 2, 0, 0);
         const auto staging_identity =
@@ -679,39 +412,52 @@ namespace storedemo
             test::MakeChunkPayload(11, "corrupted"));
 
         auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
-        const auto rebuild_result =
-            TestOnlyRebuildLiveIndexFromDisk(temp_dir.root(), rebuilt_index.get());
-        ASSERT_EQ(rebuild_result.status, StorageNodeStatusCode::kOk)
-            << rebuild_result.error_detail;
-        ASSERT_EQ(rebuild_result.recovered_entries.size(), 1U);
-        EXPECT_EQ(rebuild_result.recovered_entries[0].identity.chunk_id,
-                  live_identity.chunk_id);
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index);
+        ASSERT_EQ(restarted_store.Initialize().status, StorageNodeStatusCode::kOk);
 
-        EXPECT_EQ(rebuilt_index->Find(live_identity.chunk_id).status,
-                  StorageNodeStatusCode::kOk);
-        EXPECT_EQ(rebuilt_index->Find(staging_identity.chunk_id).status,
+        const auto list_response =
+            restarted_store.ListChunks(MakeListRequest("restart-skip-list"));
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(list_response.chunks.size(), 1U);
+        EXPECT_EQ(list_response.chunks[0].identity.chunk_id, live_identity.chunk_id);
+
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(staging_identity.chunk_id, "restart-stage-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
-        EXPECT_EQ(rebuilt_index->Find(partial_staging_identity.chunk_id).status,
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(partial_staging_identity.chunk_id,
+                                      "restart-partial-stage-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
-        EXPECT_EQ(rebuilt_index->Find(deleting_identity.chunk_id).status,
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(deleting_identity.chunk_id, "restart-deleting-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
-        EXPECT_EQ(rebuilt_index->Find(deleted_identity.chunk_id).status,
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(deleted_identity.chunk_id, "restart-deleted-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
-        EXPECT_EQ(rebuilt_index->Find(quarantined_identity.chunk_id).status,
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(quarantined_identity.chunk_id,
+                                      "restart-quarantined-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
-        EXPECT_EQ(rebuilt_index->Find(corrupted_identity.chunk_id).status,
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(corrupted_identity.chunk_id,
+                                      "restart-corrupted-stat"))
+                      .status,
                   StorageNodeStatusCode::kNotFound);
     }
 
-    TEST(StorageNodeRecoveryTest, RebuildSkipsMalformedInvalidAndNonRegularLiveCandidates)
+    TEST(StorageNodeRecoveryTest, InitializeSkipsMalformedInvalidAndMisplacedLiveCandidates)
     {
         test::ScopedStoreTestDir temp_dir(
             "storage_node_recovery_skips_malformed_candidates");
 
         auto original_index = std::make_shared<ShardedChunkIndex>();
         auto original_store = MakeStore(temp_dir.root(), original_index);
-        const auto init_result = original_store.Initialize();
-        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
 
         const auto empty_identity = MakeIdentityOrThrow("restart-empty-live", 3, 0, 0);
         ASSERT_EQ(original_store.WriteChunk(
@@ -725,6 +471,12 @@ namespace storedemo
                                    "invalid chunk.chunk",
                                "invalid");
 
+        const auto misplaced_identity =
+            MakeIdentityOrThrow("restart-misplaced-live", 3, 1, 64);
+        WriteBinaryFileOrThrow(
+            ResolveMisplacedLivePathOrThrow(temp_dir.root(), misplaced_identity.chunk_id),
+            test::MakeChunkPayload(8, "misplaced"));
+
         const auto non_regular_path =
             temp_dir.root() / "chunks" / "live" / "00" / "00" /
             "restart-directory-live~3~1.chunk";
@@ -733,28 +485,31 @@ namespace storedemo
         ASSERT_FALSE(create_error);
 
         auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
-        const auto rebuild_result =
-            TestOnlyRebuildLiveIndexFromDisk(temp_dir.root(), rebuilt_index.get());
-        ASSERT_EQ(rebuild_result.status, StorageNodeStatusCode::kOk)
-            << rebuild_result.error_detail;
-        ASSERT_EQ(rebuild_result.recovered_entries.size(), 1U);
-        EXPECT_EQ(rebuild_result.recovered_entries[0].identity.chunk_id,
-                  empty_identity.chunk_id);
-        EXPECT_EQ(rebuild_result.recovered_entries[0].size, 0U);
-        ExpectChecksumEq(rebuild_result.recovered_entries[0].checksum,
-                         ComputeChecksumOrThrow(""));
-        EXPECT_GE(rebuild_result.skipped_candidates.size(), 3U);
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index);
+        ASSERT_EQ(restarted_store.Initialize().status, StorageNodeStatusCode::kOk);
+
+        const auto list_response =
+            restarted_store.ListChunks(MakeListRequest("restart-malformed-list"));
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(list_response.chunks.size(), 1U);
+        EXPECT_EQ(list_response.chunks[0].identity.chunk_id, empty_identity.chunk_id);
+        EXPECT_EQ(list_response.chunks[0].size, 0U);
+        ExpectChecksumEq(list_response.chunks[0].checksum, ComputeChecksumOrThrow(""));
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(misplaced_identity.chunk_id,
+                                      "restart-misplaced-stat"))
+                      .status,
+                  StorageNodeStatusCode::kNotFound);
     }
 
-    TEST(StorageNodeRecoveryTest, RebuildRejectsDuplicateLiveChunkIdsAcrossPaths)
+    TEST(StorageNodeRecoveryTest, InitializeRejectsDuplicateLiveChunkIdsAcrossPaths)
     {
         test::ScopedStoreTestDir temp_dir(
             "storage_node_recovery_rejects_duplicate_live_chunk_ids");
 
         auto original_index = std::make_shared<ShardedChunkIndex>();
         auto original_store = MakeStore(temp_dir.root(), original_index);
-        const auto init_result = original_store.Initialize();
-        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
 
         const auto duplicate_identity =
             MakeIdentityOrThrow("restart-duplicate-live", 4, 0, 0);
@@ -773,10 +528,59 @@ namespace storedemo
             duplicate_payload);
 
         auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
-        const auto rebuild_result =
-            TestOnlyRebuildLiveIndexFromDisk(temp_dir.root(), rebuilt_index.get());
-        EXPECT_EQ(rebuild_result.status, StorageNodeStatusCode::kConflict);
-        EXPECT_NE(rebuild_result.error_detail.find(duplicate_identity.chunk_id),
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index);
+        const auto init_result = restarted_store.Initialize();
+        EXPECT_EQ(init_result.status, StorageNodeStatusCode::kConflict);
+        EXPECT_FALSE(init_result.initialized);
+        EXPECT_NE(init_result.error_detail.find(duplicate_identity.chunk_id),
                   std::string::npos);
+    }
+
+    TEST(StorageNodeRecoveryTest, ExplicitRebuildClearsStaleIndexEntriesAndRehydratesLiveFacts)
+    {
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_explicit_rebuild_clears_stale_entries");
+
+        auto shared_index = std::make_shared<ShardedChunkIndex>();
+        auto store = MakeStore(temp_dir.root(), shared_index);
+        ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+        const auto live_identity = MakeIdentityOrThrow("restart-rebuild-live", 5, 0, 0);
+        const auto stale_identity = MakeIdentityOrThrow("restart-stale-index", 5, 1, 64);
+        const auto live_payload = test::MakeChunkPayload(31, "restart-rebuild-live");
+        ASSERT_EQ(store.WriteChunk(
+                      MakeWriteRequest(live_identity,
+                                       live_payload,
+                                       "restart-rebuild-write"))
+                      .status,
+                  StorageNodeStatusCode::kOk);
+
+        ChunkIndexEntry stale_entry;
+        stale_entry.identity = stale_identity;
+        stale_entry.state = ChunkState::kLive;
+        stale_entry.size = 123;
+        stale_entry.checksum = ComputeChecksumOrThrow("stale");
+        stale_entry.final_path = "chunks/live/aa/bb/stale.chunk";
+        ASSERT_EQ(shared_index->Insert(stale_entry).status,
+                  StorageNodeStatusCode::kOk);
+
+        const auto rebuild_result = store.RebuildIndexFromDisk();
+        ASSERT_EQ(rebuild_result.status, StorageNodeStatusCode::kOk)
+            << rebuild_result.error_detail;
+
+        EXPECT_EQ(shared_index->Find(stale_identity.chunk_id).status,
+                  StorageNodeStatusCode::kNotFound);
+
+        const auto live_entry = shared_index->Find(live_identity.chunk_id);
+        ASSERT_EQ(live_entry.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(live_entry.entry.identity.chunk_id, live_identity.chunk_id);
+        EXPECT_EQ(live_entry.entry.final_path,
+                  ResolveFinalPathOrThrow(temp_dir.root(), live_identity.chunk_id)
+                      .lexically_relative(temp_dir.root())
+                      .lexically_normal());
+        EXPECT_EQ(live_entry.entry.size,
+                  static_cast<std::uint64_t>(live_payload.size()));
+        ExpectChecksumEq(live_entry.entry.checksum,
+                         ComputeChecksumOrThrow(live_payload));
     }
 } // namespace storedemo

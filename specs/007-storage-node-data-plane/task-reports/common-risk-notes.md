@@ -36,9 +36,9 @@
   建议后续在哪类任务处理：在后续 store runtime / LocalDiskChunkStore 接入任务中，继续按 owner 线程停机模型使用；如确实需要 worker 内触发停机，再单独演进生命周期协议。
 
 - 任务编号：T021
-  问题：`LocalDiskChunkStore` 当前只完成配置持有和目录初始化，还没有做 restart scan、stale staging cleanup、index rebuild 或 live chunk 发现。
-  影响：如果后续任务在没有补齐这些恢复路径前就把它当成“可恢复本地存储”使用，重启后可能看不到已有 live chunk，也不会自动处理遗留 staging。
-  建议后续在哪类任务处理：在 T022/T023 收紧基础测试和写入入口边界，在 T070/T071 及相关恢复任务中补齐 restart rebuild 与 staging cleanup。
+  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()` 和 `Initialize()` 自动 live index rebuild，但 stale staging cleanup、partial write 收尾和非 live 状态目录治理仍未实现。
+  影响：重启后现在能重新发现 canonical live final chunk；但遗留 staging、半写入或需要隔离的坏块仍不会自动清理或迁移，后续恢复语义依然不完整。
+  建议后续在哪类任务处理：在 T071/T072 及相关恢复任务中继续补齐 stale staging cleanup、partial write detection 和 corrupted/quarantine 治理。
 
 - 任务编号：T023
   问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
@@ -139,3 +139,8 @@
   问题：T069 已新增 cross-platform durability matrix test，明确了 Linux 当前已实测的 `fdatasync` / `fsync` / same-filesystem publish / parent directory sync 语义，以及 Windows 当前只能给出 `FlushFileBuffers`、`MoveFileExW`、replace-existing publish contract、directory durability explicit unsupported 的 contract-only / deferred 边界；但当前 Windows publish 生产实现并没有独立 `ReplaceFileW` 路径，directory durability 也仍是 explicit unsupported。
   影响：如果后续把 T069 的矩阵测试通过误读成“Windows durability 已实机验证完成”，就会高估 `MoveFileExW` replace-existing 与 `ReplaceFileW` 语义等价性，以及目录 durability、sharing violation、long path / UTF-8 path 的真实运行行为。
   建议后续在哪类任务处理：继续在 `T014-WIN`、`T023-WIN` 及后续 cross-platform/crash matrix 任务里做 Windows 实机验证和必要修正；T069 只固定 contract，不关闭 Windows runtime 风险。
+
+- 任务编号：T070
+  问题：T070 已实现生产 `RebuildIndexFromDisk()`，但当前恢复仍只依据 canonical `chunks/live/*.chunk` payload facts 重建 `LIVE` index；`deleted/deleting/quarantined/corrupted` 的持久状态、stale staging cleanup，以及 Windows `std::filesystem` 目录遍历/路径编码实机行为仍未完成。
+  影响：如果后续把 T070 的通过误解成“所有重启恢复语义都已收口”，就会高估非 live 状态恢复、坏块隔离和 Windows 路径语义的完备性；当前保证的是 live final chunk 可重建，不是全状态恢复。
+  建议后续在哪类任务处理：在 T071/T072 继续补齐 staging cleanup 与 corrupted/quarantine 语义，在 `T014-WIN` / `T023-WIN` 或后续 Windows 恢复验证任务中补 live directory traversal / path behavior 的实机验证。

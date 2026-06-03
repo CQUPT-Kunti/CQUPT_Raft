@@ -46,6 +46,7 @@ namespace storedemo
         LocalDiskChunkStore &operator=(const LocalDiskChunkStore &) = delete;
 
         LocalDiskChunkStoreInitResult Initialize();
+        ChunkStoreResult RebuildIndexFromDisk();
 
         [[nodiscard]] const LocalDiskChunkStoreConfig &config() const;
         [[nodiscard]] const LocalDiskChunkStorePaths &paths() const;

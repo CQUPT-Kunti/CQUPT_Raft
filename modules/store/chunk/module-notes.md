@@ -182,6 +182,8 @@ T021 已实现：
 - 安全解析 `data_dir`
 - 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`
 - 默认 durable file / chunk index 依赖装配
+- `RebuildIndexFromDisk`
+- `Initialize()` 自动执行 live chunk index rebuild
 
 T023-T025 已实现：
 
@@ -193,7 +195,7 @@ T023-T025 已实现：
 
 后续任务仍未实现：
 
-- restart rebuild / stale staging cleanup
+- stale staging cleanup
 - corruption / quarantine 状态自动回写
 - 后台 scrub / repair / rebalance
 
@@ -204,6 +206,7 @@ T023-T025 已实现：
 - `DeleteChunk` 已经走通 chunk guard -> expected checksum 校验 -> final file remove -> index state update
 - `StatChunk` 已经走通 index lookup 和可选 checksum verify
 - `ListChunks` 已经走通基于 `ChunkIndex` 的过滤和分页
+- `RebuildIndexFromDisk` 已经走通 canonical `chunks/live/` 目录扫描、payload size/checksum 恢复和 live index 重建
 - T026 已用真实本地文件压力测试覆盖不同 chunk 并发写入、同 chunk 冲突写入，以及读/删/查/列交错边界
 
 当前并发边界补充：
@@ -237,8 +240,8 @@ T023-T025 已实现：
 也就是说：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
-- `local_disk_chunk_store.cpp` 现在已经包含 `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地路径
-- restart 恢复和后台维护路径仍未实现
+- `local_disk_chunk_store.cpp` 现在已经包含 `Initialize` / `RebuildIndexFromDisk` / `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地路径
+- restart live index rebuild 已实现，但 staging cleanup / corruption 治理 / 后台维护路径仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -304,6 +307,134 @@ T023-T025 已实现：
 
 解析成 data root 下的安全绝对路径。
 
+### `CollectLiveChunkCandidatePaths(...)`
+
+递归扫描 `chunks/live/` 下的 regular file 候选，并返回相对 `data_root` 的稳定排序结果。
+
+输入：
+
+- `data_root`
+- `live_root`
+
+输出：
+
+- 所有 regular candidate 的相对路径列表
+
+边界：
+
+- 只负责 live 目录遍历
+- 非 regular 候选直接跳过
+- 目录不存在或遍历失败返回明确文件系统错误
+
+### `ParseChunkIdFromLiveFilename(...)`
+
+从 live final 文件名中提取 `chunk_id`，并复用 `ValidateChunkId(...)` 做合法性校验。
+
+输入：
+
+- `relative_path`
+
+输出：
+
+- 合法 `chunk_id`
+
+边界：
+
+- malformed / invalid filename 返回非 `kOk`
+- T070 当前调用方把这类候选安全跳过，不升级成 quarantine
+
+### `IsCanonicalLiveChunkPath(...)`
+
+基于 `BuildChunkPathLayout(...)` 判断某个 live candidate 是否位于 canonical final shard 路径。
+
+输入：
+
+- `chunk_id`
+- `relative_path`
+
+输出：
+
+- `is_canonical`
+
+边界：
+
+- 只接受 `chunks/live/<shard>/<shard>/<chunk_id>.chunk`
+- misplaced live candidate 不进入 rebuilt index
+
+### `RecoverFinalChunkPayloadFacts(...)`
+
+读取 final chunk payload，并恢复当前磁盘上可直接验证的 `size` 和 `checksum`。
+
+输入：
+
+- `final_path`
+
+输出：
+
+- `size`
+- `checksum`
+
+边界：
+
+- zero-byte final file 合法
+- 只基于文件内容恢复事实
+- 不做 quarantine / corrupted 状态落盘
+
+### `BuildRebuiltChunkIndexEntry(...)`
+
+把恢复出的 chunk identity、size、checksum 和 final path 组装成 `ChunkIndexEntry`。
+
+输入：
+
+- `identity`
+- `size`
+- `checksum`
+- `final_relative_path`
+
+输出：
+
+- `ChunkIndexEntry`
+
+边界：
+
+- T070 只重建 `ChunkState::kLive`
+- `updated_at` 当前不伪造历史时间，保持恢复态默认值
+
+### `ClearChunkIndexEntries(...)`
+
+在重建前清空现有 `ChunkIndex`，确保重启恢复只依赖本地磁盘事实，而不是信任旧内存索引。
+
+输入：
+
+- `chunk_index`
+
+输出：
+
+- 清空结果状态
+
+边界：
+
+- 通过 `List` + `Remove` 清理已有 entry
+- 失败时返回明确索引错误，不静默保留旧事实
+
+### `InsertRecoveredChunkIndexEntry(...)`
+
+把恢复出的 entry 写回 `ChunkIndex`。
+
+输入：
+
+- `chunk_index`
+- `entry`
+
+输出：
+
+- 插入结果状态
+
+边界：
+
+- duplicate / insert failure 返回明确错误
+- 不在这里做 metadata / Raft 交互
+
 ### `CreateDefaultDurableFile(...)`
 
 当调用方没有注入 `durable_file` 时，按当前平台创建默认 durable file 实现：
@@ -324,6 +455,27 @@ T023-T025 已实现：
 - `error_detail` 指明这是当前阶段尚未实现的接口
 
 这样做的目的，是在阶段化实现过程中明确拒绝未实现能力，而不是 silent success。
+
+### `RebuildIndexFromDisk()`
+
+这是 T070 的主恢复流程。
+
+主步骤：
+
+1. 只扫描 `chunks/live/`
+2. 过滤非 `.chunk`、非法 `chunk_id`、misplaced live candidate
+3. 对同一 `chunk_id` 的多个 live candidate 直接返回 `kConflict`
+4. 读取 canonical final chunk payload，恢复 `size` / `checksum` / `ChunkIdentity`
+5. 清空现有 `ChunkIndex`
+6. 只以 `ChunkState::kLive` 重建本地 index
+
+边界：
+
+- 不扫描 staging 进入 live index
+- 不做 stale staging cleanup
+- 不做 corrupted quarantine
+- 不调用 metadata / Raft
+- 不决定 object committed/deleted 可见性
 
 ### `CurrentUnixTimeMillis()`
 
@@ -514,14 +666,13 @@ T023-T025 已实现：
 
 ### 当前未解决的恢复边界
 
-T023 仍然没有解决这些恢复问题：
+T070 之后仍然没有解决这些恢复问题：
 
-- restart rebuild
 - stale staging cleanup
-- published-but-index-not-inserted 的重启重建
 - corrupted / quarantine
+- published final file 的 tombstone / deleted / metadata freshness 判定
 
-也就是说，当前 `WriteChunk()` 只保证在线写入时的 durable publish 顺序，不保证重启后的自动收口。
+也就是说，当前 `WriteChunk()` + `RebuildIndexFromDisk()` 已经保证 live final chunk 的本地重启可发现，但还没有把 staging 收尾、坏块隔离或 metadata 事实新鲜度一起收口。
 
 ## `ReadChunk()` 当前语义
 
@@ -611,7 +762,7 @@ T023 仍然没有解决这些恢复问题：
 
 ## 当前未实现内容
 
-- restart rebuild / stale staging cleanup
+- stale staging cleanup
 - 读路径发现损坏后的自动状态回写
 - quarantine / repair / GC / restart recovery
 - range read
