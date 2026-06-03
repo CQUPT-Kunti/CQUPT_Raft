@@ -169,7 +169,7 @@
 ### Tests for User Story 5
 
 - [x] T068 [P] [US5] 添加 restart index rebuild 测试；实际修改：`tests/storage_node_recovery_test.cpp`、`tests/CMakeLists.txt`、`specs/007-storage-node-data-plane/task-reports/t068-restart-index-rebuild-test.md`、`specs/007-storage-node-data-plane/task-reports/common-risk-notes.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：test-only recovery scanner 固定 final/live chunk 重建、staging/partial staging 不进入 live index、deleted/deleting/quarantined/corrupted 不误入 live index、malformed/duplicate 行为固定，且当前 Linux 环境下 `storage_node_recovery` 验证 PASS；依赖：T025
-- [ ] T069 [P] [US5] 添加跨平台 durability 矩阵测试；允许修改：`tests/storage_cross_platform_durability_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 Linux fsync/fdatasync/directory sync 和 Windows FlushFileBuffers/MoveFileEx/ReplaceFile contract；依赖：T013、T014
+- [x] T069 [P] [US5] 添加跨平台 durability 矩阵测试；实际修改：`tests/storage_cross_platform_durability_test.cpp`、`tests/CMakeLists.txt`、`specs/007-storage-node-data-plane/task-reports/t069-cross-platform-durability-matrix.md`、`specs/007-storage-node-data-plane/task-reports/common-risk-notes.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：新增 matrix test 固定 Linux fsync/fdatasync/directory sync/same-filesystem publish 与显式错误分类、Windows FlushFileBuffers/MoveFileEx/replace-existing/directory durability contract-only 边界，以及 `LocalDiskChunkStore` 不接受 required durability operation silent no-op success；当前 Linux 环境下 `storage_cross_platform_durability` 与 `store_durable_file` 验证 PASS；依赖：T013、T014
 
 ### Implementation for User Story 5
 

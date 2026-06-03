@@ -134,3 +134,8 @@
   问题：T068 已用 test-only restart scanner 固定了“只依据本地磁盘事实重建 live ChunkIndex”的最小 contract，并明确 staging、partial staging、deleted/deleting/quarantined/corrupted 路径事实不能误入 live index；但当前 `chunks/live/*.chunk` 仍只持久化 payload bytes，本地磁盘上没有额外 sidecar 或状态编码可直接支撑“原始预期 checksum mismatch”“deleted tombstone 持久化”“quarantine/corrupted 已确认状态”这类恢复判定。
   影响：如果后续把 T068 的测试通过误当成生产 `RebuildIndexFromDisk()`、stale staging cleanup、corrupted quarantine 都已具备，T070-T072 仍可能在 on-disk state encoding、partial write 检测和坏块隔离语义上出现实现分歧；尤其 checksum mismatch 不能仅靠当前 live 文件自描述事实独立判定。
   建议后续在哪类任务处理：在 T070-T072 中明确生产扫描时使用的 on-disk facts、状态目录/sidecar 或等价恢复语义；不要在 T068 里把 test-only scanner 伪装成生产恢复实现。
+
+- 任务编号：T069
+  问题：T069 已新增 cross-platform durability matrix test，明确了 Linux 当前已实测的 `fdatasync` / `fsync` / same-filesystem publish / parent directory sync 语义，以及 Windows 当前只能给出 `FlushFileBuffers`、`MoveFileExW`、replace-existing publish contract、directory durability explicit unsupported 的 contract-only / deferred 边界；但当前 Windows publish 生产实现并没有独立 `ReplaceFileW` 路径，directory durability 也仍是 explicit unsupported。
+  影响：如果后续把 T069 的矩阵测试通过误读成“Windows durability 已实机验证完成”，就会高估 `MoveFileExW` replace-existing 与 `ReplaceFileW` 语义等价性，以及目录 durability、sharing violation、long path / UTF-8 path 的真实运行行为。
+  建议后续在哪类任务处理：继续在 `T014-WIN`、`T023-WIN` 及后续 cross-platform/crash matrix 任务里做 Windows 实机验证和必要修正；T069 只固定 contract，不关闭 Windows runtime 风险。

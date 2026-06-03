@@ -414,6 +414,29 @@ else()
   message(STATUS "Skip test_storage_node_recovery: storage_node_recovery_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_cross_platform_durability_test.cpp")
+  add_executable(test_storage_cross_platform_durability
+    storage_cross_platform_durability_test.cpp
+  )
+
+  target_link_libraries(test_storage_cross_platform_durability
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_cross_platform_durability
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_cross_platform_durability
+    test_storage_cross_platform_durability
+    "${RAFT_STORE_LABELS_CROSS_PLATFORM}")
+else()
+  message(STATUS "Skip test_storage_cross_platform_durability: storage_cross_platform_durability_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_integration_test.cpp")
   add_executable(test_storage_upload_integration
     storage_upload_integration_test.cpp
