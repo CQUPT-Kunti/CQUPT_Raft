@@ -66,9 +66,9 @@
   建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
 
 - 任务编号：T045
-  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`，T047 也补了 unavailable / not_found / timeout / checksum mismatch fallback、全部副本失败和已知坏副本跳过的失败路径覆盖；但当前 selector 仍主要消费 manifest 顺序和调用方传入的最小候选事实，尚未接入真实 heartbeat / registry / failure cache；读路径也仍保持 `LocalDiskChunkStore` 的既有边界：range read 由底层显式拒绝，checksum mismatch / corrupted 只返回明确错误，不自动回写 `CORRUPTED` / `QUARANTINED` 状态。
-  影响：仓库现在已经有了 committed-only 的 metadata gate、副本顺序选择、逐副本 fallback、可复用测试 helper 和失败路径测试边界，后续任务不能再随意改动 T041-T047 固定下来的字段、状态和失败扩散语义；但当前还没有基于实时节点事实的更强 read selection，也没有读路径上的 corruption 自动沉淀、repair、scrub 或后台 quarantine 动作。
-  建议后续在哪类任务处理：在 T048/T052/T066 及后续 recovery-scrub 任务中继续接入 registry facts、failure scoring 与坏块治理；corrupted 状态自动回写仍按 T024/后续 recovery-scrub 任务统一处理。
+  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`，T047 固定了 unavailable / not_found / timeout / checksum mismatch fallback，T066 也已把生产 registry facts 接到 read replica selection；但当前仍没有 failure cache、recent failure scoring、corruption 自动状态回写或 repair/scrub 联动。
+  影响：仓库现在已经有了 committed-only 的 metadata gate、registry-aware 的副本排序、逐副本 fallback 和可复用测试 helper；但读路径上的坏块沉淀、后台治理和短期失败记忆仍未形成完整生产闭环。
+  建议后续在哪类任务处理：在 T048/T052 及后续 recovery-scrub/repair 任务中继续补 failure cache、corruption 沉淀与坏块治理；自动状态回写仍按 T024/后续 recovery-scrub 任务统一处理。
 
 - 任务编号：T049
   问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍不是完整后台 GC 生命周期闭环。
@@ -91,27 +91,27 @@
   建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
 
 - 任务编号：T059
-  问题：T059 已用 `storage_heartbeat_registry_test` 固定 heartbeat / registry contract；T062-T065 现已落地生产 registry、service、client 和 write-side placement 适配，但 read-side 仍未接线，clock source 与 sequence 新鲜度也仍依赖后续生产路径统一收口。
-  影响：如果把当前 registry + service + client + write placement 单测通过当成整个 heartbeat 生产链路已完成，后续可能高估 heartbeat facts 的来源一致性、stale heartbeat 过滤和 liveness 降级在真实 read-side 路径里的完备性。
-  建议后续在哪类任务处理：在 T066 中继续把 read replica selection 接线收口，并明确 clock / sequence 的最终生产语义。
+  问题：T059 已用 `storage_heartbeat_registry_test` 固定 heartbeat / registry contract；T062-T066 现已落地生产 registry、service、client、write placement 和 read selection 适配，但 clock source 与 sequence 新鲜度仍依赖后续生产路径统一收口。
+  影响：如果把当前 registry + service + client + placement/read selection 单测通过当成整个 heartbeat 生产链路已完成，后续仍可能高估 heartbeat facts 的来源一致性和 stale heartbeat 过滤在真实运行时的完备性。
+  建议后续在哪类任务处理：在后续 control-plane 可靠性或 time-source 规范任务中继续明确时钟与 sequence 生产语义。
 
 - 任务编号：T060
-  问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中固定 health-aware placement contract；T065 已把生产 registry snapshot/facts 接到 write-side `PlacementManager`，但 read replica selection、failure-domain 更细粒度 spread、以及最终的 overload/hotspot 生产打分仍未完成。
-  影响：如果把当前 contract 测试和 write placement 接线的通过当成所有副本选择消费面都已完成，后续可能高估 registry facts 在 read-side、repair/rebalance 等路径中的新鲜度和最终排序来源。
-  建议后续在哪类任务处理：在 T066 及后续 repair/rebalance/read-side 任务中继续接入 registry facts，并保持 T060 固定下来的稳定选择与排除语义。
+  问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中固定 health-aware placement contract；T065/T066 已把生产 registry snapshot/facts 分别接到 write-side placement 和 read replica selection，但 failure-domain 更细粒度 spread 以及最终的 overload/hotspot 统一生产打分仍未完成。
+  影响：如果把当前 contract 测试、write placement 和 read selection 接线的通过当成所有副本消费面都已完备，后续仍可能高估 registry facts 在 repair/rebalance 等路径中的新鲜度和排序来源。
+  建议后续在哪类任务处理：在后续 repair/rebalance/read-side 扩展任务中继续复用 registry facts，并保持 T060 固定下来的稳定选择与排除语义。
 
 - 任务编号：T061
-  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema；T062-T065 已把 registry、service、client 和 write placement 接到生产路径，但 read-side 消费和 fake stub 后续同步风险仍存在。
-  影响：如果把当前 proto/schema、registry、service、client 和 write placement 单测通过当成 US4 全量完成，后续仍可能在 T066 暴露 read-side facts 消费、新鲜度判断或 fake stub 跟随新接口演进的兼容风险。
-  建议后续在哪类任务处理：在 T066 中继续收紧 read-side 消费语义，并保持 fake stub 与生成接口同步。
+  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema；T062-T066 已把 registry、service、client、write placement 和 read selection 接到生产路径，但 fake stub 后续同步和时间语义兼容风险仍存在。
+  影响：如果把当前 proto/schema、registry、service、client、placement/read selection 单测通过当成 US4 全量完成，后续仍可能在 fake stub 跟随新接口演进或 time-source 规范上暴露兼容风险。
+  建议后续在哪类任务处理：在后续 control-plane 演进任务中继续保持 fake stub 与生成接口同步，并明确时间语义。
 
 - 任务编号：T062
-  问题：T062 已实现生产 in-memory `StorageNodeRegistry`，覆盖 register、heartbeat、partial report merge、sequence/stale 保护、liveness 和稳定 snapshot/list；T063-T065 已把这些语义接到 service、client 和 write placement 侧，但当前时钟来源仍是调用方传入的 `observed_at/now`，read-side 也还没有消费这些 facts。
-  影响：如果调用方使用漂移较大的时钟、乱序 sequence 或不一致的 report/heartbeat 源，registry + service + client + write placement 仍可能把“新鲜度”判断建立在不可靠输入上；另外当前 load facts 只是结构化保存，还没有变成跨所有消费面的统一 overload 生产打分。
-  建议后续在哪类任务处理：在 T066 中把 registry facts 正式接入 read selection，并决定最终 overload/freshness 消费规则。
+  问题：T062 已实现生产 in-memory `StorageNodeRegistry`，覆盖 register、heartbeat、partial report merge、sequence/stale 保护、liveness 和稳定 snapshot/list；T063-T066 已把这些语义接到 service、client、write placement 和 read selection 侧，但当前时钟来源仍是调用方传入的 `observed_at/now`。
+  影响：如果调用方使用漂移较大的时钟、乱序 sequence 或不一致的 report/heartbeat 源，registry + service + client + placement/read selection 仍可能把“新鲜度”判断建立在不可靠输入上；另外 load facts 还没有变成跨所有消费面的统一 overload 生产打分。
+  建议后续在哪类任务处理：在后续 control-plane / maintenance 任务中继续统一 freshness 与 overload 的最终消费规则。
 
 - 任务编号：T063
-  问题：T063 已实现 `StorageNodeService` 的 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` gRPC 适配，并把 proto request/response 映射到 `StorageNodeRegistry`；T064 已补齐 client，但 service 仍直接信任请求携带的 `observed_at_unix_ms`、health/disk/load facts 和 sequence。
+  问题：T063 已实现 `StorageNodeService` 的 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` gRPC 适配，并把 proto request/response 映射到 `StorageNodeRegistry`；T064/T066 已补齐 client 和 read-side 消费，但 service 仍直接信任请求携带的 `observed_at_unix_ms`、health/disk/load facts 和 sequence。
   影响：如果后续 client 或调用方在不同时间基准、重复请求、乱序请求或事实缺省策略上不一致，service 虽然会复用 registry 的 stale/idempotent/merge 规则，但整体链路仍可能出现“语义看似一致、输入不够可信”的问题。
   建议后续在哪类任务处理：在 T066 中继续验证 service 暴露出的 snapshot/facts 是否足够支撑 read-side 消费，并决定最终的 time-source / sequence 生产规范。
 
@@ -121,6 +121,11 @@
   建议后续在哪类任务处理：在后续 control-plane 可靠性或 proto/schema 演进任务中，评估是否需要显式补充 control-plane timeout/cancel 字段、统一 retry 策略和 sequence/time-source 生成协议；T066 继续只消费当前已经固定的 response/facts contract。
 
 - 任务编号：T065
-  问题：T065 已把生产 `StorageNodeRegistry` snapshot/facts 接到 write-side `PlacementManager`，并在 manager 层新增 liveness / invalid-capacity 的保守过滤；但当前 failure-domain 仍只消费 `zone/rack` 占位字段，没有更细粒度 spread 策略，read-side 也还没有复用这套 facts，新鲜度依旧取决于调用方提供的 `observed_at/now`。
-  影响：如果后续把当前 write placement 接线误当成所有 placement/read-side/failure-domain 策略都已完备，仍可能高估 zone spread、clock freshness 和 partial facts 在其它消费面上的可靠性。
-  建议后续在哪类任务处理：在 T066 和后续 repair/rebalance/read-side 任务中继续复用 registry facts，并决定是否需要更细粒度 failure-domain 策略和更严格的新鲜度协议。
+  问题：T065 已把生产 `StorageNodeRegistry` snapshot/facts 接到 write-side `PlacementManager`，T066 也把这套 facts 接到了 read replica selection；但当前 failure-domain 仍只消费 `zone/rack` 占位字段，没有更细粒度 spread 策略，新鲜度依旧取决于调用方提供的 `observed_at/now`。
+  影响：如果后续把当前 write/read side 接线误当成所有 placement/read-side/failure-domain 策略都已完备，仍可能高估 zone spread、clock freshness 和 partial facts 在 repair/rebalance 等消费面上的可靠性。
+  建议后续在哪类任务处理：在后续 repair/rebalance/read-side 扩展任务中继续复用 registry facts，并决定是否需要更细粒度 failure-domain 策略和更严格的新鲜度协议。
+
+- 任务编号：T066
+  问题：T066 已把生产 `StorageNodeRegistry` snapshot/facts 接到 read replica selection，并固定了 healthy/fresh/low-load 优先、stale/unavailable/overloaded/corrupted 跳过、high/full disk pressure 降权、unknown facts 保留 manifest fallback 的 contract；但当前仍没有 failure cache、recent failure scoring、corruption 自动状态回写或 registry snapshot freshness 的独立时钟源。
+  影响：如果把当前 registry-aware read selection 当成完整生产读路径治理已完成，后续仍可能在重复失败副本的短期记忆、坏块自动沉淀、以及“snapshot 何时算新鲜”的生产时钟协议上暴露语义缺口。
+  建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 time-source 规范任务中继续收口，不要在 T066 里扩展成 repair / corruption 自动回写。

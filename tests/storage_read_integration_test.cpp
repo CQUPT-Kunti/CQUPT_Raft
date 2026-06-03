@@ -13,6 +13,7 @@
 #include "raft/state_machine/metadata_state_machine.h"
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
+#include "store/node/storage_node_registry.h"
 #include "support/metadata_test_utils.h"
 #include "support/storage_read_test_utils.h"
 #include "support/store_test_utils.h"
@@ -83,6 +84,28 @@ namespace
             .size = static_cast<std::uint64_t>(payload.size()),
             .replica_nodes = std::move(replica_nodes),
             .checksum = checksum.value};
+    }
+
+    storedemo::StorageNodeRegistryFacts MakeRegistryFactsForRead(
+        const storedemo::StorageNodeHealth health =
+            storedemo::StorageNodeHealth::kHealthy,
+        const storedemo::StorageNodeDiskPressure disk_pressure =
+            storedemo::StorageNodeDiskPressure::kLow,
+        const std::uint32_t active_reads = 0,
+        const bool read_overloaded = false)
+    {
+        storedemo::StorageNodeRegistryFacts facts;
+        facts.capacity.total_capacity_bytes = 64 * 1024;
+        facts.capacity.used_capacity_bytes = 8 * 1024;
+        facts.capacity.available_capacity_bytes = 56 * 1024;
+        facts.capacity.chunk_count = 1;
+        facts.health.health = health;
+        facts.health.disk_pressure = disk_pressure;
+        facts.load.load.active_reads = active_reads;
+        facts.load.load.active_writes = active_reads / 2;
+        facts.load.load.queued_ops = active_reads / 3;
+        facts.load.read_admission_overloaded = read_overloaded;
+        return facts;
     }
 
     class StorageReadIntegrationTest : public ::testing::Test
@@ -1130,6 +1153,31 @@ namespace
                             manifest))
                         .Ok);
 
+        storedemo::StorageNodeRegistry registry(
+            storedemo::StorageNodeRegistryConfig{
+                .stale_timeout_ms = 30,
+                .dead_timeout_ms = 90});
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-a",
+                         .endpoint = "127.0.0.1:7401",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead( storedemo::StorageNodeHealth::kHealthy,
+                                                            storedemo::StorageNodeDiskPressure::kLow,
+                                                            0)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-b",
+                         .endpoint = "127.0.0.1:7402",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead( storedemo::StorageNodeHealth::kHealthy,
+                                                            storedemo::StorageNodeDiskPressure::kLow,
+                                                            1)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+
         CountingReplicaReader reader(
             [&](const storedemo::StorageNodeId &node_id,
                 const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
@@ -1173,13 +1221,297 @@ namespace
                             storedemo::ReadReplicaCandidate{
                                 .node_id = chunk_ref.replica_nodes.at(1),
                                 .has_observed_facts = true}};
-                    }});
+                    },
+                .registry_snapshot_resolver =
+                    [&registry]()
+                    { return registry.Snapshot(110); }});
 
         ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
             << result.error_detail;
         EXPECT_EQ(result.payload, fixture.payload);
         EXPECT_EQ(reader.calls_for_node("replica-a"), 0U);
         EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           CommittedObjectPrefersFreshHealthyLowLoadReplicaFromRegistryFacts)
+    {
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t066-read-priority",
+                            "create-bucket-t066-read-priority"))
+                        .Ok);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        const std::string object_id = "obj-t066-priority";
+        const std::string object_key = "objects/priority.deb";
+        const std::uint64_t version = 1;
+        const auto identity = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t066-read-priority",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t066-read-priority",
+                            fixture.payload.size(),
+                            "etag-t066-read-priority"))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t066-read-priority",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t066-read-priority",
+                            fixture.payload.size(),
+                            "etag-t066-read-priority",
+                            {MakeChunkRef(identity,
+                                          fixture.payload,
+                                          {"replica-a", "replica-b", "replica-c"})}))
+                        .Ok);
+
+        storedemo::StorageNodeRegistry registry(
+            storedemo::StorageNodeRegistryConfig{
+                .stale_timeout_ms = 20,
+                .dead_timeout_ms = 60});
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-a",
+                         .endpoint = "127.0.0.1:7501",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kHealthy,
+                             storedemo::StorageNodeDiskPressure::kLow,
+                             8)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-b",
+                         .endpoint = "127.0.0.1:7502",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kHealthy,
+                             storedemo::StorageNodeDiskPressure::kLow,
+                             1)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-c",
+                         .endpoint = "127.0.0.1:7503",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kReadOnly,
+                             storedemo::StorageNodeDiskPressure::kHigh,
+                             0)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
+            {
+                storedemo::ReadChunkResponse response;
+                response.status = storedemo::StorageNodeStatusCode::kOk;
+                response.payload = fixture.payload;
+                response.metadata.identity.chunk_id = request.chunk_id;
+                response.metadata.node_id = node_id;
+                response.metadata.size = request.expected_checksum.size_bytes;
+                response.metadata.checksum = request.expected_checksum;
+                response.metadata.state = storedemo::ChunkState::kLive;
+                response.actual_checksum = request.expected_checksum;
+                response.verified = true;
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t066-read-priority",
+                .object_key = object_key,
+                .registry_snapshot_resolver =
+                    [&registry]()
+                    { return registry.Snapshot(110); }});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, fixture.payload);
+        EXPECT_EQ(reader.read_calls(), 1U);
+        ASSERT_EQ(reader.read_node_ids().size(), 1U);
+        EXPECT_EQ(reader.read_node_ids().front(), "replica-b");
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           RegistryFactsSkipStaleReplicaAndFallbackToNextHealthyReplicaAfterReadFailure)
+    {
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t066-read-fallback",
+                            "create-bucket-t066-read-fallback"))
+                        .Ok);
+
+        const auto fixture = storedemo::test::LoadUploadFixtureBinaryPayload();
+        ASSERT_TRUE(fixture.used_repo_fixture);
+        ASSERT_EQ(fixture.source_path.filename(), "test_file.deb");
+
+        const std::string object_id = "obj-t066-fallback";
+        const std::string object_key = "objects/fallback.deb";
+        const std::uint64_t version = 1;
+        const auto identity = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t066-read-fallback",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t066-read-fallback",
+                            fixture.payload.size(),
+                            "etag-t066-read-fallback"))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t066-read-fallback",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t066-read-fallback",
+                            fixture.payload.size(),
+                            "etag-t066-read-fallback",
+                            {MakeChunkRef(identity,
+                                          fixture.payload,
+                                          {"replica-a", "replica-b", "replica-c"})}))
+                        .Ok);
+
+        storedemo::StorageNodeRegistry registry(
+            storedemo::StorageNodeRegistryConfig{
+                .stale_timeout_ms = 20,
+                .dead_timeout_ms = 60});
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-a",
+                         .endpoint = "127.0.0.1:7601",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kHealthy,
+                             storedemo::StorageNodeDiskPressure::kLow,
+                             0)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-b",
+                         .endpoint = "127.0.0.1:7602",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kHealthy,
+                             storedemo::StorageNodeDiskPressure::kLow,
+                             1)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.RegisterStorageNode(
+                        {.node_id = "replica-c",
+                         .endpoint = "127.0.0.1:7603",
+                         .observed_at_unix_ms = 100,
+                         .facts = MakeRegistryFactsForRead(
+                             storedemo::StorageNodeHealth::kHealthy,
+                             storedemo::StorageNodeDiskPressure::kLow,
+                             2)})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.ReportLoad(
+                        {.node_id = "replica-b",
+                         .endpoint = "127.0.0.1:7602",
+                         .sequence = 1,
+                         .observed_at_unix_ms = 110,
+                         .load = storedemo::StorageNodeRegistryLoadFacts{
+                             .load = storedemo::StorageNodeLoadSnapshot{
+                                 .active_reads = 0,
+                                 .active_writes = 0,
+                                 .queued_ops = 0},
+                             .read_admission_overloaded = false}})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(
+            registry.ReportLoad(
+                        {.node_id = "replica-c",
+                         .endpoint = "127.0.0.1:7603",
+                         .sequence = 1,
+                         .observed_at_unix_ms = 111,
+                         .load = storedemo::StorageNodeRegistryLoadFacts{
+                             .load = storedemo::StorageNodeLoadSnapshot{
+                                 .active_reads = 2,
+                                 .active_writes = 1,
+                                 .queued_ops = 0},
+                             .read_admission_overloaded = false}})
+                .status,
+            storedemo::StorageNodeStatusCode::kOk);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request) -> storedemo::ReadChunkResponse
+            {
+                storedemo::ReadChunkResponse response;
+                response.metadata.identity.chunk_id = request.chunk_id;
+                response.metadata.node_id = node_id;
+                response.metadata.size = request.expected_checksum.size_bytes;
+                response.metadata.checksum = request.expected_checksum;
+                response.metadata.state = storedemo::ChunkState::kLive;
+                response.actual_checksum = request.expected_checksum;
+                response.verified = true;
+                if (node_id == "replica-b")
+                {
+                    response.status = storedemo::StorageNodeStatusCode::kTimeout;
+                    response.error_detail = "replica-b timed out";
+                    return response;
+                }
+
+                response.status = storedemo::StorageNodeStatusCode::kOk;
+                response.payload = fixture.payload;
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t066-read-fallback",
+                .object_key = object_key,
+                .registry_snapshot_resolver =
+                    [&registry]()
+                    { return registry.Snapshot(125); }});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, fixture.payload);
+        EXPECT_EQ(reader.calls_for_node("replica-a"), 0U);
+        EXPECT_EQ(reader.calls_for_node("replica-b"), 1U);
+        EXPECT_EQ(reader.calls_for_node("replica-c"), 1U);
     }
 
     TEST_F(StorageReadIntegrationTest, EmptyReplicaNodesFailBeforeDataPlaneRead)

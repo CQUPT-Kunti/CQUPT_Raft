@@ -387,18 +387,53 @@
 - 当前排序语义：
   - 先排已观测到事实的副本
   - 再按更好的读健康状态
+  - 再按更低磁盘压力
   - 再按更低 `active_reads`
   - 再按更低 `TotalInflight()`
   - 最后按 manifest 原始顺序兜底
 - 边界：
   - 不做 RPC / IO
   - 不接 metadata / Raft
-  - 未接 registry facts 时，未知副本会作为中性 fallback 保留，不会被静态策略层提前丢弃
-  - 选满 `replica_count`，或在候选不足时返回明确错误
+- 未接 registry facts 时，未知副本会作为中性 fallback 保留，不会被静态策略层提前丢弃
+- 选满 `replica_count`，或在候选不足时返回明确错误
 - 返回语义：
   - 成功时返回 `kOk`，并在 `decision.replica_nodes` 中给出最终节点列表
   - 请求非法时返回 `kInvalidArgument`
   - 合法候选不足以满足 `replica_count` 时返回 `kNodeUnavailable`
+
+### `ReplicaPolicySelector::SelectReadReplicas(const ReadReplicaSelectionRequest&, const StorageNodeRegistrySnapshotResult&, std::span<const ReadReplicaCandidate>)`
+
+- 作用：
+  - 把 committed manifest 的 `replica_nodes` 和生产 `StorageNodeRegistry` snapshot 合并成读副本候选事实，再复用既有读排序逻辑。
+- 输入：
+  - `request`
+    - manifest 中的 `chunk_id`、`replica_nodes` 和显式排除列表。
+  - `registry_snapshot`
+    - 由 T062 生产 registry 生成的稳定快照。
+  - `supplemental_candidates`
+    - 读路径补充事实，例如 `known_corrupted`、`known_missing`。
+- 输出：
+  - `decision.ordered_replicas`
+    - 先按 registry node facts 排好序的候选，再保留未知 facts 的 manifest fallback。
+  - `decision.excluded_nodes`
+    - stale / unavailable / draining / overloaded / corrupted / missing 等排除原因。
+  - `decision.reasons`
+    - 记录“消费了多少个 registry snapshot 节点”和“registry node facts 优先、chunk-specific facts 追加”的边界说明。
+- registry snapshot 转 read replica candidate 映射 helper：
+  - `snapshot.node_id -> candidate.node_id`
+  - `snapshot.facts.health.health -> candidate.health`
+  - `snapshot.facts.health.disk_pressure -> candidate.disk_pressure`
+  - `snapshot.facts.load.load -> candidate.load`
+  - `snapshot.facts.load.read_admission_overloaded -> candidate.read_admission_overloaded`
+  - `snapshot.liveness != kLive -> candidate.stale = true`
+- manifest replica + registry facts merge helper：
+  - registry facts 负责 node-level `health / disk_pressure / load / stale`
+  - supplemental facts 继续追加 `known_corrupted / known_missing`
+  - 未出现在 registry snapshot 中的 manifest 副本保留为中性 fallback，不会被提前删掉
+- 边界：
+  - 不做 metadata / RPC / IO
+  - 不做 repair、corruption 自动回写或 failure cache 写入
+  - registry snapshot 不可用时返回对应错误，不伪装成“无 facts 的成功路径”
 
 ## `replica_policy.cpp` 实现细节
 

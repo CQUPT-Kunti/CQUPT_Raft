@@ -11,6 +11,8 @@
 
 namespace storedemo
 {
+    struct StorageNodeRegistrySnapshotResult;
+
     enum class StorageNodeHealth : std::uint8_t
     {
         kHealthy = 0,
@@ -156,5 +158,10 @@ namespace storedemo
         ReadReplicaSelectionResult SelectReadReplicas(
             const ReadReplicaSelectionRequest &request,
             std::span<const ReadReplicaCandidate> candidates) const;
+
+        ReadReplicaSelectionResult SelectReadReplicas(
+            const ReadReplicaSelectionRequest &request,
+            const StorageNodeRegistrySnapshotResult &registry_snapshot,
+            std::span<const ReadReplicaCandidate> supplemental_candidates) const;
     };
 }

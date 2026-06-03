@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -69,6 +70,8 @@ namespace storedemo::test
 
     using ReadReplicaCandidateResolver =
         std::function<std::vector<ReadReplicaCandidate>(const raftdemo::ChunkRef &)>;
+    using ReadReplicaRegistrySnapshotResolver =
+        std::function<StorageNodeRegistrySnapshotResult()>;
 
     struct ReadObjectByManifestRequest
     {
@@ -76,6 +79,7 @@ namespace storedemo::test
         std::string object_key;
         std::string request_id_prefix{"storage-read"};
         ReadReplicaCandidateResolver candidate_resolver;
+        ReadReplicaRegistrySnapshotResolver registry_snapshot_resolver;
     };
 
     struct ReadObjectByManifestResult
@@ -125,6 +129,11 @@ namespace storedemo::test
         ReadObjectByManifestResult result;
         result.chunk_results.reserve(ordered_manifest.size());
         ReplicaPolicySelector selector;
+        std::optional<StorageNodeRegistrySnapshotResult> registry_snapshot;
+        if (request.registry_snapshot_resolver)
+        {
+            registry_snapshot = request.registry_snapshot_resolver();
+        }
         for (std::size_t index = 0; index < ordered_manifest.size(); ++index)
         {
             const auto &chunk_ref = ordered_manifest.at(index);
@@ -141,11 +150,19 @@ namespace storedemo::test
                 read_candidates = request.candidate_resolver(chunk_ref);
             }
 
-            const auto selection = selector.SelectReadReplicas(
-                ReadReplicaSelectionRequest{
-                    .chunk_id = chunk_ref.chunk_id,
-                    .replica_nodes = chunk_ref.replica_nodes},
-                read_candidates);
+            const auto selection =
+                registry_snapshot.has_value()
+                    ? selector.SelectReadReplicas(
+                          ReadReplicaSelectionRequest{
+                              .chunk_id = chunk_ref.chunk_id,
+                              .replica_nodes = chunk_ref.replica_nodes},
+                          *registry_snapshot,
+                          read_candidates)
+                    : selector.SelectReadReplicas(
+                          ReadReplicaSelectionRequest{
+                              .chunk_id = chunk_ref.chunk_id,
+                              .replica_nodes = chunk_ref.replica_nodes},
+                          read_candidates);
             if (!selection.ok())
             {
                 return ReadObjectByManifestResult{

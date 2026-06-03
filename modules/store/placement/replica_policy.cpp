@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "store/node/storage_node_registry.h"
+
 namespace storedemo
 {
     namespace
@@ -180,6 +182,56 @@ namespace storedemo
             }
 
             return 5;
+        }
+
+        std::uint8_t ReadDiskPressureRank(const StorageNodeDiskPressure pressure)
+        {
+            switch (pressure)
+            {
+            case StorageNodeDiskPressure::kLow:
+                return 0;
+            case StorageNodeDiskPressure::kMedium:
+                return 1;
+            case StorageNodeDiskPressure::kHigh:
+                return 2;
+            case StorageNodeDiskPressure::kFull:
+                return 3;
+            }
+
+            return 4;
+        }
+
+        ReadReplicaCandidate BuildReadReplicaCandidateFromRegistrySnapshot(
+            const StorageNodeRegistryNodeSnapshot &snapshot)
+        {
+            ReadReplicaCandidate candidate;
+            candidate.node_id = snapshot.node_id;
+            candidate.health = snapshot.facts.health.health;
+            candidate.disk_pressure = snapshot.facts.health.disk_pressure;
+            candidate.load = snapshot.facts.load.load;
+            candidate.stale = snapshot.liveness != StorageNodeRegistryLiveness::kLive;
+            candidate.read_admission_overloaded =
+                snapshot.facts.load.read_admission_overloaded;
+            candidate.has_observed_facts = true;
+            return candidate;
+        }
+
+        ReadReplicaCandidate MergeReadReplicaCandidates(
+            const ReadReplicaCandidate &registry_candidate,
+            const ReadReplicaCandidate &supplemental_candidate)
+        {
+            auto merged = registry_candidate;
+            merged.known_corrupted = registry_candidate.known_corrupted ||
+                                     supplemental_candidate.known_corrupted;
+            merged.known_missing = registry_candidate.known_missing ||
+                                   supplemental_candidate.known_missing;
+            merged.stale = registry_candidate.stale || supplemental_candidate.stale;
+            merged.read_admission_overloaded =
+                registry_candidate.read_admission_overloaded ||
+                supplemental_candidate.read_admission_overloaded;
+            merged.has_observed_facts = registry_candidate.has_observed_facts ||
+                                        supplemental_candidate.has_observed_facts;
+            return merged;
         }
     }
 
@@ -524,6 +576,13 @@ namespace storedemo
                                         ReadHealthRank(rhs.candidate.health);
                              }
 
+                             if (ReadDiskPressureRank(lhs.candidate.disk_pressure) !=
+                                 ReadDiskPressureRank(rhs.candidate.disk_pressure))
+                             {
+                                 return ReadDiskPressureRank(lhs.candidate.disk_pressure) <
+                                        ReadDiskPressureRank(rhs.candidate.disk_pressure);
+                             }
+
                              if (lhs.candidate.load.active_reads != rhs.candidate.load.active_reads)
                              {
                                  return lhs.candidate.load.active_reads <
@@ -555,12 +614,85 @@ namespace storedemo
         }
 
         result.decision.reasons.push_back(
-            "read replicas are ordered by observed health, lower active_reads, lower inflight load, then manifest order");
+            "read replicas are ordered by observed health, lower disk pressure, lower active_reads, lower inflight load, then manifest order");
         if (observed_candidates.size() < request.replica_nodes.size())
         {
             result.decision.reasons.push_back(
                 "replicas without observed facts remain eligible and preserve manifest order as neutral fallback candidates");
         }
+        return result;
+    }
+
+    ReadReplicaSelectionResult ReplicaPolicySelector::SelectReadReplicas(
+        const ReadReplicaSelectionRequest &request,
+        const StorageNodeRegistrySnapshotResult &registry_snapshot,
+        const std::span<const ReadReplicaCandidate> supplemental_candidates) const
+    {
+        ReadReplicaSelectionResult result;
+        result.decision.chunk_id = request.chunk_id;
+
+        if (!registry_snapshot.ok())
+        {
+            result.status = registry_snapshot.status;
+            result.error_detail = registry_snapshot.error_detail;
+            result.decision.reasons.push_back(
+                "read replica selection could not consume registry snapshot");
+            return result;
+        }
+
+        std::unordered_map<std::string, ReadReplicaCandidate> merged_candidates_by_node;
+        merged_candidates_by_node.reserve(registry_snapshot.nodes.size() +
+                                          supplemental_candidates.size());
+        for (const auto &snapshot : registry_snapshot.nodes)
+        {
+            if (snapshot.node_id.empty())
+            {
+                continue;
+            }
+
+            merged_candidates_by_node.insert_or_assign(
+                snapshot.node_id,
+                BuildReadReplicaCandidateFromRegistrySnapshot(snapshot));
+        }
+
+        for (const auto &candidate : supplemental_candidates)
+        {
+            if (candidate.node_id.empty())
+            {
+                continue;
+            }
+
+            const auto existing = merged_candidates_by_node.find(candidate.node_id);
+            if (existing == merged_candidates_by_node.end())
+            {
+                auto observed = candidate;
+                observed.has_observed_facts = true;
+                merged_candidates_by_node.insert_or_assign(candidate.node_id,
+                                                           std::move(observed));
+                continue;
+            }
+
+            existing->second =
+                MergeReadReplicaCandidates(existing->second, candidate);
+        }
+
+        std::vector<ReadReplicaCandidate> merged_candidates;
+        merged_candidates.reserve(merged_candidates_by_node.size());
+        for (auto &[node_id, candidate] : merged_candidates_by_node)
+        {
+            (void)node_id;
+            merged_candidates.push_back(std::move(candidate));
+        }
+
+        result = SelectReadReplicas(request, merged_candidates);
+        result.decision.reasons.insert(
+            result.decision.reasons.begin(),
+            "read replica selection consumed " +
+                std::to_string(registry_snapshot.nodes.size()) +
+                " registry snapshot nodes");
+        result.decision.reasons.insert(
+            result.decision.reasons.begin() + 1,
+            "registry snapshot facts override node health/load/disk pressure while preserving chunk-specific corruption and missing facts");
         return result;
     }
 }

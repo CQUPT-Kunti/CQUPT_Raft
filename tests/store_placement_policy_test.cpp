@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "store/placement/replica_policy.h"
+#include "store/node/storage_node_registry.h"
 #include "support/store_test_utils.h"
 
 namespace
@@ -59,6 +60,30 @@ namespace
         candidate.load.active_reads = active_reads;
         candidate.has_observed_facts = true;
         return candidate;
+    }
+
+    storedemo::StorageNodeRegistryNodeSnapshot MakeRegistryReadSnapshot(
+        const std::size_t index,
+        const std::uint32_t active_reads = 0,
+        const storedemo::StorageNodeHealth health =
+            storedemo::StorageNodeHealth::kHealthy,
+        const storedemo::StorageNodeDiskPressure disk_pressure =
+            storedemo::StorageNodeDiskPressure::kLow,
+        const storedemo::StorageNodeRegistryLiveness liveness =
+            storedemo::StorageNodeRegistryLiveness::kLive)
+    {
+        storedemo::StorageNodeRegistryNodeSnapshot snapshot;
+        snapshot.node_id = storedemo::test::MakeStorageNodeIdFixture(index);
+        snapshot.endpoint = "127.0.0.1:" + std::to_string(6100 + index);
+        snapshot.last_sequence = index;
+        snapshot.last_seen_unix_ms = 100 + index;
+        snapshot.liveness = liveness;
+        snapshot.facts.health.health = health;
+        snapshot.facts.health.disk_pressure = disk_pressure;
+        snapshot.facts.load.load.active_reads = active_reads;
+        snapshot.facts.load.load.active_writes = active_reads / 2;
+        snapshot.facts.load.load.queued_ops = active_reads / 3;
+        return snapshot;
     }
 
     const storedemo::PlacementNodeExclusion *FindExclusion(
@@ -492,5 +517,143 @@ namespace
 
         EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kInvalidArgument);
         EXPECT_TRUE(result.decision.ordered_replicas.empty());
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionFromRegistryPrefersFreshHealthyLowLoadReplicas)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t066-fresh~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3),
+            storedemo::test::MakeStorageNodeIdFixture(4)};
+
+        storedemo::StorageNodeRegistrySnapshotResult registry_snapshot;
+        registry_snapshot.generated_at_unix_ms = 200;
+        registry_snapshot.nodes = {
+            MakeRegistryReadSnapshot(1, 9),
+            MakeRegistryReadSnapshot(2, 1),
+            MakeRegistryReadSnapshot(3,
+                                     2,
+                                     storedemo::StorageNodeHealth::kHealthy,
+                                     storedemo::StorageNodeDiskPressure::kLow,
+                                     storedemo::StorageNodeRegistryLiveness::kStale),
+            MakeRegistryReadSnapshot(4,
+                                     3,
+                                     storedemo::StorageNodeHealth::kDegraded)};
+
+        const auto result = selector.SelectReadReplicas(
+            request,
+            registry_snapshot,
+            std::span<const storedemo::ReadReplicaCandidate>{});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 3U);
+        EXPECT_EQ(result.decision.ordered_replicas[0].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(2));
+        EXPECT_EQ(result.decision.ordered_replicas[1].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(result.decision.ordered_replicas[2].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(4));
+
+        const auto *stale_exclusion = FindExclusion(
+            result.decision.excluded_nodes,
+            storedemo::test::MakeStorageNodeIdFixture(3));
+        ASSERT_NE(stale_exclusion, nullptr);
+        EXPECT_EQ(stale_exclusion->reason, "node facts are stale");
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionFromRegistryDownranksHighDiskPressureAndKeepsUnknownFallback)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t066-pressure~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3)};
+
+        storedemo::StorageNodeRegistrySnapshotResult registry_snapshot;
+        registry_snapshot.generated_at_unix_ms = 200;
+        registry_snapshot.nodes = {
+            MakeRegistryReadSnapshot(1,
+                                     1,
+                                     storedemo::StorageNodeHealth::kHealthy,
+                                     storedemo::StorageNodeDiskPressure::kHigh),
+            MakeRegistryReadSnapshot(2,
+                                     2,
+                                     storedemo::StorageNodeHealth::kHealthy,
+                                     storedemo::StorageNodeDiskPressure::kLow)};
+
+        const auto result = selector.SelectReadReplicas(
+            request,
+            registry_snapshot,
+            std::span<const storedemo::ReadReplicaCandidate>{});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 3U);
+        EXPECT_EQ(result.decision.ordered_replicas[0].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(2));
+        EXPECT_EQ(result.decision.ordered_replicas[1].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(result.decision.ordered_replicas[2].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(3));
+        EXPECT_FALSE(result.decision.ordered_replicas[2].has_observed_facts);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         ReadReplicaSelectionFromRegistryMergesChunkSpecificCorruptionAndMissingFacts)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        storedemo::ReadReplicaSelectionRequest request;
+        request.chunk_id = "obj-t066-merge~1~0";
+        request.replica_nodes = {
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3)};
+
+        storedemo::StorageNodeRegistrySnapshotResult registry_snapshot;
+        registry_snapshot.generated_at_unix_ms = 300;
+        registry_snapshot.nodes = {
+            MakeRegistryReadSnapshot(1, 1),
+            MakeRegistryReadSnapshot(2, 0),
+            MakeRegistryReadSnapshot(3,
+                                     1,
+                                     storedemo::StorageNodeHealth::kUnavailable)};
+
+        const std::vector<storedemo::ReadReplicaCandidate> supplemental_candidates = {
+            storedemo::ReadReplicaCandidate{
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(2),
+                .known_corrupted = true,
+                .has_observed_facts = true}};
+
+        const auto result = selector.SelectReadReplicas(request,
+                                                        registry_snapshot,
+                                                        supplemental_candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.ordered_replicas.size(), 1U);
+        EXPECT_EQ(result.decision.ordered_replicas[0].node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(1));
+
+        const auto *corrupted_exclusion = FindExclusion(
+            result.decision.excluded_nodes,
+            storedemo::test::MakeStorageNodeIdFixture(2));
+        ASSERT_NE(corrupted_exclusion, nullptr);
+        EXPECT_EQ(corrupted_exclusion->reason, "node is marked corrupted for read");
+
+        const auto *unavailable_exclusion = FindExclusion(
+            result.decision.excluded_nodes,
+            storedemo::test::MakeStorageNodeIdFixture(3));
+        ASSERT_NE(unavailable_exclusion, nullptr);
+        EXPECT_EQ(unavailable_exclusion->reason,
+                  "node health is not readable: Unavailable");
     }
 }
