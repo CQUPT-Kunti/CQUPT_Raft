@@ -212,6 +212,9 @@ namespace storedemo
                             MatrixCoverage::kVerifiedHere});
             rows.push_back({"linux-same-filesystem-publish",
                             MatrixCoverage::kVerifiedHere});
+            rows.push_back(
+                {"linux-crash-after-rename-before-parent-directory-sync-contract",
+                 MatrixCoverage::kVerifiedHere});
 #else
             rows.push_back({"linux-fdatasync-data-only-flush",
                             MatrixCoverage::kDeferredHere});
@@ -221,6 +224,9 @@ namespace storedemo
                             MatrixCoverage::kDeferredHere});
             rows.push_back({"linux-same-filesystem-publish",
                             MatrixCoverage::kDeferredHere});
+            rows.push_back(
+                {"linux-crash-after-rename-before-parent-directory-sync-contract",
+                 MatrixCoverage::kDeferredHere});
 #endif
 
 #if defined(_WIN32)
@@ -236,6 +242,9 @@ namespace storedemo
                             MatrixCoverage::kVerifiedHere});
             rows.push_back({"windows-directory-durability-explicit-unsupported",
                             MatrixCoverage::kVerifiedHere});
+            rows.push_back(
+                {"windows-crash-after-rename-before-parent-directory-sync-contract",
+                 MatrixCoverage::kVerifiedHere});
 #else
             rows.push_back({"windows-FlushFileBuffers-flush",
                             MatrixCoverage::kDeferredHere});
@@ -249,6 +258,9 @@ namespace storedemo
                             MatrixCoverage::kDeferredHere});
             rows.push_back({"windows-directory-durability-explicit-unsupported",
                             MatrixCoverage::kDeferredHere});
+            rows.push_back(
+                {"windows-crash-after-rename-before-parent-directory-sync-contract",
+                 MatrixCoverage::kDeferredHere});
 #endif
 
             return rows;
@@ -258,7 +270,7 @@ namespace storedemo
              MatrixClassifiesLinuxWindowsAndPlatformNeutralCoverage)
         {
             const auto rows = BuildCurrentPlatformMatrixRows();
-            ASSERT_GE(rows.size(), 11U);
+            ASSERT_GE(rows.size(), 13U);
 
             for (const auto &row : rows)
             {
@@ -422,6 +434,90 @@ namespace storedemo
                     .context = {}});
             EXPECT_FALSE(missing_directory_sync.ok());
             EXPECT_EQ(missing_directory_sync.error, DurableFileErrorCode::kPathInvalid);
+#endif
+        }
+
+        TEST(StorageCrossPlatformDurabilityTest,
+             LinuxCrashAfterRenameBeforeParentDirectorySyncRequiresExplicitDirectorySync)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP()
+                << "rename-before-parent-directory-sync contract is only runtime-verified on Linux";
+#else
+            test::ScopedStoreTestDir temp_dir(
+                "storage_cross_platform_durability_linux_rename_before_directory_sync");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            const std::string payload =
+                test::MakeChunkPayload(40, "rename-before-directory-sync");
+            auto open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("staging/matrix-rename.tmp"),
+                    .expected_size = static_cast<std::uint64_t>(payload.size()),
+                    .context = {}});
+            ASSERT_TRUE(open_response.ok());
+            ASSERT_NE(open_response.writer, nullptr);
+
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            const auto append_result = open_response.writer->Append(
+                DurableAppendRequest{
+                    .buffer = std::span(payload_bytes, payload.size()),
+                    .context = {}});
+            ASSERT_TRUE(append_result.ok());
+            ASSERT_TRUE(open_response.writer
+                            ->Flush(DurableFlushRequest{
+                                .mode = DurableFlushMode::kDataAndMetadata,
+                                .context = {}})
+                            .ok());
+            ASSERT_TRUE(open_response.writer->Close(DurableCloseRequest{}).ok());
+
+            const auto final_relative_path =
+                std::filesystem::path("chunks/live/matrix-rename.chunk");
+            const auto publish_result = durable_file.PublishStagedFile(
+                PublishDurableFileRequest{
+                    .staging_path = open_response.normalized_path,
+                    .final_path = final_relative_path,
+                    .mode = DurablePublishMode::kExclusive,
+                    .context = {}});
+            ASSERT_TRUE(publish_result.ok());
+            EXPECT_TRUE(publish_result.durable_boundary_reached);
+
+            const auto final_path = temp_dir.Path(final_relative_path.string());
+            ASSERT_TRUE(std::filesystem::exists(final_path));
+
+            std::ifstream input(final_path, std::ios::binary);
+            ASSERT_TRUE(input.is_open());
+            const std::string visible_payload{
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>()};
+            EXPECT_EQ(visible_payload, payload);
+
+            const DurableFileResult directory_sync_not_yet_performed{
+                .error = DurableFileErrorCode::kOk,
+                .durable_boundary_reached = false};
+            EXPECT_FALSE(
+                RequiredDurabilityContractSatisfied(directory_sync_not_yet_performed));
+
+            const bool crash_after_rename_before_directory_sync_is_fully_durable =
+                publish_result.ok() &&
+                publish_result.durable_boundary_reached &&
+                RequiredDurabilityContractSatisfied(directory_sync_not_yet_performed);
+            EXPECT_FALSE(crash_after_rename_before_directory_sync_is_fully_durable);
+
+            const auto sync_result = durable_file.SyncDirectory(
+                SyncDurableDirectoryRequest{
+                    .directory_path = final_path.parent_path(),
+                    .context = {}});
+            ASSERT_TRUE(sync_result.ok());
+            EXPECT_TRUE(sync_result.durable_boundary_reached);
+
+            const bool durable_contract_after_parent_directory_sync =
+                publish_result.ok() &&
+                publish_result.durable_boundary_reached &&
+                sync_result.ok() &&
+                sync_result.durable_boundary_reached;
+            EXPECT_TRUE(durable_contract_after_parent_directory_sync);
 #endif
         }
 
