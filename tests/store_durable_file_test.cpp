@@ -8,6 +8,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "store/io/durable_file.h"
@@ -421,6 +423,100 @@ namespace storedemo
                     .path_type = DurablePathType::kChunkData});
             EXPECT_FALSE(absolute_response.ok());
             EXPECT_EQ(absolute_response.error, DurableFileErrorCode::kPathInvalid);
+        }
+
+        TEST(StoreDurableFileTest,
+             LinuxDurableFileAcceptsUtf8PathsAndRejectsReservedOrTooLongSegments)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_utf8");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            const auto utf8_relative_path =
+                std::filesystem::path("staging/utf8/路径/块.tmp");
+            auto utf8_open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = utf8_relative_path,
+                    .expected_size = 8,
+                    .context = {}});
+            ASSERT_TRUE(utf8_open_response.ok());
+            ASSERT_NE(utf8_open_response.writer, nullptr);
+
+            const std::string payload = "utf8-path";
+            const auto *payload_bytes =
+                reinterpret_cast<const std::byte *>(payload.data());
+            ASSERT_TRUE(utf8_open_response.writer
+                            ->Append(DurableAppendRequest{
+                                .buffer = std::span(payload_bytes, payload.size()),
+                                .context = {}})
+                            .ok());
+            ASSERT_TRUE(utf8_open_response.writer
+                            ->Flush(DurableFlushRequest{
+                                .mode = DurableFlushMode::kDataOnly,
+                                .context = {}})
+                            .ok());
+            EXPECT_TRUE(utf8_open_response.writer->Close(DurableCloseRequest{}).ok());
+            EXPECT_TRUE(std::filesystem::exists(utf8_open_response.normalized_path));
+
+            auto reserved_name_response = durable_file.NormalizePath(
+                NormalizeDurablePathRequest{
+                    .relative_path = std::filesystem::path("CON/chunk.tmp"),
+                    .path_type = DurablePathType::kChunkData});
+            EXPECT_FALSE(reserved_name_response.ok());
+            EXPECT_EQ(reserved_name_response.error, DurableFileErrorCode::kPathInvalid);
+
+            const std::string long_segment(300, 'a');
+            auto long_path_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("staging") /
+                                     std::filesystem::path(long_segment + ".tmp"),
+                    .expected_size = 4,
+                    .context = {}});
+            EXPECT_FALSE(long_path_response.ok());
+            EXPECT_EQ(long_path_response.error, DurableFileErrorCode::kPathInvalid);
+        }
+
+        TEST(StoreDurableFileTest,
+             LinuxDurableFileMapsPermissionDeniedWhenOpeningStagingPath)
+        {
+            test::ScopedStoreTestDir temp_dir("store_durable_file_linux_permissions");
+            LinuxDurableFile durable_file(temp_dir.root());
+
+            const auto locked_directory = temp_dir.Path("locked");
+            std::error_code permissions_error;
+            std::filesystem::create_directories(locked_directory, permissions_error);
+            ASSERT_FALSE(permissions_error) << permissions_error.message();
+
+            const auto original_permissions =
+                std::filesystem::status(locked_directory, permissions_error).permissions();
+            ASSERT_FALSE(permissions_error) << permissions_error.message();
+
+            std::filesystem::permissions(
+                locked_directory,
+                std::filesystem::perms::owner_read |
+                    std::filesystem::perms::owner_exec,
+                std::filesystem::perm_options::replace,
+                permissions_error);
+            ASSERT_FALSE(permissions_error) << permissions_error.message();
+
+            const auto restore_permissions = [&]()
+            {
+                std::error_code restore_error;
+                std::filesystem::permissions(locked_directory,
+                                             original_permissions,
+                                             std::filesystem::perm_options::replace,
+                                             restore_error);
+            };
+
+            auto open_response = durable_file.OpenStagingWriter(
+                OpenStagingWriterRequest{
+                    .relative_path = std::filesystem::path("locked/chunk.tmp"),
+                    .expected_size = 16,
+                    .context = {}});
+
+            restore_permissions();
+
+            EXPECT_FALSE(open_response.ok());
+            EXPECT_EQ(open_response.error, DurableFileErrorCode::kPermissionDenied);
         }
 
         TEST(StoreDurableFileTest, LinuxDurableFileExclusivePublishRejectsExistingTarget)

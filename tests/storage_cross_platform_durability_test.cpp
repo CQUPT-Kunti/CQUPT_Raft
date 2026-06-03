@@ -149,6 +149,17 @@ namespace storedemo
             {
             }
 
+            DurableFileResult open_result{
+                .error = DurableFileErrorCode::kOk};
+            DurableFileResult append_result{
+                .error = DurableFileErrorCode::kOk,
+                .bytes_transferred = 0,
+                .durable_boundary_reached = false};
+            DurableFileResult flush_result{
+                .error = DurableFileErrorCode::kOk,
+                .durable_boundary_reached = true};
+            DurableFileResult close_result{
+                .error = DurableFileErrorCode::kOk};
             DurableFileResult publish_result{
                 .error = DurableFileErrorCode::kOk,
                 .durable_boundary_reached = true};
@@ -171,8 +182,25 @@ namespace storedemo
                 OpenStagingWriterResponse response;
                 response.normalized_path =
                     (root_path_ / request.relative_path).lexically_normal();
-                response.writer =
+                response.error = open_result.error;
+                response.error_detail = open_result.error_detail;
+                response.retry_after_ms = open_result.retry_after_ms;
+                response.bytes_transferred = open_result.bytes_transferred;
+                response.durable_boundary_reached =
+                    open_result.durable_boundary_reached;
+                response.partial_progress = open_result.partial_progress;
+                if (!response.ok())
+                {
+                    return response;
+                }
+
+                auto writer =
                     std::make_unique<FakeDurableFileWriter>(response.normalized_path);
+                writer->append_result = append_result;
+                writer->flush_result = flush_result;
+                writer->close_result = close_result;
+                response.writer =
+                    std::move(writer);
                 return response;
             }
 
@@ -212,6 +240,14 @@ namespace storedemo
                             MatrixCoverage::kVerifiedHere});
             rows.push_back({"linux-same-filesystem-publish",
                             MatrixCoverage::kVerifiedHere});
+            rows.push_back({"linux-path-invalid-and-reserved-name-classification",
+                            MatrixCoverage::kVerifiedHere});
+            rows.push_back({"linux-permission-denied-classification",
+                            MatrixCoverage::kVerifiedHere});
+            rows.push_back({"linux-disk-full-failure-injection-contract",
+                            MatrixCoverage::kVerifiedHere});
+            rows.push_back({"linux-utf8-safe-path-contract",
+                            MatrixCoverage::kVerifiedHere});
             rows.push_back(
                 {"linux-crash-after-rename-before-parent-directory-sync-contract",
                  MatrixCoverage::kVerifiedHere});
@@ -223,6 +259,14 @@ namespace storedemo
             rows.push_back({"linux-parent-directory-sync",
                             MatrixCoverage::kDeferredHere});
             rows.push_back({"linux-same-filesystem-publish",
+                            MatrixCoverage::kDeferredHere});
+            rows.push_back({"linux-path-invalid-and-reserved-name-classification",
+                            MatrixCoverage::kDeferredHere});
+            rows.push_back({"linux-permission-denied-classification",
+                            MatrixCoverage::kDeferredHere});
+            rows.push_back({"linux-disk-full-failure-injection-contract",
+                            MatrixCoverage::kDeferredHere});
+            rows.push_back({"linux-utf8-safe-path-contract",
                             MatrixCoverage::kDeferredHere});
             rows.push_back(
                 {"linux-crash-after-rename-before-parent-directory-sync-contract",
@@ -237,6 +281,11 @@ namespace storedemo
             rows.push_back({"windows-replace-existing-publish-contract",
                             MatrixCoverage::kVerifiedHere});
             rows.push_back({"windows-long-path-and-utf8-path-contract",
+                            MatrixCoverage::kVerifiedHere});
+            rows.push_back(
+                {"windows-permission-denied-and-disk-full-classification-contract",
+                 MatrixCoverage::kVerifiedHere});
+            rows.push_back({"windows-reserved-name-path-contract",
                             MatrixCoverage::kVerifiedHere});
             rows.push_back({"windows-sharing-violation-contract",
                             MatrixCoverage::kVerifiedHere});
@@ -253,6 +302,11 @@ namespace storedemo
             rows.push_back({"windows-replace-existing-publish-contract",
                             MatrixCoverage::kDeferredHere});
             rows.push_back({"windows-long-path-and-utf8-path-contract",
+                            MatrixCoverage::kDeferredHere});
+            rows.push_back(
+                {"windows-permission-denied-and-disk-full-classification-contract",
+                 MatrixCoverage::kDeferredHere});
+            rows.push_back({"windows-reserved-name-path-contract",
                             MatrixCoverage::kDeferredHere});
             rows.push_back({"windows-sharing-violation-contract",
                             MatrixCoverage::kDeferredHere});
@@ -270,7 +324,7 @@ namespace storedemo
              MatrixClassifiesLinuxWindowsAndPlatformNeutralCoverage)
         {
             const auto rows = BuildCurrentPlatformMatrixRows();
-            ASSERT_GE(rows.size(), 13U);
+            ASSERT_GE(rows.size(), 19U);
 
             for (const auto &row : rows)
             {
@@ -528,7 +582,8 @@ namespace storedemo
             GTEST_SKIP()
                 << "Windows durability runtime validation is deferred on this Linux environment: "
                 << "FlushFileBuffers, MoveFileEx publish, ReplaceExisting publish contract, "
-                << "long path / UTF-8 path, sharing violation, directory durability";
+                << "long path / UTF-8 path, permission denied, disk full, "
+                << "reserved name, sharing violation, directory durability";
 #else
             test::ScopedStoreTestDir temp_dir(
                 "storage_cross_platform_durability_windows_runtime");
@@ -605,6 +660,79 @@ namespace storedemo
             EXPECT_FALSE(directory_sync_result.ok());
             EXPECT_EQ(directory_sync_result.error, DurableFileErrorCode::kUnsupported);
 #endif
+        }
+
+        TEST(StorageCrossPlatformDurabilityTest,
+             LocalDiskChunkStorePropagatesDurableFilePathPermissionAndDiskFullErrors)
+        {
+            struct StoreWriteErrorCase
+            {
+                const char *name;
+                DurableFileResult open_result;
+                DurableFileResult append_result;
+                StorageNodeStatusCode expected_status;
+            };
+
+            const std::vector<StoreWriteErrorCase> cases = {
+                {"path-invalid-open",
+                 DurableFileResult{
+                     .error = DurableFileErrorCode::kPathInvalid,
+                     .error_detail = "invalid durable path"},
+                 DurableFileResult{},
+                 StorageNodeStatusCode::kInvalidArgument},
+                {"permission-denied-open",
+                 DurableFileResult{
+                     .error = DurableFileErrorCode::kPermissionDenied,
+                     .error_detail = "permission denied opening staging path"},
+                 DurableFileResult{},
+                 StorageNodeStatusCode::kPermissionDenied},
+                {"disk-full-append",
+                 DurableFileResult{},
+                 DurableFileResult{
+                     .error = DurableFileErrorCode::kDiskFull,
+                     .error_detail = "disk full while appending payload"},
+                 StorageNodeStatusCode::kDiskFull},
+            };
+
+            for (const auto &test_case : cases)
+            {
+                test::ScopedStoreTestDir temp_dir(
+                    std::string("storage_cross_platform_store_error_") +
+                    test_case.name);
+                const auto chunk_index = std::make_shared<ShardedChunkIndex>();
+                auto durable_file =
+                    std::make_shared<FakeDurableFile>(temp_dir.root());
+                durable_file->open_result = test_case.open_result;
+                durable_file->append_result = test_case.append_result;
+
+                LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                    .data_dir = temp_dir.Path("node-data"),
+                    .node_id = std::string("error-case-") + test_case.name,
+                    .durable_file = durable_file,
+                    .chunk_index = chunk_index,
+                    .executor = nullptr});
+                ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk)
+                    << test_case.name;
+
+                const auto identity =
+                    MakeIdentityOrThrow(std::string("error-case-object-") +
+                                            test_case.name,
+                                        1,
+                                        0,
+                                        0);
+                const auto response = store.WriteChunk(
+                    MakeWriteRequest(identity,
+                                     test::MakeChunkPayload(24, test_case.name),
+                                     std::string("write-") + test_case.name));
+
+                EXPECT_EQ(response.status, test_case.expected_status)
+                    << test_case.name;
+                EXPECT_FALSE(response.ok()) << test_case.name;
+
+                const auto index_find = chunk_index->Find(identity.chunk_id);
+                EXPECT_EQ(index_find.status, StorageNodeStatusCode::kNotFound)
+                    << test_case.name;
+            }
         }
 
         TEST_P(LocalDiskChunkStoreDurabilityMatrixTest,

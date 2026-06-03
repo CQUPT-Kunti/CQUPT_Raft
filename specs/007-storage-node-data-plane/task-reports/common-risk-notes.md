@@ -158,9 +158,14 @@
 - 任务编号：T073
   问题：T073 已用 test-only crash / recovery matrix 固定了 staging-only、visible live final、stale staging cleanup 顺序、quarantine 恢复等本地目录事实驱动的重启 contract；但当前仍不是 `kill -9` / 断电级 durability 验证，也没有 Windows publish/rename/directory durability 的实机 crash matrix。
   影响：如果后续把 T073 的测试通过误读成“真实断电级 crash recovery 已完全验证”，就会高估 Linux parent directory sync 与 Windows rename/delete/sharing violation 在真实故障中的运行语义；当前保证的是给定重启后可观察到的本地文件事实，`LocalDiskChunkStore` 如何重建可见性。
-  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN`、T075 及后续 Windows/断电级恢复验证任务中继续补真实 durability crash seam 与平台差异。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN` 及后续 Windows/断电级恢复验证任务中继续补真实 durability crash seam 与平台差异。
 
 - 任务编号：T074
   问题：T074 已在 cross-platform durability matrix 中补上“rename 后、parent directory sync 前 crash contract”测试，明确 Linux 当前环境下 publish/rename 后 final 文件可见不等于 crash 后 durable，只有 parent directory sync 成功后才把完整 durable-after-crash contract 视为满足；但这仍不是 `kill -9` / 断电级证明，Windows 也仍只有 contract-only / deferred。
   影响：如果后续把 T074 的通过误读成“Linux 真实断电级语义已完全证明”或“Windows rename/directory durability 已实机验证”，仍会高估 parent directory sync 边界和 Windows publish/runtime 行为的可信度。
-  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN`、T075 及后续真实断电级 durability / Windows crash 验证任务中继续补 runtime 证据和必要修正。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN` 及后续真实断电级 durability / Windows crash 验证任务中继续补 runtime 证据和必要修正。
+
+- 任务编号：T075
+  问题：T075 已在 Linux 当前环境下固定 `durable_file` / `LocalDiskChunkStore` 的 path invalid、reserved name、UTF-8 safe path、permission denied 和 disk-full failure-injection contract，并把 Windows long path / UTF-8 / permission denied / disk full / reserved name / sharing violation 继续表达为 contract-only / deferred；但当前仍没有 Windows 实机编译/运行证据，也没有真实磁盘打满或 Windows sharing violation 的 runtime 观测。
+  影响：如果后续把 T075 的通过误读成“Windows 路径/错误分类已实机验证完成”，仍会高估 Win32 路径编码、long path、sharing violation 和磁盘满场景的真实行为；当前保证的是 Linux + contract-only 层面的统一分类，不是 Windows runtime 已收口。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN`、`T025-WIN`、`T026-WIN` 及后续 Windows cross-platform/runtime 验证任务中继续补实机证据和必要修正。
