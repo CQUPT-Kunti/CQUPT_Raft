@@ -168,19 +168,19 @@
 
 ### Tests for User Story 5
 
-- [ ] T068 [P] [US5] 添加 restart index rebuild 测试；允许修改：`tests/store_recovery_test.cpp`、`tests/CMakeLists.txt`；验收：final live chunk 重建进 index，staging 不进入 live；依赖：T025
+- [x] T068 [P] [US5] 添加 restart index rebuild 测试；实际修改：`tests/storage_node_recovery_test.cpp`、`tests/CMakeLists.txt`、`specs/007-storage-node-data-plane/task-reports/t068-restart-index-rebuild-test.md`、`specs/007-storage-node-data-plane/task-reports/common-risk-notes.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：test-only recovery scanner 固定 final/live chunk 重建、staging/partial staging 不进入 live index、deleted/deleting/quarantined/corrupted 不误入 live index、malformed/duplicate 行为固定，且当前 Linux 环境下 `storage_node_recovery` 验证 PASS；依赖：T025
 - [ ] T069 [P] [US5] 添加跨平台 durability 矩阵测试；允许修改：`tests/storage_cross_platform_durability_test.cpp`、`tests/CMakeLists.txt`；验收：覆盖 Linux fsync/fdatasync/directory sync 和 Windows FlushFileBuffers/MoveFileEx/ReplaceFile contract；依赖：T013、T014
 
 ### Implementation for User Story 5
 
 - [ ] T070 [US5] 实现 `LocalDiskChunkStore::RebuildIndexFromDisk`；允许修改：`modules/store/chunk/local_disk_chunk_store.h`、`modules/store/chunk/local_disk_chunk_store.cpp`；验收：扫描 final/staging/quarantine/deleting 并重建 ChunkIndex；依赖：T025
-- [ ] T071 [US5] 实现 stale staging cleanup 和 partial write detection；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/store_recovery_test.cpp`；验收：incomplete staging 删除或隔离，size/checksum 不一致不进入 live index；依赖：T070
-- [ ] T072 [US5] 实现 corrupted chunk quarantine；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/store_recovery_test.cpp`；验收：扫描或读取 checksum mismatch 后进入 quarantine/corrupted，不作为健康副本返回；依赖：T071
-- [ ] T073 [US5] 覆盖 crash before fsync 和 crash after fsync before rename；允许修改：`tests/store_recovery_test.cpp`、`tests/support/store_test_utils.h`；验收：低并发运行，重启后无 partial live chunk；依赖：T071
+- [ ] T071 [US5] 实现 stale staging cleanup 和 partial write detection；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/storage_node_recovery_test.cpp`；验收：incomplete staging 删除或隔离，size/checksum 不一致不进入 live index；依赖：T070
+- [ ] T072 [US5] 实现 corrupted chunk quarantine；允许修改：`modules/store/chunk/local_disk_chunk_store.cpp`、`tests/storage_node_recovery_test.cpp`；验收：扫描或读取 checksum mismatch 后进入 quarantine/corrupted，不作为健康副本返回；依赖：T071
+- [ ] T073 [US5] 覆盖 crash before fsync 和 crash after fsync before rename；允许修改：`tests/storage_node_recovery_test.cpp`、`tests/support/store_test_utils.h`；验收：低并发运行，重启后无 partial live chunk；依赖：T071
 - [ ] T074 [US5] 覆盖 crash after rename before parent directory sync 的平台 contract；允许修改：`tests/storage_cross_platform_durability_test.cpp`；验收：Linux 验证 directory sync，Windows 明确 supported/weaker/unsupported contract，不允许 no-op success；依赖：T069、T073
 - [ ] T075 [US5] 覆盖 Windows long path、UTF-8 path、permission denied、disk full 错误分类；允许修改：`tests/storage_cross_platform_durability_test.cpp`、`modules/store/io/durable_file.cpp`；验收：Windows 和 Linux 分支错误分类一致，路径错误不静默成功；依赖：T014、T015
-- [ ] T076 [US5] 覆盖 orphan chunk metadata-driven GC 边界；允许修改：`tests/store_recovery_test.cpp`、`tests/storage_delete_gc_test.cpp`；验收：本地 orphan 只有经 metadata live manifest 保护检查后才可删除；依赖：T055、T070
-- [ ] T077 [US5] 运行 US5 低并发恢复验证；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ctest -R "store_recovery|storage_cross_platform_durability" --output-on-failure`；验收：PASS；依赖：T068-T076
+- [ ] T076 [US5] 覆盖 orphan chunk metadata-driven GC 边界；允许修改：`tests/storage_node_recovery_test.cpp`、`tests/storage_delete_gc_test.cpp`；验收：本地 orphan 只有经 metadata live manifest 保护检查后才可删除；依赖：T055、T070
+- [ ] T077 [US5] 运行 US5 低并发恢复验证；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ctest -R "storage_node_recovery|storage_cross_platform_durability" --output-on-failure`；验收：PASS；依赖：T068-T076
 
 ## Phase 8: User Story 6 - 自动修复和再均衡 chunk 副本 (Priority: P6)
 

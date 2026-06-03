@@ -129,3 +129,8 @@
   问题：T066 已把生产 `StorageNodeRegistry` snapshot/facts 接到 read replica selection，并固定了 healthy/fresh/low-load 优先、stale/unavailable/overloaded/corrupted 跳过、high/full disk pressure 降权、unknown facts 保留 manifest fallback 的 contract；但当前仍没有 failure cache、recent failure scoring、corruption 自动状态回写或 registry snapshot freshness 的独立时钟源。
   影响：如果把当前 registry-aware read selection 当成完整生产读路径治理已完成，后续仍可能在重复失败副本的短期记忆、坏块自动沉淀、以及“snapshot 何时算新鲜”的生产时钟协议上暴露语义缺口。
   建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 time-source 规范任务中继续收口，不要在 T066 里扩展成 repair / corruption 自动回写。
+
+- 任务编号：T068
+  问题：T068 已用 test-only restart scanner 固定了“只依据本地磁盘事实重建 live ChunkIndex”的最小 contract，并明确 staging、partial staging、deleted/deleting/quarantined/corrupted 路径事实不能误入 live index；但当前 `chunks/live/*.chunk` 仍只持久化 payload bytes，本地磁盘上没有额外 sidecar 或状态编码可直接支撑“原始预期 checksum mismatch”“deleted tombstone 持久化”“quarantine/corrupted 已确认状态”这类恢复判定。
+  影响：如果后续把 T068 的测试通过误当成生产 `RebuildIndexFromDisk()`、stale staging cleanup、corrupted quarantine 都已具备，T070-T072 仍可能在 on-disk state encoding、partial write 检测和坏块隔离语义上出现实现分歧；尤其 checksum mismatch 不能仅靠当前 live 文件自描述事实独立判定。
+  建议后续在哪类任务处理：在 T070-T072 中明确生产扫描时使用的 on-disk facts、状态目录/sidecar 或等价恢复语义；不要在 T068 里把 test-only scanner 伪装成生产恢复实现。

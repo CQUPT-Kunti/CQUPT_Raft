@@ -392,6 +392,28 @@ else()
   message(STATUS "Skip test_local_disk_chunk_store: local_disk_chunk_store_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_node_recovery_test.cpp")
+  add_executable(test_storage_node_recovery
+    storage_node_recovery_test.cpp
+  )
+
+  target_link_libraries(test_storage_node_recovery
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_node_recovery
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_node_recovery test_storage_node_recovery
+    "${RAFT_STORE_LABELS_RECOVERY}")
+else()
+  message(STATUS "Skip test_storage_node_recovery: storage_node_recovery_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_integration_test.cpp")
   add_executable(test_storage_upload_integration
     storage_upload_integration_test.cpp
