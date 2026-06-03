@@ -368,7 +368,7 @@ namespace storedemo
                          ComputeChecksumOrThrow(second_payload));
     }
 
-    TEST(StorageNodeRecoveryTest, InitializeSkipsStagingPartialAndNonLiveStatusFacts)
+    TEST(StorageNodeRecoveryTest, InitializeSkipsStagingPartialAndRecoversQuarantinedFacts)
     {
         test::ScopedStoreTestDir temp_dir("storage_node_recovery_skips_non_live_facts");
 
@@ -440,6 +440,19 @@ namespace storedemo
         ASSERT_EQ(list_response.chunks.size(), 1U);
         EXPECT_EQ(list_response.chunks[0].identity.chunk_id, live_identity.chunk_id);
 
+        auto quarantine_list_request = MakeListRequest("restart-quarantine-list");
+        quarantine_list_request.options.include_quarantine = true;
+        const auto quarantine_list_response =
+            restarted_store.ListChunks(quarantine_list_request);
+        ASSERT_EQ(quarantine_list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(quarantine_list_response.chunks.size(), 2U);
+        EXPECT_EQ(quarantine_list_response.chunks[0].identity.chunk_id, live_identity.chunk_id);
+        EXPECT_EQ(quarantine_list_response.chunks[0].state, ChunkState::kLive);
+        EXPECT_EQ(quarantine_list_response.chunks[1].identity.chunk_id,
+                  quarantined_identity.chunk_id);
+        EXPECT_EQ(quarantine_list_response.chunks[1].state,
+                  ChunkState::kQuarantined);
+
         EXPECT_EQ(restarted_store.StatChunk(
                       MakeStatRequest(staging_identity.chunk_id, "restart-stage-stat"))
                       .status,
@@ -461,7 +474,17 @@ namespace storedemo
                       MakeStatRequest(quarantined_identity.chunk_id,
                                       "restart-quarantined-stat"))
                       .status,
-                  StorageNodeStatusCode::kNotFound);
+                  StorageNodeStatusCode::kOk);
+        EXPECT_EQ(restarted_store.StatChunk(
+                      MakeStatRequest(quarantined_identity.chunk_id,
+                                      "restart-quarantined-stat"))
+                      .metadata.state,
+                  ChunkState::kQuarantined);
+        EXPECT_EQ(restarted_store.ReadChunk(
+                      MakeReadRequest(quarantined_identity.chunk_id,
+                                      "restart-quarantined-read"))
+                      .status,
+                  StorageNodeStatusCode::kCorrupted);
         EXPECT_EQ(restarted_store.StatChunk(
                       MakeStatRequest(corrupted_identity.chunk_id,
                                       "restart-corrupted-stat"))
@@ -601,6 +624,65 @@ namespace storedemo
                   static_cast<std::uint64_t>(live_payload.size()));
         ExpectChecksumEq(live_entry.entry.checksum,
                          ComputeChecksumOrThrow(live_payload));
+    }
+
+    TEST(StorageNodeRecoveryTest, RestartPreservesQuarantinedChunkFactsAfterReadTimeDetection)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "read-time quarantine recovery is only verified on Linux in this environment";
+#else
+        test::ScopedStoreTestDir temp_dir(
+            "storage_node_recovery_preserves_quarantine_after_read");
+
+        auto original_index = std::make_shared<ShardedChunkIndex>();
+        auto original_store = MakeStore(temp_dir.root(), original_index);
+        ASSERT_EQ(original_store.Initialize().status, StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeIdentityOrThrow("restart-quarantine-read", 6, 0, 0);
+        const auto payload = test::MakeChunkPayload(27, "restart-quarantine-read");
+        ASSERT_EQ(original_store.WriteChunk(
+                      MakeWriteRequest(identity,
+                                       payload,
+                                       "restart-quarantine-read-write"))
+                      .status,
+                  StorageNodeStatusCode::kOk);
+
+        const auto final_path =
+            ResolveFinalPathOrThrow(temp_dir.root(), identity.chunk_id);
+        WriteBinaryFileOrThrow(final_path,
+                               test::MakeChunkPayload(payload.size(),
+                                                      "restart-tampered"));
+
+        const auto read_response =
+            original_store.ReadChunk(MakeReadRequest(identity.chunk_id,
+                                                     "restart-quarantine-read-detect"));
+        ASSERT_EQ(read_response.status, StorageNodeStatusCode::kCorrupted);
+
+        auto rebuilt_index = std::make_shared<ShardedChunkIndex>();
+        auto restarted_store = MakeStore(temp_dir.root(), rebuilt_index);
+        const auto init_result = restarted_store.Initialize();
+        ASSERT_EQ(init_result.status, StorageNodeStatusCode::kOk)
+            << init_result.error_detail;
+
+        auto list_request = MakeListRequest("restart-quarantine-read-list");
+        list_request.options.include_quarantine = true;
+        const auto list_response = restarted_store.ListChunks(list_request);
+        ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(list_response.chunks.size(), 1U);
+        EXPECT_EQ(list_response.chunks[0].identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(list_response.chunks[0].state, ChunkState::kQuarantined);
+
+        const auto stat_response =
+            restarted_store.StatChunk(MakeStatRequest(identity.chunk_id,
+                                                      "restart-quarantine-read-stat"));
+        ASSERT_EQ(stat_response.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(stat_response.metadata.state, ChunkState::kQuarantined);
+
+        const auto restarted_read =
+            restarted_store.ReadChunk(MakeReadRequest(identity.chunk_id,
+                                                      "restart-quarantine-read-after"));
+        EXPECT_EQ(restarted_read.status, StorageNodeStatusCode::kCorrupted);
+#endif
     }
 
     TEST(StorageNodeRecoveryTest, InitializeCleansUpStaleAndPartialStagingWithoutAffectingLiveChunks)

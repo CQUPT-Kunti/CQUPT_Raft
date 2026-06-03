@@ -36,9 +36,9 @@
   建议后续在哪类任务处理：在后续 store runtime / LocalDiskChunkStore 接入任务中，继续按 owner 线程停机模型使用；如确实需要 worker 内触发停机，再单独演进生命周期协议。
 
 - 任务编号：T021
-  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()`、`Initialize()` 自动 live index rebuild，以及基于 grace period 的 stale staging cleanup；但 corrupted/quarantine 状态治理和更强的 metadata freshness 判定仍未实现。
-  影响：重启后现在能重新发现 canonical live final chunk，并清理超过阈值的 stale/partial staging；但坏块隔离、deleted/quarantined 持久状态恢复和 metadata 事实新鲜度仍未收口。
-  建议后续在哪类任务处理：在 T072 及相关恢复任务中继续补齐 corrupted/quarantine 治理，并在后续 metadata fact source 任务里收紧 freshness 边界。
+  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()`、`Initialize()` 自动 live/quarantine index rebuild、stale staging cleanup，以及 read/stat 发现坏块后的 quarantine；但更强的 metadata freshness 判定、后台 scrub/repair 联动和“从未被标记过的 live 文件损坏”主动发现仍未实现。
+  影响：重启后现在能重新发现 canonical live final chunk、恢复本地 quarantine 事实并清理 stale/partial staging；但 deleted/deleting 等更完整持久状态恢复、元数据事实新鲜度和主动巡检仍未收口。
+  建议后续在哪类任务处理：在后续 scrub/repair、metadata fact source 和 crash matrix 任务中继续收紧 freshness、主动发现和后台治理边界。
 
 - 任务编号：T023
   问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
@@ -46,9 +46,9 @@
   建议后续在哪类任务处理：执行 `T023-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
 
 - 任务编号：T024
-  问题：`LocalDiskChunkStore::ReadChunk()` 已经固定为 full read + checksum on read；T047 也补了“checksum mismatch 不向上层返回有效 payload、quarantined/corrupted 状态拒读、坏文件读取后不自动把 index 改写为 quarantine”的测试边界。但当前发现文件大小或 checksum 与 index metadata 不一致时，store 仍只返回明确错误，还不会把本地 index 状态自动写回 `CORRUPTED` / `QUARANTINED`。
-  影响：前台读取已经不会把损坏数据当成功返回，测试层也已经把 quarantine/corrupted 的拒读和 fallback 边界固定；但后续如果需要基于读路径直接沉淀损坏事实、触发真实隔离、后台清理或给 scrub/repair 复用，还需要补状态回写与恢复协同。
-  建议后续在哪类任务处理：在后续 T恢复/scrub/repair 相关任务中，再统一收紧 corruption 状态写回、隔离和恢复边界。
+  问题：`LocalDiskChunkStore::ReadChunk()` / `StatChunk(verify_checksum=true)` 现在会在发现文件大小或 checksum 与 index metadata 不一致时返回明确错误，并把本地 final chunk 移入 quarantine、更新 index 为 `kQuarantined`；但当前仍没有后台 scrub/failure cache/recent failure scoring，也不会自动修复或向 registry/metadata 传播坏块事实。
+  影响：前台读取已经不会把损坏数据当成功返回，重启后也能恢复本地 quarantine 事实；但后续如果需要跨副本短期记忆、后台治理或统一 control-plane 消费，还需要继续补 failure cache、scrub/repair 和事实传播。
+  建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 registry-facts 任务中继续收口，不要把当前前台 quarantine 误当成完整坏块治理闭环。
 
 - 任务编号：T025
   问题：`LocalDiskChunkStore::DeleteChunk()` 现已接入真实文件删除和 `DELETED` index 状态更新，但当前环境没有 Windows 实机验证能力，`std::filesystem::remove` 在 sharing violation / open-handle / unlink 语义上的真实行为仍未验证。
@@ -131,9 +131,9 @@
   建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 time-source 规范任务中继续收口，不要在 T066 里扩展成 repair / corruption 自动回写。
 
 - 任务编号：T068
-  问题：T068 已用 test-only restart scanner 固定了“只依据本地磁盘事实重建 live ChunkIndex”的最小 contract，并明确 staging、partial staging、deleted/deleting/quarantined/corrupted 路径事实不能误入 live index；但当前 `chunks/live/*.chunk` 仍只持久化 payload bytes，本地磁盘上没有额外 sidecar 或状态编码可直接支撑“原始预期 checksum mismatch”“deleted tombstone 持久化”“quarantine/corrupted 已确认状态”这类恢复判定。
-  影响：如果后续把 T068 的测试通过误当成生产 `RebuildIndexFromDisk()`、stale staging cleanup、corrupted quarantine 都已具备，T070-T072 仍可能在 on-disk state encoding、partial write 检测和坏块隔离语义上出现实现分歧；尤其 checksum mismatch 不能仅靠当前 live 文件自描述事实独立判定。
-  建议后续在哪类任务处理：在 T070-T072 中明确生产扫描时使用的 on-disk facts、状态目录/sidecar 或等价恢复语义；不要在 T068 里把 test-only scanner 伪装成生产恢复实现。
+  问题：T068 已用 test-only restart scanner 固定了“只依据本地磁盘事实重建 live ChunkIndex”的最小 contract；T070-T072 也已经把生产 live rebuild、stale staging cleanup 和 quarantine 恢复落地。但当前 `chunks/live/*.chunk` 仍只持久化 payload bytes，本地磁盘上没有额外 sidecar 或状态编码可直接支撑“原始预期 checksum mismatch”“deleted tombstone 持久化”这类恢复判定。
+  影响：如果后续把当前通过误当成“任意 live 文件损坏都能在纯重启扫描阶段自动发现”，仍会高估现有 on-disk facts 的自描述能力；尤其从未被前台读/查触发过的 checksum mismatch，不能仅靠当前 live 文件字节在 rebuild 阶段独立判定。
+  建议后续在哪类任务处理：在后续 scrub/repair 或更强 on-disk state encoding 任务中继续补主动发现和状态编码；不要把当前 quarantine 恢复语义误读成全量 corruption 自发现已完成。
 
 - 任务编号：T069
   问题：T069 已新增 cross-platform durability matrix test，明确了 Linux 当前已实测的 `fdatasync` / `fsync` / same-filesystem publish / parent directory sync 语义，以及 Windows 当前只能给出 `FlushFileBuffers`、`MoveFileExW`、replace-existing publish contract、directory durability explicit unsupported 的 contract-only / deferred 边界；但当前 Windows publish 生产实现并没有独立 `ReplaceFileW` 路径，directory durability 也仍是 explicit unsupported。
@@ -141,11 +141,16 @@
   建议后续在哪类任务处理：继续在 `T014-WIN`、`T023-WIN` 及后续 cross-platform/crash matrix 任务里做 Windows 实机验证和必要修正；T069 只固定 contract，不关闭 Windows runtime 风险。
 
 - 任务编号：T070
-  问题：T070 已实现生产 `RebuildIndexFromDisk()`，但当前恢复仍只依据 canonical `chunks/live/*.chunk` payload facts 重建 `LIVE` index；`deleted/deleting/quarantined/corrupted` 的持久状态、stale staging cleanup，以及 Windows `std::filesystem` 目录遍历/路径编码实机行为仍未完成。
-  影响：如果后续把 T070 的通过误解成“所有重启恢复语义都已收口”，就会高估非 live 状态恢复、坏块隔离和 Windows 路径语义的完备性；当前保证的是 live final chunk 可重建，不是全状态恢复。
-  建议后续在哪类任务处理：在 T071/T072 继续补齐 staging cleanup 与 corrupted/quarantine 语义，在 `T014-WIN` / `T023-WIN` 或后续 Windows 恢复验证任务中补 live directory traversal / path behavior 的实机验证。
+  问题：T070 已实现生产 `RebuildIndexFromDisk()`；T071/T072 也已补上 stale staging cleanup 和 quarantine 恢复。但当前恢复仍主要依赖 canonical `chunks/live/*.chunk` 与 `chunks/quarantine/*.chunk` 的 payload facts，`deleted/deleting` 的持久状态与 Windows `std::filesystem` 目录遍历/路径编码实机行为仍未完成。
+  影响：如果后续把当前通过误解成“所有重启恢复语义都已收口”，就会高估 deleted/deleting 等非 live 状态恢复和 Windows 路径语义的完备性；当前保证的是 live final chunk 与已持久化 quarantine facts 可重建。
+  建议后续在哪类任务处理：在后续 Windows 恢复验证、scrub/repair 或更强状态编码任务中继续收口 deleted/deleting 和路径行为边界。
 
 - 任务编号：T071
   问题：T071 已实现基于 `last_write_time + staging_cleanup_grace_period_ms` 的 stale staging cleanup，但 mtime 精度、未来时间戳、Windows sharing violation / directory delete 行为，以及“阈值内 fresh staging 是否一定代表可保留”仍是后续运行时边界。
   影响：如果后续把 T071 的通过误解成“所有 staging 恢复和跨平台删除语义都已收口”，就会高估 mtime 判定的稳定性，以及 Windows 上 stale file/empty directory 删除的实机一致性；当前保证的是超过阈值的 staging 能显式清理或显式报错，不是全平台 crash matrix 已完成。
   建议后续在哪类任务处理：在 T072-T074 和后续 Windows 恢复验证任务中继续补 sharing violation、mtime 精度、path encoding 与 crash window 语义；如需要更强的新鲜度判定，再单独演进 staging sidecar 或更明确的 recovery facts。
+
+- 任务编号：T072
+  问题：T072 已实现 read/stat 发现坏块后的 quarantine，以及 `RebuildIndexFromDisk()` 对 `chunks/quarantine/` 的恢复；但当前 quarantine 仍依赖前台读/查显式触发，Windows rename/delete/sharing violation 实机行为也未验证。
+  影响：如果后续把 T072 的通过误读成“所有损坏 final chunk 都能在纯重启扫描阶段自动发现并稳定隔离”，就会高估当前主动发现能力和跨平台文件移动语义；当前保证的是坏块一旦被前台发现，会显式隔离且重启后保持不可读。
+  建议后续在哪类任务处理：在 T073/T074、Windows 实机验证和后续 scrub/repair 任务中继续补 crash window、rename/delete 语义与主动巡检发现能力。

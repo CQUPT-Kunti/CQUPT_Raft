@@ -22,6 +22,7 @@ namespace storedemo
         constexpr const char *kChunksDirectoryRelativePath = "chunks";
         constexpr const char *kLiveDirectoryRelativePath = "chunks/live";
         constexpr const char *kStagingDirectoryRelativePath = "chunks/staging";
+        constexpr const char *kQuarantineDirectoryRelativePath = "chunks/quarantine";
 
         std::uint64_t CurrentUnixTimeMillis()
         {
@@ -592,9 +593,10 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
-        StorageNodeStatusCode CollectLiveChunkCandidatePaths(
+        StorageNodeStatusCode CollectRegularFileCandidatePaths(
             const std::filesystem::path &data_root,
-            const std::filesystem::path &live_root,
+            const std::filesystem::path &scan_root,
+            const char *root_label,
             std::vector<std::filesystem::path> *relative_paths,
             std::string *error_detail)
         {
@@ -602,7 +604,8 @@ namespace storedemo
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = "live chunk candidate output must not be null";
+                    *error_detail = std::string(root_label) +
+                                    " candidate output must not be null";
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
@@ -610,13 +613,13 @@ namespace storedemo
             relative_paths->clear();
 
             std::error_code exists_error;
-            const bool exists = std::filesystem::exists(live_root, exists_error);
+            const bool exists = std::filesystem::exists(scan_root, exists_error);
             if (exists_error)
             {
                 if (error_detail != nullptr)
                 {
                     *error_detail =
-                        BuildFilesystemErrorDetail("exists", live_root, exists_error);
+                        BuildFilesystemErrorDetail("exists", scan_root, exists_error);
                 }
                 return MapFilesystemErrorToStatus(exists_error);
             }
@@ -624,21 +627,21 @@ namespace storedemo
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = "live chunk root does not exist: " +
-                                    live_root.string();
+                    *error_detail = std::string(root_label) + " root does not exist: " +
+                                    scan_root.string();
                 }
                 return StorageNodeStatusCode::kNotFound;
             }
 
             std::error_code directory_error;
             const bool is_directory =
-                std::filesystem::is_directory(live_root, directory_error);
+                std::filesystem::is_directory(scan_root, directory_error);
             if (directory_error)
             {
                 if (error_detail != nullptr)
                 {
                     *error_detail = BuildFilesystemErrorDetail(
-                        "is_directory", live_root, directory_error);
+                        "is_directory", scan_root, directory_error);
                 }
                 return MapFilesystemErrorToStatus(directory_error);
             }
@@ -646,20 +649,21 @@ namespace storedemo
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = "live chunk root is not a directory: " +
-                                    live_root.string();
+                    *error_detail = std::string(root_label) +
+                                    " root is not a directory: " +
+                                    scan_root.string();
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
 
             std::error_code iter_error;
-            std::filesystem::recursive_directory_iterator iter(live_root, iter_error);
+            std::filesystem::recursive_directory_iterator iter(scan_root, iter_error);
             if (iter_error)
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = "failed to iterate live chunk root: " +
-                                    iter_error.message();
+                    *error_detail = std::string("failed to iterate ") + root_label +
+                                    " root: " + iter_error.message();
                 }
                 return StorageNodeStatusCode::kIoError;
             }
@@ -672,8 +676,8 @@ namespace storedemo
                 {
                     if (error_detail != nullptr)
                     {
-                        *error_detail = "failed while scanning live chunk root: " +
-                                        iter_error.message();
+                        *error_detail = std::string("failed while scanning ") +
+                                        root_label + " root: " + iter_error.message();
                     }
                     return StorageNodeStatusCode::kIoError;
                 }
@@ -684,9 +688,9 @@ namespace storedemo
                 {
                     if (error_detail != nullptr)
                     {
-                        *error_detail =
-                            "failed to inspect live chunk candidate type: " +
-                            status_error.message();
+                        *error_detail = std::string("failed to inspect ") +
+                                        root_label + " candidate type: " +
+                                        status_error.message();
                     }
                     return StorageNodeStatusCode::kIoError;
                 }
@@ -703,6 +707,32 @@ namespace storedemo
 
             std::sort(relative_paths->begin(), relative_paths->end());
             return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode CollectLiveChunkCandidatePaths(
+            const std::filesystem::path &data_root,
+            const std::filesystem::path &live_root,
+            std::vector<std::filesystem::path> *relative_paths,
+            std::string *error_detail)
+        {
+            return CollectRegularFileCandidatePaths(data_root,
+                                                    live_root,
+                                                    "live chunk",
+                                                    relative_paths,
+                                                    error_detail);
+        }
+
+        StorageNodeStatusCode CollectQuarantineChunkCandidatePaths(
+            const std::filesystem::path &data_root,
+            const std::filesystem::path &quarantine_root,
+            std::vector<std::filesystem::path> *relative_paths,
+            std::string *error_detail)
+        {
+            return CollectRegularFileCandidatePaths(data_root,
+                                                    quarantine_root,
+                                                    "quarantine chunk",
+                                                    relative_paths,
+                                                    error_detail);
         }
 
         StorageNodeStatusCode ParseChunkIdFromLiveFilename(
@@ -751,6 +781,79 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
+        StorageNodeStatusCode BuildQuarantineChunkRelativePath(
+            const ChunkId &chunk_id,
+            std::filesystem::path *relative_path,
+            std::string *error_detail)
+        {
+            if (relative_path == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "quarantine relative path output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            ChunkPathLayout layout;
+            const auto layout_status =
+                BuildChunkPathLayout(chunk_id, "quarantine", &layout, error_detail);
+            if (layout_status != StorageNodeStatusCode::kOk)
+            {
+                return layout_status;
+            }
+
+            const auto relative_under_live =
+                layout.final_relative_path.lexically_relative(
+                    std::filesystem::path(kLiveDirectoryRelativePath));
+            if (relative_under_live.empty() || relative_under_live == ".")
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "failed to derive quarantine path relative to live root";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            *relative_path =
+                (std::filesystem::path(kQuarantineDirectoryRelativePath) /
+                 relative_under_live)
+                    .lexically_normal();
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode IsCanonicalQuarantineChunkPath(
+            const ChunkId &chunk_id,
+            const std::filesystem::path &relative_path,
+            bool *is_canonical,
+            std::string *error_detail)
+        {
+            if (is_canonical == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "canonical path output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            *is_canonical = false;
+
+            std::filesystem::path expected_relative_path;
+            const auto status =
+                BuildQuarantineChunkRelativePath(chunk_id,
+                                                 &expected_relative_path,
+                                                 error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            *is_canonical = relative_path == expected_relative_path;
+            return StorageNodeStatusCode::kOk;
+        }
+
         StorageNodeStatusCode RecoverFinalChunkPayloadFacts(
             const std::filesystem::path &final_path,
             std::uint64_t *size,
@@ -788,16 +891,204 @@ namespace storedemo
             const ChunkIdentity &identity,
             const std::uint64_t size,
             const ChunkChecksum &checksum,
+            const ChunkState state,
             const std::filesystem::path &final_relative_path)
         {
             ChunkIndexEntry entry;
             entry.identity = identity;
-            entry.state = ChunkState::kLive;
+            entry.state = state;
             entry.size = size;
             entry.checksum = checksum;
             entry.final_path = final_relative_path;
             entry.updated_at = 0;
             return entry;
+        }
+
+        StorageNodeStatusCode QuarantineChunkEntry(
+            const LocalDiskChunkStorePaths &paths,
+            ChunkIndex *chunk_index,
+            const ChunkId &chunk_id,
+            ChunkIndexEntry *quarantined_entry,
+            std::string *error_detail)
+        {
+            if (!paths.IsInitialized())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "quarantine requires initialized store paths";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+            if (chunk_index == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "quarantine requires a valid ChunkIndex";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            auto lock_response = chunk_index->AcquireChunkLock(chunk_id);
+            if (!lock_response.ok() || !lock_response.acquired)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = lock_response.error_detail;
+                }
+                return lock_response.status;
+            }
+
+            const auto find_response = chunk_index->Find(chunk_id);
+            if (!find_response.ok())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = find_response.error_detail;
+                }
+                return find_response.status;
+            }
+
+            ChunkIndexEntry entry = find_response.entry;
+            if (entry.state == ChunkState::kQuarantined ||
+                entry.state == ChunkState::kCorrupted)
+            {
+                if (quarantined_entry != nullptr)
+                {
+                    *quarantined_entry = entry;
+                }
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (entry.state != ChunkState::kLive)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = std::string("cannot quarantine non-LIVE chunk state: ") +
+                                    ToString(entry.state);
+                }
+                return StorageNodeStatusCode::kConflict;
+            }
+
+            std::filesystem::path source_path;
+            auto status = ResolveIndexedFinalPath(paths.data_root,
+                                                  entry,
+                                                  &source_path,
+                                                  error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            std::error_code source_exists_error;
+            const bool source_exists =
+                std::filesystem::exists(source_path, source_exists_error);
+            if (source_exists_error)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = BuildFilesystemErrorDetail("exists",
+                                                               source_path,
+                                                               source_exists_error);
+                }
+                return MapFilesystemErrorToStatus(source_exists_error);
+            }
+            if (!source_exists)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "final chunk file does not exist: " +
+                                    source_path.string();
+                }
+                return StorageNodeStatusCode::kNotFound;
+            }
+
+            std::filesystem::path quarantine_relative_path;
+            status = BuildQuarantineChunkRelativePath(chunk_id,
+                                                      &quarantine_relative_path,
+                                                      error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            std::filesystem::path quarantine_path;
+            status = ResolveStorePath(paths.data_root,
+                                      quarantine_relative_path,
+                                      &quarantine_path,
+                                      error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            status = EnsureDirectoryExists(quarantine_path.parent_path(), error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return status;
+            }
+
+            if (source_path.lexically_normal() != quarantine_path.lexically_normal())
+            {
+                std::error_code target_exists_error;
+                const bool target_exists =
+                    std::filesystem::exists(quarantine_path, target_exists_error);
+                if (target_exists_error)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail = BuildFilesystemErrorDetail("exists",
+                                                                   quarantine_path,
+                                                                   target_exists_error);
+                    }
+                    return MapFilesystemErrorToStatus(target_exists_error);
+                }
+                if (target_exists)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail = "quarantine target already exists: " +
+                                        quarantine_path.string();
+                    }
+                    return StorageNodeStatusCode::kConflict;
+                }
+
+                std::error_code rename_error;
+                std::filesystem::rename(source_path, quarantine_path, rename_error);
+                if (rename_error)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail = BuildFilesystemErrorDetail("rename",
+                                                                   source_path,
+                                                                   rename_error);
+                    }
+                    if (rename_error == std::errc::no_such_file_or_directory)
+                    {
+                        return StorageNodeStatusCode::kNotFound;
+                    }
+                    return MapFilesystemErrorToStatus(rename_error);
+                }
+            }
+
+            entry.state = ChunkState::kQuarantined;
+            entry.final_path = quarantine_relative_path;
+            entry.updated_at = CurrentUnixTimeMillis();
+
+            const auto update_response = chunk_index->Update(entry);
+            if (!update_response.ok())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = update_response.error_detail;
+                }
+                return update_response.status;
+            }
+
+            if (quarantined_entry != nullptr)
+            {
+                *quarantined_entry = update_response.entry;
+            }
+            return StorageNodeStatusCode::kOk;
         }
 
         struct StagingCleanupScanResult
@@ -1242,7 +1533,8 @@ namespace storedemo
         return !data_root.empty() &&
                !chunks_root.empty() &&
                !live_root.empty() &&
-               !staging_root.empty();
+               !staging_root.empty() &&
+               !quarantine_root.empty();
     }
 
     LocalDiskChunkStore::LocalDiskChunkStore(LocalDiskChunkStoreConfig config)
@@ -1324,6 +1616,16 @@ namespace storedemo
             return result;
         }
 
+        status = ResolveStorePath(candidate_paths.data_root,
+                                  kQuarantineDirectoryRelativePath,
+                                  &candidate_paths.quarantine_root,
+                                  &result.error_detail);
+        if (status != StorageNodeStatusCode::kOk)
+        {
+            result.status = status;
+            return result;
+        }
+
         if (config_.chunk_index == nullptr)
         {
             config_.chunk_index = std::make_shared<ShardedChunkIndex>();
@@ -1363,6 +1665,14 @@ namespace storedemo
         }
 
         status = EnsureDirectoryExists(candidate_paths.staging_root, &result.error_detail);
+        if (status != StorageNodeStatusCode::kOk)
+        {
+            result.status = status;
+            return result;
+        }
+
+        status = EnsureDirectoryExists(candidate_paths.quarantine_root,
+                                       &result.error_detail);
         if (status != StorageNodeStatusCode::kOk)
         {
             result.status = status;
@@ -1417,18 +1727,35 @@ namespace storedemo
             return result;
         }
 
-        std::vector<std::filesystem::path> candidate_paths;
+        std::vector<std::filesystem::path> live_candidate_paths;
         result.status = CollectLiveChunkCandidatePaths(paths_.data_root,
                                                        paths_.live_root,
-                                                       &candidate_paths,
+                                                       &live_candidate_paths,
                                                        &result.error_detail);
         if (!result.ok())
         {
             return result;
         }
 
-        std::map<ChunkId, std::vector<std::filesystem::path>> candidates_by_chunk_id;
-        for (const auto &relative_path : candidate_paths)
+        std::vector<std::filesystem::path> quarantine_candidate_paths;
+        result.status = CollectQuarantineChunkCandidatePaths(paths_.data_root,
+                                                             paths_.quarantine_root,
+                                                             &quarantine_candidate_paths,
+                                                             &result.error_detail);
+        if (result.status != StorageNodeStatusCode::kOk &&
+            result.status != StorageNodeStatusCode::kNotFound)
+        {
+            return result;
+        }
+
+        struct RebuildCandidate
+        {
+            std::filesystem::path relative_path;
+            ChunkState state{ChunkState::kMissing};
+        };
+
+        std::map<ChunkId, std::vector<RebuildCandidate>> candidates_by_chunk_id;
+        for (const auto &relative_path : live_candidate_paths)
         {
             if (relative_path.extension() != ".chunk")
             {
@@ -1443,29 +1770,63 @@ namespace storedemo
                 continue;
             }
 
-            candidates_by_chunk_id[chunk_id].push_back(relative_path);
+            candidates_by_chunk_id[chunk_id].push_back(RebuildCandidate{
+                .relative_path = relative_path,
+                .state = ChunkState::kLive});
         }
 
-        for (const auto &[chunk_id, relative_paths] : candidates_by_chunk_id)
+        for (const auto &relative_path : quarantine_candidate_paths)
         {
-            if (relative_paths.size() > 1U)
+            if (relative_path.extension() != ".chunk")
+            {
+                continue;
+            }
+
+            ChunkId chunk_id;
+            std::string parse_error;
+            if (ParseChunkIdFromLiveFilename(relative_path, &chunk_id, &parse_error) !=
+                StorageNodeStatusCode::kOk)
+            {
+                continue;
+            }
+
+            candidates_by_chunk_id[chunk_id].push_back(RebuildCandidate{
+                .relative_path = relative_path,
+                .state = ChunkState::kQuarantined});
+        }
+
+        for (const auto &[chunk_id, candidates] : candidates_by_chunk_id)
+        {
+            if (candidates.size() > 1U)
             {
                 result.status = StorageNodeStatusCode::kConflict;
                 result.error_detail =
-                    "duplicate live chunk candidates found for chunk_id " + chunk_id;
+                    "duplicate rebuild chunk candidates found for chunk_id " +
+                    chunk_id;
                 return result;
             }
         }
 
         std::vector<ChunkIndexEntry> recovered_entries;
         recovered_entries.reserve(candidates_by_chunk_id.size());
-        for (const auto &[chunk_id, relative_paths] : candidates_by_chunk_id)
+        for (const auto &[chunk_id, candidates] : candidates_by_chunk_id)
         {
+            const auto &candidate = candidates.front();
             bool is_canonical = false;
-            result.status = IsCanonicalLiveChunkPath(chunk_id,
-                                                     relative_paths.front(),
-                                                     &is_canonical,
-                                                     &result.error_detail);
+            if (candidate.state == ChunkState::kLive)
+            {
+                result.status = IsCanonicalLiveChunkPath(chunk_id,
+                                                         candidate.relative_path,
+                                                         &is_canonical,
+                                                         &result.error_detail);
+            }
+            else
+            {
+                result.status = IsCanonicalQuarantineChunkPath(chunk_id,
+                                                               candidate.relative_path,
+                                                               &is_canonical,
+                                                               &result.error_detail);
+            }
             if (!result.ok())
             {
                 return result;
@@ -1477,7 +1838,7 @@ namespace storedemo
 
             std::filesystem::path final_path;
             result.status = ResolveStorePath(paths_.data_root,
-                                             relative_paths.front(),
+                                             candidate.relative_path,
                                              &final_path,
                                              &result.error_detail);
             if (!result.ok())
@@ -1507,7 +1868,8 @@ namespace storedemo
             recovered_entries.push_back(BuildRebuiltChunkIndexEntry(identity,
                                                                     size,
                                                                     checksum,
-                                                                    relative_paths.front()));
+                                                                    candidate.state,
+                                                                    candidate.relative_path));
         }
 
         result.status =
@@ -1915,8 +2277,17 @@ namespace storedemo
 
         if (static_cast<std::uint64_t>(payload.size()) != entry.size)
         {
-            response.status = StorageNodeStatusCode::kCorrupted;
-            response.error_detail = "chunk file size does not match index metadata";
+            response.status = QuarantineChunkEntry(paths_,
+                                                   config_.chunk_index.get(),
+                                                   entry.identity.chunk_id,
+                                                   nullptr,
+                                                   &response.error_detail);
+            if (response.status == StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kCorrupted;
+                response.error_detail =
+                    "chunk file size does not match index metadata";
+            }
             return response;
         }
 
@@ -1934,9 +2305,17 @@ namespace storedemo
              entry.checksum.size_bytes != actual_checksum.size_bytes ||
              entry.checksum.value != actual_checksum.value))
         {
-            response.status = StorageNodeStatusCode::kCorrupted;
-            response.error_detail =
-                "chunk file checksum does not match index metadata";
+            response.status = QuarantineChunkEntry(paths_,
+                                                   config_.chunk_index.get(),
+                                                   entry.identity.chunk_id,
+                                                   nullptr,
+                                                   &response.error_detail);
+            if (response.status == StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kCorrupted;
+                response.error_detail =
+                    "chunk file checksum does not match index metadata";
+            }
             return response;
         }
 
@@ -2168,8 +2547,17 @@ namespace storedemo
 
         if (static_cast<std::uint64_t>(payload.size()) != find_response.entry.size)
         {
-            response.status = StorageNodeStatusCode::kCorrupted;
-            response.error_detail = "chunk file size does not match index metadata";
+            response.status = QuarantineChunkEntry(paths_,
+                                                   config_.chunk_index.get(),
+                                                   find_response.entry.identity.chunk_id,
+                                                   nullptr,
+                                                   &response.error_detail);
+            if (response.status == StorageNodeStatusCode::kOk)
+            {
+                response.status = StorageNodeStatusCode::kCorrupted;
+                response.error_detail =
+                    "chunk file size does not match index metadata";
+            }
             return response;
         }
 
@@ -2188,7 +2576,15 @@ namespace storedemo
                                                &response.error_detail);
             if (!response.ok())
             {
-                response.status = StorageNodeStatusCode::kCorrupted;
+                response.status = QuarantineChunkEntry(paths_,
+                                                       config_.chunk_index.get(),
+                                                       find_response.entry.identity.chunk_id,
+                                                       nullptr,
+                                                       &response.error_detail);
+                if (response.status == StorageNodeStatusCode::kOk)
+                {
+                    response.status = StorageNodeStatusCode::kCorrupted;
+                }
                 return response;
             }
         }

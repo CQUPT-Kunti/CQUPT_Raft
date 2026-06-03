@@ -18,6 +18,7 @@ namespace storedemo
         std::filesystem::path chunks_root;
         std::filesystem::path live_root;
         std::filesystem::path staging_root;
+        std::filesystem::path quarantine_root;
 
         [[nodiscard]] bool IsInitialized() const;
     };

@@ -215,6 +215,42 @@ namespace storedemo
             return staging_path;
         }
 
+        std::filesystem::path ResolveStatusPathOrThrow(const std::filesystem::path &data_root,
+                                                       const std::string_view status_directory,
+                                                       const ChunkId &chunk_id)
+        {
+            ChunkPathLayout layout;
+            std::string error_detail;
+            const auto layout_status =
+                BuildChunkPathLayout(chunk_id, "probe", &layout, &error_detail);
+            if (layout_status != StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to build status path layout: " +
+                                         error_detail);
+            }
+
+            const auto relative_under_live =
+                layout.final_relative_path.lexically_relative(
+                    std::filesystem::path("chunks") / "live");
+            const auto status_relative_path =
+                std::filesystem::path("chunks") /
+                std::filesystem::path(std::string(status_directory)) /
+                relative_under_live;
+
+            std::filesystem::path resolved_path;
+            const auto resolve_status = ResolveDurablePathUnderRoot(data_root,
+                                                                    status_relative_path,
+                                                                    &resolved_path,
+                                                                    &error_detail);
+            if (resolve_status != StorageNodeStatusCode::kOk)
+            {
+                throw std::runtime_error("failed to resolve status path: " +
+                                         error_detail);
+            }
+
+            return resolved_path;
+        }
+
         ChunkIndexEntry MakeIndexEntry(const ChunkIdentity &identity,
                                        const ChunkState state,
                                        const std::uint64_t size,
@@ -932,9 +968,32 @@ namespace storedemo
             EXPECT_FALSE(response.ok());
             EXPECT_TRUE(response.payload.empty());
 
+            const auto quarantine_path = ResolveStatusPathOrThrow(temp_dir.Path("node-data"),
+                                                                  "quarantine",
+                                                                  identity.chunk_id);
+            EXPECT_FALSE(std::filesystem::exists(final_path));
+            EXPECT_TRUE(std::filesystem::exists(quarantine_path));
+
             const auto entry_response = shared_index->Find(identity.chunk_id);
             ASSERT_TRUE(entry_response.ok()) << entry_response.error_detail;
-            EXPECT_EQ(entry_response.entry.state, ChunkState::kLive);
+            EXPECT_EQ(entry_response.entry.state, ChunkState::kQuarantined);
+            EXPECT_EQ(entry_response.entry.final_path,
+                      quarantine_path.lexically_relative(temp_dir.Path("node-data"))
+                          .lexically_normal());
+
+            const auto second_read =
+                store.ReadChunk(MakeReadRequest(identity.chunk_id,
+                                                "read-tampered-read-after-quarantine"));
+            EXPECT_EQ(second_read.status, StorageNodeStatusCode::kCorrupted);
+            EXPECT_FALSE(second_read.ok());
+
+            auto list_request = MakeListRequest("read-tampered-list");
+            list_request.options.include_quarantine = true;
+            const auto list_response = store.ListChunks(list_request);
+            ASSERT_EQ(list_response.status, StorageNodeStatusCode::kOk);
+            ASSERT_EQ(list_response.chunks.size(), 1U);
+            EXPECT_EQ(list_response.chunks[0].identity.chunk_id, identity.chunk_id);
+            EXPECT_EQ(list_response.chunks[0].state, ChunkState::kQuarantined);
 #endif
         }
 
@@ -1133,6 +1192,52 @@ namespace storedemo
             EXPECT_EQ(response.metadata.size, fixture.payload.size());
             EXPECT_EQ(response.metadata.checksum.value, write_request.expected_checksum.value);
             EXPECT_TRUE(response.verified);
+#endif
+        }
+
+        TEST_F(LocalDiskChunkStoreTest, StatChunkVerifyChecksumQuarantinesTamperedFinalFile)
+        {
+#if !defined(__linux__)
+            GTEST_SKIP() << "real local file stat path is only verified on Linux in this environment";
+#else
+            test::ScopedStoreTestDir temp_dir("local_disk_chunk_store_stat_tampered");
+            const auto shared_index = MakeSharedIndex();
+            LocalDiskChunkStore store(LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("node-data"),
+                .node_id = test::MakeStorageNodeIdFixture(26),
+                .chunk_index = shared_index});
+            ASSERT_EQ(store.Initialize().status, StorageNodeStatusCode::kOk);
+
+            const auto payload = test::MakeChunkPayload(40, "stat-tampered");
+            const auto identity = MakeIdentityOrThrow("stat-tampered-object", 1, 0, 0);
+            ASSERT_EQ(store.WriteChunk(MakeWriteRequest(identity, payload, "stat-tampered-write")).status,
+                      StorageNodeStatusCode::kOk);
+
+            const auto final_path = ResolveFinalPathOrThrow(temp_dir.Path("node-data"),
+                                                            identity.chunk_id);
+            {
+                std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+                ASSERT_TRUE(output.is_open());
+                output << test::MakeChunkPayload(payload.size(), "tampered-stat");
+            }
+
+            auto stat_request = MakeStatRequest(identity.chunk_id, "stat-tampered-request");
+            stat_request.verify_checksum = true;
+            const auto response = store.StatChunk(stat_request);
+            EXPECT_EQ(response.status, StorageNodeStatusCode::kCorrupted);
+            EXPECT_FALSE(response.ok());
+
+            const auto quarantine_path = ResolveStatusPathOrThrow(temp_dir.Path("node-data"),
+                                                                  "quarantine",
+                                                                  identity.chunk_id);
+            EXPECT_FALSE(std::filesystem::exists(final_path));
+            EXPECT_TRUE(std::filesystem::exists(quarantine_path));
+
+            const auto stat_after_quarantine =
+                store.StatChunk(MakeStatRequest(identity.chunk_id,
+                                                "stat-tampered-after-quarantine"));
+            ASSERT_EQ(stat_after_quarantine.status, StorageNodeStatusCode::kOk);
+            EXPECT_EQ(stat_after_quarantine.metadata.state, ChunkState::kQuarantined);
 #endif
         }
 

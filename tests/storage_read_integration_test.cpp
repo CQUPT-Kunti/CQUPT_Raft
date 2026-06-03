@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,6 +16,7 @@
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
 #include "store/node/storage_node_registry.h"
+#include "store/io/durable_file.h"
 #include "support/metadata_test_utils.h"
 #include "support/storage_read_test_utils.h"
 #include "support/store_test_utils.h"
@@ -60,7 +63,34 @@ namespace
             .identity = identity,
             .expected_size = static_cast<std::uint64_t>(payload.size()),
             .expected_checksum = storedemo::test::ComputeStoreChecksumOrThrow(payload),
-            .payload = payload};
+                .payload = payload};
+    }
+
+    std::filesystem::path ResolveFinalPathOrThrow(const std::filesystem::path &data_root,
+                                                  const storedemo::ChunkId &chunk_id)
+    {
+        storedemo::ChunkPathLayout layout;
+        std::string error_detail;
+        const auto layout_status =
+            storedemo::BuildChunkPathLayout(chunk_id, "probe", &layout, &error_detail);
+        if (layout_status != storedemo::StorageNodeStatusCode::kOk)
+        {
+            throw std::runtime_error("failed to build final path layout: " +
+                                     error_detail);
+        }
+
+        std::filesystem::path final_path;
+        const auto resolve_status =
+            storedemo::ResolveDurablePathUnderRoot(data_root,
+                                                   layout.final_relative_path,
+                                                   &final_path,
+                                                   &error_detail);
+        if (resolve_status != storedemo::StorageNodeStatusCode::kOk)
+        {
+            throw std::runtime_error("failed to resolve final path: " + error_detail);
+        }
+
+        return final_path;
     }
 
     raftdemo::ChunkRef MakeChunkRefFromMetadata(const storedemo::ChunkMetadata &metadata)
@@ -1231,6 +1261,134 @@ namespace
         EXPECT_EQ(result.payload, fixture.payload);
         EXPECT_EQ(reader.calls_for_node("replica-a"), 0U);
         EXPECT_EQ(reader.calls_for_node("replica-b"), payload_parts.size());
+    }
+
+    TEST_F(StorageReadIntegrationTest, CommittedObjectFallsBackAfterLocalStoreQuarantinesCorruptedReplica)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "real local store quarantine fallback is only verified on Linux";
+#else
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t072_quarantine_fallback");
+        storedemo::LocalDiskChunkStore store_a(
+            storedemo::LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("stores") / "replica_a",
+                .node_id = "replica-a"});
+        storedemo::LocalDiskChunkStore store_b(
+            storedemo::LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.Path("stores") / "replica_b",
+                .node_id = "replica-b"});
+        ASSERT_EQ(store_a.Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store_b.Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 1;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t072-read-quarantine",
+                            "create-bucket-t072-read-quarantine"))
+                        .Ok);
+
+        const std::string object_id = "obj-t072-read-quarantine";
+        const std::string object_key = "objects/t072-quarantine.bin";
+        const std::uint64_t version = 1;
+        const std::string payload = storedemo::test::MakeChunkPayload(96, "t072-read");
+        const auto identity = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t072-read-quarantine",
+                            object_key,
+                            object_id,
+                            version,
+                            "create-object-t072-read-quarantine",
+                            payload.size(),
+                            "etag-t072-read-quarantine"))
+                        .Ok);
+
+        ASSERT_EQ(store_a.WriteChunk(MakeWriteRequest(identity, payload, "write-replica-a")).status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(store_b.WriteChunk(MakeWriteRequest(identity, payload, "write-replica-b")).status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        const auto tampered_path =
+            ResolveFinalPathOrThrow(temp_dir.Path("stores") / "replica_a",
+                                    identity.chunk_id);
+        {
+            std::ofstream output(tampered_path, std::ios::binary | std::ios::trunc);
+            ASSERT_TRUE(output.is_open());
+            output << storedemo::test::MakeChunkPayload(payload.size(), "tampered-a");
+        }
+
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t072-read-quarantine",
+                            object_key,
+                            object_id,
+                            version,
+                            "commit-object-t072-read-quarantine",
+                            payload.size(),
+                            "etag-t072-read-quarantine",
+                            {MakeChunkRef(identity, payload, {"replica-a", "replica-b"})}))
+                        .Ok);
+
+        CountingReplicaReader reader(
+            [&](const storedemo::StorageNodeId &node_id,
+                const storedemo::ReadChunkRequest &request)
+            {
+                if (node_id == "replica-a")
+                {
+                    return store_a.ReadChunk(request);
+                }
+                if (node_id == "replica-b")
+                {
+                    return store_b.ReadChunk(request);
+                }
+
+                storedemo::ReadChunkResponse response;
+                response.status = storedemo::StorageNodeStatusCode::kNotFound;
+                response.error_detail = "unknown replica";
+                return response;
+            });
+
+        const auto result = ReadObjectByManifest(
+            machine,
+            reader,
+            ReadObjectByManifestRequest{
+                .bucket = "bucket-t072-read-quarantine",
+                .object_key = object_key,
+                .candidate_resolver =
+                    [](const raftdemo::ChunkRef &chunk_ref)
+                    {
+                        return std::vector<storedemo::ReadReplicaCandidate>{
+                            storedemo::ReadReplicaCandidate{
+                                .node_id = chunk_ref.replica_nodes.at(0),
+                                .has_observed_facts = true},
+                            storedemo::ReadReplicaCandidate{
+                                .node_id = chunk_ref.replica_nodes.at(1),
+                                .has_observed_facts = true}};
+                    }});
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        EXPECT_EQ(result.payload, payload);
+        ASSERT_EQ(result.chunk_results.size(), 1U);
+        ASSERT_EQ(result.chunk_results[0].attempts.size(), 2U);
+        EXPECT_EQ(result.chunk_results[0].attempts[0].node_id, "replica-a");
+        EXPECT_EQ(result.chunk_results[0].attempts[0].status,
+                  storedemo::StorageNodeStatusCode::kCorrupted);
+        EXPECT_EQ(result.chunk_results[0].selected_node_id, "replica-b");
+
+        const auto replica_a_stat =
+            store_a.StatChunk({.request_id = "stat-replica-a", .chunk_id = identity.chunk_id});
+        ASSERT_EQ(replica_a_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(replica_a_stat.metadata.state, storedemo::ChunkState::kQuarantined);
+#endif
     }
 
     TEST_F(StorageReadIntegrationTest,

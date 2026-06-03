@@ -137,6 +137,7 @@ chunk data-plane 抽象接口。
 - `chunks_root`
 - `live_root`
 - `staging_root`
+- `quarantine_root`
 
 它只表达当前已经准备好的目录边界，不承载索引或恢复状态。
 
@@ -182,10 +183,10 @@ T021 已实现：
 
 - 配置持有
 - 安全解析 `data_dir`
-- 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`
+- 初始化 `data_root`、`chunks/`、`chunks/live/`、`chunks/staging/`、`chunks/quarantine/`
 - 默认 durable file / chunk index 依赖装配
 - `RebuildIndexFromDisk`
-- `Initialize()` 自动执行 live chunk index rebuild
+- `Initialize()` 自动执行 live/quarantine chunk index rebuild
 
 T023-T025 已实现：
 
@@ -197,18 +198,17 @@ T023-T025 已实现：
 
 后续任务仍未实现：
 
-- corruption / quarantine 状态自动回写
 - 后台 scrub / repair / rebalance
 
 其中：
 
 - `WriteChunk` 已经走通 staging -> flush -> publish -> directory sync -> LIVE index update
-- `ReadChunk` 已经走通 index lookup -> state check -> final file read -> checksum verify -> return payload
+- `ReadChunk` 已经走通 index lookup -> state check -> final file read -> checksum verify；发现 size/checksum 与 index metadata 不一致时会把本地 final chunk 移入 quarantine，并将 index 状态更新为 `kQuarantined`
 - `DeleteChunk` 已经走通 chunk guard -> expected checksum 校验 -> final file remove -> index state update
-- `StatChunk` 已经走通 index lookup 和可选 checksum verify
+- `StatChunk` 已经走通 index lookup 和可选 checksum verify；verify 阶段发现 size/checksum 不一致时也会触发 quarantine
 - `ListChunks` 已经走通基于 `ChunkIndex` 的过滤和分页
-- `RebuildIndexFromDisk` 已经走通 canonical `chunks/live/` 目录扫描、payload size/checksum 恢复和 live index 重建
-- `Initialize()` 已经走通 staging scan -> stale staging cleanup -> live index rebuild
+- `RebuildIndexFromDisk` 已经走通 canonical `chunks/live/` + `chunks/quarantine/` 目录扫描、payload size/checksum 恢复，以及 `LIVE` / `QUARANTINED` index 重建
+- `Initialize()` 已经走通 staging scan -> stale staging cleanup -> live/quarantine index rebuild
 - T026 已用真实本地文件压力测试覆盖不同 chunk 并发写入、同 chunk 冲突写入，以及读/删/查/列交错边界
 
 当前并发边界补充：
@@ -244,7 +244,7 @@ T023-T025 已实现：
 
 - `chunk_store.cpp` 的职责仍然只是提供虚析构定义，避免接口类链接缺口
 - `local_disk_chunk_store.cpp` 现在已经包含 `Initialize` / `RebuildIndexFromDisk` / `WriteChunk` / `ReadChunk` / `DeleteChunk` / `StatChunk` / `ListChunks` 的本地路径
-- restart live index rebuild 和 stale staging cleanup 已实现，但 corruption 治理 / 后台维护路径仍未实现
+- restart live/quarantine index rebuild、stale staging cleanup 和 read/stat quarantine 已实现，但后台 scrub/repair/rebalance 仍未实现
 
 ## `local_disk_chunk_store.cpp` 内部 helper 对照
 
@@ -260,8 +260,10 @@ T023-T025 已实现：
   - 表示 `chunks/live`
 - `kStagingDirectoryRelativePath`
   - 表示 `chunks/staging`
+- `kQuarantineDirectoryRelativePath`
+  - 表示 `chunks/quarantine`
 
-这三个常量只用于 `Initialize()` 里生成目录布局，避免把相对路径字面量散落在实现里。
+这四个常量只用于 `Initialize()` 里生成目录布局，避免把相对路径字面量散落在实现里。
 
 ### `MapFilesystemErrorToStatus(...)`
 
@@ -310,6 +312,26 @@ T023-T025 已实现：
 
 解析成 data root 下的安全绝对路径。
 
+### `CollectRegularFileCandidatePaths(...)`
+
+递归扫描指定根目录下的 regular file 候选，并返回相对 `data_root` 的稳定排序结果。
+
+输入：
+
+- `data_root`
+- `scan_root`
+- `root_label`
+
+输出：
+
+- 所有 regular candidate 的相对路径列表
+
+边界：
+
+- 只负责目录遍历和 regular file 过滤
+- root 不存在、不是目录或遍历失败都返回明确错误
+- 被 `CollectLiveChunkCandidatePaths(...)` 和 `CollectQuarantineChunkCandidatePaths(...)` 复用
+
 ### `CollectLiveChunkCandidatePaths(...)`
 
 递归扫描 `chunks/live/` 下的 regular file 候选，并返回相对 `data_root` 的稳定排序结果。
@@ -328,6 +350,24 @@ T023-T025 已实现：
 - 只负责 live 目录遍历
 - 非 regular 候选直接跳过
 - 目录不存在或遍历失败返回明确文件系统错误
+
+### `CollectQuarantineChunkCandidatePaths(...)`
+
+递归扫描 `chunks/quarantine/` 下的 regular file 候选，并返回相对 `data_root` 的稳定排序结果。
+
+输入：
+
+- `data_root`
+- `quarantine_root`
+
+输出：
+
+- quarantine candidate 的相对路径列表
+
+边界：
+
+- 只负责 quarantine 目录遍历
+- 不把 quarantine 候选直接当成 live
 
 ### `CollectStagingCleanupCandidates(...)`
 
@@ -478,6 +518,40 @@ T023-T025 已实现：
 - 只接受 `chunks/live/<shard>/<shard>/<chunk_id>.chunk`
 - misplaced live candidate 不进入 rebuilt index
 
+### `BuildQuarantineChunkRelativePath(...)`
+
+根据 `chunk_id` 生成 canonical quarantine 相对路径。
+
+输入：
+
+- `chunk_id`
+
+输出：
+
+- `chunks/quarantine/<shard>/<shard>/<chunk_id>.chunk`
+
+边界：
+
+- 复用 `BuildChunkPathLayout(...)` 的 shard 规则
+- 不引入新的 chunk 命名格式
+
+### `IsCanonicalQuarantineChunkPath(...)`
+
+判断 quarantine candidate 是否位于 canonical quarantine shard 路径。
+
+输入：
+
+- `chunk_id`
+- `relative_path`
+
+输出：
+
+- `is_canonical`
+
+边界：
+
+- misplaced quarantine candidate 不进入 rebuilt index
+
 ### `RecoverFinalChunkPayloadFacts(...)`
 
 读取 final chunk payload，并恢复当前磁盘上可直接验证的 `size` 和 `checksum`。
@@ -495,7 +569,7 @@ T023-T025 已实现：
 
 - zero-byte final file 合法
 - 只基于文件内容恢复事实
-- 不做 quarantine / corrupted 状态落盘
+- 不会凭空推断“此前未标记”的 checksum mismatch；更强 corruption 判定仍依赖本地 quarantine 目录事实或前台读/查时检测
 
 ### `BuildRebuiltChunkIndexEntry(...)`
 
@@ -506,6 +580,7 @@ T023-T025 已实现：
 - `identity`
 - `size`
 - `checksum`
+- `state`
 - `final_relative_path`
 
 输出：
@@ -514,8 +589,36 @@ T023-T025 已实现：
 
 边界：
 
-- T070 只重建 `ChunkState::kLive`
+- 当前可重建 `ChunkState::kLive` 和 `ChunkState::kQuarantined`
 - `updated_at` 当前不伪造历史时间，保持恢复态默认值
+
+### `QuarantineChunkEntry(...)`
+
+这是 T072 的核心隔离 helper。
+
+主步骤：
+
+1. 对目标 `chunk_id` 获取 per-chunk guard
+2. 重新读取最新 `ChunkIndexEntry`
+3. 把 canonical live final chunk 移到 canonical quarantine 路径
+4. 将 index 状态更新为 `kQuarantined`
+
+输入：
+
+- `paths`
+- `chunk_index`
+- `chunk_id`
+
+输出：
+
+- 更新后的 quarantined entry
+
+边界：
+
+- 只处理当前仍是 `kLive` 的 entry
+- quarantine target 已存在、rename 失败或路径异常都会返回明确错误
+- 不调用 metadata / Raft
+- 不做 repair，不删除 payload
 
 ### `ClearChunkIndexEntries(...)`
 
@@ -579,17 +682,17 @@ T023-T025 已实现：
 
 主步骤：
 
-1. 只扫描 `chunks/live/`
-2. 过滤非 `.chunk`、非法 `chunk_id`、misplaced live candidate
-3. 对同一 `chunk_id` 的多个 live candidate 直接返回 `kConflict`
-4. 读取 canonical final chunk payload，恢复 `size` / `checksum` / `ChunkIdentity`
+1. 扫描 `chunks/live/` 和 `chunks/quarantine/`
+2. 过滤非 `.chunk`、非法 `chunk_id`、misplaced candidate
+3. 对同一 `chunk_id` 的多个 rebuild candidate 直接返回 `kConflict`
+4. 读取 canonical final/quarantine chunk payload，恢复 `size` / `checksum` / `ChunkIdentity`
 5. 清空现有 `ChunkIndex`
-6. 只以 `ChunkState::kLive` 重建本地 index
+6. 以 `ChunkState::kLive` 或 `ChunkState::kQuarantined` 重建本地 index
 
 边界：
 
 - 不扫描 staging 进入 live index
-- 不做 corrupted quarantine
+- 不能仅靠 `chunks/live/*.chunk` payload bytes 自行发现“此前未标记”的 checksum mismatch
 - 不调用 metadata / Raft
 - 不决定 object committed/deleted 可见性
 
