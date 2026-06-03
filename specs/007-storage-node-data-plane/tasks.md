@@ -189,7 +189,7 @@
 
 ### Tests for User Story 6
 
-- [ ] T078 [P] [US6] 添加 ScrubManager 测试；允许修改：`tests/storage_scrub_repair_test.cpp`、`tests/CMakeLists.txt`；验收：background checksum validation 能标记 corrupted replica 并输出 repair candidate；依赖：T077
+- [x] T078 [P] [US6] 添加 ScrubManager 测试；实际修改：`tests/storage_scrub_repair_test.cpp`、`tests/CMakeLists.txt`、`specs/007-storage-node-data-plane/task-reports/t078-scrub-manager-test.md`、`specs/007-storage-node-data-plane/task-reports/common-risk-notes.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：新增 test-only `TestOnlyScrubRunner`，用真实 `LocalDiskChunkStore + StorageNodeRegistry + ReplicaPolicySelector` 固定 scrub contract：healthy replica 不产出 candidate，corrupted replica 会被 quarantine 并产出包含 `chunk_id/expected checksum/size/bad replica/healthy source` 的 repair candidate，all-corrupted 输出 `lost_or_unrecoverable` candidate，under-replicated / stale / unavailable / unhealthy source 过滤与 repeated scrub 幂等当前 Linux 环境下由 `storage_scrub_repair` 定向验证 PASS；不新增生产 ScrubManager、RepairManager、RebalanceManager、proto 或 RPC；依赖：T077
 - [ ] T079 [P] [US6] 添加 RepairManager 测试；允许修改：`tests/storage_scrub_repair_test.cpp`；验收：under-replicated chunk 选择 healthy source 和 healthy target，target durable 后才更新 facts；依赖：T078
 - [ ] T080 [P] [US6] 添加 RebalanceManager 测试骨架；允许修改：`tests/storage_rebalance_test.cpp`、`tests/CMakeLists.txt`；验收：测试表达 target durable before manifest coordination 和 source cleanup after metadata update；依赖：T079
 

@@ -503,6 +503,28 @@ else()
   message(STATUS "Skip test_storage_delete_gc: storage_delete_gc_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_scrub_repair_test.cpp")
+  add_executable(test_storage_scrub_repair
+    storage_scrub_repair_test.cpp
+  )
+
+  target_link_libraries(test_storage_scrub_repair
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_scrub_repair
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_scrub_repair test_storage_scrub_repair
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_scrub_repair: storage_scrub_repair_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_delete_chunk_contract_test.cpp")
   add_executable(test_storage_delete_chunk_contract
     storage_delete_chunk_contract_test.cpp

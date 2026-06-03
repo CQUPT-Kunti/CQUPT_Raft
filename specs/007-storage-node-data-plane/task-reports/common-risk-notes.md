@@ -174,3 +174,8 @@
   问题：T076 已用真实 `GarbageCollector + metadata-driven safety checker + LocalDiskChunkStore::DeleteChunk` 固定 orphan chunk 的 metadata-driven GC 边界：pending-timeout / failed-upload / deleted-object 候选在进入 delete handler 前都必须经过 safety gate，committed live manifest 仍引用时必须阻止删除，metadata 不再引用时才允许删除；但当前 safety checker 仍依赖调用方提供的 metadata 事实源，没有单独证明 metadata snapshot 新鲜度或跨进程/跨节点时间窗。
   影响：如果后续把 T076 的通过误读成“只要本地看起来 orphan 就能安全删”或“metadata facts 一定足够新鲜”，仍会高估 GC 在陈旧 metadata 视图、竞态窗口和 Windows 删除语义下的可靠性；当前保证的是 delete handler 不得绕过 safety checker，本地 orphan 仍由 metadata live-manifest gate 决定。
   建议后续在哪类任务处理：在后续真实 metadata fact source、新鲜度协议、Windows 删除语义和更完整后台维护任务中继续收口。
+
+- 任务编号：T078
+  问题：T078 已新增 test-only ScrubManager contract 测试，固定了“background checksum validation 发现 corrupted replica -> quarantine / unhealthy fact -> 产出 repair candidate”的最小语义；但当前 repair candidate 仍只基于 test-only manifest、实时 registry snapshot 和本地 quarantine / missing 事实组合推导，尚未定义生产级 freshness boundary、registry failure cache 或 scrub-task persistence。
+  影响：如果后续把 T078 的通过误读成“生产 ScrubManager 已完成”或“repair candidate 与 metadata manifest / registry facts / quarantine 状态天然一致”，仍会高估跨快照时间窗内 candidate 的可靠性；当前保证的是 contract 测试存在，不是生产后台 scrub / repair 编排已落地。
+  建议后续在哪类任务处理：在 T079/T083 及后续 registry failure cache、ScrubChunk RPC、RepairManager、生产 scrub queue 任务中继续收口 candidate freshness、一致性边界和后台执行语义。
