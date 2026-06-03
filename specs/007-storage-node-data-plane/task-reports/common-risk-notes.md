@@ -169,3 +169,8 @@
   问题：T075 已在 Linux 当前环境下固定 `durable_file` / `LocalDiskChunkStore` 的 path invalid、reserved name、UTF-8 safe path、permission denied 和 disk-full failure-injection contract，并把 Windows long path / UTF-8 / permission denied / disk full / reserved name / sharing violation 继续表达为 contract-only / deferred；但当前仍没有 Windows 实机编译/运行证据，也没有真实磁盘打满或 Windows sharing violation 的 runtime 观测。
   影响：如果后续把 T075 的通过误读成“Windows 路径/错误分类已实机验证完成”，仍会高估 Win32 路径编码、long path、sharing violation 和磁盘满场景的真实行为；当前保证的是 Linux + contract-only 层面的统一分类，不是 Windows runtime 已收口。
   建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN`、`T025-WIN`、`T026-WIN` 及后续 Windows cross-platform/runtime 验证任务中继续补实机证据和必要修正。
+
+- 任务编号：T076
+  问题：T076 已用真实 `GarbageCollector + metadata-driven safety checker + LocalDiskChunkStore::DeleteChunk` 固定 orphan chunk 的 metadata-driven GC 边界：pending-timeout / failed-upload / deleted-object 候选在进入 delete handler 前都必须经过 safety gate，committed live manifest 仍引用时必须阻止删除，metadata 不再引用时才允许删除；但当前 safety checker 仍依赖调用方提供的 metadata 事实源，没有单独证明 metadata snapshot 新鲜度或跨进程/跨节点时间窗。
+  影响：如果后续把 T076 的通过误读成“只要本地看起来 orphan 就能安全删”或“metadata facts 一定足够新鲜”，仍会高估 GC 在陈旧 metadata 视图、竞态窗口和 Windows 删除语义下的可靠性；当前保证的是 delete handler 不得绕过 safety checker，本地 orphan 仍由 metadata live-manifest gate 决定。
+  建议后续在哪类任务处理：在后续真实 metadata fact source、新鲜度协议、Windows 删除语义和更完整后台维护任务中继续收口。

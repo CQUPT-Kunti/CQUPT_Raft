@@ -120,6 +120,18 @@ namespace
         return fact;
     }
 
+    storedemo::CleanupChunkFact MakeCleanupChunkFactFromUploadCommittedChunk(
+        const storedemo::UploadCommittedChunk &chunk)
+    {
+        storedemo::CleanupChunkFact fact;
+        fact.identity = chunk.identity;
+        fact.identity.offset = chunk.offset;
+        fact.size = chunk.size;
+        fact.checksum = chunk.checksum;
+        fact.replica_nodes = chunk.replica_nodes;
+        return fact;
+    }
+
     std::vector<std::string> CandidateChunkIds(
         const std::vector<TestCleanupCandidate> &candidates)
     {
@@ -970,6 +982,232 @@ namespace
     }
 
     TEST_F(StorageDeleteGcTest,
+           CleanupCandidatesPreserveMetadataBoundaryAcrossPendingFailedAbortAndDeletedSources)
+    {
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t076-boundary", 7, 2, 4096);
+
+        storedemo::CleanupChunkFact fact;
+        fact.identity = identity;
+        fact.size = 512;
+        fact.checksum = storedemo::test::ComputeStoreChecksumOrThrow(
+            storedemo::test::MakeChunkPayload(16, "t076-boundary"));
+        fact.checksum.size_bytes = fact.size;
+        fact.replica_nodes = {storedemo::test::MakeStorageNodeIdFixture(1)};
+
+        storedemo::PendingTimeoutCleanupRequest pending_request;
+        pending_request.bucket = "bucket-t076-boundary";
+        pending_request.object_key = "objects/pending";
+        pending_request.object_id = identity.object_id;
+        pending_request.version = identity.version;
+        pending_request.object_state = storedemo::CleanupObjectState::kPending;
+        pending_request.created_at_unix_ms = 1713000000;
+        pending_request.now_unix_ms = 1713008000;
+        pending_request.timeout_ms = 3000;
+        pending_request.durable_chunks = {fact};
+
+        storedemo::FailedUploadCleanupRequest failed_request;
+        failed_request.bucket = "bucket-t076-boundary";
+        failed_request.object_key = "objects/failed";
+        failed_request.object_id = identity.object_id;
+        failed_request.version = identity.version;
+        failed_request.object_state = storedemo::CleanupObjectState::kPending;
+        failed_request.created_at_unix_ms = 1713001000;
+        failed_request.durable_chunks = {fact};
+
+        storedemo::AbortCleanupRequest abort_request;
+        abort_request.bucket = "bucket-t076-boundary";
+        abort_request.object_key = "objects/aborted";
+        abort_request.object_id = identity.object_id;
+        abort_request.version = identity.version;
+        abort_request.object_state = storedemo::CleanupObjectState::kAborted;
+        abort_request.created_at_unix_ms = 1713002000;
+        abort_request.durable_chunks = {fact};
+
+        storedemo::DeletedObjectCleanupRequest deleted_request;
+        deleted_request.bucket = "bucket-t076-boundary";
+        deleted_request.object_key = "objects/deleted";
+        deleted_request.object_id = identity.object_id;
+        deleted_request.version = identity.version;
+        deleted_request.object_state = storedemo::CleanupObjectState::kDeleted;
+        deleted_request.created_at_unix_ms = 1713003000;
+        deleted_request.durable_chunks = {fact};
+
+        const auto pending_candidates =
+            storedemo::BuildPendingTimeoutCleanupCandidates(pending_request);
+        const auto failed_candidates =
+            storedemo::BuildFailedUploadCleanupCandidates(failed_request);
+        const auto abort_candidates =
+            storedemo::BuildAbortCleanupCandidates(abort_request);
+        const auto deleted_candidates =
+            storedemo::BuildDeletedObjectCleanupCandidates(deleted_request);
+
+        ASSERT_EQ(pending_candidates.size(), 1U);
+        ASSERT_EQ(failed_candidates.size(), 1U);
+        ASSERT_EQ(abort_candidates.size(), 1U);
+        ASSERT_EQ(deleted_candidates.size(), 1U);
+
+        EXPECT_NE(pending_candidates.front().metadata_boundary.find(
+                      "metadata-fact:pending-timeout"),
+                  std::string::npos);
+        EXPECT_NE(pending_candidates.front().metadata_boundary.find("deadline_ms="),
+                  std::string::npos);
+        EXPECT_NE(failed_candidates.front().metadata_boundary.find(
+                      "metadata-fact:failed-upload"),
+                  std::string::npos);
+        EXPECT_NE(abort_candidates.front().metadata_boundary.find(
+                      "metadata-fact:abort-cleanup"),
+                  std::string::npos);
+        EXPECT_NE(deleted_candidates.front().metadata_boundary.find(
+                      "metadata-fact:deleted-object"),
+                  std::string::npos);
+
+        const auto pending_task =
+            storedemo::CleanupCandidateToGarbageCollectorTask(
+                pending_candidates.front());
+        const auto failed_task =
+            storedemo::CleanupCandidateToGarbageCollectorTask(
+                failed_candidates.front());
+        const auto abort_task =
+            storedemo::CleanupCandidateToGarbageCollectorTask(
+                abort_candidates.front());
+        const auto deleted_task =
+            storedemo::CleanupCandidateToGarbageCollectorTask(
+                deleted_candidates.front());
+
+        EXPECT_EQ(pending_task.metadata_boundary,
+                  pending_candidates.front().metadata_boundary);
+        EXPECT_EQ(failed_task.metadata_boundary,
+                  failed_candidates.front().metadata_boundary);
+        EXPECT_EQ(abort_task.metadata_boundary,
+                  abort_candidates.front().metadata_boundary);
+        EXPECT_EQ(deleted_task.metadata_boundary,
+                  deleted_candidates.front().metadata_boundary);
+    }
+
+    TEST_F(StorageDeleteGcTest,
+           PendingTimeoutOrphanChunkStillRequiresMetadataSafetyCheckBeforeDelete)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "T076 orphan GC boundary tests are currently validated on Linux";
+#else
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_delete_gc_t076_pending_blocked");
+        storedemo::LocalDiskChunkStore store(MakeStoreConfig(temp_dir.root(), 76));
+        ASSERT_EQ(store.Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        raftdemo::MetadataStateMachine machine;
+        std::uint64_t index = 180;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t076-pending",
+                            "create-bucket-t076-pending"))
+                        .Ok);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(704, "t076-pending-timeout-blocked");
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t076-pending-timeout", 1, 0, 0);
+        const auto write = store.WriteChunk(
+            MakeWriteRequest(identity, payload, "write-t076-pending-timeout"));
+        ASSERT_EQ(write.status, storedemo::StorageNodeStatusCode::kOk)
+            << write.error_detail;
+
+        const auto shared_chunk_ref = MakeChunkRefFromMetadata(write.metadata);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                            "bucket-t076-pending",
+                            "objects/protecting-committed",
+                            "obj-t076-protecting",
+                            1,
+                            "create-object-t076-protecting",
+                            payload.size(),
+                            "etag-t076-protecting"))
+                        .Ok);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                            "bucket-t076-pending",
+                            "objects/protecting-committed",
+                            "obj-t076-protecting",
+                            1,
+                            "commit-object-t076-protecting",
+                            payload.size(),
+                            "etag-t076-protecting",
+                            {shared_chunk_ref}))
+                        .Ok);
+
+        storedemo::PendingTimeoutCleanupRequest cleanup_request;
+        cleanup_request.bucket = "bucket-t076-pending";
+        cleanup_request.object_key = "objects/pending-timeout";
+        cleanup_request.object_id = identity.object_id;
+        cleanup_request.version = identity.version;
+        cleanup_request.object_state = storedemo::CleanupObjectState::kPending;
+        cleanup_request.created_at_unix_ms = 1713004000;
+        cleanup_request.now_unix_ms = 1713009000;
+        cleanup_request.timeout_ms = 1000;
+        cleanup_request.durable_chunks = {
+            MakeCleanupChunkFactFromChunkRef(shared_chunk_ref)};
+
+        const auto candidates =
+            storedemo::BuildPendingTimeoutCleanupCandidates(cleanup_request);
+        ASSERT_EQ(candidates.size(), 1U);
+        EXPECT_NE(candidates.front().metadata_boundary.find(
+                      "metadata-fact:pending-timeout"),
+                  std::string::npos);
+
+        auto task = storedemo::CleanupCandidateToGarbageCollectorTask(
+            candidates.front());
+        EXPECT_EQ(task.metadata_boundary, candidates.front().metadata_boundary);
+
+        std::atomic<int> checker_runs{0};
+        std::atomic<int> handler_runs{0};
+        storedemo::GarbageCollector collector(
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                handler_runs.fetch_add(1, std::memory_order_relaxed);
+                storedemo::DeleteChunkRequest request;
+                request.request_id = "delete-handler-" + collector_task.task_id;
+                request.chunk_id = collector_task.chunk_id;
+                request.reason = "gc pending timeout cleanup";
+                request.metadata_boundary = collector_task.metadata_boundary;
+                return store.DeleteChunk(request);
+            },
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                checker_runs.fetch_add(1, std::memory_order_relaxed);
+                return EvaluateMetadataDrivenSafety(machine,
+                                                    {"bucket-t076-pending"},
+                                                    collector_task);
+            },
+            {.worker_count = 1, .queue_capacity = 4, .default_max_attempts = 2});
+
+        ASSERT_TRUE(collector.SubmitTask(std::move(task)).accepted());
+        ASSERT_TRUE(collector.Drain().drained);
+
+        const auto snapshot = collector.FindTask(
+            "gc-candidate/PendingTimeout/" + identity.chunk_id);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->state, storedemo::GarbageCollectorTaskState::kFailed);
+        EXPECT_EQ(snapshot->last_error, storedemo::StorageNodeStatusCode::kConflict);
+        EXPECT_EQ(snapshot->metadata_boundary, candidates.front().metadata_boundary);
+        EXPECT_EQ(checker_runs.load(std::memory_order_relaxed), 1);
+        EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 0);
+
+        const auto read = store.ReadChunk(storedemo::ReadChunkRequest{
+            .request_id = "read-t076-pending-timeout-blocked",
+            .chunk_id = identity.chunk_id});
+        ASSERT_EQ(read.status, storedemo::StorageNodeStatusCode::kOk)
+            << read.error_detail;
+        EXPECT_EQ(read.payload, payload);
+#endif
+    }
+
+    TEST_F(StorageDeleteGcTest,
            RepeatedDeleteReplayAndRepeatedCleanupAttemptRemainIdempotent)
     {
 #if !defined(__linux__)
@@ -1200,6 +1438,164 @@ namespace
             .request_id = "read-after-cleanup-t049-upload-fail",
             .chunk_id = candidates.front().chunk.chunk_id});
         EXPECT_EQ(read_after_cleanup.status, storedemo::StorageNodeStatusCode::kNotFound);
+#endif
+    }
+
+    TEST_F(StorageDeleteGcTest,
+           FailedUploadOrphanChunkDeletesOnlyAfterMetadataSafetyCheckAllowsIt)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "T076 orphan GC boundary tests are currently validated on Linux";
+#else
+        raftdemo::MetadataStateMachine machine;
+        auto metadata_client =
+            std::make_shared<storedemo::test::InMemoryUploadMetadataClient>(machine);
+        auto chunk_writer =
+            std::make_shared<storedemo::test::LocalStoreUploadChunkWriter>();
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_delete_gc_t076_failed_upload");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            storedemo::test::MakeUploadStoreConfig(temp_dir.Path("stores"), 1));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+        chunk_writer->RegisterStore(store->config().node_id, store);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(640, "t076-failed-upload");
+
+        storedemo::WriteChunkResponse forced_overloaded;
+        forced_overloaded.status = storedemo::StorageNodeStatusCode::kOverloaded;
+        forced_overloaded.error_detail = "forced overloaded replica";
+        forced_overloaded.retry_after_ms = 20;
+        chunk_writer->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(2),
+                                    forced_overloaded);
+
+        storedemo::WriteChunkResponse forced_unavailable;
+        forced_unavailable.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+        forced_unavailable.error_detail = "forced unavailable replica";
+        chunk_writer->ForceResponse(storedemo::test::MakeStorageNodeIdFixture(3),
+                                    forced_unavailable);
+
+        storedemo::UploadCoordinatorRequest request;
+        request.request_id = "upload-t076";
+        request.bucket = "bucket-t076-upload-fail";
+        request.object_key = "objects/t076-failed-upload";
+        request.object_id = "obj-t076-upload-fail";
+        request.version = 1;
+        request.replica_policy = storedemo::ReplicaPolicy{
+            .replica_count = 3,
+            .minimum_successful_writes = 2,
+            .avoid_same_node = true};
+        request.candidates = {
+            storedemo::StorageNodePlacementCandidate{
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(1),
+                .endpoint = "127.0.0.1:7101",
+                .health = storedemo::StorageNodeHealth::kHealthy,
+                .disk_pressure = storedemo::StorageNodeDiskPressure::kLow,
+                .total_capacity_bytes = 128ULL * 1024ULL * 1024ULL,
+                .used_capacity_bytes = 1024,
+                .available_capacity_bytes = 128ULL * 1024ULL * 1024ULL - 1024,
+                .load = {.queued_ops = 1}},
+            storedemo::StorageNodePlacementCandidate{
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(2),
+                .endpoint = "127.0.0.1:7102",
+                .health = storedemo::StorageNodeHealth::kHealthy,
+                .disk_pressure = storedemo::StorageNodeDiskPressure::kLow,
+                .total_capacity_bytes = 96ULL * 1024ULL * 1024ULL,
+                .used_capacity_bytes = 1024,
+                .available_capacity_bytes = 96ULL * 1024ULL * 1024ULL - 1024,
+                .load = {.queued_ops = 2}},
+            storedemo::StorageNodePlacementCandidate{
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(3),
+                .endpoint = "127.0.0.1:7103",
+                .health = storedemo::StorageNodeHealth::kHealthy,
+                .disk_pressure = storedemo::StorageNodeDiskPressure::kLow,
+                .total_capacity_bytes = 64ULL * 1024ULL * 1024ULL,
+                .used_capacity_bytes = 1024,
+                .available_capacity_bytes = 64ULL * 1024ULL * 1024ULL - 1024,
+                .load = {.queued_ops = 3}}};
+        request.client_time_unix_ms = 1713010000;
+        request.chunks.push_back(storedemo::UploadChunkInput{
+            .chunk_index = 0,
+            .offset = 0,
+            .payload = payload});
+
+        storedemo::UploadCoordinator coordinator(metadata_client, chunk_writer);
+        const auto result = coordinator.UploadObject(request);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOverloaded);
+        ASSERT_TRUE(result.orphan_chunk_possible);
+        ASSERT_EQ(result.cleanup_candidates.size(), 1U);
+
+        storedemo::FailedUploadCleanupRequest cleanup_request;
+        cleanup_request.bucket = request.bucket;
+        cleanup_request.object_key = request.object_key;
+        cleanup_request.object_id = request.object_id;
+        cleanup_request.version = request.version;
+        cleanup_request.object_state = storedemo::CleanupObjectState::kPending;
+        cleanup_request.created_at_unix_ms = request.client_time_unix_ms;
+        cleanup_request.durable_chunks = {
+            MakeCleanupChunkFactFromUploadCommittedChunk(
+                result.cleanup_candidates.front().chunk)};
+
+        const auto candidates =
+            storedemo::BuildFailedUploadCleanupCandidates(cleanup_request);
+        ASSERT_EQ(candidates.size(), 1U);
+        EXPECT_NE(candidates.front().metadata_boundary.find(
+                      "metadata-fact:failed-upload"),
+                  std::string::npos);
+
+        auto task = storedemo::CleanupCandidateToGarbageCollectorTask(
+            candidates.front());
+        EXPECT_EQ(task.metadata_boundary, candidates.front().metadata_boundary);
+
+        std::atomic<int> checker_runs{0};
+        std::atomic<int> handler_runs{0};
+        storedemo::GarbageCollector collector(
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                handler_runs.fetch_add(1, std::memory_order_relaxed);
+                storedemo::DeleteChunkRequest delete_request;
+                delete_request.request_id =
+                    "delete-handler-" + collector_task.task_id;
+                delete_request.chunk_id = collector_task.chunk_id;
+                delete_request.reason = "gc failed upload cleanup";
+                delete_request.metadata_boundary =
+                    collector_task.metadata_boundary;
+                return store->DeleteChunk(delete_request);
+            },
+            [&](const storedemo::GarbageCollectorTask &collector_task)
+            {
+                checker_runs.fetch_add(1, std::memory_order_relaxed);
+                return EvaluateMetadataDrivenSafety(machine,
+                                                    {request.bucket},
+                                                    collector_task);
+            },
+            {.worker_count = 1, .queue_capacity = 4, .default_max_attempts = 2});
+
+        ASSERT_TRUE(collector.SubmitTask(std::move(task)).accepted());
+        ASSERT_TRUE(collector.Drain().drained);
+
+        const auto snapshot = collector.FindTask(
+            "gc-candidate/FailedUpload/" +
+            candidates.front().identity.chunk_id);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->state, storedemo::GarbageCollectorTaskState::kCompleted);
+        EXPECT_EQ(snapshot->attempts, 1U);
+        EXPECT_EQ(snapshot->metadata_boundary, candidates.front().metadata_boundary);
+        EXPECT_EQ(checker_runs.load(std::memory_order_relaxed), 1);
+        EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 1);
+
+        const auto read_after_cleanup = store->ReadChunk(storedemo::ReadChunkRequest{
+            .request_id = "read-after-cleanup-t076-failed-upload",
+            .chunk_id = candidates.front().identity.chunk_id});
+        EXPECT_EQ(read_after_cleanup.status, storedemo::StorageNodeStatusCode::kNotFound);
+
+        const auto stat_after_cleanup = store->StatChunk(storedemo::StatChunkRequest{
+            .request_id = "stat-after-cleanup-t076-failed-upload",
+            .chunk_id = candidates.front().identity.chunk_id,
+            .verify_checksum = false});
+        ASSERT_EQ(stat_after_cleanup.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(stat_after_cleanup.metadata.state, storedemo::ChunkState::kDeleted);
 #endif
     }
 } // namespace
