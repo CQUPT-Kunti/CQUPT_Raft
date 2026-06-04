@@ -39,6 +39,11 @@ namespace storedemo
             const storage::ScrubChunkRequest *request,
             storage::ScrubChunkResponse *response) override;
 
+        grpc::ServerUnaryReactor *RepairChunk(
+            grpc::CallbackServerContext *context,
+            const storage::RepairChunkRequest *request,
+            storage::RepairChunkResponse *response) override;
+
         grpc::ServerUnaryReactor *BatchDeleteChunks(
             grpc::CallbackServerContext *context,
             const storage::BatchDeleteChunksRequest *request,

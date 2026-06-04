@@ -162,6 +162,32 @@ namespace
         return request;
     }
 
+    storedemo::StorageNodeClientRepairChunkRequest MakeRepairRequest(
+        const storedemo::ChunkIdentity &identity,
+        const std::string &payload,
+        const std::string &request_id)
+    {
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        storedemo::StorageNodeClientRepairChunkRequest request;
+        request.request_id = request_id;
+        request.chunk_id = identity.chunk_id;
+        request.object_id = identity.object_id;
+        request.version = identity.version;
+        request.chunk_index = identity.chunk_index;
+        request.offset = identity.offset;
+        request.expected_size = static_cast<std::uint64_t>(payload.size());
+        request.expected_checksum = checksum;
+        request.source_node_id = "repair-source-node";
+        request.source_size = static_cast<std::uint64_t>(payload.size());
+        request.source_checksum = checksum;
+        request.source_state = storedemo::ChunkState::kLive;
+        request.source_checksum_verified = true;
+        request.payload = payload;
+        request.durability = storedemo::StorageNodeWriteDurability::kPublish;
+        return request;
+    }
+
     storedemo::StorageNodeClientDeleteChunkRequest MakeDeleteRequest(
         const storedemo::ChunkIdentity &identity,
         const std::string &request_id)
@@ -945,6 +971,117 @@ namespace
         response.mutable_result()->mutable_fact()->set_known_missing(known_missing);
         response.mutable_result()->mutable_fact()->set_quarantined(quarantined);
         response.mutable_result()->set_repair_required(repair_required);
+        response.mutable_result()->set_retryable(retryable);
+        return response;
+    }
+
+    storage::RepairChunkResponse MakeProtoRepairResponse(
+        const storedemo::StorageNodeStatusCode status,
+        const storedemo::ChunkIdentity &identity,
+        const std::string &source_node_id,
+        const std::string &target_node_id,
+        const storedemo::ChunkChecksum &expected_checksum,
+        const storedemo::ChunkChecksum &observed_checksum,
+        const std::uint64_t expected_size,
+        const std::uint64_t observed_size,
+        const storedemo::ChunkState source_state,
+        const storedemo::ChunkState target_state,
+        const bool source_checksum_verified,
+        const bool source_unavailable,
+        const bool target_durable,
+        const bool already_exists,
+        const bool repaired,
+        const bool retryable,
+        const std::string &message = {},
+        const std::uint64_t retry_after_ms = 0)
+    {
+        storage::RepairChunkResponse response;
+
+        storage::StorageNodeStatusCode proto_status =
+            storage::STORAGE_NODE_STATUS_CODE_UNSPECIFIED;
+        switch (status)
+        {
+        case storedemo::StorageNodeStatusCode::kOk:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_OK;
+            break;
+        case storedemo::StorageNodeStatusCode::kAlreadyExists:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_ALREADY_EXISTS;
+            break;
+        case storedemo::StorageNodeStatusCode::kConflict:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CONFLICT;
+            break;
+        case storedemo::StorageNodeStatusCode::kChecksumMismatch:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH;
+            break;
+        case storedemo::StorageNodeStatusCode::kTimeout:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_TIMEOUT;
+            break;
+        case storedemo::StorageNodeStatusCode::kCancelled:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CANCELLED;
+            break;
+        case storedemo::StorageNodeStatusCode::kNodeUnavailable:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_NODE_UNAVAILABLE;
+            break;
+        case storedemo::StorageNodeStatusCode::kInvalidArgument:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT;
+            break;
+        case storedemo::StorageNodeStatusCode::kCorrupted:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_CORRUPTED;
+            break;
+        default:
+            proto_status = storage::STORAGE_NODE_STATUS_CODE_IO_ERROR;
+            break;
+        }
+
+        auto to_proto_state = [](const storedemo::ChunkState state)
+        {
+            switch (state)
+            {
+            case storedemo::ChunkState::kStaging:
+                return storage::STORAGE_CHUNK_STATE_STAGING;
+            case storedemo::ChunkState::kLive:
+                return storage::STORAGE_CHUNK_STATE_LIVE;
+            case storedemo::ChunkState::kDeleting:
+                return storage::STORAGE_CHUNK_STATE_DELETING;
+            case storedemo::ChunkState::kDeleted:
+                return storage::STORAGE_CHUNK_STATE_DELETED;
+            case storedemo::ChunkState::kQuarantined:
+                return storage::STORAGE_CHUNK_STATE_QUARANTINED;
+            case storedemo::ChunkState::kCorrupted:
+                return storage::STORAGE_CHUNK_STATE_CORRUPTED;
+            case storedemo::ChunkState::kMissing:
+            default:
+                return storage::STORAGE_CHUNK_STATE_MISSING;
+            }
+        };
+
+        response.mutable_summary()->set_code(proto_status);
+        response.mutable_summary()->set_message(message);
+        response.mutable_summary()->set_request_id("proto-repair-request-id");
+        response.mutable_summary()->set_node_id(target_node_id);
+        response.mutable_summary()->set_chunk_id(identity.chunk_id);
+        response.mutable_summary()->set_retry_after_ms(retry_after_ms);
+
+        response.mutable_result()->mutable_fact()->set_chunk_id(identity.chunk_id);
+        response.mutable_result()->mutable_fact()->set_source_node_id(source_node_id);
+        response.mutable_result()->mutable_fact()->set_target_node_id(target_node_id);
+        response.mutable_result()->mutable_fact()->set_expected_size(expected_size);
+        response.mutable_result()->mutable_fact()->set_observed_size(observed_size);
+        FillProtoChecksum(expected_checksum,
+                          response.mutable_result()->mutable_fact()->mutable_expected_checksum());
+        FillProtoChecksum(observed_checksum,
+                          response.mutable_result()->mutable_fact()->mutable_observed_checksum());
+        response.mutable_result()->mutable_fact()->set_source_state(
+            to_proto_state(source_state));
+        response.mutable_result()->mutable_fact()->set_target_state(
+            to_proto_state(target_state));
+        response.mutable_result()->mutable_fact()->set_source_checksum_verified(
+            source_checksum_verified);
+        response.mutable_result()->mutable_fact()->set_source_unavailable(
+            source_unavailable);
+        response.mutable_result()->mutable_fact()->set_target_durable(target_durable);
+        response.mutable_result()->mutable_fact()->set_already_exists(already_exists);
+        response.mutable_result()->set_repaired(repaired);
         response.mutable_result()->set_retryable(retryable);
         return response;
     }
@@ -3164,6 +3301,279 @@ namespace
                 .chunk_id = identity.chunk_id});
         ASSERT_EQ(post_scrub.status, storedemo::StorageNodeStatusCode::kOk);
         EXPECT_EQ(post_scrub.metadata.state, storedemo::ChunkState::kQuarantined);
+    }
+
+    TEST_F(StorageNodeClientTest, RepairChunkMapsRequestFieldsAndSemanticResponses)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t085-client-repair", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "t085-client-repair");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+        const auto request = MakeRepairRequest(identity, payload, "repair-client-t085");
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+
+        stub_ptr->repair_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::RepairChunkRequest &request,
+                                 storage::RepairChunkResponse *response)
+        {
+            EXPECT_EQ(request.request_id(), "repair-client-t085");
+            EXPECT_EQ(request.chunk_id(), identity.chunk_id);
+            EXPECT_EQ(request.object_id(), identity.object_id);
+            EXPECT_EQ(request.version(), identity.version);
+            EXPECT_EQ(request.chunk_index(), identity.chunk_index);
+            EXPECT_EQ(request.offset(), identity.offset);
+            EXPECT_EQ(request.expected_size(), checksum.size_bytes);
+            EXPECT_EQ(request.expected_checksum().value(), checksum.value);
+            EXPECT_EQ(request.source_node_id(), "repair-source-node");
+            EXPECT_EQ(request.source_size(), checksum.size_bytes);
+            EXPECT_EQ(request.source_checksum().value(), checksum.value);
+            EXPECT_EQ(request.source_state(), storage::STORAGE_CHUNK_STATE_LIVE);
+            EXPECT_TRUE(request.source_checksum_verified());
+            EXPECT_EQ(request.payload().size(), static_cast<int>(checksum.size_bytes));
+
+            *response = MakeProtoRepairResponse(storedemo::StorageNodeStatusCode::kOk,
+                                                identity,
+                                                "repair-source-node",
+                                                "repair-target-node",
+                                                checksum,
+                                                checksum,
+                                                checksum.size_bytes,
+                                                checksum.size_bytes,
+                                                storedemo::ChunkState::kLive,
+                                                storedemo::ChunkState::kLive,
+                                                true,
+                                                false,
+                                                true,
+                                                false,
+                                                true,
+                                                false);
+            return grpc::Status::OK;
+        };
+
+        const auto ok_response = client.RepairChunk(
+            request,
+            {.context = {.timeout_ms = 900, .best_effort_cancel = true}});
+
+        ASSERT_EQ(stub_ptr->repair_calls, 1U);
+        const auto deadline_delta =
+            stub_ptr->repair_observed_deadline - stub_ptr->repair_call_observed_at;
+        EXPECT_GT(deadline_delta, 0ms);
+        EXPECT_LE(deadline_delta, 1200ms);
+        EXPECT_EQ(ok_response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(ok_response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(ok_response.metadata.node_id, "repair-target-node");
+        EXPECT_EQ(ok_response.metadata.state, storedemo::ChunkState::kLive);
+        EXPECT_EQ(ok_response.expected_size, checksum.size_bytes);
+        EXPECT_EQ(ok_response.observed_size, checksum.size_bytes);
+        EXPECT_EQ(ok_response.expected_checksum.value, checksum.value);
+        EXPECT_EQ(ok_response.observed_checksum.value, checksum.value);
+        EXPECT_EQ(ok_response.source_node_id, "repair-source-node");
+        EXPECT_EQ(ok_response.source_state, storedemo::ChunkState::kLive);
+        EXPECT_EQ(ok_response.target_state, storedemo::ChunkState::kLive);
+        EXPECT_TRUE(ok_response.source_checksum_verified);
+        EXPECT_FALSE(ok_response.source_unavailable);
+        EXPECT_TRUE(ok_response.target_durable);
+        EXPECT_FALSE(ok_response.already_exists);
+        EXPECT_TRUE(ok_response.repaired);
+        EXPECT_FALSE(ok_response.retryable);
+
+        stub_ptr->repair_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::RepairChunkRequest &,
+                                 storage::RepairChunkResponse *response)
+        {
+            *response = MakeProtoRepairResponse(
+                storedemo::StorageNodeStatusCode::kOk,
+                identity,
+                "repair-source-node",
+                "repair-target-node",
+                checksum,
+                checksum,
+                checksum.size_bytes,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                storedemo::ChunkState::kLive,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false);
+            return grpc::Status::OK;
+        };
+
+        const auto already_exists_response = client.RepairChunk(request);
+        EXPECT_EQ(already_exists_response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(already_exists_response.already_exists);
+        EXPECT_TRUE(already_exists_response.target_durable);
+        EXPECT_TRUE(already_exists_response.repaired);
+
+        stub_ptr->repair_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::RepairChunkRequest &,
+                                 storage::RepairChunkResponse *response)
+        {
+            *response = MakeProtoRepairResponse(
+                storedemo::StorageNodeStatusCode::kChecksumMismatch,
+                identity,
+                "repair-source-node",
+                "repair-target-node",
+                checksum,
+                checksum,
+                checksum.size_bytes,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                storedemo::ChunkState::kMissing,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                "checksum mismatch");
+            return grpc::Status::OK;
+        };
+
+        const auto mismatch_response = client.RepairChunk(request);
+        EXPECT_EQ(mismatch_response.status,
+                  storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        EXPECT_EQ(mismatch_response.error_detail, "checksum mismatch");
+        EXPECT_FALSE(mismatch_response.target_durable);
+        EXPECT_FALSE(mismatch_response.repaired);
+
+        stub_ptr->repair_handler =
+            [identity, checksum](grpc::ClientContext *,
+                                 const storage::RepairChunkRequest &,
+                                 storage::RepairChunkResponse *response)
+        {
+            *response = MakeProtoRepairResponse(
+                storedemo::StorageNodeStatusCode::kConflict,
+                identity,
+                "repair-source-node",
+                "repair-target-node",
+                checksum,
+                checksum,
+                checksum.size_bytes,
+                checksum.size_bytes,
+                storedemo::ChunkState::kLive,
+                storedemo::ChunkState::kLive,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                "conflict");
+            return grpc::Status::OK;
+        };
+
+        const auto conflict_response = client.RepairChunk(request);
+        EXPECT_EQ(conflict_response.status, storedemo::StorageNodeStatusCode::kConflict);
+        EXPECT_EQ(conflict_response.error_detail, "conflict");
+        EXPECT_FALSE(conflict_response.retryable);
+    }
+
+    TEST_F(StorageNodeClientTest, RepairChunkMapsGrpcFailureStatuses)
+    {
+        auto *stub_ptr = new FakeStorageNodeStub();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t085-client-grpc", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(48, "t085-client-grpc");
+        const auto request = MakeRepairRequest(identity, payload, "repair-grpc-t085");
+
+        storedemo::StorageNodeClient client{
+            std::unique_ptr<storage::StorageNodeService::StubInterface>(stub_ptr)};
+
+        stub_ptr->repair_handler =
+            [](grpc::ClientContext *,
+               const storage::RepairChunkRequest &,
+               storage::RepairChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                "deadline exceeded");
+        };
+        auto response = client.RepairChunk(request);
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kTimeout);
+        EXPECT_EQ(response.error_detail, "deadline exceeded");
+        EXPECT_TRUE(response.retryable);
+
+        stub_ptr->repair_handler =
+            [](grpc::ClientContext *,
+               const storage::RepairChunkRequest &,
+               storage::RepairChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "cancelled");
+        };
+        response = client.RepairChunk(request);
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kCancelled);
+        EXPECT_EQ(response.error_detail, "cancelled");
+        EXPECT_FALSE(response.retryable);
+
+        stub_ptr->repair_handler =
+            [](grpc::ClientContext *,
+               const storage::RepairChunkRequest &,
+               storage::RepairChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
+        };
+        response = client.RepairChunk(request);
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kNodeUnavailable);
+        EXPECT_EQ(response.error_detail, "unavailable");
+        EXPECT_TRUE(response.retryable);
+
+        stub_ptr->repair_handler =
+            [](grpc::ClientContext *,
+               const storage::RepairChunkRequest &,
+               storage::RepairChunkResponse *)
+        {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "invalid argument");
+        };
+        response = client.RepairChunk(request);
+        EXPECT_EQ(response.status,
+                  storedemo::StorageNodeStatusCode::kInvalidArgument);
+        EXPECT_EQ(response.error_detail, "invalid argument");
+        EXPECT_FALSE(response.retryable);
+    }
+
+    TEST_F(StorageNodeClientTest, RepairChunkUsesRealServiceForDurableSuccess)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_client_repair_real");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 85));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t085-client-real", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(112, "t085-client-real");
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+        storedemo::StorageNodeClient client{server.channel()};
+
+        const auto response = client.RepairChunk(
+            MakeRepairRequest(identity, payload, "repair-real-t085"),
+            {.context = {.timeout_ms = 1500, .best_effort_cancel = true}});
+
+        EXPECT_EQ(response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(response.metadata.identity.chunk_id, identity.chunk_id);
+        EXPECT_EQ(response.metadata.state, storedemo::ChunkState::kLive);
+        EXPECT_TRUE(response.target_durable);
+        EXPECT_TRUE(response.repaired);
+        EXPECT_EQ(response.observed_checksum.value,
+                  ComputeStoreChecksumOrThrow(payload).value);
+
+        const auto read_response = store->ReadChunk(
+            MakeReadRequest(identity.chunk_id, "repair-client-real-read-t085"));
+        ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(read_response.payload, payload);
     }
 
     TEST_F(StorageNodeClientTest, DeleteChunkMapsRequestFieldsAndSuccessResponse)

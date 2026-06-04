@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "store/chunk/chunk_store.h"
 #include "store/maintenance/scrub_manager.h"
 #include "store/runtime/storage_executor.h"
 
@@ -64,6 +65,7 @@ namespace storedemo
         std::uint64_t expected_size{0};
         std::vector<StorageNodeId> existing_replica_nodes;
         std::vector<StorageNodeId> bad_replicas;
+        StorageTaskContext context;
         RepairTaskState state{RepairTaskState::kQueued};
         std::uint32_t progress_percent{0};
         std::uint32_t attempts{0};
@@ -75,13 +77,49 @@ namespace storedemo
         std::uint64_t retry_after_ms{0};
     };
 
+    struct RepairSourceReadResult : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        ChunkChecksum actual_checksum;
+        std::string payload;
+        bool verified{false};
+    };
+
+    struct RepairTargetWriteResult : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        StorageNodeId source_node_id;
+        ChunkState source_state{ChunkState::kMissing};
+        ChunkState target_state{ChunkState::kMissing};
+        ChunkChecksum expected_checksum;
+        ChunkChecksum observed_checksum;
+        std::uint64_t expected_size{0};
+        std::uint64_t observed_size{0};
+        bool source_checksum_verified{false};
+        bool source_unavailable{false};
+        bool target_durable{false};
+        bool already_exists{false};
+        bool repaired{false};
+        bool retryable{false};
+    };
+
+    using RepairTaskSourceReader =
+        std::function<RepairSourceReadResult(const RepairTask &, const StorageTaskContext &)>;
+    using RepairTaskTargetWriter =
+        std::function<RepairTargetWriteResult(const RepairTask &,
+                                              std::string_view,
+                                              const StorageTaskContext &)>;
+
     using RepairManagerNowSource = std::function<std::uint64_t()>;
 
     struct RepairManagerConfig
     {
         std::size_t max_active_tasks{64};
         std::size_t max_tasks{256};
+        std::uint64_t default_timeout_ms{0};
         RepairManagerNowSource now_unix_ms;
+        RepairTaskSourceReader source_reader;
+        RepairTaskTargetWriter target_writer;
     };
 
     struct RepairManagerSubmitResult
@@ -110,6 +148,22 @@ namespace storedemo
         }
 
         [[nodiscard]] StorageNodeStatusCode status_code() const;
+    };
+
+    struct RepairTaskRunResult : ChunkStoreResult
+    {
+        std::optional<RepairTask> task;
+        StorageNodeId source_node;
+        StorageNodeId target_node;
+        ChunkChecksum source_checksum;
+        ChunkChecksum target_checksum;
+        std::uint64_t source_size{0};
+        std::uint64_t target_size{0};
+        bool source_verified{false};
+        bool target_durable{false};
+        bool already_exists{false};
+        bool repaired{false};
+        bool retryable{false};
     };
 
     struct RepairManagerStats
@@ -153,6 +207,7 @@ namespace storedemo
                                            std::uint64_t retry_after_ms = 0);
         RepairTaskOperationResult CancelTask(std::string_view task_id);
         RepairTaskOperationResult RetryTask(std::string_view task_id);
+        RepairTaskRunResult RunTask(std::string_view task_id);
 
         [[nodiscard]] std::optional<RepairTask> FindTask(
             std::string_view task_id) const;

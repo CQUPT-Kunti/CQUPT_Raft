@@ -11,6 +11,7 @@
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeService::DeleteChunk` 的 gRPC `DeleteChunk` 入口
 - `StorageNodeService::ScrubChunk` 的 gRPC `ScrubChunk` 入口
+- `StorageNodeService::RepairChunk` 的 gRPC `RepairChunk` 入口
 - `StorageNodeService::BatchDeleteChunks` 的 gRPC `BatchDeleteChunks` 入口
 - `StorageNodeService::RegisterStorageNode` 的 gRPC `RegisterStorageNode` 入口
 - `StorageNodeService::UpdateStorageNodeHeartbeat` 的 gRPC `UpdateStorageNodeHeartbeat` 入口
@@ -21,6 +22,7 @@
 - `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
 - `StorageNodeClient::DeleteChunk` 的本地请求到 gRPC `DeleteChunk` 调用
 - `StorageNodeClient::ScrubChunk` 的本地请求到 gRPC `ScrubChunk` 调用
+- `StorageNodeClient::RepairChunk` 的本地请求到 gRPC `RepairChunk` 调用
 - `StorageNodeClient::BatchDeleteChunks` 的本地请求到 gRPC `BatchDeleteChunks` 调用
 - `StorageNodeClient::RegisterStorageNode` 的本地请求到 gRPC `RegisterStorageNode` 调用
 - `StorageNodeClient::UpdateStorageNodeHeartbeat` 的本地请求到 gRPC `UpdateStorageNodeHeartbeat` 调用
@@ -29,14 +31,17 @@
 - proto `WriteChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `ReadChunkRequest` 到 `ChunkStore::ReadChunk` 的字段转换
 - proto `ScrubChunkRequest` 到 `ChunkStore::StatChunk` 的字段转换
+- proto `RepairChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `DeleteChunkRequest` / `BatchDeleteChunkRequest` 到 `ChunkStore::DeleteChunk` 的字段转换
 - `ChunkStore` 结果到 `storage_node.proto` 响应的状态码、checksum、state、durable、already_exists 映射
 - `ChunkStore` 的 `ReadChunkResponse` 到 `storage_node.proto::ReadChunkResponse` 的状态码、checksum、state、payload、offset、complete/full_read 映射
 - `ChunkStore` 的 `StatChunk` 结果到 `storage_node.proto::ScrubChunkResponse` 的状态码、checksum、size、state、corrupted/quarantine/missing facts 映射
+- `ChunkStore` 的 `WriteChunk` 结果到 `storage_node.proto::RepairChunkResponse` 的状态码、checksum、size、durable、already_exists、source/target state 映射
 - `ChunkStore` 的 `DeleteChunkResponse` 到 `storage_node.proto::DeleteChunkResponse` / `BatchDeleteChunkResult` 的状态码、checksum、state、idempotent、retryable 映射
 - `storage_node.proto`（`package storage`）`WriteChunkResponse` 和 gRPC status 到本地 `storedemo::WriteChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`ReadChunkResponse` 和 gRPC status 到本地 `storedemo::ReadChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`ScrubChunkResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientScrubChunkResponse` / `StorageNodeStatusCode` 的映射
+- `storage_node.proto`（`package storage`）`RepairChunkResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientRepairChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`DeleteChunkResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientDeleteChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`BatchDeleteChunksResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientBatchDeleteChunksResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`RegisterStorageNodeResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientRegisterStorageNodeResponse` / `StorageNodeStatusCode` 的映射
@@ -602,6 +607,57 @@
 - 输出：本地 `StorageNodeClientScrubChunkResponse`
 - 边界：不调用 metadata / Raft；不决定 object committed/deleted 可见性；当前只做单节点 scrub RPC 适配，不伪装生产 ScrubManager 已完成
 
+## T085 RepairChunk 适配边界
+
+### `TranslateRepairRequest(const storage::RepairChunkRequest&, RepairChunkRequestContext*)`
+
+- 责任：把 proto `RepairChunkRequest` 转成本地 target durable write 所需的 `WriteChunkRequest` 和 repair 校验上下文。
+- 输入：proto repair request、本地 repair request context 输出指针。
+- 输出：规范化后的 `chunk_id/source_node_id/expected checksum/size/source facts/payload`，以及可直接传给 `ChunkStore::WriteChunk()` 的写入请求。
+- 边界：只做 chunk data-plane 字段收口；缺失 request id、chunk identity、source_node_id、expected/source checksum 等必要事实时返回显式 `INVALID_ARGUMENT`，不触碰 metadata / Raft。
+
+### `FillRepairFact(...)` / `FillRepairResponse(...)`
+
+- 责任：把本地 repair 结果回填成 proto `RepairChunkFact` / `RepairChunkResponse`。
+- 输入：proto repair request、本地 repair service 结果、configured node id。
+- 输出：`chunk_id`、source/target node、expected/observed checksum/size、source/target state、`target_durable/already_exists/repaired/retryable` 等事实。
+- 边界：只表达 source read 校验和 target durable write 结果；不表达 object committed/deleted，可见性不进入 data-plane RPC。
+
+### `StorageNodeService::RepairChunk(...)`
+
+- 责任：执行最小生产 repair data-plane 流程：校验 source facts 和 payload，验证 checksum/size，再调用 `ChunkStore::WriteChunk()` 落到 target durable boundary。
+- 输入：gRPC `RepairChunkRequest`。
+- 输出：gRPC `RepairChunkResponse`。
+- 边界：source 为 missing/deleted 时返回 `NOT_FOUND`，quarantined/corrupted 时返回 `CORRUPTED`，source 未校验或 checksum/size 不匹配时返回 `CHECKSUM_MISMATCH/INVALID_ARGUMENT`；只有 target durable 成功才返回 `repaired=true`，不修改 metadata manifest，不调用 Raft。
+
+### `FillProtoRepairRequest(...)`
+
+- 责任：把本地 `StorageNodeClientRepairChunkRequest` 转成 proto `RepairChunkRequest`。
+- 输入：本地 repair request、client repair options。
+- 输出：带 `timeout_ms/best_effort_cancel/durability/source facts/payload` 的 proto request。
+- 边界：client 只表达 repair copy 所需 data-plane 事实，不伪装 metadata manifest coordination 或 object commit 决策已接线。
+
+### `TranslateProtoRepairResponse(...)`
+
+- 责任：把 proto `RepairChunkResponse` 转回本地 `StorageNodeClientRepairChunkResponse`。
+- 输入：本地 repair request、proto repair response。
+- 输出：本地 `status`、source/target node、expected/observed checksum/size、source/target state、`target_durable/already_exists/repaired/retryable` 等结果。
+- 边界：服务端返回非法 chunk id/checksum/state 会显式映射成 `IO_ERROR`，避免把坏 response 当成成功。
+
+### `MakeGrpcRepairFailureResponse(const grpc::Status&)`
+
+- 责任：把非 OK gRPC status 映射成明确的本地 repair 错误。
+- 输入：gRPC status。
+- 输出：本地 `StorageNodeClientRepairChunkResponse`。
+- 边界：`DEADLINE_EXCEEDED -> TIMEOUT`、`CANCELLED -> CANCELLED`、`UNAVAILABLE -> NODE_UNAVAILABLE`；`best_effort_cancel` 仍只是 hint，不代表运行中 copy 会被中断。
+
+### `StorageNodeClient::RepairChunk(...)`
+
+- 责任：组装 proto repair request、设置 deadline、发起同步 `RepairChunk` RPC，并把 proto/gRPC 结果转回本地 repair 响应。
+- 输入：本地 `StorageNodeClientRepairChunkRequest`、client repair options。
+- 输出：本地 `StorageNodeClientRepairChunkResponse`。
+- 边界：只做单节点 target durable write RPC 适配；不调用 metadata / Raft，不决定 object committed/deleted 可见性，也不把 completed 伪装成 manifest 已更新。
+
 ## 后续演进
 
-- T045 已补最小 committed-manifest 读 fallback helper；T053 已补 client 侧 `DeleteChunk` / `BatchDeleteChunks` 适配；T082 已补最小 `ScrubChunk` service/client 适配；后续仍需继续补 registry/heartbeat facts 接入、`RepairChunk`/manager、read replica health 演进、生产 GC/restart cleanup，以及 `ListChunks`
+- T045 已补最小 committed-manifest 读 fallback helper；T053 已补 client 侧 `DeleteChunk` / `BatchDeleteChunks` 适配；T082 已补最小 `ScrubChunk` service/client 适配；T085 已补最小 `RepairChunk` service/client copy flow；后续仍需继续补 metadata manifest coordination、read replica health 演进、生产 GC/restart cleanup，以及 `ListChunks`

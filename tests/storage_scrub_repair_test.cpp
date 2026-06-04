@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -18,19 +19,25 @@
 #include <utility>
 #include <vector>
 
+#include <grpcpp/grpcpp.h>
+
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/common/store_types.h"
 #include "store/index/chunk_index.h"
 #include "store/io/durable_file.h"
 #include "store/maintenance/repair_manager.h"
 #include "store/maintenance/scrub_manager.h"
+#include "store/node/storage_node_client.h"
 #include "store/node/storage_node_registry.h"
+#include "store/node/storage_node_service.h"
 #include "store/placement/placement_manager.h"
 #include "store/placement/replica_policy.h"
 #include "support/store_test_utils.h"
 
 namespace
 {
+    using namespace std::chrono_literals;
+
     struct ScrubManifest
     {
         storedemo::ChunkIdentity identity;
@@ -229,6 +236,96 @@ namespace
         std::shared_ptr<RecordingWriterState> writer_state_;
     };
 
+    class RunningStorageNodeService
+    {
+    public:
+        explicit RunningStorageNodeService(
+            std::shared_ptr<storedemo::StorageNodeService> service)
+            : service_(std::move(service))
+        {
+            if (service_ == nullptr)
+            {
+                throw std::invalid_argument("service must not be null");
+            }
+
+            grpc::ServerBuilder builder;
+            builder.AddListeningPort("127.0.0.1:0",
+                                     grpc::InsecureServerCredentials(),
+                                     &selected_port_);
+            builder.RegisterService(service_.get());
+            server_ = builder.BuildAndStart();
+            if (!server_ || selected_port_ <= 0)
+            {
+                throw std::runtime_error("failed to start storage node service");
+            }
+
+            channel_ = grpc::CreateChannel(
+                "127.0.0.1:" + std::to_string(selected_port_),
+                grpc::InsecureChannelCredentials());
+        }
+
+        ~RunningStorageNodeService()
+        {
+            if (server_ != nullptr)
+            {
+                server_->Shutdown();
+                server_->Wait();
+            }
+        }
+
+        RunningStorageNodeService(const RunningStorageNodeService &) = delete;
+        RunningStorageNodeService &operator=(const RunningStorageNodeService &) = delete;
+
+        [[nodiscard]] std::shared_ptr<grpc::Channel> channel() const
+        {
+            return channel_;
+        }
+
+    private:
+        std::shared_ptr<storedemo::StorageNodeService> service_;
+        std::unique_ptr<grpc::Server> server_;
+        std::shared_ptr<grpc::Channel> channel_;
+        int selected_port_{0};
+    };
+
+    storedemo::RepairSourceReadResult ToRepairSourceReadResult(
+        const storedemo::ReadChunkResponse &response)
+    {
+        storedemo::RepairSourceReadResult result;
+        result.status = response.status;
+        result.error_detail = response.error_detail;
+        result.retry_after_ms = response.retry_after_ms;
+        result.metadata = response.metadata;
+        result.actual_checksum = response.actual_checksum;
+        result.payload = response.payload;
+        result.verified = response.verified;
+        return result;
+    }
+
+    storedemo::RepairTargetWriteResult ToRepairTargetWriteResult(
+        const storedemo::StorageNodeClientRepairChunkResponse &response)
+    {
+        storedemo::RepairTargetWriteResult result;
+        result.status = response.status;
+        result.error_detail = response.error_detail;
+        result.retry_after_ms = response.retry_after_ms;
+        result.metadata = response.metadata;
+        result.source_node_id = response.source_node_id;
+        result.source_state = response.source_state;
+        result.target_state = response.target_state;
+        result.expected_checksum = response.expected_checksum;
+        result.observed_checksum = response.observed_checksum;
+        result.expected_size = response.expected_size;
+        result.observed_size = response.observed_size;
+        result.source_checksum_verified = response.source_checksum_verified;
+        result.source_unavailable = response.source_unavailable;
+        result.target_durable = response.target_durable;
+        result.already_exists = response.already_exists;
+        result.repaired = response.repaired;
+        result.retryable = response.retryable;
+        return result;
+    }
+
     storedemo::ChunkChecksum ComputeChecksumOrThrow(const std::string_view payload)
     {
         storedemo::ChunkChecksum checksum;
@@ -371,6 +468,15 @@ namespace
         {
             throw std::runtime_error("failed to write payload to " + path.string());
         }
+    }
+
+    void TamperChunkOrThrow(storedemo::LocalDiskChunkStore &store,
+                            const storedemo::ChunkId &chunk_id,
+                            const std::string_view payload)
+    {
+        WriteBinaryFileOrThrow(
+            ResolveFinalPathOrThrow(store.paths().data_root, chunk_id),
+            payload);
     }
 
     bool ChecksumEquals(const storedemo::ChunkChecksum &lhs,
@@ -2661,5 +2767,638 @@ namespace
         EXPECT_EQ(stats.completed_tasks, 1U);
         EXPECT_EQ(stats.running_tasks, 2U);
         EXPECT_EQ(stats.total_attempts, 4U);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRunsRepairCopyFlowAndCompletesAfterTargetDurable)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(3, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(128, "repair-manager-copy-success");
+        const auto identity = MakeIdentityOrThrow("repair-manager-copy-success", 1, 0, 0);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(identity, payload, "repair-manager-source-write"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto source_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[source_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            source_store.config().node_id);
+        auto target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            target_store.config().node_id);
+        RunningStorageNodeService source_server(source_service);
+        RunningStorageNodeService target_server(target_service);
+
+        std::map<storedemo::StorageNodeId, std::unique_ptr<storedemo::StorageNodeClient>> clients;
+        clients.emplace(source_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            source_server.channel()));
+        clients.emplace(target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            target_server.channel()));
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 4,
+                .default_timeout_ms = 1500,
+                .now_unix_ms = []()
+                {
+                    return 120;
+                },
+                .source_reader =
+                    [&clients](const storedemo::RepairTask &task,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    const auto client_it = clients.find(task.source_node);
+                    if (client_it == clients.end())
+                    {
+                        storedemo::RepairSourceReadResult result;
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "repair source client is unavailable";
+                        return result;
+                    }
+
+                    storedemo::ReadChunkRequest request;
+                    request.request_id = task.task_id + "/source-read";
+                    request.chunk_id = task.chunk_id;
+                    request.expected_checksum = task.expected_checksum;
+                    request.verify_checksum = true;
+                    return ToRepairSourceReadResult(
+                        client_it->second->ReadChunk(request, {.context = context}));
+                },
+                .target_writer =
+                    [&clients](const storedemo::RepairTask &task,
+                               const std::string_view repair_payload,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    const auto client_it = clients.find(task.target_node);
+                    if (client_it == clients.end())
+                    {
+                        storedemo::RepairTargetWriteResult result;
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "repair target client is unavailable";
+                        return result;
+                    }
+
+                    storedemo::StorageNodeClientRepairChunkRequest request;
+                    request.request_id = task.task_id + "/target-repair";
+                    request.chunk_id = task.chunk_id;
+                    request.object_id = task.identity.object_id;
+                    request.version = task.identity.version;
+                    request.chunk_index = task.identity.chunk_index;
+                    request.offset = task.identity.offset;
+                    request.expected_size = task.expected_size;
+                    request.expected_checksum = task.expected_checksum;
+                    request.source_node_id = task.source_node;
+                    request.source_size = task.expected_size;
+                    request.source_checksum = task.expected_checksum;
+                    request.source_state = storedemo::ChunkState::kLive;
+                    request.source_checksum_verified = true;
+                    request.payload = std::string(repair_payload);
+                    return ToRepairTargetWriteResult(
+                        client_it->second->RepairChunk(request, {.context = context}));
+                }});
+
+        const auto manifest =
+            MakeManifest(identity, payload, {source_store.config().node_id}, 2);
+        const auto submit_result = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                manifest,
+                MakeManagerRepairCandidate(manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(submit_result.accepted());
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        ASSERT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << run_result.error_detail;
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RepairTaskState::kCompleted);
+        EXPECT_EQ(run_result.task->progress_percent, 100U);
+        EXPECT_TRUE(run_result.target_durable);
+        EXPECT_TRUE(run_result.repaired);
+        EXPECT_FALSE(run_result.already_exists);
+        EXPECT_EQ(run_result.target_checksum.value,
+                  ComputeChecksumOrThrow(payload).value);
+
+        const auto target_read = target_store.ReadChunk(
+            MakeReadRequest(identity.chunk_id, "repair-manager-target-read"));
+        ASSERT_EQ(target_read.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_read.payload, payload);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRejectsCorruptedSourceAndKeepsTargetMissing)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(3, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "repair-manager-source-corrupted");
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-source-corrupted", 1, 0, 0);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(identity, payload, "repair-corrupted-source-write"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_NO_THROW(TamperChunkOrThrow(
+            source_store,
+            identity.chunk_id,
+            storedemo::test::MakeChunkPayload(payload.size(), "repair-corrupted-tamper")));
+
+        auto source_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[source_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            source_store.config().node_id);
+        auto target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            target_store.config().node_id);
+        RunningStorageNodeService source_server(source_service);
+        RunningStorageNodeService target_server(target_service);
+
+        std::map<storedemo::StorageNodeId, std::unique_ptr<storedemo::StorageNodeClient>> clients;
+        clients.emplace(source_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            source_server.channel()));
+        clients.emplace(target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            target_server.channel()));
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 4,
+                .default_timeout_ms = 1500,
+                .now_unix_ms = []()
+                {
+                    return 120;
+                },
+                .source_reader =
+                    [&clients](const storedemo::RepairTask &task,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::ReadChunkRequest request;
+                    request.request_id = task.task_id + "/source-read";
+                    request.chunk_id = task.chunk_id;
+                    request.expected_checksum = task.expected_checksum;
+                    request.verify_checksum = true;
+                    return ToRepairSourceReadResult(
+                        clients.at(task.source_node)->ReadChunk(request, {.context = context}));
+                },
+                .target_writer =
+                    [&clients](const storedemo::RepairTask &task,
+                               const std::string_view repair_payload,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::StorageNodeClientRepairChunkRequest request;
+                    request.request_id = task.task_id + "/target-repair";
+                    request.chunk_id = task.chunk_id;
+                    request.object_id = task.identity.object_id;
+                    request.version = task.identity.version;
+                    request.chunk_index = task.identity.chunk_index;
+                    request.offset = task.identity.offset;
+                    request.expected_size = task.expected_size;
+                    request.expected_checksum = task.expected_checksum;
+                    request.source_node_id = task.source_node;
+                    request.source_size = task.expected_size;
+                    request.source_checksum = task.expected_checksum;
+                    request.source_state = storedemo::ChunkState::kLive;
+                    request.source_checksum_verified = true;
+                    request.payload = std::string(repair_payload);
+                    return ToRepairTargetWriteResult(
+                        clients.at(task.target_node)->RepairChunk(request, {.context = context}));
+                }});
+
+        const auto manifest =
+            MakeManifest(identity, payload, {source_store.config().node_id}, 2);
+        const auto submit_result = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                manifest,
+                MakeManagerRepairCandidate(manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(submit_result.accepted());
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kCorrupted);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RepairTaskState::kFailed);
+        EXPECT_EQ(run_result.task->last_error,
+                  storedemo::StorageNodeStatusCode::kCorrupted);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-corrupted-target-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerKeepsTaskPendingWhenTargetDurableWriteFails)
+    {
+        auto &source_store = CreateStore(1);
+        auto writer_state = std::make_shared<RecordingWriterState>();
+        auto durable_file = std::make_shared<RecordingDurableFile>(writer_state);
+        durable_file->publish_result.error = storedemo::DurableFileErrorCode::kIoError;
+        durable_file->publish_result.error_detail = "simulated publish failure";
+        auto &target_store = CreateStore(3, durable_file);
+        RegisterNode(1, 100);
+        RegisterNode(3, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(88, "repair-manager-target-fail");
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-target-fail", 1, 0, 0);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(identity, payload, "repair-target-fail-source"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto source_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[source_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            source_store.config().node_id);
+        auto target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            target_store.config().node_id);
+        RunningStorageNodeService source_server(source_service);
+        RunningStorageNodeService target_server(target_service);
+
+        std::map<storedemo::StorageNodeId, std::unique_ptr<storedemo::StorageNodeClient>> clients;
+        clients.emplace(source_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            source_server.channel()));
+        clients.emplace(target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            target_server.channel()));
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 4,
+                .default_timeout_ms = 1500,
+                .now_unix_ms = []()
+                {
+                    return 120;
+                },
+                .source_reader =
+                    [&clients](const storedemo::RepairTask &task,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::ReadChunkRequest request;
+                    request.request_id = task.task_id + "/source-read";
+                    request.chunk_id = task.chunk_id;
+                    request.expected_checksum = task.expected_checksum;
+                    request.verify_checksum = true;
+                    return ToRepairSourceReadResult(
+                        clients.at(task.source_node)->ReadChunk(request, {.context = context}));
+                },
+                .target_writer =
+                    [&clients](const storedemo::RepairTask &task,
+                               const std::string_view repair_payload,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::StorageNodeClientRepairChunkRequest request;
+                    request.request_id = task.task_id + "/target-repair";
+                    request.chunk_id = task.chunk_id;
+                    request.object_id = task.identity.object_id;
+                    request.version = task.identity.version;
+                    request.chunk_index = task.identity.chunk_index;
+                    request.offset = task.identity.offset;
+                    request.expected_size = task.expected_size;
+                    request.expected_checksum = task.expected_checksum;
+                    request.source_node_id = task.source_node;
+                    request.source_size = task.expected_size;
+                    request.source_checksum = task.expected_checksum;
+                    request.source_state = storedemo::ChunkState::kLive;
+                    request.source_checksum_verified = true;
+                    request.payload = std::string(repair_payload);
+                    return ToRepairTargetWriteResult(
+                        clients.at(task.target_node)->RepairChunk(request, {.context = context}));
+                }});
+
+        const auto manifest =
+            MakeManifest(identity, payload, {source_store.config().node_id}, 2);
+        const auto submit_result = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                manifest,
+                MakeManagerRepairCandidate(manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(submit_result.accepted());
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kIoError);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RepairTaskState::kRetryPending);
+        EXPECT_EQ(run_result.task->last_error,
+                  storedemo::StorageNodeStatusCode::kIoError);
+        EXPECT_FALSE(run_result.target_durable);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-target-fail-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerTreatsExistingTargetAsIdempotentAndRejectsConflict)
+    {
+        auto &source_store = CreateStore(1);
+        auto &idempotent_target_store = CreateStore(3);
+        auto &conflict_target_store = CreateStore(4);
+        RegisterNode(1, 150);
+        RegisterNode(3, 150);
+        RegisterNode(4, 150);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(72, "repair-manager-idempotent");
+        const auto different_payload =
+            storedemo::test::MakeChunkPayload(72, "repair-manager-conflict");
+        const auto idempotent_identity =
+            MakeIdentityOrThrow("repair-manager-idempotent", 1, 0, 0);
+        const auto conflict_identity =
+            MakeIdentityOrThrow("repair-manager-conflict", 1, 0, 0);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(idempotent_identity, payload, "repair-idempotent-source"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(conflict_identity, payload, "repair-conflict-source"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(idempotent_target_store.WriteChunk(
+                      MakeWriteRequest(idempotent_identity, payload, "repair-idempotent-target"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_EQ(conflict_target_store.WriteChunk(
+                      MakeWriteRequest(conflict_identity,
+                                       different_payload,
+                                       "repair-conflict-target"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto source_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[source_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            source_store.config().node_id);
+        auto idempotent_target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[idempotent_target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            idempotent_target_store.config().node_id);
+        auto conflict_target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[conflict_target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            conflict_target_store.config().node_id);
+        RunningStorageNodeService source_server(source_service);
+        RunningStorageNodeService idempotent_target_server(idempotent_target_service);
+        RunningStorageNodeService conflict_target_server(conflict_target_service);
+
+        std::map<storedemo::StorageNodeId, std::unique_ptr<storedemo::StorageNodeClient>> clients;
+        clients.emplace(source_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            source_server.channel()));
+        clients.emplace(idempotent_target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            idempotent_target_server.channel()));
+        clients.emplace(conflict_target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            conflict_target_server.channel()));
+
+        auto make_manager = [&clients, this](const std::uint64_t now_unix_ms)
+        {
+            return storedemo::RepairManager(
+                &registry_,
+                storedemo::RepairManagerConfig{
+                    .max_active_tasks = 8,
+                    .max_tasks = 8,
+                    .default_timeout_ms = 1500,
+                    .now_unix_ms = [now_unix_ms]()
+                    {
+                        return now_unix_ms;
+                    },
+                    .source_reader =
+                        [&clients](const storedemo::RepairTask &task,
+                                   const storedemo::StorageTaskContext &context)
+                    {
+                        storedemo::ReadChunkRequest request;
+                        request.request_id = task.task_id + "/source-read";
+                        request.chunk_id = task.chunk_id;
+                        request.expected_checksum = task.expected_checksum;
+                        request.verify_checksum = true;
+                        return ToRepairSourceReadResult(
+                            clients.at(task.source_node)->ReadChunk(
+                                request,
+                                {.context = context}));
+                    },
+                    .target_writer =
+                        [&clients](const storedemo::RepairTask &task,
+                                   const std::string_view repair_payload,
+                                   const storedemo::StorageTaskContext &context)
+                    {
+                        storedemo::StorageNodeClientRepairChunkRequest request;
+                        request.request_id = task.task_id + "/target-repair";
+                        request.chunk_id = task.chunk_id;
+                        request.object_id = task.identity.object_id;
+                        request.version = task.identity.version;
+                        request.chunk_index = task.identity.chunk_index;
+                        request.offset = task.identity.offset;
+                        request.expected_size = task.expected_size;
+                        request.expected_checksum = task.expected_checksum;
+                        request.source_node_id = task.source_node;
+                        request.source_size = task.expected_size;
+                        request.source_checksum = task.expected_checksum;
+                        request.source_state = storedemo::ChunkState::kLive;
+                        request.source_checksum_verified = true;
+                        request.payload = std::string(repair_payload);
+                        return ToRepairTargetWriteResult(
+                            clients.at(task.target_node)->RepairChunk(
+                                request,
+                                {.context = context}));
+                    }});
+        };
+
+        auto idempotent_manager = make_manager(160);
+        const auto idempotent_manifest = MakeManifest(
+            idempotent_identity,
+            payload,
+            {source_store.config().node_id},
+            2);
+        const auto idempotent_submit = idempotent_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                idempotent_manifest,
+                MakeManagerRepairCandidate(idempotent_manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(idempotent_submit.accepted());
+        const auto idempotent_run =
+            idempotent_manager.RunTask(idempotent_submit.task->task_id);
+        EXPECT_EQ(idempotent_run.status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(idempotent_run.task.has_value());
+        EXPECT_EQ(idempotent_run.task->state, storedemo::RepairTaskState::kCompleted);
+        EXPECT_TRUE(idempotent_run.already_exists);
+
+        storedemo::ReportLoadRequest steer_conflict_target_request;
+        steer_conflict_target_request.node_id = idempotent_target_store.config().node_id;
+        steer_conflict_target_request.endpoint = "127.0.0.1:7103";
+        steer_conflict_target_request.sequence = 1;
+        steer_conflict_target_request.observed_at_unix_ms = 160;
+        steer_conflict_target_request.load.write_admission_overloaded = true;
+        const auto steer_conflict_target_result =
+            registry_.ReportLoad(steer_conflict_target_request);
+        ASSERT_EQ(steer_conflict_target_result.status,
+                  storedemo::StorageNodeStatusCode::kOk)
+            << steer_conflict_target_result.error_detail;
+
+        auto conflict_manager = make_manager(161);
+        const auto conflict_manifest = MakeManifest(
+            conflict_identity,
+            payload,
+            {source_store.config().node_id},
+            2);
+        const auto conflict_submit = conflict_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                conflict_manifest,
+                MakeManagerRepairCandidate(conflict_manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(conflict_submit.accepted());
+        const auto conflict_run =
+            conflict_manager.RunTask(conflict_submit.task->task_id);
+        EXPECT_EQ(conflict_run.status, storedemo::StorageNodeStatusCode::kConflict);
+        ASSERT_TRUE(conflict_run.task.has_value());
+        EXPECT_EQ(conflict_run.task->state, storedemo::RepairTaskState::kFailed);
+        EXPECT_FALSE(conflict_run.target_durable);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRejectsTargetThatBecomesOverloadedBeforeCopy)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 150);
+        RegisterNode(3, 150);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(64, "repair-manager-overloaded");
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-overloaded", 1, 0, 0);
+        ASSERT_EQ(source_store.WriteChunk(
+                      MakeWriteRequest(identity, payload, "repair-overloaded-source"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto source_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[source_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            source_store.config().node_id);
+        auto target_service = std::make_shared<storedemo::StorageNodeService>(
+            std::shared_ptr<storedemo::ChunkStore>(stores_[target_store.config().node_id].get(),
+                                                   [](storedemo::ChunkStore *) {}),
+            target_store.config().node_id);
+        RunningStorageNodeService source_server(source_service);
+        RunningStorageNodeService target_server(target_service);
+
+        std::map<storedemo::StorageNodeId, std::unique_ptr<storedemo::StorageNodeClient>> clients;
+        clients.emplace(source_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            source_server.channel()));
+        clients.emplace(target_store.config().node_id,
+                        std::make_unique<storedemo::StorageNodeClient>(
+                            target_server.channel()));
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 4,
+                .default_timeout_ms = 1500,
+                .now_unix_ms = []()
+                {
+                    return 161;
+                },
+                .source_reader =
+                    [&clients](const storedemo::RepairTask &task,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::ReadChunkRequest request;
+                    request.request_id = task.task_id + "/source-read";
+                    request.chunk_id = task.chunk_id;
+                    request.expected_checksum = task.expected_checksum;
+                    request.verify_checksum = true;
+                    return ToRepairSourceReadResult(
+                        clients.at(task.source_node)->ReadChunk(request, {.context = context}));
+                },
+                .target_writer =
+                    [&clients](const storedemo::RepairTask &task,
+                               const std::string_view repair_payload,
+                               const storedemo::StorageTaskContext &context)
+                {
+                    storedemo::StorageNodeClientRepairChunkRequest request;
+                    request.request_id = task.task_id + "/target-repair";
+                    request.chunk_id = task.chunk_id;
+                    request.object_id = task.identity.object_id;
+                    request.version = task.identity.version;
+                    request.chunk_index = task.identity.chunk_index;
+                    request.offset = task.identity.offset;
+                    request.expected_size = task.expected_size;
+                    request.expected_checksum = task.expected_checksum;
+                    request.source_node_id = task.source_node;
+                    request.source_size = task.expected_size;
+                    request.source_checksum = task.expected_checksum;
+                    request.source_state = storedemo::ChunkState::kLive;
+                    request.source_checksum_verified = true;
+                    request.payload = std::string(repair_payload);
+                    return ToRepairTargetWriteResult(
+                        clients.at(task.target_node)->RepairChunk(request, {.context = context}));
+                }});
+
+        const auto manifest =
+            MakeManifest(identity, payload, {source_store.config().node_id}, 2);
+        const auto submit_result = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                manifest,
+                MakeManagerRepairCandidate(manifest,
+                                           {source_store.config().node_id},
+                                           {},
+                                           true)));
+        ASSERT_TRUE(submit_result.accepted());
+
+        storedemo::ReportLoadRequest overload_request;
+        overload_request.node_id = target_store.config().node_id;
+        overload_request.endpoint = "127.0.0.1:7103";
+        overload_request.sequence = 1;
+        overload_request.observed_at_unix_ms = 160;
+        overload_request.load.write_admission_overloaded = true;
+        overload_request.load.read_admission_overloaded = false;
+        const auto overload_result = registry_.ReportLoad(overload_request);
+        ASSERT_EQ(overload_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << overload_result.error_detail;
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kOverloaded);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RepairTaskState::kRetryPending);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-overloaded-target-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
     }
 } // namespace

@@ -76,6 +76,29 @@ namespace storedemo
             }
         }
 
+        ChunkState ToStoreChunkState(const storage::StorageChunkState state)
+        {
+            switch (state)
+            {
+            case storage::STORAGE_CHUNK_STATE_STAGING:
+                return ChunkState::kStaging;
+            case storage::STORAGE_CHUNK_STATE_LIVE:
+                return ChunkState::kLive;
+            case storage::STORAGE_CHUNK_STATE_DELETING:
+                return ChunkState::kDeleting;
+            case storage::STORAGE_CHUNK_STATE_DELETED:
+                return ChunkState::kDeleted;
+            case storage::STORAGE_CHUNK_STATE_QUARANTINED:
+                return ChunkState::kQuarantined;
+            case storage::STORAGE_CHUNK_STATE_CORRUPTED:
+                return ChunkState::kCorrupted;
+            case storage::STORAGE_CHUNK_STATE_MISSING:
+            case storage::STORAGE_CHUNK_STATE_UNSPECIFIED:
+            default:
+                return ChunkState::kMissing;
+            }
+        }
+
         storage::StorageChecksumAlgorithm ToProtoChecksumAlgorithm(
             const ChunkChecksumAlgorithm algorithm)
         {
@@ -224,6 +247,37 @@ namespace storedemo
             bool known_missing{false};
             bool quarantined{false};
             bool repair_required{false};
+            bool retryable{false};
+        };
+
+        struct RepairChunkRequestContext
+        {
+            WriteChunkRequest write_request;
+            ChunkIdentity identity;
+            ChunkChecksum expected_checksum;
+            ChunkChecksum source_checksum;
+            StorageNodeId source_node_id;
+            ChunkState source_state{ChunkState::kMissing};
+            std::uint64_t expected_size{0};
+            std::uint64_t source_size{0};
+            bool source_checksum_verified{false};
+        };
+
+        struct RepairChunkServiceResult : ChunkStoreResult
+        {
+            ChunkMetadata metadata;
+            StorageNodeId source_node_id;
+            ChunkState source_state{ChunkState::kMissing};
+            ChunkState target_state{ChunkState::kMissing};
+            ChunkChecksum expected_checksum;
+            ChunkChecksum observed_checksum;
+            std::uint64_t expected_size{0};
+            std::uint64_t observed_size{0};
+            bool source_checksum_verified{false};
+            bool source_unavailable{false};
+            bool target_durable{false};
+            bool already_exists{false};
+            bool repaired{false};
             bool retryable{false};
         };
 
@@ -716,6 +770,72 @@ namespace storedemo
                                error_detail);
         }
 
+        StorageNodeStatusCode ResolveRepairRequestChunkId(const std::string_view chunk_id,
+                                                          const std::string_view object_id,
+                                                          const std::uint64_t version,
+                                                          const std::uint32_t chunk_index,
+                                                          ChunkId *out_chunk_id,
+                                                          std::string *error_detail)
+        {
+            if (out_chunk_id == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair chunk_id output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            const bool has_identity = HasObjectIdentity(object_id, version, chunk_index);
+            if (!chunk_id.empty())
+            {
+                *out_chunk_id = std::string(chunk_id);
+                if (!has_identity)
+                {
+                    return StorageNodeStatusCode::kOk;
+                }
+
+                ChunkId derived_chunk_id;
+                const auto derive_status = MakeChunkId(object_id,
+                                                       version,
+                                                       chunk_index,
+                                                       &derived_chunk_id,
+                                                       error_detail);
+                if (derive_status != StorageNodeStatusCode::kOk)
+                {
+                    return derive_status;
+                }
+
+                if (derived_chunk_id != chunk_id)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail =
+                            "RepairChunk chunk_id does not match object identity";
+                    }
+                    return StorageNodeStatusCode::kInvalidArgument;
+                }
+
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (!has_identity)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "RepairChunk requires chunk_id or object identity";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            return MakeChunkId(object_id,
+                               version,
+                               chunk_index,
+                               out_chunk_id,
+                               error_detail);
+        }
+
         std::string ResolveResponseChunkId(const storage::DeleteChunkRequest &request,
                                            const DeleteChunkResponse &store_response)
         {
@@ -867,8 +987,70 @@ namespace storedemo
             return chunk_id;
         }
 
+        std::string ResolveResponseChunkId(const storage::RepairChunkRequest &request,
+                                           const RepairChunkServiceResult &store_response)
+        {
+            if (!store_response.metadata.identity.chunk_id.empty())
+            {
+                return store_response.metadata.identity.chunk_id;
+            }
+
+            if (!request.chunk_id().empty())
+            {
+                return request.chunk_id();
+            }
+
+            if (!HasObjectIdentity(request.object_id(),
+                                   request.version(),
+                                   request.chunk_index()))
+            {
+                return {};
+            }
+
+            ChunkId chunk_id;
+            std::string error_detail;
+            const auto status = MakeChunkId(request.object_id(),
+                                            request.version(),
+                                            request.chunk_index(),
+                                            &chunk_id,
+                                            &error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return {};
+            }
+
+            return chunk_id;
+        }
+
         void FillSummary(const storage::ScrubChunkRequest &request,
                          const ScrubChunkServiceResult &store_response,
+                         const std::string &configured_node_id,
+                         storage::StorageNodeResponseSummary *summary)
+        {
+            if (summary == nullptr)
+            {
+                return;
+            }
+
+            summary->set_code(ToProtoStatusCode(store_response.status));
+            summary->set_message(store_response.error_detail);
+            summary->set_request_id(request.request_id());
+
+            if (!store_response.metadata.node_id.empty())
+            {
+                summary->set_node_id(store_response.metadata.node_id);
+            }
+            else
+            {
+                summary->set_node_id(configured_node_id);
+            }
+
+            summary->set_chunk_id(ResolveResponseChunkId(request, store_response));
+            summary->set_retry_after_ms(store_response.retry_after_ms);
+        }
+
+        void FillSummary(const storage::RepairChunkRequest &request,
+                         const RepairChunkServiceResult &store_response,
                          const std::string &configured_node_id,
                          storage::StorageNodeResponseSummary *summary)
         {
@@ -1133,6 +1315,19 @@ namespace storedemo
             return response;
         }
 
+        RepairChunkServiceResult MakeRepairValidationError(
+            const StorageNodeStatusCode status,
+            std::string error_detail)
+        {
+            RepairChunkServiceResult response;
+            response.status = status;
+            response.error_detail = std::move(error_detail);
+            response.retryable =
+                response.status != StorageNodeStatusCode::kOk &&
+                IsRetriableStatus(response.status);
+            return response;
+        }
+
         WriteChunkResponse TranslateWriteRequest(const storage::WriteChunkRequest &request,
                                                  WriteChunkRequest *store_request)
         {
@@ -1316,6 +1511,80 @@ namespace storedemo
                 return MakeScrubValidationError(checksum_status, std::move(error_detail));
             }
 
+            return {};
+        }
+
+        RepairChunkServiceResult TranslateRepairRequest(
+            const storage::RepairChunkRequest &request,
+            RepairChunkRequestContext *request_context)
+        {
+            if (request_context == nullptr)
+            {
+                return MakeRepairValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "store repair request output must not be null");
+            }
+
+            if (request.request_id().empty())
+            {
+                return MakeRepairValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "RepairChunk request_id must not be empty");
+            }
+
+            request_context->write_request.request_id = request.request_id();
+            request_context->write_request.payload = request.payload();
+            request_context->expected_size = request.expected_size();
+            request_context->source_node_id = request.source_node_id();
+            request_context->source_size = request.source_size();
+            request_context->source_state = ToStoreChunkState(request.source_state());
+            request_context->source_checksum_verified =
+                request.source_checksum_verified();
+            request_context->identity.chunk_id = request.chunk_id();
+            request_context->identity.object_id = request.object_id();
+            request_context->identity.version = request.version();
+            request_context->identity.chunk_index = request.chunk_index();
+            request_context->identity.offset = request.offset();
+
+            std::string error_detail;
+            const auto chunk_status = ResolveRepairRequestChunkId(request.chunk_id(),
+                                                                  request.object_id(),
+                                                                  request.version(),
+                                                                  request.chunk_index(),
+                                                                  &request_context->write_request.identity.chunk_id,
+                                                                  &error_detail);
+            if (chunk_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeRepairValidationError(chunk_status, std::move(error_detail));
+            }
+
+            request_context->identity.chunk_id =
+                request_context->write_request.identity.chunk_id;
+            request_context->write_request.identity = request_context->identity;
+
+            const auto expected_checksum_status =
+                FromProtoChecksum(request.expected_checksum(),
+                                  &request_context->expected_checksum,
+                                  &error_detail);
+            if (expected_checksum_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeRepairValidationError(expected_checksum_status,
+                                                 std::move(error_detail));
+            }
+
+            const auto source_checksum_status =
+                FromProtoChecksum(request.source_checksum(),
+                                  &request_context->source_checksum,
+                                  &error_detail);
+            if (source_checksum_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeRepairValidationError(source_checksum_status,
+                                                 std::move(error_detail));
+            }
+
+            request_context->write_request.expected_size = request.expected_size();
+            request_context->write_request.expected_checksum =
+                request_context->expected_checksum;
             return {};
         }
 
@@ -1551,6 +1820,58 @@ namespace storedemo
                           response->mutable_result()->mutable_fact());
             response->mutable_result()->set_repair_required(
                 store_response.repair_required);
+            response->mutable_result()->set_retryable(store_response.retryable);
+        }
+
+        void FillRepairFact(const storage::RepairChunkRequest &request,
+                            const RepairChunkServiceResult &store_response,
+                            const std::string &configured_node_id,
+                            storage::RepairChunkFact *fact)
+        {
+            if (fact == nullptr)
+            {
+                return;
+            }
+
+            fact->set_chunk_id(ResolveResponseChunkId(request, store_response));
+            fact->set_source_node_id(store_response.source_node_id);
+            fact->set_target_node_id(!store_response.metadata.node_id.empty()
+                                         ? store_response.metadata.node_id
+                                         : configured_node_id);
+            fact->set_expected_size(store_response.expected_size);
+            fact->set_observed_size(store_response.observed_size);
+            FillProtoChecksum(store_response.expected_checksum,
+                              fact->mutable_expected_checksum());
+            FillProtoChecksum(store_response.observed_checksum,
+                              fact->mutable_observed_checksum());
+            fact->set_source_state(ToProtoChunkState(store_response.source_state));
+            fact->set_target_state(ToProtoChunkState(store_response.target_state));
+            fact->set_source_checksum_verified(
+                store_response.source_checksum_verified);
+            fact->set_source_unavailable(store_response.source_unavailable);
+            fact->set_target_durable(store_response.target_durable);
+            fact->set_already_exists(store_response.already_exists);
+        }
+
+        void FillRepairResponse(const storage::RepairChunkRequest &request,
+                                const RepairChunkServiceResult &store_response,
+                                const std::string &configured_node_id,
+                                storage::RepairChunkResponse *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            FillSummary(request,
+                        store_response,
+                        configured_node_id,
+                        response->mutable_summary());
+            FillRepairFact(request,
+                           store_response,
+                           configured_node_id,
+                           response->mutable_result()->mutable_fact());
+            response->mutable_result()->set_repaired(store_response.repaired);
             response->mutable_result()->set_retryable(store_response.retryable);
         }
 
@@ -2003,6 +2324,178 @@ namespace storedemo
         }
 
         FillScrubResponse(*request, store_response, node_id_, response);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor *StorageNodeService::RepairChunk(
+        grpc::CallbackServerContext *context,
+        const storage::RepairChunkRequest *request,
+        storage::RepairChunkResponse *response)
+    {
+        auto *reactor = context->DefaultReactor();
+
+        if (request == nullptr || response == nullptr)
+        {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                         "RepairChunk request/response must not be null"));
+            return reactor;
+        }
+
+        (void)request->timeout_ms();
+        (void)request->best_effort_cancel();
+        (void)request->durability();
+
+        RepairChunkRequestContext request_context;
+        auto store_response = TranslateRepairRequest(*request, &request_context);
+        if (store_response.status == StorageNodeStatusCode::kOk)
+        {
+            store_response.metadata.identity = request_context.identity;
+            store_response.source_node_id = request_context.source_node_id;
+            store_response.source_state = request_context.source_state;
+            store_response.target_state = ChunkState::kMissing;
+            store_response.expected_size = request_context.expected_size;
+            store_response.expected_checksum = request_context.expected_checksum;
+            store_response.observed_size = static_cast<std::uint64_t>(
+                request_context.write_request.payload.size());
+            store_response.source_checksum_verified =
+                request_context.source_checksum_verified;
+
+            if (request_context.source_node_id.empty())
+            {
+                store_response = MakeRepairValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "RepairChunk source_node_id must not be empty");
+            }
+            else if (!request_context.expected_checksum.IsSet())
+            {
+                store_response = MakeRepairValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "RepairChunk expected_checksum must be set");
+            }
+            else if (!request_context.source_checksum.IsSet())
+            {
+                store_response = MakeRepairValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "RepairChunk source_checksum must be set");
+            }
+            else if (request_context.source_state == ChunkState::kMissing ||
+                     request_context.source_state == ChunkState::kDeleted)
+            {
+                store_response.status = StorageNodeStatusCode::kNotFound;
+                store_response.error_detail = "RepairChunk source chunk is missing";
+                store_response.source_unavailable = true;
+            }
+            else if (request_context.source_state == ChunkState::kQuarantined ||
+                     request_context.source_state == ChunkState::kCorrupted)
+            {
+                store_response.status = StorageNodeStatusCode::kCorrupted;
+                store_response.error_detail =
+                    request_context.source_state == ChunkState::kQuarantined
+                        ? "RepairChunk source chunk is quarantined"
+                        : "RepairChunk source chunk is corrupted";
+            }
+            else if (request_context.source_state != ChunkState::kLive)
+            {
+                store_response.status = StorageNodeStatusCode::kConflict;
+                store_response.error_detail =
+                    std::string("RepairChunk source state is not readable: ") +
+                    ToString(request_context.source_state);
+            }
+            else if (!request_context.source_checksum_verified)
+            {
+                store_response.status = StorageNodeStatusCode::kChecksumMismatch;
+                store_response.error_detail =
+                    "RepairChunk source checksum must be verified before target write";
+            }
+            else if (request_context.expected_size != store_response.observed_size)
+            {
+                store_response.status = StorageNodeStatusCode::kInvalidArgument;
+                store_response.error_detail =
+                    "RepairChunk payload size does not match expected_size";
+            }
+            else if (request_context.source_size != 0 &&
+                     request_context.source_size != request_context.expected_size)
+            {
+                store_response.status = StorageNodeStatusCode::kChecksumMismatch;
+                store_response.error_detail =
+                    "RepairChunk source_size does not match expected_size";
+            }
+            else if (request_context.source_checksum.algorithm !=
+                          request_context.expected_checksum.algorithm ||
+                     request_context.source_checksum.value !=
+                          request_context.expected_checksum.value ||
+                     request_context.source_checksum.size_bytes !=
+                          request_context.expected_checksum.size_bytes)
+            {
+                store_response.status = StorageNodeStatusCode::kChecksumMismatch;
+                store_response.error_detail =
+                    "RepairChunk source checksum does not match expected checksum";
+            }
+            else
+            {
+                ChunkChecksum actual_checksum;
+                std::string checksum_error;
+                const auto checksum_status = VerifyChunkChecksum(
+                    request_context.write_request.payload,
+                    request_context.expected_checksum,
+                    &actual_checksum,
+                    &checksum_error);
+                store_response.observed_checksum = actual_checksum;
+                if (checksum_status != StorageNodeStatusCode::kOk)
+                {
+                    store_response.status = checksum_status;
+                    store_response.error_detail = std::move(checksum_error);
+                }
+                else if (request_context.source_checksum.algorithm !=
+                              actual_checksum.algorithm ||
+                         request_context.source_checksum.value != actual_checksum.value ||
+                         request_context.source_checksum.size_bytes !=
+                              actual_checksum.size_bytes)
+                {
+                    store_response.status = StorageNodeStatusCode::kChecksumMismatch;
+                    store_response.error_detail =
+                        "RepairChunk payload does not match source checksum";
+                }
+                else
+                {
+                    const auto write_response =
+                        chunk_store_->WriteChunk(request_context.write_request);
+                    store_response.status = write_response.status;
+                    store_response.error_detail = write_response.error_detail;
+                    store_response.retry_after_ms = write_response.retry_after_ms;
+                    store_response.metadata = write_response.metadata;
+                    store_response.target_state = write_response.metadata.state;
+                    store_response.observed_size = write_response.metadata.size;
+                    if (write_response.metadata.checksum.IsSet())
+                    {
+                        store_response.observed_checksum =
+                            write_response.metadata.checksum;
+                    }
+                    store_response.target_durable = write_response.durable;
+                    store_response.already_exists = write_response.already_exists;
+                    store_response.repaired =
+                        write_response.status == StorageNodeStatusCode::kOk &&
+                        write_response.durable;
+
+                    if (store_response.status == StorageNodeStatusCode::kOk &&
+                        !store_response.target_durable)
+                    {
+                        store_response.status = StorageNodeStatusCode::kIoError;
+                        store_response.error_detail =
+                            "RepairChunk target write did not reach durable boundary";
+                        store_response.repaired = false;
+                    }
+                }
+            }
+
+            store_response.retryable =
+                store_response.status != StorageNodeStatusCode::kOk &&
+                IsRetriableStatus(store_response.status);
+            store_response.metadata.last_error = store_response.status;
+        }
+
+        FillRepairResponse(*request, store_response, node_id_, response);
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }

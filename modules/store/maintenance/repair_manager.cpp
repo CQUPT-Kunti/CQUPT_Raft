@@ -152,6 +152,111 @@ namespace storedemo
                        StorageNodeDiskPressure::kFull;
         }
 
+        bool IsHealthyRepairTarget(const StorageNodeRegistryNodeSnapshot &snapshot,
+                                   const std::uint64_t expected_size)
+        {
+            if (snapshot.liveness != StorageNodeRegistryLiveness::kLive)
+            {
+                return false;
+            }
+            if (snapshot.facts.health.health == StorageNodeHealth::kUnavailable ||
+                snapshot.facts.health.health == StorageNodeHealth::kDraining)
+            {
+                return false;
+            }
+            if (snapshot.facts.health.disk_pressure == StorageNodeDiskPressure::kHigh ||
+                snapshot.facts.health.disk_pressure == StorageNodeDiskPressure::kFull)
+            {
+                return false;
+            }
+            if (snapshot.facts.load.write_admission_overloaded)
+            {
+                return false;
+            }
+            return snapshot.facts.capacity.available_capacity_bytes >= expected_size;
+        }
+
+        StorageNodeStatusCode ValidateExecutionSourceSnapshot(
+            const StorageNodeRegistryNodeSnapshot *snapshot,
+            std::string *error_detail)
+        {
+            if (snapshot == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair source registry snapshot is missing";
+                }
+                return StorageNodeStatusCode::kNodeUnavailable;
+            }
+            if (!IsHealthyRepairSource(*snapshot))
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair source is not currently healthy";
+                }
+                return StorageNodeStatusCode::kNodeUnavailable;
+            }
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode ValidateExecutionTargetSnapshot(
+            const StorageNodeRegistryNodeSnapshot *snapshot,
+            const std::uint64_t expected_size,
+            std::string *error_detail)
+        {
+            if (snapshot == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target registry snapshot is missing";
+                }
+                return StorageNodeStatusCode::kNodeUnavailable;
+            }
+            if (snapshot->liveness != StorageNodeRegistryLiveness::kLive)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target is stale or unavailable";
+                }
+                return StorageNodeStatusCode::kNodeUnavailable;
+            }
+            if (snapshot->facts.health.health == StorageNodeHealth::kUnavailable ||
+                snapshot->facts.health.health == StorageNodeHealth::kDraining)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target health is not writable";
+                }
+                return StorageNodeStatusCode::kNodeUnavailable;
+            }
+            if (snapshot->facts.health.disk_pressure == StorageNodeDiskPressure::kHigh ||
+                snapshot->facts.health.disk_pressure == StorageNodeDiskPressure::kFull)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target disk pressure is too high";
+                }
+                return StorageNodeStatusCode::kDiskFull;
+            }
+            if (snapshot->facts.load.write_admission_overloaded)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target write admission is overloaded";
+                }
+                return StorageNodeStatusCode::kOverloaded;
+            }
+            if (!IsHealthyRepairTarget(*snapshot, expected_size))
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "repair target capacity is insufficient";
+                }
+                return StorageNodeStatusCode::kDiskFull;
+            }
+            return StorageNodeStatusCode::kOk;
+        }
+
         StorageNodeStatusCode SelectSourceNode(
             const std::vector<StorageNodeId> &candidate_sources,
             const std::map<StorageNodeId, StorageNodeRegistryNodeSnapshot, std::less<>> &snapshots,
@@ -382,6 +487,7 @@ namespace storedemo
             task.expected_size = request.repair_candidate.expected_size;
             task.existing_replica_nodes = request.manifest.replica_nodes;
             task.bad_replicas = request.repair_candidate.bad_replicas;
+            task.context = request.context;
             task.task_id = BuildRepairTaskId(task.chunk_id,
                                              task.expected_checksum,
                                              task.expected_size,
@@ -404,8 +510,7 @@ namespace storedemo
     {
         explicit Impl(const StorageNodeRegistry *registry_ptr,
                       RepairManagerConfig manager_config)
-            : registry(registry_ptr)
-            , config(std::move(manager_config))
+            : registry(registry_ptr), config(std::move(manager_config))
         {
         }
 
@@ -504,8 +609,7 @@ namespace storedemo
 
     RepairManager::RepairManager(const StorageNodeRegistry *registry,
                                  RepairManagerConfig config)
-        : config_(SanitizeRepairManagerConfig(std::move(config)))
-        , impl_(std::make_unique<Impl>(registry, config_))
+        : config_(SanitizeRepairManagerConfig(std::move(config))), impl_(std::make_unique<Impl>(registry, config_))
     {
         if (registry == nullptr)
         {
@@ -786,6 +890,253 @@ namespace storedemo
         return result;
     }
 
+    RepairTaskRunResult RepairManager::RunTask(std::string_view task_id)
+    {
+        RepairTaskRunResult result;
+
+        const auto running_result = MarkTaskRunning(task_id);
+        if (!running_result.ok())
+        {
+            result.status = running_result.status_code();
+            result.error_detail = running_result.error_detail;
+            result.task = running_result.task;
+            if (running_result.task.has_value())
+            {
+                result.source_node = running_result.task->source_node;
+                result.target_node = running_result.task->target_node;
+            }
+            return result;
+        }
+
+        auto task = *running_result.task;
+        result.task = task;
+        result.source_node = task.source_node;
+        result.target_node = task.target_node;
+
+        if (!config_.source_reader || !config_.target_writer)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kUnsupported,
+                                              "repair manager requires source_reader and target_writer",
+                                              false);
+            result.status = StorageNodeStatusCode::kUnsupported;
+            result.error_detail = "repair manager requires source_reader and target_writer";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        StorageTaskContext run_context = task.context;
+        if (run_context.timeout_ms == 0)
+        {
+            run_context.timeout_ms = config_.default_timeout_ms;
+        }
+
+        const auto now_unix_ms = config_.now_unix_ms();
+        const auto snapshot = impl_->registry->Snapshot(now_unix_ms);
+        if (!snapshot.ok())
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              snapshot.status,
+                                              snapshot.error_detail,
+                                              IsRetriableStatus(snapshot.status),
+                                              0);
+            result.status = snapshot.status;
+            result.error_detail = snapshot.error_detail;
+            result.retryable = IsRetriableStatus(snapshot.status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        const StorageNodeRegistryNodeSnapshot *source_snapshot = nullptr;
+        const StorageNodeRegistryNodeSnapshot *target_snapshot = nullptr;
+        for (const auto &node_snapshot : snapshot.nodes)
+        {
+            if (node_snapshot.node_id == task.source_node)
+            {
+                source_snapshot = &node_snapshot;
+            }
+            if (node_snapshot.node_id == task.target_node)
+            {
+                target_snapshot = &node_snapshot;
+            }
+        }
+
+        std::string validation_error;
+        auto validation_status =
+            ValidateExecutionSourceSnapshot(source_snapshot, &validation_error);
+        if (validation_status != StorageNodeStatusCode::kOk)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              validation_status,
+                                              validation_error,
+                                              IsRetriableStatus(validation_status),
+                                              0);
+            result.status = validation_status;
+            result.error_detail = validation_error;
+            result.retryable = IsRetriableStatus(validation_status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        validation_status = ValidateExecutionTargetSnapshot(target_snapshot,
+                                                            task.expected_size,
+                                                            &validation_error);
+        if (validation_status != StorageNodeStatusCode::kOk)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              validation_status,
+                                              validation_error,
+                                              IsRetriableStatus(validation_status),
+                                              0);
+            result.status = validation_status;
+            result.error_detail = validation_error;
+            result.retryable = IsRetriableStatus(validation_status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        const auto source_response = config_.source_reader(task, run_context);
+        result.source_checksum = source_response.actual_checksum;
+        result.source_size = source_response.metadata.size;
+        result.source_verified = source_response.verified;
+
+        if (!source_response.ok())
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              source_response.status,
+                                              source_response.error_detail,
+                                              IsRetriableStatus(source_response.status),
+                                              source_response.retry_after_ms);
+            result.status = source_response.status;
+            result.error_detail = source_response.error_detail;
+            result.retry_after_ms = source_response.retry_after_ms;
+            result.retryable = IsRetriableStatus(source_response.status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (source_response.metadata.state == ChunkState::kQuarantined ||
+            source_response.metadata.state == ChunkState::kCorrupted)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kCorrupted,
+                                              "repair source is corrupted or quarantined",
+                                              false);
+            result.status = StorageNodeStatusCode::kCorrupted;
+            result.error_detail = "repair source is corrupted or quarantined";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (source_response.metadata.state == ChunkState::kMissing ||
+            source_response.metadata.state == ChunkState::kDeleted)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kNotFound,
+                                              "repair source chunk is missing",
+                                              false);
+            result.status = StorageNodeStatusCode::kNotFound;
+            result.error_detail = "repair source chunk is missing";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (source_response.metadata.state != ChunkState::kLive)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kConflict,
+                                              "repair source is not in LIVE state",
+                                              false);
+            result.status = StorageNodeStatusCode::kConflict;
+            result.error_detail = "repair source is not in LIVE state";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (!source_response.verified)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kChecksumMismatch,
+                                              "repair source checksum must be verified",
+                                              false);
+            result.status = StorageNodeStatusCode::kChecksumMismatch;
+            result.error_detail = "repair source checksum must be verified";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (source_response.metadata.size != task.expected_size)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kChecksumMismatch,
+                                              "repair source size does not match expected size",
+                                              false);
+            result.status = StorageNodeStatusCode::kChecksumMismatch;
+            result.error_detail = "repair source size does not match expected size";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        if (!source_response.actual_checksum.IsSet() ||
+            source_response.actual_checksum.algorithm != task.expected_checksum.algorithm ||
+            source_response.actual_checksum.value != task.expected_checksum.value ||
+            source_response.actual_checksum.size_bytes !=
+                task.expected_checksum.size_bytes)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              StorageNodeStatusCode::kChecksumMismatch,
+                                              "repair source checksum does not match expected checksum",
+                                              false);
+            result.status = StorageNodeStatusCode::kChecksumMismatch;
+            result.error_detail =
+                "repair source checksum does not match expected checksum";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        (void)UpdateTaskProgress(task.task_id, 50);
+
+        const auto target_response =
+            config_.target_writer(task, source_response.payload, run_context);
+        result.target_checksum = target_response.observed_checksum;
+        result.target_size = target_response.observed_size;
+        result.target_durable = target_response.target_durable;
+        result.already_exists = target_response.already_exists;
+        result.repaired = target_response.repaired;
+
+        if (!target_response.ok() || !target_response.target_durable)
+        {
+            const StorageNodeStatusCode failure_code =
+                target_response.ok() ? StorageNodeStatusCode::kIoError
+                                     : target_response.status;
+            const std::string failure_detail =
+                target_response.ok()
+                    ? "repair target write did not reach durable boundary"
+                    : target_response.error_detail;
+            const bool retryable =
+                target_response.retryable || IsRetriableStatus(failure_code);
+            const auto fail_result = FailTask(task.task_id,
+                                              failure_code,
+                                              failure_detail,
+                                              retryable,
+                                              target_response.retry_after_ms);
+            result.status = failure_code;
+            result.error_detail = failure_detail;
+            result.retry_after_ms = target_response.retry_after_ms;
+            result.retryable = retryable;
+            result.task = fail_result.task;
+            return result;
+        }
+
+        (void)UpdateTaskProgress(task.task_id, 90);
+        const auto complete_result = CompleteTask(task.task_id);
+        result.status = complete_result.status_code();
+        result.error_detail = complete_result.error_detail;
+        result.task = complete_result.task;
+        result.retryable = false;
+        return result;
+    }
+
     std::optional<RepairTask> RepairManager::FindTask(std::string_view task_id) const
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -814,6 +1165,7 @@ namespace storedemo
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         RepairManagerStats stats;
+        stats.accepting_new_tasks = true;
         stats.max_active_tasks = config_.max_active_tasks;
         stats.max_tasks = config_.max_tasks;
         stats.total_tasks = impl_->tasks.size();

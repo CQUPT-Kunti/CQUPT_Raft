@@ -49,6 +49,11 @@ namespace storedemo
         StorageTaskContext context;
     };
 
+    struct StorageNodeClientRepairChunkOptions
+    {
+        StorageTaskContext context;
+    };
+
     struct StorageNodeClientRegistryOptions
     {
         StorageTaskContext context;
@@ -102,6 +107,43 @@ namespace storedemo
         bool known_missing{false};
         bool quarantined{false};
         bool repair_required{false};
+        bool retryable{false};
+    };
+
+    struct StorageNodeClientRepairChunkRequest
+    {
+        std::string request_id;
+        ChunkId chunk_id;
+        std::string object_id;
+        std::uint64_t version{0};
+        std::uint32_t chunk_index{0};
+        std::uint64_t offset{0};
+        std::uint64_t expected_size{0};
+        ChunkChecksum expected_checksum;
+        StorageNodeId source_node_id;
+        std::uint64_t source_size{0};
+        ChunkChecksum source_checksum;
+        ChunkState source_state{ChunkState::kMissing};
+        bool source_checksum_verified{false};
+        std::string payload;
+        StorageNodeWriteDurability durability{StorageNodeWriteDurability::kPublish};
+    };
+
+    struct StorageNodeClientRepairChunkResponse : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        StorageNodeId source_node_id;
+        ChunkState source_state{ChunkState::kMissing};
+        ChunkState target_state{ChunkState::kMissing};
+        ChunkChecksum expected_checksum;
+        ChunkChecksum observed_checksum;
+        std::uint64_t expected_size{0};
+        std::uint64_t observed_size{0};
+        bool source_checksum_verified{false};
+        bool source_unavailable{false};
+        bool target_durable{false};
+        bool already_exists{false};
+        bool repaired{false};
         bool retryable{false};
     };
 
@@ -272,6 +314,10 @@ namespace storedemo
         StorageNodeClientScrubChunkResponse ScrubChunk(
             const StorageNodeClientScrubChunkRequest &request,
             StorageNodeClientScrubChunkOptions options = {});
+
+        StorageNodeClientRepairChunkResponse RepairChunk(
+            const StorageNodeClientRepairChunkRequest &request,
+            StorageNodeClientRepairChunkOptions options = {});
 
         StorageNodeClientDeleteChunkResponse DeleteChunk(
             const StorageNodeClientDeleteChunkRequest &request,

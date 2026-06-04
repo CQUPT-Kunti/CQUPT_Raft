@@ -14,11 +14,10 @@
 - task submit / retry / stop / drain / stats
 - 注入式 delete handler 调用边界
 - `ScrubManager` bounded background queue 与 scrub facts 聚合
-- `RepairManager` task model、source/target 规划与生命周期状态机
+- `RepairManager` task model、source/target 规划、copy flow 与生命周期状态机
 
 当前不负责：
 
-- RepairChunk copy flow
 - under-replicated detection
 - rebalance
 - metadata / Raft 调用
@@ -31,12 +30,14 @@
 - healthy source 选择仍基于 registry snapshot + `ReplicaPolicySelector` + 本地 checksum 校验；stale/unavailable/unhealthy/high-disk-pressure 副本不会进入 healthy source。
 - 当前 `ScrubManager` 不做 task persistence、restart resume、跨节点 `ScrubChunk` fan-out 或 read-side repair。
 
-## T084 fixed boundary
+## T084/T085 fixed boundary
 
 - T084 新增生产 `RepairManager` task model，负责从 scrub/repair candidate 生成 repair task，并固定 source_node、target_node、chunk_id、expected checksum/size、state、progress、attempts、last_error、last_error_detail。
-- `RepairManager` 只表达 repair 生命周期和可观察计划事实，不执行 `RepairChunk` copy flow，不直接写 target chunk，不更新 metadata manifest，不调用 Raft，也不保存 object payload。
-- `RepairManager` 当前通过 registry snapshot + `PlacementManager` 固定 source/target，可做 submit / lookup / list / cancel / retry / complete / fail / running / progress 更新，但不做 task persistence、read-side repair 或 rebalance。
-- `retry_pending` 只表示“等待下一次 repair attempt 的 task model 状态”；真正 copy 和 durable 写入留给 T085。
+- T085 在此基础上补上最小生产 copy flow：`RunTask()` 通过注入的 `source_reader` / `target_writer` 执行 source read、checksum verify、target durable write 和 task state 推进。
+- `RepairManager` 当前可做 submit / lookup / list / cancel / retry / running / progress / complete / fail / run-task 更新，但不做 metadata manifest coordination、不发布 replica facts、不做 task persistence、read-side repair 或 rebalance。
+- `Completed` 只表示 target durable write 已完成；不代表 metadata manifest 已更新，也不代表 source cleanup 已发生。
+- `RetryPending` 表示 task 需要下一次 repair attempt；retryable failure 由 source/target 校验、RPC/IO 状态和 target durable 结果共同驱动。
+- copy flow 只处理 chunk data-plane payload 和 checksum/size 事实，不调用 metadata / Raft，也不保存 object payload 到 metadata / Raft。
 
 ## 主要文件
 
@@ -258,6 +259,31 @@
 
 - 责任：对单副本执行 `StatChunk` + checksum verify，产出副本事实。
 - 输入：副本对应 `ChunkStore`、node_id、manifest 和副本序号。
+- 输出：单副本 `ScrubReplicaFact`。
+- 边界：只做本地 checksum/state 检查，不触发 repair。
+
+## repair_manager.cpp 关键 helper
+
+### `ValidateExecutionSourceSnapshot(...)` / `ValidateExecutionTargetSnapshot(...)`
+
+- 责任：在真正执行 copy 前重新校验 source/target 的 registry snapshot。
+- 输入：source/target 节点快照、target 期望容量。
+- 输出：`OK` 或明确的 `NODE_UNAVAILABLE/OVERLOADED/DISK_FULL/CONFLICT` 等错误。
+- 边界：只依赖运行时 registry snapshot；不做 metadata manifest freshness 协调。
+
+### `RepairManager::RunTask(std::string_view)`
+
+- 责任：驱动单个 repair task 的最小生产 copy flow。
+- 输入：task id。
+- 输出：`RepairTaskRunResult`，包含 source/target、source checksum/size、retryable、最终 task snapshot。
+- 边界：顺序固定为 source/target revalidate -> source read -> checksum/size verify -> target durable write -> task state update；只有 target durable 成功才 `CompleteTask()`，否则进入 `Failed` 或 `RetryPending`；不更新 metadata manifest，不做 source cleanup。
+
+### `RepairTaskSourceReader` / `RepairTaskTargetWriter`
+
+- 责任：把 source read 和 target durable write 抽象成可注入生产路径。
+- 输入：`RepairTask`、`StorageTaskContext`，以及 target writer 的 payload/checksum。
+- 输出：source 侧的 payload/checksum/state/verified 事实，或 target 侧的 durable/already_exists/retryable 结果。
+- 边界：允许通过真实 `StorageNodeClient::ReadChunk/RepairChunk` 或等价生产路径接线；maintenance 层不硬编码 metadata / Raft / manifest 更新。
 - 输出：`ScrubReplicaFact`。
 - 边界：只读本地 chunk facts；发现 checksum mismatch/corruption 时可沿用现有 quarantine 语义，但不触发 repair。
 

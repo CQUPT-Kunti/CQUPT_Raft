@@ -195,6 +195,61 @@ namespace
         return request;
     }
 
+    storage::RepairChunkRequest MakeProtoRepairRequest(
+        const storedemo::ChunkIdentity &identity,
+        const std::string &payload,
+        const std::string &request_id,
+        const storedemo::StorageNodeId &source_node_id = "repair-source-node",
+        const storedemo::ChunkState source_state = storedemo::ChunkState::kLive,
+        const bool source_checksum_verified = true)
+    {
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        storage::RepairChunkRequest request;
+        request.set_request_id(request_id);
+        request.set_chunk_id(identity.chunk_id);
+        request.set_object_id(identity.object_id);
+        request.set_version(identity.version);
+        request.set_chunk_index(identity.chunk_index);
+        request.set_offset(identity.offset);
+        request.set_expected_size(static_cast<std::uint64_t>(payload.size()));
+        FillProtoChecksum(checksum, request.mutable_expected_checksum());
+        request.set_source_node_id(source_node_id);
+        request.set_source_size(static_cast<std::uint64_t>(payload.size()));
+        FillProtoChecksum(checksum, request.mutable_source_checksum());
+        switch (source_state)
+        {
+        case storedemo::ChunkState::kStaging:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_STAGING);
+            break;
+        case storedemo::ChunkState::kLive:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_LIVE);
+            break;
+        case storedemo::ChunkState::kDeleting:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_DELETING);
+            break;
+        case storedemo::ChunkState::kDeleted:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_DELETED);
+            break;
+        case storedemo::ChunkState::kQuarantined:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_QUARANTINED);
+            break;
+        case storedemo::ChunkState::kCorrupted:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_CORRUPTED);
+            break;
+        case storedemo::ChunkState::kMissing:
+        default:
+            request.set_source_state(storage::STORAGE_CHUNK_STATE_MISSING);
+            break;
+        }
+        request.set_source_checksum_verified(source_checksum_verified);
+        request.set_payload(payload);
+        request.set_timeout_ms(1500);
+        request.set_best_effort_cancel(true);
+        request.set_durability(storage::WRITE_CHUNK_DURABILITY_PUBLISH);
+        return request;
+    }
+
     std::shared_ptr<storedemo::ShardedChunkIndex> MakeSharedIndex()
     {
         return std::make_shared<storedemo::ShardedChunkIndex>();
@@ -763,6 +818,21 @@ namespace
 
             storage::ScrubChunkResponse response;
             grpc::Status status = stub_->ScrubChunk(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::RepairChunkResponse RepairChunk(const storage::RepairChunkRequest &request,
+                                                 grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::RepairChunkResponse response;
+            grpc::Status status = stub_->RepairChunk(&context, request, &response);
             if (grpc_status != nullptr)
             {
                 *grpc_status = status;
@@ -2029,6 +2099,229 @@ namespace
         EXPECT_TRUE(response.result().fact().quarantined());
         EXPECT_TRUE(response.result().repair_required());
         EXPECT_FALSE(response.result().fact().checksum_verified());
+    }
+
+    TEST_F(StorageNodeServiceTest, RepairChunkMapsDurableSuccessAndFacts)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_repair_success");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 85));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t085-repair-success", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(128, "t085-repair-success");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.RepairChunk(
+            MakeProtoRepairRequest(identity, payload, "repair-success-t085"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().source_node_id(), "repair-source-node");
+        EXPECT_EQ(response.result().fact().target_node_id(), store->config().node_id);
+        EXPECT_EQ(response.result().fact().expected_size(), payload.size());
+        EXPECT_EQ(response.result().fact().observed_size(), payload.size());
+        EXPECT_EQ(response.result().fact().expected_checksum().value(), checksum.value);
+        EXPECT_EQ(response.result().fact().observed_checksum().value(), checksum.value);
+        EXPECT_EQ(response.result().fact().source_state(),
+                  storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.result().fact().target_state(),
+                  storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_TRUE(response.result().fact().source_checksum_verified());
+        EXPECT_FALSE(response.result().fact().source_unavailable());
+        EXPECT_TRUE(response.result().fact().target_durable());
+        EXPECT_FALSE(response.result().fact().already_exists());
+        EXPECT_TRUE(response.result().repaired());
+        EXPECT_FALSE(response.result().retryable());
+
+        const auto read_response = store->ReadChunk(
+            MakeReadRequest(identity.chunk_id, "repair-success-read-t085"));
+        ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(read_response.payload, payload);
+    }
+
+    TEST_F(StorageNodeServiceTest, RepairChunkAlreadyExistsSameChecksumIsIdempotentSuccess)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_repair_already_exists");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 86));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t085-repair-already-exists", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "t085-repair-already-exists");
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "repair-prewrite-t085",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = ComputeStoreChecksumOrThrow(payload),
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.RepairChunk(
+            MakeProtoRepairRequest(identity, payload, "repair-already-exists-t085"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_TRUE(response.result().fact().already_exists());
+        EXPECT_TRUE(response.result().fact().target_durable());
+        EXPECT_TRUE(response.result().repaired());
+    }
+
+    TEST_F(StorageNodeServiceTest, RepairChunkAlreadyExistsDifferentPayloadReturnsConflict)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_repair_conflict");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 87));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t085-repair-conflict", 1, 0, 0);
+        const auto original_payload =
+            storedemo::test::MakeChunkPayload(80, "t085-repair-original");
+        const auto different_payload =
+            storedemo::test::MakeChunkPayload(80, "t085-repair-different");
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "repair-conflict-prewrite-t085",
+                          .identity = identity,
+                          .expected_size =
+                              static_cast<std::uint64_t>(original_payload.size()),
+                          .expected_checksum =
+                              ComputeStoreChecksumOrThrow(original_payload),
+                          .payload = original_payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.RepairChunk(
+            MakeProtoRepairRequest(identity,
+                                   different_payload,
+                                   "repair-conflict-t085"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CONFLICT);
+        EXPECT_FALSE(response.result().fact().target_durable());
+        EXPECT_FALSE(response.result().repaired());
+
+        const auto read_response = store->ReadChunk(
+            MakeReadRequest(identity.chunk_id, "repair-conflict-read-t085"));
+        ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(read_response.payload, original_payload);
+    }
+
+    TEST_F(StorageNodeServiceTest, RepairChunkPayloadChecksumMismatchDoesNotWriteTarget)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_repair_checksum");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 88));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t085-repair-checksum", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(72, "t085-repair-checksum");
+        auto request = MakeProtoRepairRequest(identity, payload, "repair-checksum-t085");
+        request.set_payload(
+            storedemo::test::MakeChunkPayload(payload.size(), "t085-repair-tampered"));
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.RepairChunk(request, &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CHECKSUM_MISMATCH);
+        EXPECT_FALSE(response.result().fact().target_durable());
+        EXPECT_FALSE(response.result().repaired());
+
+        EXPECT_EQ(store->StatChunk(
+                      storedemo::StatChunkRequest{
+                          .request_id = "repair-checksum-stat-t085",
+                          .chunk_id = identity.chunk_id})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageNodeServiceTest, RepairChunkRejectsInvalidIdentityAndQuarantinedSource)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_repair_invalid");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 89));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity =
+            MakeStoreIdentityOrThrow("obj-t085-repair-invalid", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(64, "t085-repair-invalid");
+
+        auto invalid_request =
+            MakeProtoRepairRequest(identity, payload, "repair-invalid-t085");
+        invalid_request.clear_chunk_id();
+        invalid_request.clear_object_id();
+        invalid_request.set_version(0);
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto invalid_response = server.RepairChunk(invalid_request, &grpc_status);
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(invalid_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_INVALID_ARGUMENT);
+        EXPECT_FALSE(invalid_response.result().repaired());
+
+        grpc::Status quarantined_grpc_status;
+        const auto quarantined_response = server.RepairChunk(
+            MakeProtoRepairRequest(identity,
+                                   payload,
+                                   "repair-quarantined-source-t085",
+                                   "repair-source-node",
+                                   storedemo::ChunkState::kQuarantined),
+            &quarantined_grpc_status);
+        ASSERT_TRUE(quarantined_grpc_status.ok())
+            << quarantined_grpc_status.error_message();
+        EXPECT_EQ(quarantined_response.summary().code(),
+                  storage::STORAGE_NODE_STATUS_CODE_CORRUPTED);
+        EXPECT_FALSE(quarantined_response.result().fact().target_durable());
+        EXPECT_FALSE(quarantined_response.result().repaired());
     }
 
     TEST_F(StorageNodeServiceTest, DeleteChunkMapsFieldsAndRetryableResponseFacts)
