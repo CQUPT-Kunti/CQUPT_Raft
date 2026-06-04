@@ -48,6 +48,19 @@ namespace storedemo
                    state == RebalanceTaskState::kRetryPending;
         }
 
+        bool ChecksumsMatch(const ChunkChecksum &lhs, const ChunkChecksum &rhs)
+        {
+            return lhs.algorithm == rhs.algorithm && lhs.value == rhs.value &&
+                   lhs.size_bytes == rhs.size_bytes;
+        }
+
+        bool HasReachedCompletedStages(const RebalanceTask &task)
+        {
+            return task.source_payload_verified && task.target_durable &&
+                   task.target_verified && task.manifest_coordinated &&
+                   task.source_cleanup_completed;
+        }
+
         const char *TaskReasonToken(const RebalanceTaskReason reason)
         {
             switch (reason)
@@ -278,6 +291,131 @@ namespace storedemo
                     *error_detail = "rebalance target capacity is insufficient";
                 }
                 return StorageNodeStatusCode::kDiskFull;
+            }
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode ValidateSourceReadResult(
+            const RebalanceTask &task,
+            const RebalanceSourceReadResult &source_response,
+            std::string *error_detail)
+        {
+            if (!source_response.ok())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = source_response.error_detail;
+                }
+                return source_response.status;
+            }
+            if (source_response.metadata.state == ChunkState::kQuarantined ||
+                source_response.metadata.state == ChunkState::kCorrupted)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance source is corrupted or quarantined";
+                }
+                return StorageNodeStatusCode::kCorrupted;
+            }
+            if (source_response.metadata.state == ChunkState::kMissing ||
+                source_response.metadata.state == ChunkState::kDeleted)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "rebalance source chunk is missing";
+                }
+                return StorageNodeStatusCode::kNotFound;
+            }
+            if (source_response.metadata.state != ChunkState::kLive)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "rebalance source is not in LIVE state";
+                }
+                return StorageNodeStatusCode::kConflict;
+            }
+            if (!source_response.verified)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance source checksum must be verified";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+            if (source_response.metadata.size != task.expected_size)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance source size does not match expected size";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+            if (!source_response.actual_checksum.IsSet() ||
+                !ChecksumsMatch(source_response.actual_checksum,
+                                task.expected_checksum))
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance source checksum does not match expected checksum";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+            return StorageNodeStatusCode::kOk;
+        }
+
+        StorageNodeStatusCode ValidateTargetVerifyResult(
+            const RebalanceTask &task,
+            const RebalanceTargetVerifyResult &verify_response,
+            std::string *error_detail)
+        {
+            if (!verify_response.ok())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = verify_response.error_detail;
+                }
+                return verify_response.status;
+            }
+            if (verify_response.metadata.state != ChunkState::kLive)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "rebalance target is not in LIVE state";
+                }
+                return StorageNodeStatusCode::kConflict;
+            }
+            if (!verify_response.verified)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance target checksum must be verified";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+            if (verify_response.actual_size != task.expected_size)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance target size does not match expected size";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+            if (!verify_response.actual_checksum.IsSet() ||
+                !ChecksumsMatch(verify_response.actual_checksum,
+                                task.expected_checksum))
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "rebalance target checksum does not match expected checksum";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
             }
             return StorageNodeStatusCode::kOk;
         }
@@ -690,6 +828,15 @@ namespace storedemo
             result.task = task_it->second;
             return result;
         }
+        if (!HasReachedCompletedStages(task_it->second))
+        {
+            RebalanceTaskOperationResult result;
+            result.code = RebalanceTaskOperationCode::kConflict;
+            result.error_detail =
+                "rebalance task cannot complete before copy, verify, manifest coordination and source cleanup finish";
+            result.task = task_it->second;
+            return result;
+        }
 
         task_it->second.state = RebalanceTaskState::kCompleted;
         task_it->second.progress_percent = 100;
@@ -808,6 +955,490 @@ namespace storedemo
 
         RebalanceTaskOperationResult result;
         result.task = task_it->second;
+        return result;
+    }
+
+    RebalanceTaskRunResult RebalanceManager::RunTask(std::string_view task_id)
+    {
+        RebalanceTaskRunResult result;
+
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            const auto task_it = impl_->tasks.find(std::string(task_id));
+            if (task_it == impl_->tasks.end())
+            {
+                result.status = StorageNodeStatusCode::kNotFound;
+                result.error_detail =
+                    "rebalance task not found: " + std::string(task_id);
+                return result;
+            }
+            if (task_it->second.state == RebalanceTaskState::kCompleted)
+            {
+                result.status = StorageNodeStatusCode::kOk;
+                result.task = task_it->second;
+                result.source_node = task_it->second.source_node;
+                result.target_node = task_it->second.target_node;
+                result.source_verified = task_it->second.source_payload_verified;
+                result.target_durable = task_it->second.target_durable;
+                result.target_already_exists = task_it->second.target_already_exists;
+                result.target_verified = task_it->second.target_verified;
+                result.manifest_updated = task_it->second.manifest_coordinated;
+                result.manifest_idempotent =
+                    task_it->second.manifest_already_applied;
+                result.source_cleanup_completed =
+                    task_it->second.source_cleanup_completed;
+                result.orphan_candidate_created =
+                    task_it->second.orphan_candidate_recorded;
+                result.idempotent_success = true;
+                return result;
+            }
+        }
+
+        const auto running_result = MarkTaskRunning(task_id);
+        if (!running_result.ok())
+        {
+            result.status = running_result.status_code();
+            result.error_detail = running_result.error_detail;
+            result.task = running_result.task;
+            if (running_result.task.has_value())
+            {
+                result.source_node = running_result.task->source_node;
+                result.target_node = running_result.task->target_node;
+            }
+            return result;
+        }
+
+        auto task = *running_result.task;
+        result.task = task;
+        result.source_node = task.source_node;
+        result.target_node = task.target_node;
+        result.source_verified = task.source_payload_verified;
+        result.target_durable = task.target_durable;
+        result.target_already_exists = task.target_already_exists;
+        result.target_verified = task.target_verified;
+        result.manifest_updated = task.manifest_coordinated;
+        result.manifest_idempotent = task.manifest_already_applied;
+        result.source_cleanup_completed = task.source_cleanup_completed;
+        result.orphan_candidate_created = task.orphan_candidate_recorded;
+
+        if (!config_.source_reader || !config_.target_writer ||
+            !config_.target_verifier || !config_.manifest_coordinator ||
+            !config_.source_cleanup_handler || !config_.cleanup_candidate_recorder)
+        {
+            const auto fail_result = FailTask(
+                task.task_id,
+                StorageNodeStatusCode::kUnsupported,
+                "rebalance manager requires source_reader, target_writer, target_verifier, manifest_coordinator, source_cleanup_handler and cleanup_candidate_recorder",
+                false);
+            result.status = StorageNodeStatusCode::kUnsupported;
+            result.error_detail =
+                "rebalance manager requires source_reader, target_writer, target_verifier, manifest_coordinator, source_cleanup_handler and cleanup_candidate_recorder";
+            result.task = fail_result.task;
+            return result;
+        }
+
+        StorageTaskContext run_context = task.context;
+        if (run_context.timeout_ms == 0)
+        {
+            run_context.timeout_ms = config_.default_timeout_ms;
+        }
+
+        const auto now_unix_ms = config_.now_unix_ms();
+        const auto snapshot = impl_->registry->Snapshot(now_unix_ms);
+        if (!snapshot.ok())
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              snapshot.status,
+                                              snapshot.error_detail,
+                                              IsRetriableStatus(snapshot.status),
+                                              0);
+            result.status = snapshot.status;
+            result.error_detail = snapshot.error_detail;
+            result.retryable = IsRetriableStatus(snapshot.status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        const StorageNodeRegistryNodeSnapshot *source_snapshot = nullptr;
+        const StorageNodeRegistryNodeSnapshot *target_snapshot = nullptr;
+        for (const auto &node_snapshot : snapshot.nodes)
+        {
+            if (node_snapshot.node_id == task.source_node)
+            {
+                source_snapshot = &node_snapshot;
+            }
+            if (node_snapshot.node_id == task.target_node)
+            {
+                target_snapshot = &node_snapshot;
+            }
+        }
+
+        std::string validation_error;
+        auto validation_status =
+            ValidateSourceSnapshot(source_snapshot, &validation_error);
+        if (validation_status != StorageNodeStatusCode::kOk)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              validation_status,
+                                              validation_error,
+                                              IsRetriableStatus(validation_status),
+                                              0);
+            result.status = validation_status;
+            result.error_detail = validation_error;
+            result.retryable = IsRetriableStatus(validation_status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        validation_status = ValidateTargetSnapshot(target_snapshot,
+                                                   task.expected_size,
+                                                   &validation_error);
+        if (validation_status != StorageNodeStatusCode::kOk)
+        {
+            const auto fail_result = FailTask(task.task_id,
+                                              validation_status,
+                                              validation_error,
+                                              IsRetriableStatus(validation_status),
+                                              0);
+            result.status = validation_status;
+            result.error_detail = validation_error;
+            result.retryable = IsRetriableStatus(validation_status);
+            result.task = fail_result.task;
+            return result;
+        }
+
+        auto store_stage = [&](const auto &mutator) -> std::optional<RebalanceTask>
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            const auto task_it = impl_->tasks.find(task.task_id);
+            if (task_it == impl_->tasks.end())
+            {
+                return std::nullopt;
+            }
+            mutator(&task_it->second);
+            return task_it->second;
+        };
+
+        std::string source_payload;
+        bool source_payload_loaded = false;
+        if (!task.source_payload_verified || !task.target_durable)
+        {
+            const auto source_response = config_.source_reader(task, run_context);
+            result.source_checksum = source_response.actual_checksum;
+            result.source_size = source_response.metadata.size;
+            result.source_verified = source_response.verified;
+            source_payload = source_response.payload;
+            source_payload_loaded = true;
+
+            const auto source_status =
+                ValidateSourceReadResult(task, source_response, &validation_error);
+            if (source_status != StorageNodeStatusCode::kOk)
+            {
+                const bool retryable = IsRetriableStatus(source_status);
+                const auto fail_result =
+                    FailTask(task.task_id,
+                             source_status,
+                             validation_error,
+                             retryable,
+                             source_response.retry_after_ms);
+                result.status = source_status;
+                result.error_detail = validation_error;
+                result.retry_after_ms = source_response.retry_after_ms;
+                result.retryable = retryable;
+                result.task = fail_result.task;
+                return result;
+            }
+
+            const auto updated_task = store_stage(
+                [&](RebalanceTask *mutable_task)
+                {
+                    mutable_task->source_payload_verified = true;
+                });
+            if (updated_task.has_value())
+            {
+                task = *updated_task;
+                result.task = task;
+            }
+            (void)UpdateTaskProgress(task.task_id, 25);
+        }
+
+        if (!task.target_durable)
+        {
+            if (!source_payload_loaded)
+            {
+                const auto source_response =
+                    config_.source_reader(task, run_context);
+                result.source_checksum = source_response.actual_checksum;
+                result.source_size = source_response.metadata.size;
+                result.source_verified = source_response.verified;
+                if (const auto source_status =
+                        ValidateSourceReadResult(task,
+                                                 source_response,
+                                                 &validation_error);
+                    source_status != StorageNodeStatusCode::kOk)
+                {
+                    const bool retryable = IsRetriableStatus(source_status);
+                    const auto fail_result =
+                        FailTask(task.task_id,
+                                 source_status,
+                                 validation_error,
+                                 retryable,
+                                 source_response.retry_after_ms);
+                    result.status = source_status;
+                    result.error_detail = validation_error;
+                    result.retry_after_ms = source_response.retry_after_ms;
+                    result.retryable = retryable;
+                    result.task = fail_result.task;
+                    return result;
+                }
+                source_payload = source_response.payload;
+                source_payload_loaded = true;
+            }
+
+            const auto target_response =
+                config_.target_writer(task, source_payload, run_context);
+            result.target_checksum = target_response.observed_checksum;
+            result.target_size = target_response.observed_size;
+            result.target_durable = target_response.target_durable;
+            result.target_already_exists = target_response.already_exists;
+
+            if (!target_response.ok() || !target_response.target_durable)
+            {
+                const StorageNodeStatusCode failure_code =
+                    target_response.ok() ? StorageNodeStatusCode::kIoError
+                                         : target_response.status;
+                const std::string failure_detail =
+                    target_response.ok()
+                        ? "rebalance target write did not reach durable boundary"
+                        : target_response.error_detail;
+                const bool retryable =
+                    target_response.retryable || IsRetriableStatus(failure_code);
+                const auto fail_result =
+                    FailTask(task.task_id,
+                             failure_code,
+                             failure_detail,
+                             retryable,
+                             target_response.retry_after_ms);
+                result.status = failure_code;
+                result.error_detail = failure_detail;
+                result.retry_after_ms = target_response.retry_after_ms;
+                result.retryable = retryable;
+                result.task = fail_result.task;
+                return result;
+            }
+
+            const auto updated_task = store_stage(
+                [&](RebalanceTask *mutable_task)
+                {
+                    mutable_task->target_durable = true;
+                    mutable_task->target_already_exists =
+                        target_response.already_exists;
+                });
+            if (updated_task.has_value())
+            {
+                task = *updated_task;
+                result.task = task;
+            }
+            (void)UpdateTaskProgress(task.task_id, 50);
+        }
+        else
+        {
+            result.target_durable = true;
+            result.target_already_exists = task.target_already_exists;
+        }
+
+        if (!task.target_verified)
+        {
+            const auto verify_response =
+                config_.target_verifier(task, run_context);
+            result.target_checksum = verify_response.actual_checksum;
+            result.target_size = verify_response.actual_size;
+            result.target_verified = verify_response.verified;
+
+            const auto verify_status =
+                ValidateTargetVerifyResult(task, verify_response, &validation_error);
+            if (verify_status != StorageNodeStatusCode::kOk)
+            {
+                const bool retryable =
+                    verify_response.retryable || IsRetriableStatus(verify_status);
+                const auto fail_result =
+                    FailTask(task.task_id,
+                             verify_status,
+                             validation_error,
+                             retryable,
+                             verify_response.retry_after_ms);
+                result.status = verify_status;
+                result.error_detail = validation_error;
+                result.retry_after_ms = verify_response.retry_after_ms;
+                result.retryable = retryable;
+                result.task = fail_result.task;
+                return result;
+            }
+
+            const auto updated_task = store_stage(
+                [&](RebalanceTask *mutable_task)
+                {
+                    mutable_task->target_verified = true;
+                });
+            if (updated_task.has_value())
+            {
+                task = *updated_task;
+                result.task = task;
+            }
+            result.target_verified = true;
+            (void)UpdateTaskProgress(task.task_id, 75);
+        }
+        else
+        {
+            result.target_verified = true;
+        }
+
+        if (!task.manifest_coordinated)
+        {
+            result.manifest_coordination_attempted = true;
+            const auto coordination =
+                config_.manifest_coordinator(task, run_context);
+            if (!coordination.ok())
+            {
+                const auto cleanup_candidate =
+                    config_.cleanup_candidate_recorder(
+                        task,
+                        "manifest_coordination_failed_after_target_verify",
+                        run_context);
+                if (cleanup_candidate.ok() &&
+                    (cleanup_candidate.recorded ||
+                     cleanup_candidate.already_exists))
+                {
+                    const auto updated_task = store_stage(
+                        [&](RebalanceTask *mutable_task)
+                        {
+                            mutable_task->orphan_candidate_recorded = true;
+                        });
+                    if (updated_task.has_value())
+                    {
+                        task = *updated_task;
+                        result.task = task;
+                    }
+                    result.orphan_candidate_created = true;
+                }
+
+                const bool retryable =
+                    coordination.retryable || IsRetriableStatus(coordination.status);
+                std::string failure_detail = coordination.error_detail;
+                if (!cleanup_candidate.ok())
+                {
+                    if (!failure_detail.empty())
+                    {
+                        failure_detail += "; ";
+                    }
+                    failure_detail +=
+                        "failed to record rebalance cleanup candidate: " +
+                        cleanup_candidate.error_detail;
+                }
+                else if (!cleanup_candidate.recorded &&
+                         !cleanup_candidate.already_exists)
+                {
+                    if (!failure_detail.empty())
+                    {
+                        failure_detail += "; ";
+                    }
+                    failure_detail +=
+                        "rebalance cleanup candidate was not recorded";
+                }
+
+                const auto fail_result =
+                    FailTask(task.task_id,
+                             coordination.status,
+                             failure_detail,
+                             retryable,
+                             coordination.retry_after_ms);
+                result.status = coordination.status;
+                result.error_detail = failure_detail;
+                result.retry_after_ms = coordination.retry_after_ms;
+                result.retryable = retryable;
+                result.task = fail_result.task;
+                return result;
+            }
+
+            const auto updated_task = store_stage(
+                [&](RebalanceTask *mutable_task)
+                {
+                    mutable_task->manifest_coordinated = true;
+                    mutable_task->manifest_already_applied =
+                        coordination.already_applied;
+                });
+            if (updated_task.has_value())
+            {
+                task = *updated_task;
+                result.task = task;
+            }
+            result.manifest_updated = true;
+            result.manifest_idempotent = coordination.already_applied;
+            (void)UpdateTaskProgress(task.task_id, 90);
+        }
+        else
+        {
+            result.manifest_updated = true;
+            result.manifest_idempotent = task.manifest_already_applied;
+        }
+
+        if (!task.source_cleanup_completed)
+        {
+            result.source_cleanup_attempted = true;
+            const auto cleanup =
+                config_.source_cleanup_handler(task, run_context);
+            if (!cleanup.ok())
+            {
+                const bool retryable =
+                    cleanup.retryable || IsRetriableStatus(cleanup.status);
+                const auto fail_result =
+                    FailTask(task.task_id,
+                             cleanup.status,
+                             cleanup.error_detail,
+                             retryable,
+                             cleanup.retry_after_ms);
+                result.status = cleanup.status;
+                result.error_detail = cleanup.error_detail;
+                result.retry_after_ms = cleanup.retry_after_ms;
+                result.retryable = retryable;
+                result.task = fail_result.task;
+                return result;
+            }
+
+            const auto updated_task = store_stage(
+                [&](RebalanceTask *mutable_task)
+                {
+                    mutable_task->source_cleanup_completed =
+                        cleanup.completed || cleanup.already_missing;
+                    mutable_task->source_cleanup_already_missing =
+                        cleanup.already_missing;
+                });
+            if (updated_task.has_value())
+            {
+                task = *updated_task;
+                result.task = task;
+            }
+            result.source_cleanup_completed =
+                cleanup.completed || cleanup.already_missing;
+            (void)UpdateTaskProgress(task.task_id, 95);
+        }
+        else
+        {
+            result.source_cleanup_completed = true;
+        }
+
+        const auto complete_result = CompleteTask(task.task_id);
+        result.status = complete_result.status_code();
+        result.error_detail = complete_result.error_detail;
+        result.task = complete_result.task;
+        result.retryable = false;
+        if (complete_result.task.has_value())
+        {
+            result.idempotent_success =
+                complete_result.task->target_already_exists ||
+                complete_result.task->manifest_already_applied ||
+                complete_result.task->source_cleanup_already_missing;
+        }
         return result;
     }
 

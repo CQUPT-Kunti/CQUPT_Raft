@@ -51,8 +51,17 @@
 - T087 新增生产 `RebalanceManager` task model，负责创建并维护 capacity imbalance / hotspot / new node join / draining / maintenance rebalance task。
 - task 固定记录 `task_id/chunk_id/source_node/target_node/reason/expected checksum/expected size/state/progress/attempts/last_error/last_error_detail`，并提供 submit / lookup / list / running / progress / complete / fail / cancel / retry 边界。
 - submit 阶段当前会校验 chunk identity、expected checksum/size、`source != target`、source chunk state，以及 registry snapshot 中 source/target 的 live/health/capacity/load 边界；stale/unavailable/unhealthy source、overloaded/high-disk-pressure/insufficient-capacity target 会被拒绝。
-- `Completed` 当前只表示 rebalance task model 已完成，不代表 rebalance copy、target durable、metadata manifest coordination 或 source cleanup 已执行。
-- 当前不做 rebalance copy/verify、不做 metadata manifest coordination、不做 source cleanup、不做自动后台调度，也不做 task persistence、metadata/Raft 写入或 object payload 持久化。
+- 当前不做自动后台调度，也不做 task persistence、metadata/Raft 写入或 object payload 持久化。
+
+## T088 fixed boundary
+
+- T088 在 T087 task model 上补上生产 `RebalanceManager::RunTask()` 占位流程：`source read -> target durable write -> target verify -> manifest coordination callback -> source cleanup callback`。
+- `target durable` 和 `target verify` 都成功后，才允许进入 manifest coordination callback；manifest coordination 成功后，才允许 source cleanup。
+- manifest coordination callback 当前只是注入式占位接口，不代表真实 metadata manifest update、Raft 提交或 object 可见性决策。
+- manifest coordination 失败时，source 不会清理；target durable chunk 会通过 cleanup candidate / orphan candidate recorder 进入后续待清理边界。
+- source cleanup 失败时，task 进入 `RetryPending` 或明确失败状态，并保留 `target_durable/target_verified/manifest_coordinated` 阶段事实，下一次 `RunTask()` 不会重复写 target 或重复做 manifest coordination。
+- `Completed` 现在只允许在 source payload verified、target durable、target verified、manifest coordinated、source cleanup completed 全部满足后生成。
+- 当前仍不做真实 metadata manifest coordination、自动后台调度、rebalance task persistence、read-side repair 或 metadata/Raft 写入。
 
 ## 主要文件
 
@@ -472,7 +481,28 @@
 - 责任：维护 rebalance task 的 lifecycle、progress、attempts、last_error 和 retry_pending 语义。
 - 输入：task_id 与状态变更参数。
 - 输出：更新后的 task snapshot。
-- 边界：状态迁移只更新 task model，不代表 T088 的 copy/verify/manifest coordination 已执行。
+- 边界：`CompleteTask()` 现在要求 copy/verify/manifest/source-cleanup 阶段事实已满足；其余状态迁移仍只更新 task model，不直接调用 metadata / Raft。
+
+### `ValidateSourceReadResult(...)` / `ValidateTargetVerifyResult(...)`
+
+- 责任：固定 rebalance source read 和 target verify 的 checksum/size/state 校验边界。
+- 输入：`RebalanceTask` 与阶段回调结果。
+- 输出：`kOk` 或明确 `checksum_mismatch/corrupted/not_found/conflict` 错误。
+- 边界：source checksum mismatch、verify mismatch 都会阻断 manifest coordination。
+
+### `RunTask(std::string_view)`
+
+- 责任：按 `source read -> target durable -> verify -> manifest coordination callback -> source cleanup callback` 顺序推进一个 rebalance task。
+- 输入：task_id。
+- 输出：`RebalanceTaskRunResult`，包含阶段结果、retryable 和最新 task snapshot。
+- 边界：当前阶段执行全部通过注入 callbacks 完成；不直接做 metadata / Raft 更新，也不自动后台调度。
+
+### stage resume helper（`RebalanceTask` 内阶段布尔事实）
+
+- 责任：让 cleanup retry 或 manifest retry 复用同一个 task，并跳过已经成功的 target durable / verify / manifest 阶段。
+- 输入：task 上的 `source_payload_verified/target_durable/target_verified/manifest_coordinated/source_cleanup_completed/orphan_candidate_recorded`。
+- 输出：下一次 `RunTask()` 的跳阶段行为。
+- 边界：当前只做进程内 task state 记忆，不做 task persistence 或 crash recovery。
 
 ### task state normalization helper（`NormalizeRecoveredTaskState`）
 

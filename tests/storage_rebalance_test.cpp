@@ -622,6 +622,221 @@ namespace
         std::map<storedemo::StorageNodeId, std::size_t> completions_;
     };
 
+    storedemo::RebalanceManagerConfig MakeProductionRebalanceManagerConfig(
+        const std::map<storedemo::StorageNodeId, storedemo::LocalDiskChunkStore *> &stores,
+        TestOnlyManifestLedger *manifest_ledger,
+        TestOnlyCleanupCandidateLedger *cleanup_candidate_ledger,
+        TestOnlySourceCleanupLedger *source_cleanup_ledger,
+        std::uint64_t *now_unix_ms,
+        std::size_t *manifest_calls = nullptr,
+        std::size_t *cleanup_candidate_calls = nullptr,
+        std::size_t *source_cleanup_calls = nullptr)
+    {
+        return storedemo::RebalanceManagerConfig{
+            .max_active_tasks = 8,
+            .max_tasks = 8,
+            .now_unix_ms = [now_unix_ms]()
+            {
+                if (now_unix_ms == nullptr)
+                {
+                    return std::uint64_t{0};
+                }
+                return *now_unix_ms;
+            },
+            .source_reader =
+                [stores](const storedemo::RebalanceTask &task,
+                         const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceSourceReadResult result;
+                    const auto store_it = stores.find(task.source_node);
+                    if (store_it == stores.end() || store_it->second == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "rebalance source store is unavailable";
+                        return result;
+                    }
+
+                    const auto read_response = store_it->second->ReadChunk(
+                        MakeReadRequest(task.chunk_id,
+                                        task.expected_checksum,
+                                        "rebalance-manager-read-" + task.source_node));
+                    result.status = read_response.status;
+                    result.error_detail = read_response.error_detail;
+                    result.retry_after_ms = read_response.retry_after_ms;
+                    result.metadata = read_response.metadata;
+                    result.actual_checksum = read_response.actual_checksum;
+                    result.payload = read_response.payload;
+                    result.verified = read_response.verified;
+                    return result;
+                },
+            .target_writer =
+                [stores](const storedemo::RebalanceTask &task,
+                         std::string_view payload,
+                         const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceTargetWriteResult result;
+                    const auto store_it = stores.find(task.target_node);
+                    if (store_it == stores.end() || store_it->second == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "rebalance target store is unavailable";
+                        result.retryable = true;
+                        return result;
+                    }
+
+                    const auto write_response = store_it->second->WriteChunk(
+                        MakeWriteRequest(task.identity,
+                                         std::string(payload),
+                                         "rebalance-manager-write-" + task.target_node));
+                    result.status = write_response.status;
+                    result.error_detail = write_response.error_detail;
+                    result.retry_after_ms = write_response.retry_after_ms;
+                    result.metadata = write_response.metadata;
+                    result.target_state = write_response.metadata.state;
+                    result.expected_checksum = task.expected_checksum;
+                    result.observed_checksum = write_response.metadata.checksum;
+                    result.expected_size = task.expected_size;
+                    result.observed_size = write_response.metadata.size;
+                    result.target_durable = write_response.durable;
+                    result.already_exists = write_response.already_exists;
+                    result.repaired =
+                        write_response.ok() && write_response.durable &&
+                        !write_response.already_exists;
+                    result.retryable =
+                        storedemo::IsRetriableStatus(write_response.status);
+                    return result;
+                },
+            .target_verifier =
+                [stores](const storedemo::RebalanceTask &task,
+                         const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceTargetVerifyResult result;
+                    const auto store_it = stores.find(task.target_node);
+                    if (store_it == stores.end() || store_it->second == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "rebalance target store is unavailable";
+                        result.retryable = true;
+                        return result;
+                    }
+
+                    const auto read_response = store_it->second->ReadChunk(
+                        MakeReadRequest(task.chunk_id,
+                                        task.expected_checksum,
+                                        "rebalance-manager-verify-" +
+                                            task.target_node));
+                    result.status = read_response.status;
+                    result.error_detail = read_response.error_detail;
+                    result.retry_after_ms = read_response.retry_after_ms;
+                    result.metadata = read_response.metadata;
+                    result.actual_checksum = read_response.actual_checksum;
+                    result.actual_size = read_response.metadata.size;
+                    result.verified = read_response.verified;
+                    result.retryable =
+                        storedemo::IsRetriableStatus(read_response.status);
+                    return result;
+                },
+            .manifest_coordinator =
+                [manifest_ledger, manifest_calls](
+                    const storedemo::RebalanceTask &task,
+                    const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceManifestCoordinationResult result;
+                    if (manifest_calls != nullptr)
+                    {
+                        ++(*manifest_calls);
+                    }
+                    if (manifest_ledger == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kInvalidArgument;
+                        result.error_detail =
+                            "rebalance manifest ledger is unavailable";
+                        return result;
+                    }
+
+                    const auto coordination = manifest_ledger->CoordinateMove(
+                        task.source_node, task.target_node);
+                    result.status = coordination.status;
+                    result.error_detail = coordination.error_detail;
+                    result.updated = coordination.updated;
+                    result.already_applied = coordination.already_applied;
+                    result.retryable =
+                        storedemo::IsRetriableStatus(coordination.status);
+                    return result;
+                },
+            .source_cleanup_handler =
+                [stores, source_cleanup_ledger, source_cleanup_calls](
+                    const storedemo::RebalanceTask &task,
+                    const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceSourceCleanupResult result;
+                    if (source_cleanup_calls != nullptr)
+                    {
+                        ++(*source_cleanup_calls);
+                    }
+                    const auto store_it = stores.find(task.source_node);
+                    if (store_it == stores.end() || store_it->second == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+                        result.error_detail = "rebalance source store is unavailable";
+                        result.retryable = true;
+                        return result;
+                    }
+                    if (source_cleanup_ledger == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kInvalidArgument;
+                        result.error_detail =
+                            "rebalance source cleanup ledger is unavailable";
+                        return result;
+                    }
+
+                    const auto cleanup = source_cleanup_ledger->Cleanup(
+                        *store_it->second,
+                        task.chunk_id,
+                        task.expected_checksum,
+                        task.source_node);
+                    result.status = cleanup.status;
+                    result.error_detail = cleanup.error_detail;
+                    result.completed = cleanup.completed;
+                    result.already_missing = cleanup.already_missing;
+                    result.retryable = storedemo::IsRetriableStatus(cleanup.status);
+                    return result;
+                },
+            .cleanup_candidate_recorder =
+                [cleanup_candidate_ledger, cleanup_candidate_calls](
+                    const storedemo::RebalanceTask &task,
+                    std::string_view reason,
+                    const storedemo::StorageTaskContext &)
+                {
+                    storedemo::RebalanceCleanupCandidateResult result;
+                    if (cleanup_candidate_calls != nullptr)
+                    {
+                        ++(*cleanup_candidate_calls);
+                    }
+                    if (cleanup_candidate_ledger == nullptr)
+                    {
+                        result.status = storedemo::StorageNodeStatusCode::kInvalidArgument;
+                        result.error_detail =
+                            "rebalance cleanup candidate ledger is unavailable";
+                        return result;
+                    }
+
+                    const bool recorded = cleanup_candidate_ledger->Record(
+                        RebalanceManifest{
+                            .identity = task.identity,
+                            .expected_size = task.expected_size,
+                            .expected_checksum = task.expected_checksum,
+                            .replica_nodes = {task.source_node, task.target_node},
+                            .desired_replica_count = 0},
+                        task.target_node,
+                        std::string(reason));
+                    result.status = storedemo::StorageNodeStatusCode::kOk;
+                    result.recorded = recorded;
+                    result.already_exists = !recorded;
+                    return result;
+                }};
+    }
+
     class TestOnlyRebalanceRunner
     {
     public:
@@ -1767,12 +1982,11 @@ namespace
 
         now_unix_ms = 112;
         const auto complete_result = manager.CompleteTask(first_submit.task->task_id);
-        ASSERT_TRUE(complete_result.ok()) << complete_result.error_detail;
+        EXPECT_EQ(complete_result.code,
+                  storedemo::RebalanceTaskOperationCode::kConflict);
         ASSERT_TRUE(complete_result.task.has_value());
         EXPECT_EQ(complete_result.task->state,
-                  storedemo::RebalanceTaskState::kCompleted);
-        EXPECT_EQ(complete_result.task->progress_percent, 100U);
-        EXPECT_EQ(complete_result.task->completed_at_unix_ms, now_unix_ms);
+                  storedemo::RebalanceTaskState::kRunning);
 
         const auto cancel_completed =
             manager.CancelTask(first_submit.task->task_id);
@@ -1808,10 +2022,601 @@ namespace
         const auto stats = manager.SnapshotStats();
         EXPECT_EQ(stats.submitted_tasks, 2U);
         EXPECT_EQ(stats.rejected_tasks, 2U);
-        EXPECT_EQ(stats.completed_tasks, 1U);
+        EXPECT_EQ(stats.completed_tasks, 0U);
         EXPECT_EQ(stats.cancelled_tasks, 1U);
         EXPECT_EQ(stats.failed_tasks, 0U);
         EXPECT_EQ(stats.total_attempts, 1U);
         EXPECT_EQ(stats.last_error_detail, "rebalance task cancelled");
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskCompletesHappyPathInOrder)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity = MakeIdentityOrThrow("rebalance-run-happy", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-happy");
+        WriteReplica(source_store, identity, payload, "rebalance-run-happy-source");
+        WriteReplica(peer_store, identity, payload, "rebalance-run-happy-peer");
+
+        TestOnlyManifestLedger manifest_ledger(MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2));
+        TestOnlyCleanupCandidateLedger cleanup_candidates;
+        TestOnlySourceCleanupLedger cleanup_ledger;
+        std::size_t manifest_calls = 0;
+        std::size_t cleanup_candidate_calls = 0;
+        std::size_t source_cleanup_calls = 0;
+        std::uint64_t now_unix_ms = 110;
+        auto config = MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                           &manifest_ledger,
+                                                           &cleanup_candidates,
+                                                           &cleanup_ledger,
+                                                           &now_unix_ms,
+                                                           &manifest_calls,
+                                                           &cleanup_candidate_calls,
+                                                           &source_cleanup_calls);
+        storedemo::RebalanceManager manager(&registry_, std::move(config));
+
+        const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3),
+            storedemo::RebalanceTaskReason::kCapacityImbalance));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        ASSERT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << run_result.error_detail;
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_TRUE(run_result.source_verified);
+        EXPECT_TRUE(run_result.target_durable);
+        EXPECT_TRUE(run_result.target_verified);
+        EXPECT_TRUE(run_result.manifest_coordination_attempted);
+        EXPECT_TRUE(run_result.manifest_updated);
+        EXPECT_TRUE(run_result.source_cleanup_attempted);
+        EXPECT_TRUE(run_result.source_cleanup_completed);
+        EXPECT_FALSE(run_result.orphan_candidate_created);
+        EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kCompleted);
+        EXPECT_EQ(run_result.task->progress_percent, 100U);
+        EXPECT_TRUE(run_result.task->source_payload_verified);
+        EXPECT_TRUE(run_result.task->target_durable);
+        EXPECT_TRUE(run_result.task->target_verified);
+        EXPECT_TRUE(run_result.task->manifest_coordinated);
+        EXPECT_TRUE(run_result.task->source_cleanup_completed);
+        EXPECT_EQ(manifest_calls, 1U);
+        EXPECT_EQ(cleanup_candidate_calls, 0U);
+        EXPECT_EQ(source_cleanup_calls, 1U);
+        EXPECT_TRUE(cleanup_candidates.candidates().empty());
+
+        const std::vector<storedemo::StorageNodeId> expected_manifest_nodes{
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(3)};
+        EXPECT_EQ(manifest_ledger.manifest().replica_nodes, expected_manifest_nodes);
+
+        const auto source_stat = source_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-happy-source-stat"));
+        ASSERT_EQ(source_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(source_stat.metadata.state, storedemo::ChunkState::kDeleted);
+
+        const auto target_stat = target_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-happy-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskStopsAfterTargetDurableFailure)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto writer_state = std::make_shared<RecordingWriterState>();
+        auto failing_durable_file =
+            std::make_shared<RecordingDurableFile>(writer_state);
+        failing_durable_file->publish_result.error =
+            storedemo::DurableFileErrorCode::kIoError;
+        auto &target_store = CreateStore(3, failing_durable_file);
+        (void)target_store;
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity = MakeIdentityOrThrow("rebalance-run-target-fail", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-target-fail");
+        WriteReplica(source_store, identity, payload, "rebalance-run-target-fail-source");
+        WriteReplica(peer_store, identity, payload, "rebalance-run-target-fail-peer");
+
+        TestOnlyManifestLedger manifest_ledger(MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2));
+        TestOnlyCleanupCandidateLedger cleanup_candidates;
+        TestOnlySourceCleanupLedger cleanup_ledger;
+        std::size_t manifest_calls = 0;
+        std::size_t cleanup_candidate_calls = 0;
+        std::size_t source_cleanup_calls = 0;
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                 &manifest_ledger,
+                                                 &cleanup_candidates,
+                                                 &cleanup_ledger,
+                                                 &now_unix_ms,
+                                                 &manifest_calls,
+                                                 &cleanup_candidate_calls,
+                                                 &source_cleanup_calls));
+
+        const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3)));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kIoError);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kRetryPending);
+        EXPECT_TRUE(run_result.source_verified);
+        EXPECT_FALSE(run_result.target_durable);
+        EXPECT_FALSE(run_result.target_verified);
+        EXPECT_FALSE(run_result.manifest_coordination_attempted);
+        EXPECT_FALSE(run_result.source_cleanup_attempted);
+        EXPECT_EQ(manifest_calls, 0U);
+        EXPECT_EQ(cleanup_candidate_calls, 0U);
+        EXPECT_EQ(source_cleanup_calls, 0U);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskStopsAfterVerifyFailure)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        (void)target_store;
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity = MakeIdentityOrThrow("rebalance-run-verify-fail", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-verify-fail");
+        WriteReplica(source_store, identity, payload, "rebalance-run-verify-fail-source");
+        WriteReplica(peer_store, identity, payload, "rebalance-run-verify-fail-peer");
+
+        TestOnlyManifestLedger manifest_ledger(MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2));
+        TestOnlyCleanupCandidateLedger cleanup_candidates;
+        TestOnlySourceCleanupLedger cleanup_ledger;
+        std::size_t manifest_calls = 0;
+        std::size_t cleanup_candidate_calls = 0;
+        std::size_t source_cleanup_calls = 0;
+        std::uint64_t now_unix_ms = 110;
+        auto config = MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                           &manifest_ledger,
+                                                           &cleanup_candidates,
+                                                           &cleanup_ledger,
+                                                           &now_unix_ms,
+                                                           &manifest_calls,
+                                                           &cleanup_candidate_calls,
+                                                           &source_cleanup_calls);
+        config.target_verifier = [](const storedemo::RebalanceTask &task,
+                                    const storedemo::StorageTaskContext &)
+        {
+            storedemo::RebalanceTargetVerifyResult result;
+            result.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
+            result.error_detail = "target verify checksum mismatch";
+            result.actual_checksum = task.expected_checksum;
+            result.actual_size = task.expected_size;
+            result.verified = false;
+            return result;
+        };
+        storedemo::RebalanceManager manager(&registry_, std::move(config));
+
+        const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3)));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status,
+                  storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kFailed);
+        EXPECT_TRUE(run_result.target_durable);
+        EXPECT_FALSE(run_result.target_verified);
+        EXPECT_FALSE(run_result.manifest_coordination_attempted);
+        EXPECT_FALSE(run_result.source_cleanup_attempted);
+        EXPECT_EQ(manifest_calls, 0U);
+        EXPECT_EQ(cleanup_candidate_calls, 0U);
+        EXPECT_EQ(source_cleanup_calls, 0U);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskRecordsCleanupCandidateWhenManifestFails)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity =
+            MakeIdentityOrThrow("rebalance-run-manifest-fail", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-manifest-fail");
+        WriteReplica(source_store,
+                     identity,
+                     payload,
+                     "rebalance-run-manifest-fail-source");
+        WriteReplica(peer_store,
+                     identity,
+                     payload,
+                     "rebalance-run-manifest-fail-peer");
+
+        TestOnlyManifestLedger manifest_ledger(MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2));
+        manifest_ledger.FailNextUpdate(storedemo::StorageNodeStatusCode::kConflict,
+                                       "manifest coordination rejected move");
+        TestOnlyCleanupCandidateLedger cleanup_candidates;
+        TestOnlySourceCleanupLedger cleanup_ledger;
+        std::size_t manifest_calls = 0;
+        std::size_t cleanup_candidate_calls = 0;
+        std::size_t source_cleanup_calls = 0;
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                 &manifest_ledger,
+                                                 &cleanup_candidates,
+                                                 &cleanup_ledger,
+                                                 &now_unix_ms,
+                                                 &manifest_calls,
+                                                 &cleanup_candidate_calls,
+                                                 &source_cleanup_calls));
+
+        const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3)));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto run_result = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kConflict);
+        ASSERT_TRUE(run_result.task.has_value());
+        EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kFailed);
+        EXPECT_TRUE(run_result.target_durable);
+        EXPECT_TRUE(run_result.target_verified);
+        EXPECT_TRUE(run_result.manifest_coordination_attempted);
+        EXPECT_FALSE(run_result.manifest_updated);
+        EXPECT_FALSE(run_result.source_cleanup_attempted);
+        EXPECT_TRUE(run_result.orphan_candidate_created);
+        EXPECT_EQ(manifest_calls, 1U);
+        EXPECT_EQ(cleanup_candidate_calls, 1U);
+        EXPECT_EQ(source_cleanup_calls, 0U);
+        EXPECT_TRUE(cleanup_candidates.HasCandidate(
+            identity.chunk_id, storedemo::test::MakeStorageNodeIdFixture(3)));
+
+        const auto source_stat = source_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-manifest-fail-source-stat"));
+        ASSERT_EQ(source_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(source_stat.metadata.state, storedemo::ChunkState::kLive);
+
+        const auto target_stat = target_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-manifest-fail-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskReturnsCleanupRetryableAndCanResume)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity =
+            MakeIdentityOrThrow("rebalance-run-cleanup-retry", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-cleanup-retry");
+        WriteReplica(source_store,
+                     identity,
+                     payload,
+                     "rebalance-run-cleanup-retry-source");
+        WriteReplica(peer_store,
+                     identity,
+                     payload,
+                     "rebalance-run-cleanup-retry-peer");
+
+        TestOnlyManifestLedger manifest_ledger(MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2));
+        TestOnlyCleanupCandidateLedger cleanup_candidates;
+        TestOnlySourceCleanupLedger cleanup_ledger;
+        cleanup_ledger.FailCleanupFor(storedemo::test::MakeStorageNodeIdFixture(1),
+                                      storedemo::StorageNodeStatusCode::kIoError,
+                                      "cleanup retry required");
+        std::size_t manifest_calls = 0;
+        std::size_t cleanup_candidate_calls = 0;
+        std::size_t source_cleanup_calls = 0;
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                 &manifest_ledger,
+                                                 &cleanup_candidates,
+                                                 &cleanup_ledger,
+                                                 &now_unix_ms,
+                                                 &manifest_calls,
+                                                 &cleanup_candidate_calls,
+                                                 &source_cleanup_calls));
+
+        const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3)));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto first_run = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(first_run.status, storedemo::StorageNodeStatusCode::kIoError);
+        ASSERT_TRUE(first_run.task.has_value());
+        EXPECT_EQ(first_run.task->state, storedemo::RebalanceTaskState::kRetryPending);
+        EXPECT_TRUE(first_run.target_durable);
+        EXPECT_TRUE(first_run.target_verified);
+        EXPECT_TRUE(first_run.manifest_updated);
+        EXPECT_TRUE(first_run.source_cleanup_attempted);
+        EXPECT_FALSE(first_run.source_cleanup_completed);
+        EXPECT_EQ(manifest_calls, 1U);
+        EXPECT_EQ(source_cleanup_calls, 1U);
+
+        cleanup_ledger = TestOnlySourceCleanupLedger{};
+        now_unix_ms = 111;
+        const auto second_run = manager.RunTask(submit_result.task->task_id);
+        EXPECT_EQ(second_run.status, storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(second_run.task.has_value());
+        EXPECT_EQ(second_run.task->state, storedemo::RebalanceTaskState::kCompleted);
+        EXPECT_TRUE(second_run.source_cleanup_attempted);
+        EXPECT_TRUE(second_run.source_cleanup_completed);
+        EXPECT_EQ(manifest_calls, 1U);
+        EXPECT_EQ(source_cleanup_calls, 2U);
+        EXPECT_EQ(cleanup_candidate_calls, 0U);
+
+        const auto source_stat = source_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-cleanup-retry-source-stat"));
+        ASSERT_EQ(source_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(source_stat.metadata.state, storedemo::ChunkState::kDeleted);
+
+        const auto target_stat = target_store.StatChunk(
+            MakeStatRequest(identity.chunk_id, "rebalance-run-cleanup-retry-target-stat"));
+        ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRunTaskHandlesAlreadyExistsSourceMismatchAndIdempotency)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &idempotent_target_store = CreateStore(3);
+        auto &conflict_target_store = CreateStore(4);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+        RegisterNode(4, 100);
+
+        const auto idempotent_identity =
+            MakeIdentityOrThrow("rebalance-run-idempotent", 1, 0, 0);
+        const auto conflict_identity =
+            MakeIdentityOrThrow("rebalance-run-conflict", 1, 0, 0);
+        const auto mismatch_identity =
+            MakeIdentityOrThrow("rebalance-run-source-mismatch", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-idempotent");
+        const auto mismatch_payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-run-source-mismatch");
+
+        WriteReplica(source_store, idempotent_identity, payload, "rebalance-idempotent-source");
+        WriteReplica(peer_store, idempotent_identity, payload, "rebalance-idempotent-peer");
+        WriteReplica(idempotent_target_store, idempotent_identity, payload, "rebalance-idempotent-target");
+
+        WriteReplica(source_store, conflict_identity, payload, "rebalance-conflict-source");
+        WriteReplica(peer_store, conflict_identity, payload, "rebalance-conflict-peer");
+        WriteReplica(conflict_target_store,
+                     conflict_identity,
+                     storedemo::test::MakeChunkPayload(96, "rebalance-conflict-target"),
+                     "rebalance-conflict-target");
+
+        WriteReplica(source_store, mismatch_identity, mismatch_payload, "rebalance-mismatch-source");
+        WriteReplica(peer_store, mismatch_identity, mismatch_payload, "rebalance-mismatch-peer");
+        TamperReplica(source_store,
+                      mismatch_identity,
+                      storedemo::test::MakeChunkPayload(mismatch_payload.size(),
+                                                        "rebalance-mismatch-bad"));
+
+        {
+            TestOnlyManifestLedger manifest_ledger(MakeManifest(
+                idempotent_identity,
+                payload,
+                {storedemo::test::MakeStorageNodeIdFixture(1),
+                 storedemo::test::MakeStorageNodeIdFixture(2)},
+                2));
+            TestOnlyCleanupCandidateLedger cleanup_candidates;
+            TestOnlySourceCleanupLedger cleanup_ledger;
+            std::size_t manifest_calls = 0;
+            std::size_t cleanup_candidate_calls = 0;
+            std::size_t source_cleanup_calls = 0;
+            std::uint64_t now_unix_ms = 110;
+            storedemo::RebalanceManager manager(
+                &registry_,
+                MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                     &manifest_ledger,
+                                                     &cleanup_candidates,
+                                                     &cleanup_ledger,
+                                                     &now_unix_ms,
+                                                     &manifest_calls,
+                                                     &cleanup_candidate_calls,
+                                                     &source_cleanup_calls));
+
+            const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+                idempotent_identity,
+                payload,
+                storedemo::test::MakeStorageNodeIdFixture(1),
+                storedemo::test::MakeStorageNodeIdFixture(3)));
+            ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+            const auto first_run = manager.RunTask(submit_result.task->task_id);
+            EXPECT_EQ(first_run.status, storedemo::StorageNodeStatusCode::kOk);
+            ASSERT_TRUE(first_run.task.has_value());
+            EXPECT_TRUE(first_run.target_durable);
+            EXPECT_TRUE(first_run.target_already_exists);
+            EXPECT_EQ(first_run.task->state, storedemo::RebalanceTaskState::kCompleted);
+            EXPECT_EQ(manifest_calls, 1U);
+            EXPECT_EQ(source_cleanup_calls, 1U);
+
+            const auto second_run = manager.RunTask(submit_result.task->task_id);
+            EXPECT_EQ(second_run.status, storedemo::StorageNodeStatusCode::kOk);
+            EXPECT_TRUE(second_run.idempotent_success);
+            EXPECT_EQ(manifest_calls, 1U);
+            EXPECT_EQ(source_cleanup_calls, 1U);
+            EXPECT_EQ(cleanup_candidate_calls, 0U);
+        }
+
+        {
+            TestOnlyManifestLedger manifest_ledger(MakeManifest(
+                conflict_identity,
+                payload,
+                {storedemo::test::MakeStorageNodeIdFixture(1),
+                 storedemo::test::MakeStorageNodeIdFixture(2)},
+                2));
+            TestOnlyCleanupCandidateLedger cleanup_candidates;
+            TestOnlySourceCleanupLedger cleanup_ledger;
+            std::size_t manifest_calls = 0;
+            std::size_t cleanup_candidate_calls = 0;
+            std::size_t source_cleanup_calls = 0;
+            std::uint64_t now_unix_ms = 110;
+            storedemo::RebalanceManager manager(
+                &registry_,
+                MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                     &manifest_ledger,
+                                                     &cleanup_candidates,
+                                                     &cleanup_ledger,
+                                                     &now_unix_ms,
+                                                     &manifest_calls,
+                                                     &cleanup_candidate_calls,
+                                                     &source_cleanup_calls));
+
+            const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+                conflict_identity,
+                payload,
+                storedemo::test::MakeStorageNodeIdFixture(1),
+                storedemo::test::MakeStorageNodeIdFixture(4)));
+            ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+            const auto run_result = manager.RunTask(submit_result.task->task_id);
+            EXPECT_EQ(run_result.status, storedemo::StorageNodeStatusCode::kConflict);
+            ASSERT_TRUE(run_result.task.has_value());
+            EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kFailed);
+            EXPECT_FALSE(run_result.target_durable);
+            EXPECT_FALSE(run_result.manifest_coordination_attempted);
+            EXPECT_FALSE(run_result.source_cleanup_attempted);
+            EXPECT_EQ(manifest_calls, 0U);
+            EXPECT_EQ(source_cleanup_calls, 0U);
+            EXPECT_EQ(cleanup_candidate_calls, 0U);
+        }
+
+        {
+            TestOnlyManifestLedger manifest_ledger(MakeManifest(
+                mismatch_identity,
+                mismatch_payload,
+                {storedemo::test::MakeStorageNodeIdFixture(1),
+                 storedemo::test::MakeStorageNodeIdFixture(2)},
+                2));
+            TestOnlyCleanupCandidateLedger cleanup_candidates;
+            TestOnlySourceCleanupLedger cleanup_ledger;
+            std::size_t manifest_calls = 0;
+            std::size_t cleanup_candidate_calls = 0;
+            std::size_t source_cleanup_calls = 0;
+            std::uint64_t now_unix_ms = 110;
+            auto config = MakeProductionRebalanceManagerConfig(RawStoreMap(),
+                                                               &manifest_ledger,
+                                                               &cleanup_candidates,
+                                                               &cleanup_ledger,
+                                                               &now_unix_ms,
+                                                               &manifest_calls,
+                                                               &cleanup_candidate_calls,
+                                                               &source_cleanup_calls);
+            config.source_reader = [mismatch_identity,
+                                    mismatch_payload](const storedemo::RebalanceTask &task,
+                                                      const storedemo::StorageTaskContext &)
+            {
+                storedemo::RebalanceSourceReadResult result;
+                result.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
+                result.error_detail = "source checksum mismatch";
+                result.metadata.identity = mismatch_identity;
+                result.metadata.node_id = task.source_node;
+                result.metadata.size =
+                    static_cast<std::uint64_t>(mismatch_payload.size());
+                result.metadata.state = storedemo::ChunkState::kLive;
+                result.actual_checksum = ComputeChecksumOrThrow(
+                    storedemo::test::MakeChunkPayload(mismatch_payload.size(),
+                                                      "rebalance-mismatch-bad"));
+                result.payload = mismatch_payload;
+                result.verified = false;
+                return result;
+            };
+            storedemo::RebalanceManager manager(&registry_, std::move(config));
+
+            const auto submit_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+                mismatch_identity,
+                mismatch_payload,
+                storedemo::test::MakeStorageNodeIdFixture(1),
+                storedemo::test::MakeStorageNodeIdFixture(3)));
+            ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+            const auto run_result = manager.RunTask(submit_result.task->task_id);
+            EXPECT_EQ(run_result.status,
+                      storedemo::StorageNodeStatusCode::kChecksumMismatch);
+            ASSERT_TRUE(run_result.task.has_value());
+            EXPECT_EQ(run_result.task->state, storedemo::RebalanceTaskState::kFailed);
+            EXPECT_FALSE(run_result.target_durable);
+            EXPECT_FALSE(run_result.manifest_coordination_attempted);
+            EXPECT_FALSE(run_result.source_cleanup_attempted);
+            EXPECT_EQ(manifest_calls, 0U);
+            EXPECT_EQ(source_cleanup_calls, 0U);
+            EXPECT_EQ(cleanup_candidate_calls, 0U);
+        }
     }
 }

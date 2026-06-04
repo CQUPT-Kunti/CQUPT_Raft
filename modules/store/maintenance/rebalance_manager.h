@@ -89,7 +89,90 @@ namespace storedemo
         std::uint64_t started_at_unix_ms{0};
         std::uint64_t completed_at_unix_ms{0};
         std::uint64_t retry_after_ms{0};
+        bool source_payload_verified{false};
+        bool target_durable{false};
+        bool target_already_exists{false};
+        bool target_verified{false};
+        bool manifest_coordinated{false};
+        bool manifest_already_applied{false};
+        bool source_cleanup_completed{false};
+        bool source_cleanup_already_missing{false};
+        bool orphan_candidate_recorded{false};
     };
+
+    struct RebalanceSourceReadResult : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        ChunkChecksum actual_checksum;
+        std::string payload;
+        bool verified{false};
+    };
+
+    struct RebalanceTargetWriteResult : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        ChunkState target_state{ChunkState::kMissing};
+        ChunkChecksum expected_checksum;
+        ChunkChecksum observed_checksum;
+        std::uint64_t expected_size{0};
+        std::uint64_t observed_size{0};
+        bool target_durable{false};
+        bool already_exists{false};
+        bool repaired{false};
+        bool retryable{false};
+    };
+
+    struct RebalanceTargetVerifyResult : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        ChunkChecksum actual_checksum;
+        std::uint64_t actual_size{0};
+        bool verified{false};
+        bool retryable{false};
+    };
+
+    struct RebalanceManifestCoordinationResult : ChunkStoreResult
+    {
+        bool updated{false};
+        bool already_applied{false};
+        bool retryable{false};
+    };
+
+    struct RebalanceSourceCleanupResult : ChunkStoreResult
+    {
+        bool completed{false};
+        bool already_missing{false};
+        bool retryable{false};
+    };
+
+    struct RebalanceCleanupCandidateResult : ChunkStoreResult
+    {
+        bool recorded{false};
+        bool already_exists{false};
+        bool retryable{false};
+    };
+
+    using RebalanceTaskSourceReader =
+        std::function<RebalanceSourceReadResult(const RebalanceTask &,
+                                                const StorageTaskContext &)>;
+    using RebalanceTaskTargetWriter =
+        std::function<RebalanceTargetWriteResult(const RebalanceTask &,
+                                                 std::string_view,
+                                                 const StorageTaskContext &)>;
+    using RebalanceTaskTargetVerifier =
+        std::function<RebalanceTargetVerifyResult(const RebalanceTask &,
+                                                  const StorageTaskContext &)>;
+    using RebalanceTaskManifestCoordinator =
+        std::function<RebalanceManifestCoordinationResult(
+            const RebalanceTask &,
+            const StorageTaskContext &)>;
+    using RebalanceTaskSourceCleanupHandler =
+        std::function<RebalanceSourceCleanupResult(const RebalanceTask &,
+                                                   const StorageTaskContext &)>;
+    using RebalanceTaskCleanupCandidateRecorder =
+        std::function<RebalanceCleanupCandidateResult(const RebalanceTask &,
+                                                      std::string_view,
+                                                      const StorageTaskContext &)>;
 
     using RebalanceManagerNowSource = std::function<std::uint64_t()>;
 
@@ -97,7 +180,14 @@ namespace storedemo
     {
         std::size_t max_active_tasks{64};
         std::size_t max_tasks{256};
+        std::uint64_t default_timeout_ms{0};
         RebalanceManagerNowSource now_unix_ms;
+        RebalanceTaskSourceReader source_reader;
+        RebalanceTaskTargetWriter target_writer;
+        RebalanceTaskTargetVerifier target_verifier;
+        RebalanceTaskManifestCoordinator manifest_coordinator;
+        RebalanceTaskSourceCleanupHandler source_cleanup_handler;
+        RebalanceTaskCleanupCandidateRecorder cleanup_candidate_recorder;
     };
 
     struct RebalanceManagerSubmitResult
@@ -126,6 +216,29 @@ namespace storedemo
         }
 
         [[nodiscard]] StorageNodeStatusCode status_code() const;
+    };
+
+    struct RebalanceTaskRunResult : ChunkStoreResult
+    {
+        std::optional<RebalanceTask> task;
+        StorageNodeId source_node;
+        StorageNodeId target_node;
+        ChunkChecksum source_checksum;
+        ChunkChecksum target_checksum;
+        std::uint64_t source_size{0};
+        std::uint64_t target_size{0};
+        bool source_verified{false};
+        bool target_durable{false};
+        bool target_already_exists{false};
+        bool target_verified{false};
+        bool manifest_coordination_attempted{false};
+        bool manifest_updated{false};
+        bool manifest_idempotent{false};
+        bool source_cleanup_attempted{false};
+        bool source_cleanup_completed{false};
+        bool orphan_candidate_created{false};
+        bool idempotent_success{false};
+        bool retryable{false};
     };
 
     struct RebalanceManagerStats
@@ -169,6 +282,7 @@ namespace storedemo
                                               std::uint64_t retry_after_ms = 0);
         RebalanceTaskOperationResult CancelTask(std::string_view task_id);
         RebalanceTaskOperationResult RetryTask(std::string_view task_id);
+        RebalanceTaskRunResult RunTask(std::string_view task_id);
 
         [[nodiscard]] std::optional<RebalanceTask> FindTask(
             std::string_view task_id) const;
