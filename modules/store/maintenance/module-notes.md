@@ -19,6 +19,14 @@
 - scrub / repair / rebalance
 - metadata / Raft 调用
 
+## T083 fixed boundary
+
+- T083 新增生产 `ScrubManager`，负责 bounded background scrub task queue、task 状态、drain/stop/query 和 scrub facts 聚合。
+- `ScrubManager` 只发现 corrupted / lost / under-replicated facts，并产出 repair candidate；不直接 repair，不修改 metadata manifest，不调用 Raft，也不保存 object payload。
+- bounded queue 复用独立后台 executor，foreground `ReadChunk` / `WriteChunk` 不经过这条队列；当前 contract 只固定“队列有界、submit 可拒绝、后台任务不无界堆积”，不承诺 OS-level IO priority。
+- healthy source 选择仍基于 registry snapshot + `ReplicaPolicySelector` + 本地 checksum 校验；stale/unavailable/unhealthy/high-disk-pressure 副本不会进入 healthy source。
+- 当前 `ScrubManager` 不做 task persistence、restart resume、跨节点 `ScrubChunk` fan-out 或 read-side repair。
+
 ## 主要文件
 
 - `garbage_collector.h`：GC 任务模型、cleanup candidate 模型、状态、配置、提交/停机/统计接口
@@ -218,6 +226,57 @@
 - 输入：task 字段与原始 snapshot 行
 - 输出：序列化字符串或反序列化后的 task
 - 边界：字符串字段采用 hex 编码，空串使用显式占位，避免空字段破坏解析；单 task 行仍保持 `GC_TASK_STORE_V1` 兼容格式
+
+## scrub_manager.cpp 关键 helper
+
+### `ValidateTaskForSubmission(ScrubTask*, const ScrubManagerConfig&, std::string*)`
+
+- 责任：校验 scrub task 的 `task_id`、manifest 和默认 timeout，并规范化初始状态。
+- 输入：待提交 task、manager config。
+- 输出：合法时返回 `kOk`，非法时返回明确错误。
+- 边界：要求 `replica_nodes` 非空，且 manifest 必须能收口到稳定 `chunk_id`。
+
+### `ResolveManifestIdentity(ScrubManifest*, std::string*)`
+
+- 责任：统一收口 manifest 的 `chunk_id` / object identity。
+- 输入：manifest 中的 `chunk_id/object_id/version/chunk_index`。
+- 输出：稳定可用的 `identity.chunk_id`。
+- 边界：显式 `chunk_id` 与 object identity 不一致时返回参数错误。
+
+### `InspectReplica(ChunkStore*, const StorageNodeId&, const ScrubManifest&, std::size_t)`
+
+- 责任：对单副本执行 `StatChunk` + checksum verify，产出副本事实。
+- 输入：副本对应 `ChunkStore`、node_id、manifest 和副本序号。
+- 输出：`ScrubReplicaFact`。
+- 边界：只读本地 chunk facts；发现 checksum mismatch/corruption 时可沿用现有 quarantine 语义，但不触发 repair。
+
+### `RunDefaultScrubTask(const ScrubTask&, const std::map<StorageNodeId, ChunkStore*>&, const StorageNodeRegistry*, std::uint64_t)`
+
+- 责任：执行默认生产 scrub 逻辑，聚合 replica facts、healthy sources 和 repair candidate。
+- 输入：scrub task、store map、registry snapshot source、当前时间。
+- 输出：`ScrubTaskResult`。
+- 边界：只产出 facts/candidate；不修改 metadata manifest，不调用 Raft，不落 payload。
+
+### `SubmitTask(ScrubTask)`
+
+- 责任：把 scrub task 放入 bounded background queue，并登记任务状态。
+- 输入：调用方提供的 task。
+- 输出：`ScrubManagerSubmitResult`。
+- 边界：队列满返回 overloaded，stop 后返回 stopped，重复 `task_id` 返回 already exists。
+
+### `Drain()`
+
+- 责任：等待当前已提交 scrub task 收口。
+- 输入：无。
+- 输出：`ScrubManagerDrainResult`。
+- 边界：当前只等待内存中 queued/running 任务，不负责持久化 task 恢复。
+
+### `Stop(ScrubManagerStopRequest)`
+
+- 责任：停止接收新任务，并按 `Drain` 或 `CancelPending` 语义关停后台队列。
+- 输入：stop mode。
+- 输出：`ScrubManagerStopResult`。
+- 边界：`CancelPending` 只取消尚未开始的 queued task；正在运行的 task 允许自然跑完。
 
 ### task state normalization helper（`NormalizeRecoveredTaskState`）
 

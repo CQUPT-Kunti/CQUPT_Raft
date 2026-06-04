@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -19,6 +22,7 @@
 #include "store/common/store_types.h"
 #include "store/index/chunk_index.h"
 #include "store/io/durable_file.h"
+#include "store/maintenance/scrub_manager.h"
 #include "store/node/storage_node_registry.h"
 #include "store/placement/placement_manager.h"
 #include "store/placement/replica_policy.h"
@@ -393,6 +397,24 @@ namespace
         return summary;
     }
 
+    std::string CandidateSummary(const storedemo::ScrubRepairCandidate &candidate)
+    {
+        std::string summary = candidate.chunk_id + "|" +
+                              std::to_string(candidate.expected_size) + "|" +
+                              candidate.expected_checksum.value + "|";
+        for (const auto &node_id : candidate.bad_replicas)
+        {
+            summary += "bad:" + node_id + ";";
+        }
+        for (const auto &node_id : candidate.healthy_source_replicas)
+        {
+            summary += "src:" + node_id + ";";
+        }
+        summary += candidate.under_replicated ? "|under" : "|full";
+        summary += candidate.lost_or_unrecoverable ? "|lost" : "|repairable";
+        return summary;
+    }
+
     ScrubRepairCandidate MakeRepairCandidate(
         const ScrubManifest &manifest,
         std::vector<storedemo::StorageNodeId> healthy_source_replicas,
@@ -423,6 +445,23 @@ namespace
         return summary;
     }
 
+    std::string FactSummary(const std::vector<storedemo::ScrubReplicaFact> &facts)
+    {
+        std::string summary;
+        for (const auto &fact : facts)
+        {
+            summary += fact.node_id + ":" +
+                       std::to_string(static_cast<int>(fact.status)) + ":" +
+                       std::to_string(static_cast<int>(fact.state_before)) + ":" +
+                       std::to_string(static_cast<int>(fact.state_after)) + ":" +
+                       (fact.checksum_verified ? "v" : "n") + ":" +
+                       (fact.known_corrupted ? "c" : "h") + ":" +
+                       (fact.known_missing ? "m" : "p") + ":" +
+                       (fact.quarantined ? "q" : "l") + ";";
+        }
+        return summary;
+    }
+
     void ExpectManifestEq(const ScrubManifest &actual, const ScrubManifest &expected)
     {
         EXPECT_EQ(actual.identity.chunk_id, expected.identity.chunk_id);
@@ -438,6 +477,20 @@ namespace
 
     const ScrubReplicaFact *FindFact(const ScrubRunResult &result,
                                      const storedemo::StorageNodeId &node_id)
+    {
+        for (const auto &fact : result.replica_facts)
+        {
+            if (fact.node_id == node_id)
+            {
+                return &fact;
+            }
+        }
+        return nullptr;
+    }
+
+    const storedemo::ScrubReplicaFact *FindFact(
+        const storedemo::ScrubTaskResult &result,
+        const storedemo::StorageNodeId &node_id)
     {
         for (const auto &fact : result.replica_facts)
         {
@@ -937,6 +990,17 @@ namespace
             return map;
         }
 
+        std::map<storedemo::StorageNodeId, storedemo::ChunkStore *>
+        RawChunkStoreMap()
+        {
+            std::map<storedemo::StorageNodeId, storedemo::ChunkStore *> map;
+            for (auto &[node_id, store] : stores_)
+            {
+                map.emplace(node_id, store.get());
+            }
+            return map;
+        }
+
         ScrubManifest MakeManifest(const storedemo::ChunkIdentity &identity,
                                    const std::string &payload,
                                    std::vector<storedemo::StorageNodeId> replica_nodes,
@@ -948,6 +1012,22 @@ namespace
                 .expected_checksum = ComputeChecksumOrThrow(payload),
                 .replica_nodes = std::move(replica_nodes),
                 .desired_replica_count = desired_replica_count};
+        }
+
+        storedemo::ScrubTask MakeScrubManagerTask(
+            const std::string &task_id,
+            const ScrubManifest &manifest,
+            const std::uint64_t timeout_ms = 0) const
+        {
+            storedemo::ScrubTask task;
+            task.task_id = task_id;
+            task.manifest.identity = manifest.identity;
+            task.manifest.expected_size = manifest.expected_size;
+            task.manifest.expected_checksum = manifest.expected_checksum;
+            task.manifest.replica_nodes = manifest.replica_nodes;
+            task.manifest.desired_replica_count = manifest.desired_replica_count;
+            task.context.timeout_ms = timeout_ms;
+            return task;
         }
 
         storedemo::test::ScopedStoreTestDir temp_dir_{"storage_scrub_repair"};
@@ -1626,5 +1706,520 @@ namespace
             MakeStatRequest(identity.chunk_id, "repair-repeat-target-stat"));
         ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
         EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerCompletesHealthyTaskWithoutRepairCandidate)
+    {
+        auto &store = CreateStore(1);
+        RegisterNode(1, 100);
+
+        const auto identity = MakeIdentityOrThrow("scrub-manager-healthy", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(32, "scrub-manager-healthy");
+        WriteReplica(store, identity, payload, "scrub-manager-healthy-write");
+
+        const auto manifest = MakeManifest(
+            identity, payload, {storedemo::test::MakeStorageNodeIdFixture(1)}, 1);
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 4,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        const auto submit_result =
+            manager.SubmitTask(MakeScrubManagerTask("scrub-manager-healthy", manifest));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+
+        const auto drain_result = manager.Drain();
+        ASSERT_TRUE(drain_result.drained) << drain_result.error_detail;
+
+        const auto task = manager.FindTask("scrub-manager-healthy");
+        ASSERT_TRUE(task.has_value());
+        EXPECT_EQ(task->state, storedemo::ScrubTaskState::kCompleted);
+        ASSERT_TRUE(task->result.has_value());
+        EXPECT_EQ(task->result->status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_FALSE(task->result->repair_candidate.has_value());
+        ASSERT_EQ(task->result->replica_facts.size(), 1U);
+        EXPECT_TRUE(task->result->replica_facts.front().checksum_verified);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerQueueIsBoundedAndDoesNotBlockForegroundIo)
+    {
+        auto &store = CreateStore(1);
+        RegisterNode(1, 100);
+
+        const auto runner_started = std::make_shared<std::promise<void>>();
+        const auto release_runner = std::make_shared<std::promise<void>>();
+        const auto runner_started_once = std::make_shared<bool>(false);
+        const auto runner_started_mutex = std::make_shared<std::mutex>();
+        auto runner_started_future = runner_started->get_future();
+        auto release_runner_future =
+            std::make_shared<std::shared_future<void>>(
+                release_runner->get_future().share());
+
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 1,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }},
+            [runner_started,
+             runner_started_once,
+             runner_started_mutex,
+             release_runner_future](
+                const storedemo::ScrubTask &) -> storedemo::ScrubTaskResult
+            {
+                {
+                    std::lock_guard<std::mutex> lock(*runner_started_mutex);
+                    if (!*runner_started_once)
+                    {
+                        *runner_started_once = true;
+                        runner_started->set_value();
+                    }
+                }
+                release_runner_future->wait();
+                storedemo::ScrubTaskResult result;
+                result.status = storedemo::StorageNodeStatusCode::kOk;
+                return result;
+            });
+
+        auto first_task = MakeScrubManagerTask(
+            "scrub-manager-queued-1",
+            MakeManifest(MakeIdentityOrThrow("queued-1", 1, 0, 0),
+                         storedemo::test::MakeChunkPayload(8, "queued-1"),
+                         {storedemo::test::MakeStorageNodeIdFixture(1)},
+                         1));
+        auto second_task = MakeScrubManagerTask(
+            "scrub-manager-queued-2",
+            MakeManifest(MakeIdentityOrThrow("queued-2", 1, 0, 0),
+                         storedemo::test::MakeChunkPayload(8, "queued-2"),
+                         {storedemo::test::MakeStorageNodeIdFixture(1)},
+                         1));
+        auto third_task = MakeScrubManagerTask(
+            "scrub-manager-queued-3",
+            MakeManifest(MakeIdentityOrThrow("queued-3", 1, 0, 0),
+                         storedemo::test::MakeChunkPayload(8, "queued-3"),
+                         {storedemo::test::MakeStorageNodeIdFixture(1)},
+                         1));
+
+        ASSERT_TRUE(manager.SubmitTask(std::move(first_task)).accepted());
+        ASSERT_EQ(runner_started_future.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+        ASSERT_TRUE(manager.SubmitTask(std::move(second_task)).accepted());
+
+        const auto overloaded_result = manager.SubmitTask(std::move(third_task));
+        EXPECT_EQ(overloaded_result.code,
+                  storedemo::ScrubManagerSubmitCode::kOverloaded);
+
+        const auto foreground_identity =
+            MakeIdentityOrThrow("foreground-io", 1, 0, 0);
+        const auto foreground_payload =
+            storedemo::test::MakeChunkPayload(24, "foreground-io");
+        const auto write_response = store.WriteChunk(
+            MakeWriteRequest(foreground_identity,
+                             foreground_payload,
+                             "foreground-io-write"));
+        ASSERT_EQ(write_response.status, storedemo::StorageNodeStatusCode::kOk)
+            << write_response.error_detail;
+
+        auto read_request =
+            MakeReadRequest(foreground_identity.chunk_id, "foreground-io-read");
+        read_request.expected_checksum = ComputeChecksumOrThrow(foreground_payload);
+        read_request.verify_checksum = true;
+        const auto read_response = store.ReadChunk(read_request);
+        ASSERT_EQ(read_response.status, storedemo::StorageNodeStatusCode::kOk)
+            << read_response.error_detail;
+        EXPECT_EQ(read_response.payload, foreground_payload);
+
+        release_runner->set_value();
+        const auto drain_result = manager.Drain();
+        EXPECT_TRUE(drain_result.drained);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerDrainWaitsForSubmittedTaskAndStopRejectsNewTasks)
+    {
+        auto &store = CreateStore(1);
+        RegisterNode(1, 100);
+
+        const auto runner_started = std::make_shared<std::promise<void>>();
+        const auto release_runner = std::make_shared<std::promise<void>>();
+        const auto runner_started_once = std::make_shared<bool>(false);
+        const auto runner_started_mutex = std::make_shared<std::mutex>();
+        auto runner_started_future = runner_started->get_future();
+        auto release_runner_future =
+            std::make_shared<std::shared_future<void>>(
+                release_runner->get_future().share());
+
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 2,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }},
+            [runner_started,
+             runner_started_once,
+             runner_started_mutex,
+             release_runner_future](
+                const storedemo::ScrubTask &) -> storedemo::ScrubTaskResult
+            {
+                {
+                    std::lock_guard<std::mutex> lock(*runner_started_mutex);
+                    if (!*runner_started_once)
+                    {
+                        *runner_started_once = true;
+                        runner_started->set_value();
+                    }
+                }
+                release_runner_future->wait();
+                storedemo::ScrubTaskResult result;
+                result.status = storedemo::StorageNodeStatusCode::kOk;
+                return result;
+            });
+
+        ASSERT_TRUE(manager.SubmitTask(
+                              MakeScrubManagerTask(
+                                  "scrub-manager-drain",
+                                  MakeManifest(
+                                      MakeIdentityOrThrow("drain", 1, 0, 0),
+                                      storedemo::test::MakeChunkPayload(8, "drain"),
+                                      {storedemo::test::MakeStorageNodeIdFixture(1)},
+                                      1)))
+                        .accepted());
+        ASSERT_EQ(runner_started_future.wait_for(std::chrono::milliseconds(200)),
+                  std::future_status::ready);
+
+        auto drain_future = std::async(std::launch::async,
+                                       [&manager]()
+                                       {
+                                           return manager.Drain();
+                                       });
+        EXPECT_EQ(drain_future.wait_for(std::chrono::milliseconds(50)),
+                  std::future_status::timeout);
+
+        release_runner->set_value();
+        const auto drain_result = drain_future.get();
+        EXPECT_TRUE(drain_result.drained);
+
+        const auto stop_result = manager.Stop();
+        EXPECT_TRUE(stop_result.stopped);
+
+        const auto rejected_result = manager.SubmitTask(
+            MakeScrubManagerTask(
+                "scrub-manager-after-stop",
+                MakeManifest(MakeIdentityOrThrow("after-stop", 1, 0, 0),
+                             storedemo::test::MakeChunkPayload(8, "after-stop"),
+                             {storedemo::test::MakeStorageNodeIdFixture(1)},
+                             1)));
+        EXPECT_EQ(rejected_result.code, storedemo::ScrubManagerSubmitCode::kStopped);
+
+        (void)store;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerCorruptedReplicaProducesRepairCandidate)
+    {
+        auto &healthy_store = CreateStore(1);
+        auto &corrupted_store = CreateStore(2);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+
+        const auto identity = MakeIdentityOrThrow("scrub-manager-corrupted", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(48, "scrub-manager-corrupted");
+        WriteReplica(healthy_store, identity, payload, "scrub-manager-corrupted-1");
+        WriteReplica(corrupted_store, identity, payload, "scrub-manager-corrupted-2");
+        TamperReplica(corrupted_store,
+                      identity,
+                      storedemo::test::MakeChunkPayload(payload.size(), "tampered"));
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            2);
+
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 4,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        ASSERT_TRUE(manager.SubmitTask(
+                              MakeScrubManagerTask(
+                                  "scrub-manager-corrupted-task", manifest))
+                        .accepted());
+        ASSERT_TRUE(manager.Drain().drained);
+
+        const auto task = manager.FindTask("scrub-manager-corrupted-task");
+        ASSERT_TRUE(task.has_value());
+        EXPECT_EQ(task->state, storedemo::ScrubTaskState::kCompleted);
+        ASSERT_TRUE(task->result.has_value());
+        ASSERT_TRUE(task->result->repair_candidate.has_value());
+        EXPECT_EQ(task->result->repair_candidate->bad_replicas,
+                  std::vector<storedemo::StorageNodeId>{
+                      storedemo::test::MakeStorageNodeIdFixture(2)});
+        EXPECT_EQ(task->result->repair_candidate->healthy_source_replicas,
+                  std::vector<storedemo::StorageNodeId>{
+                      storedemo::test::MakeStorageNodeIdFixture(1)});
+
+        const auto *corrupted_fact = FindFact(
+            *task->result, storedemo::test::MakeStorageNodeIdFixture(2));
+        ASSERT_NE(corrupted_fact, nullptr);
+        EXPECT_TRUE(corrupted_fact->known_corrupted);
+        EXPECT_TRUE(corrupted_fact->quarantined);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerProducesLostAndUnderReplicatedFacts)
+    {
+        auto &first_store = CreateStore(1);
+        auto &second_store = CreateStore(2);
+        auto &missing_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto lost_identity = MakeIdentityOrThrow("scrub-manager-lost", 1, 0, 0);
+        const auto lost_payload =
+            storedemo::test::MakeChunkPayload(24, "scrub-manager-lost");
+        WriteReplica(first_store, lost_identity, lost_payload, "scrub-manager-lost-1");
+        WriteReplica(second_store, lost_identity, lost_payload, "scrub-manager-lost-2");
+        TamperReplica(first_store,
+                      lost_identity,
+                      storedemo::test::MakeChunkPayload(lost_payload.size(), "lost-a"));
+        TamperReplica(second_store,
+                      lost_identity,
+                      storedemo::test::MakeChunkPayload(lost_payload.size(), "lost-b"));
+
+        const auto under_identity =
+            MakeIdentityOrThrow("scrub-manager-under", 1, 0, 0);
+        const auto under_payload =
+            storedemo::test::MakeChunkPayload(24, "scrub-manager-under");
+        WriteReplica(first_store, under_identity, under_payload, "scrub-manager-under-1");
+        WriteReplica(second_store, under_identity, under_payload, "scrub-manager-under-2");
+
+        storedemo::ScrubManager lost_manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 4,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        ASSERT_TRUE(lost_manager.SubmitTask(
+                                   MakeScrubManagerTask(
+                                       "scrub-manager-lost-task",
+                                       MakeManifest(
+                                           lost_identity,
+                                           lost_payload,
+                                           {storedemo::test::MakeStorageNodeIdFixture(1),
+                                            storedemo::test::MakeStorageNodeIdFixture(2)},
+                                           2)))
+                        .accepted());
+        ASSERT_TRUE(lost_manager.Drain().drained);
+
+        const auto lost_task = lost_manager.FindTask("scrub-manager-lost-task");
+        ASSERT_TRUE(lost_task.has_value());
+        ASSERT_TRUE(lost_task->result.has_value());
+        ASSERT_TRUE(lost_task->result->repair_candidate.has_value());
+        EXPECT_TRUE(lost_task->result->repair_candidate->lost_or_unrecoverable);
+        EXPECT_TRUE(lost_task->result->repair_candidate->healthy_source_replicas.empty());
+
+        storedemo::ScrubManager under_manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 4,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        const auto under_submit = under_manager.SubmitTask(
+            MakeScrubManagerTask(
+                "scrub-manager-under-task",
+                MakeManifest(
+                    under_identity,
+                    under_payload,
+                    {storedemo::test::MakeStorageNodeIdFixture(1),
+                     storedemo::test::MakeStorageNodeIdFixture(2),
+                     storedemo::test::MakeStorageNodeIdFixture(3)},
+                    3)));
+        ASSERT_TRUE(under_submit.accepted()) << under_submit.error_detail;
+        ASSERT_TRUE(under_manager.Drain().drained);
+
+        const auto under_task = under_manager.FindTask("scrub-manager-under-task");
+        ASSERT_TRUE(under_task.has_value());
+        ASSERT_TRUE(under_task->result.has_value());
+        ASSERT_TRUE(under_task->result->repair_candidate.has_value());
+        EXPECT_TRUE(under_task->result->repair_candidate->under_replicated);
+        EXPECT_EQ(under_task->result->repair_candidate->bad_replicas,
+                  std::vector<storedemo::StorageNodeId>{
+                      storedemo::test::MakeStorageNodeIdFixture(3)});
+        EXPECT_EQ(missing_store.StatChunk(
+                      MakeStatRequest(under_identity.chunk_id, "scrub-manager-under-stat"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerFiltersUnhealthySourcesAndIsIdempotent)
+    {
+        auto &healthy_store = CreateStore(1);
+        auto &stale_store = CreateStore(2);
+        auto &unavailable_store = CreateStore(3);
+        auto &degraded_store = CreateStore(4);
+        auto &corrupted_store = CreateStore(5);
+
+        RegisterNode(1, 100);
+        RegisterNode(2, 60);
+        RegisterNode(3, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kDegraded);
+        RegisterNode(5, 100);
+
+        const auto identity =
+            MakeIdentityOrThrow("scrub-manager-filtered", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(32, "scrub-manager-filtered");
+        WriteReplica(healthy_store, identity, payload, "scrub-manager-filtered-1");
+        WriteReplica(stale_store, identity, payload, "scrub-manager-filtered-2");
+        WriteReplica(unavailable_store, identity, payload, "scrub-manager-filtered-3");
+        WriteReplica(degraded_store, identity, payload, "scrub-manager-filtered-4");
+        WriteReplica(corrupted_store, identity, payload, "scrub-manager-filtered-5");
+        TamperReplica(corrupted_store,
+                      identity,
+                      storedemo::test::MakeChunkPayload(payload.size(), "tampered"));
+
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2),
+             storedemo::test::MakeStorageNodeIdFixture(3),
+             storedemo::test::MakeStorageNodeIdFixture(4),
+             storedemo::test::MakeStorageNodeIdFixture(5)},
+            5);
+
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 4,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        ASSERT_TRUE(manager.SubmitTask(
+                              MakeScrubManagerTask(
+                                  "scrub-manager-filtered-1", manifest))
+                        .accepted());
+        ASSERT_TRUE(manager.SubmitTask(
+                              MakeScrubManagerTask(
+                                  "scrub-manager-filtered-2", manifest))
+                        .accepted());
+        ASSERT_TRUE(manager.Drain().drained);
+
+        const auto first = manager.FindTask("scrub-manager-filtered-1");
+        const auto second = manager.FindTask("scrub-manager-filtered-2");
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE(second.has_value());
+        ASSERT_TRUE(first->result.has_value());
+        ASSERT_TRUE(second->result.has_value());
+        ASSERT_TRUE(first->result->repair_candidate.has_value());
+        ASSERT_TRUE(second->result->repair_candidate.has_value());
+        EXPECT_EQ(first->result->repair_candidate->healthy_source_replicas,
+                  std::vector<storedemo::StorageNodeId>{
+                      storedemo::test::MakeStorageNodeIdFixture(1)});
+        EXPECT_EQ(CandidateSummary(*first->result->repair_candidate),
+                  CandidateSummary(*second->result->repair_candidate));
+
+        const auto *first_corrupted = FindFact(
+            *first->result, storedemo::test::MakeStorageNodeIdFixture(5));
+        const auto *second_corrupted = FindFact(
+            *second->result, storedemo::test::MakeStorageNodeIdFixture(5));
+        ASSERT_NE(first_corrupted, nullptr);
+        ASSERT_NE(second_corrupted, nullptr);
+        EXPECT_TRUE(first_corrupted->known_corrupted);
+        EXPECT_TRUE(second_corrupted->known_corrupted);
+        EXPECT_TRUE(first_corrupted->quarantined);
+        EXPECT_TRUE(second_corrupted->quarantined);
+        EXPECT_EQ(first_corrupted->state_after, storedemo::ChunkState::kQuarantined);
+        EXPECT_EQ(second_corrupted->state_after, storedemo::ChunkState::kQuarantined);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionScrubManagerFailedTaskRecordsAttemptsAndLastError)
+    {
+        auto &store = CreateStore(1);
+        RegisterNode(1, 100);
+
+        storedemo::ScrubManager manager(
+            RawChunkStoreMap(),
+            &registry_,
+            storedemo::ScrubManagerConfig{
+                .worker_count = 1,
+                .queue_capacity = 2,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }},
+            [](const storedemo::ScrubTask &) -> storedemo::ScrubTaskResult
+            {
+                storedemo::ScrubTaskResult result;
+                result.status = storedemo::StorageNodeStatusCode::kTimeout;
+                result.error_detail = "forced scrub timeout";
+                result.retry_after_ms = 25;
+                return result;
+            });
+
+        ASSERT_TRUE(manager.SubmitTask(
+                              MakeScrubManagerTask(
+                                  "scrub-manager-failed",
+                                  MakeManifest(
+                                      MakeIdentityOrThrow("failed", 1, 0, 0),
+                                      storedemo::test::MakeChunkPayload(8, "failed"),
+                                      {storedemo::test::MakeStorageNodeIdFixture(1)},
+                                      1),
+                                  10))
+                        .accepted());
+        ASSERT_TRUE(manager.Drain().drained);
+
+        const auto task = manager.FindTask("scrub-manager-failed");
+        ASSERT_TRUE(task.has_value());
+        EXPECT_EQ(task->state, storedemo::ScrubTaskState::kFailed);
+        EXPECT_EQ(task->attempts, 1U);
+        EXPECT_EQ(task->last_error, storedemo::StorageNodeStatusCode::kTimeout);
+        EXPECT_EQ(task->last_error_detail, "forced scrub timeout");
+
+        const auto stats = manager.SnapshotStats();
+        EXPECT_EQ(stats.failed_tasks, 1U);
+        EXPECT_EQ(stats.total_attempts, 1U);
+
+        (void)store;
     }
 } // namespace
