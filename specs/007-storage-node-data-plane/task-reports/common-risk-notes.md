@@ -189,3 +189,8 @@
   问题：T080 已新增 test-only RebalanceManager contract 测试骨架，固定了 target durable -> manifest coordination -> source cleanup 三阶段顺序，以及 target durable 失败、manifest update 失败、cleanup retry、bad source/target 过滤、already-exists durable 幂等和 repeated rebalance 幂等边界；但当前 rebalance 仍只依赖 test-only manifest ledger、实时 registry snapshot 和本地 chunk facts，没有生产级 manifest coordination、rebalance task persistence 或 target durable 后 orphan cleanup 持久化协议。
   影响：如果后续把 T080 的通过误读成“生产 RebalanceManager 已完成”或“target durable / manifest update / source cleanup 三阶段在多进程、多节点和快照新鲜度漂移下天然一致”，仍会高估 half-migrated target、cleanup candidate 和记账顺序的可靠性；当前保证的是 contract 测试存在，不是生产 rebalance 编排、manifest 接线、task persistence 和 orphan cleanup 持久化已落地。
   建议后续在哪类任务处理：在 T081/T087/T088 及后续 production manifest coordination、Rebalance RPC、rebalance task persistence、orphan cleanup persistence 和 Windows 实机文件语义验证任务中继续收口 target durable / manifest update / source cleanup 的一致性与持久化边界。
+
+- 任务编号：T081
+  问题：T081 已补齐 `ScrubChunk` / `RepairChunk` proto schema 与 codegen，并同步最小 fake stub 编译面；但当前仍只完成 schema/codegen，生产 `StorageNodeService::ScrubChunk` / `RepairChunk`、`StorageNodeClient::ScrubChunk` / `RepairChunk`、后台 manager、repair task persistence 和 read-side repair 都未实现。`RepairChunkRequest` 现允许直接承载 chunk bytes，这一边界后续如果接错到 metadata / Raft 或缺少独立 payload size/streaming 约束，仍可能放大对象 payload 泄漏或大报文风险。
+  影响：如果后续把 T081 的通过误读成“ScrubChunk/RepairChunk 已可用”或“schema 已自动保证 payload 不会进入 metadata/Raft”，仍会高估当前系统的 RPC 落地与安全边界；当前保证的是 proto 契约存在、codegen 可用、既有 client/service 测试不被接口扩面打坏，不是生产 scrub/repair flow、payload 约束和 task durability 已落地。
+  建议后续在哪类任务处理：在 T082-T085 及后续 read-side repair、repair task persistence、large-payload/streaming 边界和 Windows codegen/runtime 验证任务中继续收口 fake stub 同步、RepairChunk payload 边界、object commit 决策隔离和真实 service/client 语义。

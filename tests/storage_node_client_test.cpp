@@ -904,6 +904,42 @@ namespace
                                 "BatchDeleteChunks is not implemented in this fake stub");
         }
 
+        grpc::Status ScrubChunk(grpc::ClientContext *context,
+                                const storage::ScrubChunkRequest &request,
+                                storage::ScrubChunkResponse *response) override
+        {
+            ++scrub_calls;
+            last_scrub_request = request;
+            scrub_call_observed_at = std::chrono::system_clock::now();
+            scrub_observed_deadline = context->deadline();
+
+            if (scrub_handler)
+            {
+                return scrub_handler(context, request, response);
+            }
+
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "ScrubChunk is not implemented in this fake stub");
+        }
+
+        grpc::Status RepairChunk(grpc::ClientContext *context,
+                                 const storage::RepairChunkRequest &request,
+                                 storage::RepairChunkResponse *response) override
+        {
+            ++repair_calls;
+            last_repair_request = request;
+            repair_call_observed_at = std::chrono::system_clock::now();
+            repair_observed_deadline = context->deadline();
+
+            if (repair_handler)
+            {
+                return repair_handler(context, request, response);
+            }
+
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "RepairChunk is not implemented in this fake stub");
+        }
+
         grpc::Status RegisterStorageNode(
             grpc::ClientContext *context,
             const storage::RegisterStorageNodeRequest &request,
@@ -1014,6 +1050,14 @@ namespace
                                    storage::BatchDeleteChunksResponse *)>
             batch_delete_handler;
         std::function<grpc::Status(grpc::ClientContext *,
+                                   const storage::ScrubChunkRequest &,
+                                   storage::ScrubChunkResponse *)>
+            scrub_handler;
+        std::function<grpc::Status(grpc::ClientContext *,
+                                   const storage::RepairChunkRequest &,
+                                   storage::RepairChunkResponse *)>
+            repair_handler;
+        std::function<grpc::Status(grpc::ClientContext *,
                                    const storage::RegisterStorageNodeRequest &,
                                    storage::RegisterStorageNodeResponse *)>
             register_handler;
@@ -1037,6 +1081,8 @@ namespace
         storage::ReadChunkRequest last_read_request;
         storage::DeleteChunkRequest last_delete_request;
         storage::BatchDeleteChunksRequest last_batch_delete_request;
+        storage::ScrubChunkRequest last_scrub_request;
+        storage::RepairChunkRequest last_repair_request;
         storage::RegisterStorageNodeRequest last_register_request;
         storage::UpdateStorageNodeHeartbeatRequest last_heartbeat_request;
         storage::ReportHealthRequest last_health_report_request;
@@ -1046,6 +1092,8 @@ namespace
         std::size_t read_calls{0};
         std::size_t delete_calls{0};
         std::size_t batch_delete_calls{0};
+        std::size_t scrub_calls{0};
+        std::size_t repair_calls{0};
         std::size_t register_calls{0};
         std::size_t heartbeat_calls{0};
         std::size_t health_report_calls{0};
@@ -1059,6 +1107,10 @@ namespace
         std::chrono::system_clock::time_point delete_observed_deadline{};
         std::chrono::system_clock::time_point batch_delete_call_observed_at{};
         std::chrono::system_clock::time_point batch_delete_observed_deadline{};
+        std::chrono::system_clock::time_point scrub_call_observed_at{};
+        std::chrono::system_clock::time_point scrub_observed_deadline{};
+        std::chrono::system_clock::time_point repair_call_observed_at{};
+        std::chrono::system_clock::time_point repair_observed_deadline{};
         std::chrono::system_clock::time_point register_call_observed_at{};
         std::chrono::system_clock::time_point register_observed_deadline{};
         std::chrono::system_clock::time_point heartbeat_call_observed_at{};
@@ -1131,6 +1183,38 @@ namespace
         PrepareAsyncBatchDeleteChunksRaw(grpc::ClientContext *,
                                          const storage::BatchDeleteChunksRequest &,
                                          grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::ScrubChunkResponse> *
+        AsyncScrubChunkRaw(grpc::ClientContext *,
+                           const storage::ScrubChunkRequest &,
+                           grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::ScrubChunkResponse> *
+        PrepareAsyncScrubChunkRaw(grpc::ClientContext *,
+                                  const storage::ScrubChunkRequest &,
+                                  grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::RepairChunkResponse> *
+        AsyncRepairChunkRaw(grpc::ClientContext *,
+                            const storage::RepairChunkRequest &,
+                            grpc::CompletionQueue *) override
+        {
+            return nullptr;
+        }
+
+        grpc::ClientAsyncResponseReaderInterface<storage::RepairChunkResponse> *
+        PrepareAsyncRepairChunkRaw(grpc::ClientContext *,
+                                   const storage::RepairChunkRequest &,
+                                   grpc::CompletionQueue *) override
         {
             return nullptr;
         }

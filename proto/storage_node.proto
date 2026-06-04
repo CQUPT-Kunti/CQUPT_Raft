@@ -303,11 +303,99 @@ message BatchDeleteChunksResponse {
   bool partial_failure = 7;
 }
 
+message ScrubChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  string object_id = 3;
+  uint64 version = 4;
+  uint32 chunk_index = 5;
+  uint64 expected_size = 6;
+  StorageChunkChecksum expected_checksum = 7;
+  uint64 timeout_ms = 8;
+  bool best_effort_cancel = 9;
+  bool verify_checksum = 10;
+  bool quarantine_on_corruption = 11;
+}
+
+message ScrubChunkFact {
+  string chunk_id = 1;
+  uint64 expected_size = 2;
+  uint64 observed_size = 3;
+  StorageChunkChecksum expected_checksum = 4;
+  StorageChunkChecksum observed_checksum = 5;
+  StorageChunkState state_before = 6;
+  StorageChunkState state_after = 7;
+  bool checksum_verified = 8;
+  bool known_corrupted = 9;
+  bool known_missing = 10;
+  bool quarantined = 11;
+}
+
+message ScrubChunkResult {
+  ScrubChunkFact fact = 1;
+  bool repair_required = 2;
+  bool retryable = 3;
+}
+
+message ScrubChunkResponse {
+  StorageNodeResponseSummary summary = 1;
+  ScrubChunkResult result = 2;
+}
+
+message RepairChunkRequest {
+  string request_id = 1;
+  string chunk_id = 2;
+  string object_id = 3;
+  uint64 version = 4;
+  uint32 chunk_index = 5;
+  uint64 offset = 6;
+  uint64 expected_size = 7;
+  StorageChunkChecksum expected_checksum = 8;
+  string source_node_id = 9;
+  uint64 source_size = 10;
+  StorageChunkChecksum source_checksum = 11;
+  StorageChunkState source_state = 12;
+  bool source_checksum_verified = 13;
+  bytes payload = 14;
+  uint64 timeout_ms = 15;
+  bool best_effort_cancel = 16;
+  WriteChunkDurability durability = 17;
+}
+
+message RepairChunkFact {
+  string chunk_id = 1;
+  string source_node_id = 2;
+  string target_node_id = 3;
+  uint64 expected_size = 4;
+  uint64 observed_size = 5;
+  StorageChunkChecksum expected_checksum = 6;
+  StorageChunkChecksum observed_checksum = 7;
+  StorageChunkState source_state = 8;
+  StorageChunkState target_state = 9;
+  bool source_checksum_verified = 10;
+  bool source_unavailable = 11;
+  bool target_durable = 12;
+  bool already_exists = 13;
+}
+
+message RepairChunkResult {
+  RepairChunkFact fact = 1;
+  bool repaired = 2;
+  bool retryable = 3;
+}
+
+message RepairChunkResponse {
+  StorageNodeResponseSummary summary = 1;
+  RepairChunkResult result = 2;
+}
+
 service StorageNodeService {
   rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
   rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
   rpc BatchDeleteChunks(BatchDeleteChunksRequest) returns (BatchDeleteChunksResponse);
+  rpc ScrubChunk(ScrubChunkRequest) returns (ScrubChunkResponse);
+  rpc RepairChunk(RepairChunkRequest) returns (RepairChunkResponse);
   rpc RegisterStorageNode(RegisterStorageNodeRequest) returns (RegisterStorageNodeResponse);
   rpc UpdateStorageNodeHeartbeat(UpdateStorageNodeHeartbeatRequest) returns (StorageNodeFactUpdateResponse);
   rpc ReportHealth(ReportHealthRequest) returns (StorageNodeFactUpdateResponse);
