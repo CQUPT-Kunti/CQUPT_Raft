@@ -75,6 +75,9 @@ namespace storedemo
         ChunkChecksum expected_checksum;
         std::vector<StorageNodeId> bad_replicas;
         std::vector<StorageNodeId> healthy_source_replicas;
+        std::size_t healthy_replica_count{0};
+        std::size_t required_replica_count{0};
+        std::size_t missing_replica_count{0};
         bool under_replicated{false};
         bool lost_or_unrecoverable{false};
     };

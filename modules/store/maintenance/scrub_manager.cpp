@@ -218,6 +218,36 @@ namespace storedemo
                    lhs.size_bytes == rhs.size_bytes;
         }
 
+        bool IsHealthyReplicaForRepairSource(
+            const ScrubReplicaFact &fact,
+            const StorageNodeRegistryNodeSnapshot *snapshot)
+        {
+            if (snapshot == nullptr)
+            {
+                return false;
+            }
+            if (!fact.checksum_verified || fact.known_corrupted || fact.known_missing)
+            {
+                return false;
+            }
+            if (snapshot->liveness != StorageNodeRegistryLiveness::kLive)
+            {
+                return false;
+            }
+            if (snapshot->facts.health.health != StorageNodeHealth::kHealthy)
+            {
+                return false;
+            }
+            if (snapshot->facts.health.disk_pressure ==
+                    StorageNodeDiskPressure::kHigh ||
+                snapshot->facts.health.disk_pressure ==
+                    StorageNodeDiskPressure::kFull)
+            {
+                return false;
+            }
+            return true;
+        }
+
         ScrubReplicaFact InspectReplica(ChunkStore *store,
                                         const StorageNodeId &node_id,
                                         const ScrubManifest &manifest,
@@ -425,27 +455,13 @@ namespace storedemo
                 }
 
                 const auto fact_it = fact_by_node.find(candidate.node_id);
-                if (fact_it == fact_by_node.end() ||
-                    !fact_it->second.checksum_verified ||
-                    fact_it->second.known_corrupted ||
-                    fact_it->second.known_missing)
+                if (fact_it == fact_by_node.end())
                 {
                     continue;
                 }
 
                 const auto &node_snapshot = snapshot_it->second;
-                if (node_snapshot.liveness != StorageNodeRegistryLiveness::kLive)
-                {
-                    continue;
-                }
-                if (node_snapshot.facts.health.health != StorageNodeHealth::kHealthy)
-                {
-                    continue;
-                }
-                if (node_snapshot.facts.health.disk_pressure ==
-                        StorageNodeDiskPressure::kHigh ||
-                    node_snapshot.facts.health.disk_pressure ==
-                        StorageNodeDiskPressure::kFull)
+                if (!IsHealthyReplicaForRepairSource(fact_it->second, &node_snapshot))
                 {
                     continue;
                 }
@@ -453,8 +469,14 @@ namespace storedemo
                 healthy_sources.push_back(candidate.node_id);
             }
 
+            const auto healthy_replica_count = healthy_sources.size();
+            const auto required_replica_count = task.manifest.desired_replica_count;
+            const auto missing_replica_count =
+                healthy_replica_count >= required_replica_count
+                    ? 0U
+                    : required_replica_count - healthy_replica_count;
             const bool under_replicated =
-                healthy_sources.size() < task.manifest.desired_replica_count;
+                healthy_replica_count < required_replica_count;
             if (!bad_replicas.empty() || under_replicated)
             {
                 result.repair_candidate = ScrubRepairCandidate{
@@ -463,6 +485,9 @@ namespace storedemo
                     .expected_checksum = task.manifest.expected_checksum,
                     .bad_replicas = std::move(bad_replicas),
                     .healthy_source_replicas = std::move(healthy_sources),
+                    .healthy_replica_count = healthy_replica_count,
+                    .required_replica_count = required_replica_count,
+                    .missing_replica_count = missing_replica_count,
                     .under_replicated = under_replicated,
                     .lost_or_unrecoverable = false};
                 result.repair_candidate->lost_or_unrecoverable =

@@ -35,6 +35,18 @@ namespace storedemo
         kAlreadyExists = 3,
     };
 
+    enum class UnderReplicatedTaskSubmitCode : std::uint8_t
+    {
+        kAccepted = 0,
+        kAlreadyExists = 1,
+        kOverloaded = 2,
+        kInvalidArgument = 3,
+        kNotUnderReplicated = 4,
+        kLostOrUnrecoverable = 5,
+        kNoHealthySource = 6,
+        kNoHealthyTarget = 7,
+    };
+
     enum class RepairTaskOperationCode : std::uint8_t
     {
         kOk = 0,
@@ -45,6 +57,7 @@ namespace storedemo
 
     const char *ToString(RepairTaskState state);
     const char *ToString(RepairManagerSubmitCode code);
+    const char *ToString(UnderReplicatedTaskSubmitCode code);
     const char *ToString(RepairTaskOperationCode code);
 
     struct RepairTaskRequest
@@ -136,6 +149,20 @@ namespace storedemo
         [[nodiscard]] StorageNodeStatusCode status_code() const;
     };
 
+    struct UnderReplicatedTaskSubmitResult
+    {
+        UnderReplicatedTaskSubmitCode code{UnderReplicatedTaskSubmitCode::kAccepted};
+        std::string error_detail;
+        std::optional<RepairTask> task;
+
+        [[nodiscard]] bool accepted() const
+        {
+            return code == UnderReplicatedTaskSubmitCode::kAccepted;
+        }
+
+        [[nodiscard]] StorageNodeStatusCode status_code() const;
+    };
+
     struct RepairTaskOperationResult
     {
         RepairTaskOperationCode code{RepairTaskOperationCode::kOk};
@@ -195,6 +222,8 @@ namespace storedemo
         RepairManager &operator=(const RepairManager &) = delete;
 
         RepairManagerSubmitResult SubmitTask(const RepairTaskRequest &request);
+        UnderReplicatedTaskSubmitResult SubmitUnderReplicatedTask(
+            const ScrubTask &scrub_task);
 
         RepairTaskOperationResult MarkTaskRunning(std::string_view task_id);
         RepairTaskOperationResult UpdateTaskProgress(std::string_view task_id,

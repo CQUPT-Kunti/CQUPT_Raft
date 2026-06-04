@@ -15,10 +15,10 @@
 - 注入式 delete handler 调用边界
 - `ScrubManager` bounded background queue 与 scrub facts 聚合
 - `RepairManager` task model、source/target 规划、copy flow 与生命周期状态机
+- under-replicated detection 与 under-replicated fact -> repair task 生成
 
 当前不负责：
 
-- under-replicated detection
 - rebalance
 - metadata / Raft 调用
 
@@ -30,14 +30,16 @@
 - healthy source 选择仍基于 registry snapshot + `ReplicaPolicySelector` + 本地 checksum 校验；stale/unavailable/unhealthy/high-disk-pressure 副本不会进入 healthy source。
 - 当前 `ScrubManager` 不做 task persistence、restart resume、跨节点 `ScrubChunk` fan-out 或 read-side repair。
 
-## T084/T085 fixed boundary
+## T084/T085/T086 fixed boundary
 
 - T084 新增生产 `RepairManager` task model，负责从 scrub/repair candidate 生成 repair task，并固定 source_node、target_node、chunk_id、expected checksum/size、state、progress、attempts、last_error、last_error_detail。
 - T085 在此基础上补上最小生产 copy flow：`RunTask()` 通过注入的 `source_reader` / `target_writer` 执行 source read、checksum verify、target durable write 和 task state 推进。
+- T086 补上最小生产 under-replicated detection 收口：`ScrubManager` 现在固定 healthy replica count / required replica count / missing replica count，并由 `RepairManager::SubmitUnderReplicatedTask()` 把 completed scrub task 中的 under-replicated fact 转成 repair task。
 - `RepairManager` 当前可做 submit / lookup / list / cancel / retry / running / progress / complete / fail / run-task 更新，但不做 metadata manifest coordination、不发布 replica facts、不做 task persistence、read-side repair 或 rebalance。
 - `Completed` 只表示 target durable write 已完成；不代表 metadata manifest 已更新，也不代表 source cleanup 已发生。
 - `RetryPending` 表示 task 需要下一次 repair attempt；retryable failure 由 source/target 校验、RPC/IO 状态和 target durable 结果共同驱动。
 - copy flow 只处理 chunk data-plane payload 和 checksum/size 事实，不调用 metadata / Raft，也不保存 object payload 到 metadata / Raft。
+- under-replicated detection 只依赖 scrub manifest、replica checksum/state 事实和 registry snapshot；不直接修改 metadata manifest，不做 read-side repair，也不把 repair completed 伪装成 manifest 已协调。
 
 ## 主要文件
 
@@ -262,6 +264,13 @@
 - 输出：单副本 `ScrubReplicaFact`。
 - 边界：只做本地 checksum/state 检查，不触发 repair。
 
+### `IsHealthyReplicaForRepairSource(...)`
+
+- 责任：统一判断某个 scrub 副本事实是否能计入 healthy replica count 并作为 repair source。
+- 输入：单副本 `ScrubReplicaFact`、对应 registry snapshot。
+- 输出：是否计入 healthy replica/source。
+- 边界：checksum verified、非 corrupted/missing、registry liveness live、health healthy、disk pressure 非 high/full 才算 healthy；stale/unavailable/unhealthy 副本不计入。
+
 ## repair_manager.cpp 关键 helper
 
 ### `ValidateExecutionSourceSnapshot(...)` / `ValidateExecutionTargetSnapshot(...)`
@@ -284,6 +293,20 @@
 - 输入：`RepairTask`、`StorageTaskContext`，以及 target writer 的 payload/checksum。
 - 输出：source 侧的 payload/checksum/state/verified 事实，或 target 侧的 durable/already_exists/retryable 结果。
 - 边界：允许通过真实 `StorageNodeClient::ReadChunk/RepairChunk` 或等价生产路径接线；maintenance 层不硬编码 metadata / Raft / manifest 更新。
+
+### `PlanRepairTask(...)`
+
+- 责任：收口 repair candidate、registry snapshot 和 placement 结果，规划稳定的 source_node / target_node。
+- 输入：`RepairTaskRequest`、registry、`now_unix_ms`。
+- 输出：source/target 已固定的 planning result，或明确的 invalid/no-source/no-target 边界。
+- 边界：只做 under-replicated/repair candidate -> task 规划；不执行 copy，不修改 metadata manifest。
+
+### `RepairManager::SubmitUnderReplicatedTask(const ScrubTask &)`
+
+- 责任：把 completed scrub task 中的 under-replicated fact 转成生产 repair task。
+- 输入：带 `repair_candidate` 的 completed scrub task。
+- 输出：`UnderReplicatedTaskSubmitResult` 和可选 `RepairTask`。
+- 边界：只接受 `under_replicated=true` 且存在 healthy source 的 scrub 结果；`lost_or_unrecoverable`、`no healthy source`、`no healthy target` 都返回明确状态；重复扫描生成的同一 plan 走稳定 task id 幂等。
 - 输出：`ScrubReplicaFact`。
 - 边界：只读本地 chunk facts；发现 checksum mismatch/corruption 时可沿用现有 quarantine 语义，但不触发 repair。
 

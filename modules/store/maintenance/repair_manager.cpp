@@ -335,12 +335,172 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
-        StorageNodeStatusCode ValidateSubmitRequest(RepairTaskRequest *request,
-                                                    const StorageNodeRegistry *registry,
-                                                    StorageNodeId *selected_source,
-                                                    StorageNodeId *selected_target,
-                                                    std::string *error_detail,
-                                                    const std::uint64_t now_unix_ms)
+        enum class RepairTaskPlanningCode : std::uint8_t
+        {
+            kOk = 0,
+            kInvalidArgument = 1,
+            kNoHealthySource = 2,
+            kNoHealthyTarget = 3,
+        };
+
+        struct RepairTaskPlanningResult
+        {
+            RepairTaskPlanningCode code{RepairTaskPlanningCode::kOk};
+            StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+            RepairTaskRequest request;
+            StorageNodeId source_node;
+            StorageNodeId target_node;
+            std::string error_detail;
+
+            [[nodiscard]] bool ok() const
+            {
+                return code == RepairTaskPlanningCode::kOk &&
+                       status == StorageNodeStatusCode::kOk;
+            }
+        };
+
+        RepairTaskPlanningResult PlanRepairTask(RepairTaskRequest request,
+                                                const StorageNodeRegistry *registry,
+                                                const std::uint64_t now_unix_ms)
+        {
+            RepairTaskPlanningResult result;
+            result.request = std::move(request);
+
+            if (registry == nullptr)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail = "repair manager requires a registry";
+                return result;
+            }
+
+            const auto identity_status =
+                ResolveManifestIdentity(&result.request.manifest, &result.error_detail);
+            if (identity_status != StorageNodeStatusCode::kOk)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = identity_status;
+                return result;
+            }
+
+            if (result.request.manifest.expected_size == 0 ||
+                result.request.repair_candidate.expected_size == 0)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail = "repair task requires expected_size";
+                return result;
+            }
+
+            if (!result.request.manifest.expected_checksum.IsSet() ||
+                !result.request.repair_candidate.expected_checksum.IsSet())
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail = "repair task requires expected_checksum";
+                return result;
+            }
+
+            if (result.request.repair_candidate.chunk_id.empty())
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail = "repair candidate requires chunk_id";
+                return result;
+            }
+
+            if (result.request.repair_candidate.chunk_id !=
+                result.request.manifest.identity.chunk_id)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail =
+                    "repair candidate chunk_id does not match repair manifest";
+                return result;
+            }
+
+            if (result.request.repair_candidate.expected_size !=
+                result.request.manifest.expected_size)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail =
+                    "repair candidate expected_size does not match repair manifest";
+                return result;
+            }
+
+            if (result.request.repair_candidate.expected_checksum.algorithm !=
+                    result.request.manifest.expected_checksum.algorithm ||
+                result.request.repair_candidate.expected_checksum.value !=
+                    result.request.manifest.expected_checksum.value ||
+                result.request.repair_candidate.expected_checksum.size_bytes !=
+                    result.request.manifest.expected_checksum.size_bytes)
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = StorageNodeStatusCode::kInvalidArgument;
+                result.error_detail =
+                    "repair candidate expected_checksum does not match repair manifest";
+                return result;
+            }
+
+            if (result.request.repair_candidate.healthy_source_replicas.empty())
+            {
+                result.code = RepairTaskPlanningCode::kNoHealthySource;
+                result.status = StorageNodeStatusCode::kNodeUnavailable;
+                result.error_detail =
+                    "repair candidate must include at least one healthy source replica";
+                return result;
+            }
+
+            const auto snapshot = registry->Snapshot(now_unix_ms);
+            if (!snapshot.ok())
+            {
+                result.code = RepairTaskPlanningCode::kInvalidArgument;
+                result.status = snapshot.status;
+                result.error_detail = snapshot.error_detail;
+                return result;
+            }
+
+            std::map<StorageNodeId, StorageNodeRegistryNodeSnapshot, std::less<>> snapshots;
+            for (const auto &node : snapshot.nodes)
+            {
+                snapshots.emplace(node.node_id, node);
+            }
+
+            const auto source_status = SelectSourceNode(
+                result.request.repair_candidate.healthy_source_replicas,
+                snapshots,
+                &result.source_node,
+                &result.error_detail);
+            if (source_status != StorageNodeStatusCode::kOk)
+            {
+                result.code = RepairTaskPlanningCode::kNoHealthySource;
+                result.status = StorageNodeStatusCode::kNodeUnavailable;
+                return result;
+            }
+
+            const auto target_status = SelectTargetNode(result.request.manifest,
+                                                        *registry,
+                                                        now_unix_ms,
+                                                        &result.target_node,
+                                                        &result.error_detail);
+            if (target_status != StorageNodeStatusCode::kOk)
+            {
+                result.code = RepairTaskPlanningCode::kNoHealthyTarget;
+                result.status = StorageNodeStatusCode::kNodeUnavailable;
+                return result;
+            }
+
+            return result;
+        }
+
+        [[maybe_unused]] StorageNodeStatusCode ValidateSubmitRequest(
+            RepairTaskRequest *request,
+            const StorageNodeRegistry *registry,
+            StorageNodeId *selected_source,
+            StorageNodeId *selected_target,
+            std::string *error_detail,
+            const std::uint64_t now_unix_ms)
         {
             if (request == nullptr)
             {
@@ -473,6 +633,70 @@ namespace storedemo
                                     error_detail);
         }
 
+        RepairManagerSubmitResult EnqueuePlannedTask(
+            const RepairTask &planned_task,
+            std::mutex *mutex,
+            std::map<std::string, RepairTask, std::less<>> *tasks,
+            std::uint64_t *submitted_tasks,
+            std::uint64_t *rejected_tasks,
+            std::string *last_error_detail,
+            const RepairManagerConfig &config)
+        {
+            RepairManagerSubmitResult result;
+            if (mutex == nullptr || tasks == nullptr || submitted_tasks == nullptr ||
+                rejected_tasks == nullptr || last_error_detail == nullptr)
+            {
+                result.code = RepairManagerSubmitCode::kInvalidArgument;
+                result.error_detail = "repair manager queue state must not be null";
+                return result;
+            }
+
+            std::lock_guard<std::mutex> lock(*mutex);
+            if (tasks->contains(planned_task.task_id))
+            {
+                result.code = RepairManagerSubmitCode::kAlreadyExists;
+                result.error_detail = "repair task already exists";
+                result.task = tasks->find(planned_task.task_id)->second;
+                ++(*rejected_tasks);
+                *last_error_detail = result.error_detail;
+                return result;
+            }
+
+            std::size_t active_task_count = 0;
+            for (const auto &[task_id, task] : *tasks)
+            {
+                (void)task_id;
+                if (IsActiveTaskState(task.state))
+                {
+                    ++active_task_count;
+                }
+            }
+
+            if (tasks->size() >= config.max_tasks)
+            {
+                result.code = RepairManagerSubmitCode::kOverloaded;
+                result.error_detail = "repair task registry is full";
+                ++(*rejected_tasks);
+                *last_error_detail = result.error_detail;
+                return result;
+            }
+
+            if (active_task_count >= config.max_active_tasks)
+            {
+                result.code = RepairManagerSubmitCode::kOverloaded;
+                result.error_detail = "repair task queue is full";
+                ++(*rejected_tasks);
+                *last_error_detail = result.error_detail;
+                return result;
+            }
+
+            auto [task_it, inserted] = tasks->emplace(planned_task.task_id, planned_task);
+            (void)inserted;
+            ++(*submitted_tasks);
+            result.task = task_it->second;
+            return result;
+        }
+
         RepairTask MakeRepairTask(const RepairTaskRequest &request,
                                   const StorageNodeId &source_node,
                                   const StorageNodeId &target_node,
@@ -560,6 +784,30 @@ namespace storedemo
         return "UnknownRepairManagerSubmitCode";
     }
 
+    const char *ToString(const UnderReplicatedTaskSubmitCode code)
+    {
+        switch (code)
+        {
+        case UnderReplicatedTaskSubmitCode::kAccepted:
+            return "Accepted";
+        case UnderReplicatedTaskSubmitCode::kAlreadyExists:
+            return "AlreadyExists";
+        case UnderReplicatedTaskSubmitCode::kOverloaded:
+            return "Overloaded";
+        case UnderReplicatedTaskSubmitCode::kInvalidArgument:
+            return "InvalidArgument";
+        case UnderReplicatedTaskSubmitCode::kNotUnderReplicated:
+            return "NotUnderReplicated";
+        case UnderReplicatedTaskSubmitCode::kLostOrUnrecoverable:
+            return "LostOrUnrecoverable";
+        case UnderReplicatedTaskSubmitCode::kNoHealthySource:
+            return "NoHealthySource";
+        case UnderReplicatedTaskSubmitCode::kNoHealthyTarget:
+            return "NoHealthyTarget";
+        }
+        return "UnknownUnderReplicatedTaskSubmitCode";
+    }
+
     const char *ToString(const RepairTaskOperationCode code)
     {
         switch (code)
@@ -607,6 +855,28 @@ namespace storedemo
         return StorageNodeStatusCode::kIoError;
     }
 
+    StorageNodeStatusCode UnderReplicatedTaskSubmitResult::status_code() const
+    {
+        switch (code)
+        {
+        case UnderReplicatedTaskSubmitCode::kAccepted:
+            return StorageNodeStatusCode::kOk;
+        case UnderReplicatedTaskSubmitCode::kAlreadyExists:
+        case UnderReplicatedTaskSubmitCode::kNotUnderReplicated:
+            return StorageNodeStatusCode::kConflict;
+        case UnderReplicatedTaskSubmitCode::kOverloaded:
+            return StorageNodeStatusCode::kOverloaded;
+        case UnderReplicatedTaskSubmitCode::kInvalidArgument:
+            return StorageNodeStatusCode::kInvalidArgument;
+        case UnderReplicatedTaskSubmitCode::kLostOrUnrecoverable:
+            return StorageNodeStatusCode::kNotFound;
+        case UnderReplicatedTaskSubmitCode::kNoHealthySource:
+        case UnderReplicatedTaskSubmitCode::kNoHealthyTarget:
+            return StorageNodeStatusCode::kNodeUnavailable;
+        }
+        return StorageNodeStatusCode::kIoError;
+    }
+
     RepairManager::RepairManager(const StorageNodeRegistry *registry,
                                  RepairManagerConfig config)
         : config_(SanitizeRepairManagerConfig(std::move(config))), impl_(std::make_unique<Impl>(registry, config_))
@@ -622,75 +892,125 @@ namespace storedemo
     RepairManagerSubmitResult RepairManager::SubmitTask(const RepairTaskRequest &request)
     {
         RepairManagerSubmitResult result;
-        auto request_copy = request;
-        StorageNodeId selected_source;
-        StorageNodeId selected_target;
-        std::string error_detail;
         const auto now_unix_ms = config_.now_unix_ms();
-        const auto validation_status = ValidateSubmitRequest(&request_copy,
-                                                             impl_->registry,
-                                                             &selected_source,
-                                                             &selected_target,
-                                                             &error_detail,
-                                                             now_unix_ms);
-        if (validation_status != StorageNodeStatusCode::kOk)
+        auto plan = PlanRepairTask(request, impl_->registry, now_unix_ms);
+        if (!plan.ok())
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             result.code = RepairManagerSubmitCode::kInvalidArgument;
-            result.error_detail = std::move(error_detail);
+            result.error_detail = std::move(plan.error_detail);
             ++impl_->rejected_tasks;
             impl_->last_error_detail = result.error_detail;
             return result;
         }
 
-        const auto planned_task = MakeRepairTask(request_copy,
-                                                 selected_source,
-                                                 selected_target,
+        const auto planned_task = MakeRepairTask(plan.request,
+                                                 plan.source_node,
+                                                 plan.target_node,
                                                  now_unix_ms);
+        return EnqueuePlannedTask(planned_task,
+                                  &impl_->mutex,
+                                  &impl_->tasks,
+                                  &impl_->submitted_tasks,
+                                  &impl_->rejected_tasks,
+                                  &impl_->last_error_detail,
+                                  config_);
+    }
 
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->tasks.contains(planned_task.task_id))
+    UnderReplicatedTaskSubmitResult RepairManager::SubmitUnderReplicatedTask(
+        const ScrubTask &scrub_task)
+    {
+        UnderReplicatedTaskSubmitResult result;
+        if (!scrub_task.result.has_value())
         {
-            result.code = RepairManagerSubmitCode::kAlreadyExists;
-            result.error_detail = "repair task already exists";
-            result.task = impl_->tasks.find(planned_task.task_id)->second;
-            ++impl_->rejected_tasks;
-            impl_->last_error_detail = result.error_detail;
+            result.code = UnderReplicatedTaskSubmitCode::kInvalidArgument;
+            result.error_detail = "completed scrub result is required";
+            return result;
+        }
+        if (!scrub_task.result->repair_candidate.has_value())
+        {
+            result.code = UnderReplicatedTaskSubmitCode::kNotUnderReplicated;
+            result.error_detail = "scrub task did not produce a repair candidate";
             return result;
         }
 
-        std::size_t active_task_count = 0;
-        for (const auto &[task_id, task] : impl_->tasks)
+        const auto &candidate = *scrub_task.result->repair_candidate;
+        if (!candidate.under_replicated)
         {
-            (void)task_id;
-            if (IsActiveTaskState(task.state))
+            result.code = UnderReplicatedTaskSubmitCode::kNotUnderReplicated;
+            result.error_detail = "scrub repair candidate is not under-replicated";
+            return result;
+        }
+        if (candidate.lost_or_unrecoverable)
+        {
+            result.code = UnderReplicatedTaskSubmitCode::kLostOrUnrecoverable;
+            result.error_detail =
+                "under-replicated chunk has no healthy source and is unrecoverable";
+            return result;
+        }
+        if (candidate.healthy_source_replicas.empty())
+        {
+            result.code = UnderReplicatedTaskSubmitCode::kNoHealthySource;
+            result.error_detail =
+                "under-replicated chunk has no healthy source replica";
+            return result;
+        }
+
+        RepairTaskRequest request;
+        request.manifest = scrub_task.manifest;
+        request.repair_candidate = candidate;
+        request.context = scrub_task.context;
+
+        const auto now_unix_ms = config_.now_unix_ms();
+        auto plan = PlanRepairTask(std::move(request), impl_->registry, now_unix_ms);
+        if (!plan.ok())
+        {
+            switch (plan.code)
             {
-                ++active_task_count;
+            case RepairTaskPlanningCode::kNoHealthySource:
+                result.code = UnderReplicatedTaskSubmitCode::kNoHealthySource;
+                break;
+            case RepairTaskPlanningCode::kNoHealthyTarget:
+                result.code = UnderReplicatedTaskSubmitCode::kNoHealthyTarget;
+                break;
+            case RepairTaskPlanningCode::kOk:
+            case RepairTaskPlanningCode::kInvalidArgument:
+                result.code = UnderReplicatedTaskSubmitCode::kInvalidArgument;
+                break;
             }
-        }
-
-        if (impl_->tasks.size() >= config_.max_tasks)
-        {
-            result.code = RepairManagerSubmitCode::kOverloaded;
-            result.error_detail = "repair task registry is full";
-            ++impl_->rejected_tasks;
-            impl_->last_error_detail = result.error_detail;
+            result.error_detail = std::move(plan.error_detail);
             return result;
         }
 
-        if (active_task_count >= config_.max_active_tasks)
+        const auto planned_task = MakeRepairTask(plan.request,
+                                                 plan.source_node,
+                                                 plan.target_node,
+                                                 now_unix_ms);
+        const auto submit_result =
+            EnqueuePlannedTask(planned_task,
+                               &impl_->mutex,
+                               &impl_->tasks,
+                               &impl_->submitted_tasks,
+                               &impl_->rejected_tasks,
+                               &impl_->last_error_detail,
+                               config_);
+        switch (submit_result.code)
         {
-            result.code = RepairManagerSubmitCode::kOverloaded;
-            result.error_detail = "repair task queue is full";
-            ++impl_->rejected_tasks;
-            impl_->last_error_detail = result.error_detail;
-            return result;
+        case RepairManagerSubmitCode::kAccepted:
+            result.code = UnderReplicatedTaskSubmitCode::kAccepted;
+            break;
+        case RepairManagerSubmitCode::kAlreadyExists:
+            result.code = UnderReplicatedTaskSubmitCode::kAlreadyExists;
+            break;
+        case RepairManagerSubmitCode::kOverloaded:
+            result.code = UnderReplicatedTaskSubmitCode::kOverloaded;
+            break;
+        case RepairManagerSubmitCode::kInvalidArgument:
+            result.code = UnderReplicatedTaskSubmitCode::kInvalidArgument;
+            break;
         }
-
-        auto [task_it, inserted] = impl_->tasks.emplace(planned_task.task_id, planned_task);
-        (void)inserted;
-        ++impl_->submitted_tasks;
-        result.task = task_it->second;
+        result.error_detail = submit_result.error_detail;
+        result.task = submit_result.task;
         return result;
     }
 
