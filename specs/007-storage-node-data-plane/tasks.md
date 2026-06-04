@@ -209,7 +209,7 @@
 
 **Purpose**: 收口跨平台、no-KV、高并发和全量验证，不执行新的大范围功能。
 
-- [ ] T090 运行 no-KV audit 并修复仅 007 引入的违规；允许修改：`tests/no_kv_surface_audit.cmake` 和触发违规的 007 文件；验收：`cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit` PASS；依赖：T089
+- [x] T090 运行 no-KV audit 并修复仅 007 引入的违规；实际修改：`specs/007-storage-node-data-plane/task-reports/t090-no-kv-audit.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：在当前 Linux 环境下执行 `cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit`，`no_kv_surface_audit` 直接 PASS，未发现 007 引入的 no-KV 违规，因此未修改生产代码、测试代码、proto、`tests/no_kv_surface_audit.cmake` 或 `common-risk-notes.md`；日志位于 `tmp/007/t090-no-kv-audit.log`；依赖：T089
 - [ ] T091 运行 storage 高并发并行验证；允许修改：无生产文件，仅运行 `ctest -L storage-node-concurrency --output-on-failure`；验收：PASS，日志不含无界队列、deadlock、data race 摘要；依赖：T026、T089
 - [ ] T092 运行 recovery/snapshot/catch-up 低并发回归；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ./test.sh --group persistence`；验收：PASS，不因 StorageNode 影响 Raft recovery/snapshot/catch-up；依赖：T077
 - [ ] T093 运行全量平台中立回归；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ./test.sh --group all`；验收：PASS 或按日志规则输出失败摘要；依赖：T090-T092
