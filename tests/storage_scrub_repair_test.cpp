@@ -22,6 +22,7 @@
 #include "store/common/store_types.h"
 #include "store/index/chunk_index.h"
 #include "store/io/durable_file.h"
+#include "store/maintenance/repair_manager.h"
 #include "store/maintenance/scrub_manager.h"
 #include "store/node/storage_node_registry.h"
 #include "store/placement/placement_manager.h"
@@ -428,6 +429,23 @@ namespace
             .healthy_source_replicas = std::move(healthy_source_replicas),
             .under_replicated = under_replicated,
             .lost_or_unrecoverable = false};
+    }
+
+    storedemo::ScrubRepairCandidate MakeManagerRepairCandidate(
+        const ScrubManifest &manifest,
+        std::vector<storedemo::StorageNodeId> healthy_source_replicas,
+        std::vector<storedemo::StorageNodeId> bad_replicas = {},
+        const bool under_replicated = false,
+        const bool lost_or_unrecoverable = false)
+    {
+        return storedemo::ScrubRepairCandidate{
+            .chunk_id = manifest.identity.chunk_id,
+            .expected_size = manifest.expected_size,
+            .expected_checksum = manifest.expected_checksum,
+            .bad_replicas = std::move(bad_replicas),
+            .healthy_source_replicas = std::move(healthy_source_replicas),
+            .under_replicated = under_replicated,
+            .lost_or_unrecoverable = lost_or_unrecoverable};
     }
 
     std::string FactSummary(const std::vector<ScrubReplicaFact> &facts)
@@ -1028,6 +1046,22 @@ namespace
             task.manifest.desired_replica_count = manifest.desired_replica_count;
             task.context.timeout_ms = timeout_ms;
             return task;
+        }
+
+        storedemo::RepairTaskRequest MakeRepairTaskRequest(
+            const ScrubManifest &manifest,
+            const storedemo::ScrubRepairCandidate &candidate,
+            const std::uint64_t timeout_ms = 0) const
+        {
+            storedemo::RepairTaskRequest request;
+            request.manifest.identity = manifest.identity;
+            request.manifest.expected_size = manifest.expected_size;
+            request.manifest.expected_checksum = manifest.expected_checksum;
+            request.manifest.replica_nodes = manifest.replica_nodes;
+            request.manifest.desired_replica_count = manifest.desired_replica_count;
+            request.repair_candidate = candidate;
+            request.context.timeout_ms = timeout_ms;
+            return request;
         }
 
         storedemo::test::ScopedStoreTestDir temp_dir_{"storage_scrub_repair"};
@@ -2221,5 +2255,411 @@ namespace
         EXPECT_EQ(stats.total_attempts, 1U);
 
         (void)store;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerCreatesTaskFromCandidateAndRecordsPlan)
+    {
+        auto &source_store = CreateStore(1);
+        auto &peer_store = CreateStore(2);
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity = MakeIdentityOrThrow("repair-manager-create", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(48, "repair-manager-create");
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto candidate = MakeManagerRepairCandidate(
+            manifest,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            {storedemo::test::MakeStorageNodeIdFixture(4)},
+            true,
+            false);
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        const auto submit_result =
+            manager.SubmitTask(MakeRepairTaskRequest(manifest, candidate, 10));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+        ASSERT_TRUE(submit_result.task.has_value());
+
+        const auto task = manager.FindTask(submit_result.task->task_id);
+        ASSERT_TRUE(task.has_value());
+        EXPECT_EQ(task->source_node, storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(task->target_node, storedemo::test::MakeStorageNodeIdFixture(3));
+        EXPECT_EQ(task->chunk_id, identity.chunk_id);
+        EXPECT_TRUE(ChecksumEquals(task->expected_checksum, manifest.expected_checksum));
+        EXPECT_EQ(task->expected_size, manifest.expected_size);
+        EXPECT_EQ(task->state, storedemo::RepairTaskState::kQueued);
+        EXPECT_EQ(task->progress_percent, 0U);
+        EXPECT_EQ(task->attempts, 0U);
+        EXPECT_EQ(task->last_error, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(task->last_error_detail.empty());
+
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(identity.chunk_id, "repair-manager-create-target"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+
+        (void)source_store;
+        (void)peer_store;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRejectsDuplicateAndReturnsOverloadedForQueueAndCapacity)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+        RegisterNode(4, 100);
+
+        const auto first_identity = MakeIdentityOrThrow("repair-manager-dupe-a", 1, 0, 0);
+        const auto second_identity = MakeIdentityOrThrow("repair-manager-dupe-b", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(32, "repair-manager-dupe");
+
+        const auto first_manifest = MakeManifest(
+            first_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        const auto second_manifest = MakeManifest(
+            second_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(2)},
+            2);
+
+        storedemo::RepairManager queue_manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 1,
+                .max_tasks = 2,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        const auto first_submit = queue_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                first_manifest,
+                MakeManagerRepairCandidate(
+                    first_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        ASSERT_TRUE(first_submit.accepted()) << first_submit.error_detail;
+
+        const auto duplicate_submit = queue_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                first_manifest,
+                MakeManagerRepairCandidate(
+                    first_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        EXPECT_EQ(duplicate_submit.code,
+                  storedemo::RepairManagerSubmitCode::kAlreadyExists);
+
+        const auto queue_full_submit = queue_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                second_manifest,
+                MakeManagerRepairCandidate(
+                    second_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(2)})));
+        EXPECT_EQ(queue_full_submit.code,
+                  storedemo::RepairManagerSubmitCode::kOverloaded);
+
+        storedemo::RepairManager capacity_manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 1,
+                .max_tasks = 1,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+        const auto capacity_first = capacity_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                first_manifest,
+                MakeManagerRepairCandidate(
+                    first_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        ASSERT_TRUE(capacity_first.accepted()) << capacity_first.error_detail;
+        ASSERT_TRUE(capacity_manager.MarkTaskRunning(
+                                      capacity_first.task->task_id)
+                        .ok());
+        ASSERT_TRUE(capacity_manager.CompleteTask(
+                                      capacity_first.task->task_id)
+                        .ok());
+
+        const auto capacity_full_submit = capacity_manager.SubmitTask(
+            MakeRepairTaskRequest(
+                second_manifest,
+                MakeManagerRepairCandidate(
+                    second_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(2)})));
+        EXPECT_EQ(capacity_full_submit.code,
+                  storedemo::RepairManagerSubmitCode::kOverloaded);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRejectsInvalidSourceTargetAndMissingFacts)
+    {
+        RegisterNode(1, 60);
+        RegisterNode(2, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(3, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kFull);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, true);
+        RegisterNode(5, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, 0, false, 1024, 900);
+        RegisterNode(6, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(2048, "repair-manager-invalid");
+        const auto invalid_source_identity =
+            MakeIdentityOrThrow("repair-manager-invalid-source", 1, 0, 0);
+        const auto invalid_target_identity =
+            MakeIdentityOrThrow("repair-manager-invalid-target", 1, 0, 0);
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        const auto invalid_source_manifest = MakeManifest(
+            invalid_source_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1)},
+            2);
+        const auto invalid_source = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                invalid_source_manifest,
+                MakeManagerRepairCandidate(
+                    invalid_source_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        EXPECT_EQ(invalid_source.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+
+        const auto invalid_target_manifest = MakeManifest(
+            invalid_target_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(6)},
+            2);
+        const auto invalid_target = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                invalid_target_manifest,
+                MakeManagerRepairCandidate(
+                    invalid_target_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(6)})));
+        EXPECT_EQ(invalid_target.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+
+        auto missing_checksum_manifest = invalid_target_manifest;
+        missing_checksum_manifest.expected_checksum = {};
+        auto missing_checksum_candidate =
+            MakeManagerRepairCandidate(invalid_target_manifest,
+                                       {storedemo::test::MakeStorageNodeIdFixture(6)});
+        missing_checksum_candidate.expected_checksum = {};
+        const auto missing_checksum = manager.SubmitTask(
+            MakeRepairTaskRequest(missing_checksum_manifest, missing_checksum_candidate));
+        EXPECT_EQ(missing_checksum.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+
+        auto missing_size_manifest = invalid_target_manifest;
+        missing_size_manifest.expected_size = 0;
+        auto missing_size_candidate =
+            MakeManagerRepairCandidate(invalid_target_manifest,
+                                       {storedemo::test::MakeStorageNodeIdFixture(6)});
+        missing_size_candidate.expected_size = 0;
+        const auto missing_size = manager.SubmitTask(
+            MakeRepairTaskRequest(missing_size_manifest, missing_size_candidate));
+        EXPECT_EQ(missing_size.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+
+        storedemo::RepairTaskRequest missing_chunk_request;
+        missing_chunk_request.repair_candidate.expected_checksum =
+            ComputeChecksumOrThrow(payload);
+        missing_chunk_request.repair_candidate.expected_size =
+            payload.size();
+        missing_chunk_request.repair_candidate.healthy_source_replicas = {
+            storedemo::test::MakeStorageNodeIdFixture(2)};
+        const auto missing_chunk = manager.SubmitTask(missing_chunk_request);
+        EXPECT_EQ(missing_chunk.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerCancelRetryFailCompleteAndListSemanticsAreStable)
+    {
+        auto &target_store = CreateStore(3);
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+        RegisterNode(4, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(40, "repair-manager-lifecycle");
+        const auto queued_identity =
+            MakeIdentityOrThrow("repair-manager-queued", 1, 0, 0);
+        const auto running_identity =
+            MakeIdentityOrThrow("repair-manager-running", 1, 0, 0);
+        const auto completed_identity =
+            MakeIdentityOrThrow("repair-manager-completed", 1, 0, 0);
+        const auto failed_identity =
+            MakeIdentityOrThrow("repair-manager-failed", 1, 0, 0);
+
+        const auto queued_manifest = MakeManifest(
+            queued_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto running_manifest = MakeManifest(
+            running_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto completed_manifest = MakeManifest(
+            completed_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto failed_manifest = MakeManifest(
+            failed_identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 8,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        const auto queued_submit = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                queued_manifest,
+                MakeManagerRepairCandidate(
+                    queued_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        const auto running_submit = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                running_manifest,
+                MakeManagerRepairCandidate(
+                    running_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        const auto completed_submit = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                completed_manifest,
+                MakeManagerRepairCandidate(
+                    completed_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+        const auto failed_submit = manager.SubmitTask(
+            MakeRepairTaskRequest(
+                failed_manifest,
+                MakeManagerRepairCandidate(
+                    failed_manifest,
+                    {storedemo::test::MakeStorageNodeIdFixture(1)})));
+
+        ASSERT_TRUE(queued_submit.accepted());
+        ASSERT_TRUE(running_submit.accepted());
+        ASSERT_TRUE(completed_submit.accepted());
+        ASSERT_TRUE(failed_submit.accepted());
+
+        const auto cancel_queued =
+            manager.CancelTask(queued_submit.task->task_id);
+        ASSERT_TRUE(cancel_queued.ok());
+        EXPECT_EQ(cancel_queued.task->state, storedemo::RepairTaskState::kCancelled);
+
+        ASSERT_TRUE(manager.MarkTaskRunning(running_submit.task->task_id).ok());
+        const auto cancel_running =
+            manager.CancelTask(running_submit.task->task_id);
+        EXPECT_EQ(cancel_running.code, storedemo::RepairTaskOperationCode::kConflict);
+
+        ASSERT_TRUE(manager.MarkTaskRunning(completed_submit.task->task_id).ok());
+        ASSERT_TRUE(manager.UpdateTaskProgress(completed_submit.task->task_id, 55).ok());
+        const auto complete_result =
+            manager.CompleteTask(completed_submit.task->task_id);
+        ASSERT_TRUE(complete_result.ok());
+        EXPECT_EQ(complete_result.task->state, storedemo::RepairTaskState::kCompleted);
+        EXPECT_EQ(complete_result.task->progress_percent, 100U);
+        EXPECT_EQ(target_store.StatChunk(
+                      MakeStatRequest(completed_identity.chunk_id,
+                                      "repair-manager-complete-target"))
+                      .status,
+                  storedemo::StorageNodeStatusCode::kNotFound);
+        const auto cancel_completed =
+            manager.CancelTask(completed_submit.task->task_id);
+        EXPECT_EQ(cancel_completed.code, storedemo::RepairTaskOperationCode::kConflict);
+
+        ASSERT_TRUE(manager.MarkTaskRunning(failed_submit.task->task_id).ok());
+        const auto fail_result = manager.FailTask(
+            failed_submit.task->task_id,
+            storedemo::StorageNodeStatusCode::kTimeout,
+            "repair task timed out",
+            false,
+            0);
+        ASSERT_TRUE(fail_result.ok());
+        EXPECT_EQ(fail_result.task->state, storedemo::RepairTaskState::kFailed);
+        EXPECT_EQ(fail_result.task->last_error,
+                  storedemo::StorageNodeStatusCode::kTimeout);
+        EXPECT_EQ(fail_result.task->last_error_detail, "repair task timed out");
+        const auto cancel_failed =
+            manager.CancelTask(failed_submit.task->task_id);
+        EXPECT_EQ(cancel_failed.code, storedemo::RepairTaskOperationCode::kConflict);
+
+        const auto retry_result =
+            manager.RetryTask(failed_submit.task->task_id);
+        ASSERT_TRUE(retry_result.ok());
+        EXPECT_EQ(retry_result.task->state, storedemo::RepairTaskState::kRetryPending);
+        EXPECT_EQ(retry_result.task->progress_percent, 0U);
+        const auto retry_task = manager.FindTask(failed_submit.task->task_id);
+        ASSERT_TRUE(retry_task.has_value());
+        EXPECT_EQ(retry_task->attempts, 1U);
+
+        const auto rerun_result =
+            manager.MarkTaskRunning(failed_submit.task->task_id);
+        ASSERT_TRUE(rerun_result.ok());
+        EXPECT_EQ(rerun_result.task->attempts, 2U);
+
+        const auto listed_tasks = manager.ListTasks();
+        ASSERT_EQ(listed_tasks.size(), 4U);
+        std::vector<std::string> task_ids;
+        for (const auto &task : listed_tasks)
+        {
+            task_ids.push_back(task.task_id);
+        }
+        auto sorted_task_ids = task_ids;
+        std::sort(sorted_task_ids.begin(), sorted_task_ids.end());
+        EXPECT_EQ(task_ids, sorted_task_ids);
+
+        const auto stats = manager.SnapshotStats();
+        EXPECT_EQ(stats.cancelled_tasks, 1U);
+        EXPECT_EQ(stats.completed_tasks, 1U);
+        EXPECT_EQ(stats.running_tasks, 2U);
+        EXPECT_EQ(stats.total_attempts, 4U);
     }
 } // namespace

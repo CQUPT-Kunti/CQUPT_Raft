@@ -187,7 +187,7 @@ namespace storedemo
     private:
         struct Impl;
 
-        std::unique_ptr<Impl> impl_;
         ScrubManagerConfig config_;
+        std::unique_ptr<Impl> impl_;
     };
 }

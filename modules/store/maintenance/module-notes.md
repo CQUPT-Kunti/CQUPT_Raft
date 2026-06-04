@@ -13,10 +13,14 @@
 - GC task persistence / restart resume
 - task submit / retry / stop / drain / stats
 - 注入式 delete handler 调用边界
+- `ScrubManager` bounded background queue 与 scrub facts 聚合
+- `RepairManager` task model、source/target 规划与生命周期状态机
 
 当前不负责：
 
-- scrub / repair / rebalance
+- RepairChunk copy flow
+- under-replicated detection
+- rebalance
 - metadata / Raft 调用
 
 ## T083 fixed boundary
@@ -26,6 +30,13 @@
 - bounded queue 复用独立后台 executor，foreground `ReadChunk` / `WriteChunk` 不经过这条队列；当前 contract 只固定“队列有界、submit 可拒绝、后台任务不无界堆积”，不承诺 OS-level IO priority。
 - healthy source 选择仍基于 registry snapshot + `ReplicaPolicySelector` + 本地 checksum 校验；stale/unavailable/unhealthy/high-disk-pressure 副本不会进入 healthy source。
 - 当前 `ScrubManager` 不做 task persistence、restart resume、跨节点 `ScrubChunk` fan-out 或 read-side repair。
+
+## T084 fixed boundary
+
+- T084 新增生产 `RepairManager` task model，负责从 scrub/repair candidate 生成 repair task，并固定 source_node、target_node、chunk_id、expected checksum/size、state、progress、attempts、last_error、last_error_detail。
+- `RepairManager` 只表达 repair 生命周期和可观察计划事实，不执行 `RepairChunk` copy flow，不直接写 target chunk，不更新 metadata manifest，不调用 Raft，也不保存 object payload。
+- `RepairManager` 当前通过 registry snapshot + `PlacementManager` 固定 source/target，可做 submit / lookup / list / cancel / retry / complete / fail / running / progress 更新，但不做 task persistence、read-side repair 或 rebalance。
+- `retry_pending` 只表示“等待下一次 repair attempt 的 task model 状态”；真正 copy 和 durable 写入留给 T085。
 
 ## 主要文件
 
@@ -277,6 +288,85 @@
 - 输入：stop mode。
 - 输出：`ScrubManagerStopResult`。
 - 边界：`CancelPending` 只取消尚未开始的 queued task；正在运行的 task 允许自然跑完。
+
+## repair_manager.cpp 关键 helper
+
+### `ValidateSubmitRequest(RepairTaskRequest*, const StorageNodeRegistry*, StorageNodeId*, StorageNodeId*, std::string*, std::uint64_t)`
+
+- 责任：校验 repair task request，收口 manifest/candidate，并固定 source_node 与 target_node。
+- 输入：repair task request、registry、当前时间。
+- 输出：合法时返回 `kOk` 并写出选中的 source/target。
+- 边界：要求 chunk_id、expected checksum、expected size、healthy source candidate 都存在；不执行 copy，不写 chunk。
+
+### `SelectSourceNode(...)`
+
+- 责任：从 repair candidate 的 healthy source 列表里选出当前可用 source。
+- 输入：source candidates、registry snapshots。
+- 输出：选中的 `source_node`。
+- 边界：只接受 live + healthy + 非高/full disk pressure 的 source；不读取 payload，不做 checksum copy。
+
+### `SelectTargetNode(const ScrubManifest&, const StorageNodeRegistry&, std::uint64_t, StorageNodeId*, std::string*)`
+
+- 责任：基于 manifest 和 registry facts 用 `PlacementManager` 规划 target。
+- 输入：manifest、registry、当前时间。
+- 输出：选中的 `target_node`。
+- 边界：只做规划，不执行 target durable write；target 仍受 placement 的 health / overload / capacity 过滤。
+
+### `BuildRepairTaskId(...)`
+
+- 责任：为 repair task 生成稳定、幂等的 `task_id`。
+- 输入：`chunk_id`、expected checksum/size、source_node、target_node。
+- 输出：稳定 task_id。
+- 边界：同一规划结果重复提交会命中相同 task_id，并返回 already exists。
+
+### `SubmitTask(const RepairTaskRequest&)`
+
+- 责任：从 repair candidate 创建 repair task 并写入 task registry。
+- 输入：repair task request。
+- 输出：`RepairManagerSubmitResult`。
+- 边界：active queue 满或 task registry 满返回 overloaded；重复 task_id 返回 already exists；只创建 task，不启动 copy。
+
+### `MarkTaskRunning(std::string_view)`
+
+- 责任：把 task 从 `Queued/RetryPending` 推进到 `Running`，并记一次 attempt。
+- 输入：task_id。
+- 输出：更新后的 task snapshot。
+- 边界：不执行真实 copy；attempts 只在进入 running 时增加。
+
+### `UpdateTaskProgress(std::string_view, std::uint32_t)`
+
+- 责任：更新 running task 的 progress。
+- 输入：task_id、`0..100` 的 progress。
+- 输出：更新后的 task snapshot。
+- 边界：只改 task model；completed progress 仍必须通过 `CompleteTask(...)` 收口。
+
+### `FailTask(std::string_view, StorageNodeStatusCode, std::string, bool, std::uint64_t)`
+
+- 责任：记录 repair failure，并根据 retryable 边界落到 `Failed` 或 `RetryPending`。
+- 输入：task_id、错误码、错误详情、是否可重试、retry_after_ms。
+- 输出：更新后的 task snapshot。
+- 边界：只记录失败事实，不代表 target durable 写入或 metadata 更新发生过。
+
+### `RetryTask(std::string_view)`
+
+- 责任：把 `Failed` task 重新推进到 `RetryPending`。
+- 输入：task_id。
+- 输出：更新后的 task snapshot。
+- 边界：retry 只改变 task model；不会自动写 target chunk，也不会自动变成 completed。
+
+### `CancelTask(std::string_view)`
+
+- 责任：取消尚未执行的 `Queued/RetryPending` task。
+- 输入：task_id。
+- 输出：更新后的 task snapshot。
+- 边界：running/completed/failed task 当前返回 conflict，不做运行中中断。
+
+### `CompleteTask(std::string_view)`
+
+- 责任：把 running task 标记为 completed，并把 progress 收口到 100。
+- 输入：task_id。
+- 输出：更新后的 task snapshot。
+- 边界：只更新 task model，不代表 metadata manifest 已协调或 target durable copy 已完成。
 
 ### task state normalization helper（`NormalizeRecoveredTaskState`）
 
