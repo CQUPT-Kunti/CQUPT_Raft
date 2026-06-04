@@ -19,6 +19,7 @@
 #include "store/common/store_types.h"
 #include "store/index/chunk_index.h"
 #include "store/io/durable_file.h"
+#include "store/maintenance/rebalance_manager.h"
 #include "store/node/storage_node_registry.h"
 #include "store/placement/placement_manager.h"
 #include "support/store_test_utils.h"
@@ -269,6 +270,25 @@ namespace
         return storedemo::StatChunkRequest{
             .request_id = request_id,
             .chunk_id = chunk_id};
+    }
+
+    storedemo::RebalanceTaskRequest MakeRebalanceTaskRequest(
+        const storedemo::ChunkIdentity &identity,
+        const std::string &payload,
+        const storedemo::StorageNodeId &source_node,
+        const storedemo::StorageNodeId &target_node,
+        const storedemo::RebalanceTaskReason reason =
+            storedemo::RebalanceTaskReason::kCapacityImbalance,
+        const storedemo::ChunkState source_state = storedemo::ChunkState::kLive)
+    {
+        return storedemo::RebalanceTaskRequest{
+            .identity = identity,
+            .source_node = source_node,
+            .target_node = target_node,
+            .reason = reason,
+            .expected_checksum = ComputeChecksumOrThrow(payload),
+            .expected_size = static_cast<std::uint64_t>(payload.size()),
+            .source_state = source_state};
     }
 
     storedemo::DeleteChunkRequest MakeDeleteRequest(
@@ -1424,5 +1444,374 @@ namespace
             MakeStatRequest(identity.chunk_id, "rebalance-repeat-target-stat"));
         ASSERT_EQ(target_stat.status, storedemo::StorageNodeStatusCode::kOk);
         EXPECT_EQ(target_stat.metadata.state, storedemo::ChunkState::kLive);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerCreatesReasonScopedTasks)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+        RegisterNode(4, 100);
+        RegisterNode(5, 100);
+        RegisterNode(6, 100);
+
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "rebalance-task-model");
+        const auto checksum = ComputeChecksumOrThrow(payload);
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            storedemo::RebalanceManagerConfig{
+                .max_active_tasks = 8,
+                .max_tasks = 8,
+                .now_unix_ms = [&now_unix_ms]()
+                { return now_unix_ms; }});
+
+        const auto capacity_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            MakeIdentityOrThrow("rebalance-capacity-task", 1, 0, 0),
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::RebalanceTaskReason::kCapacityImbalance));
+        const auto hotspot_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            MakeIdentityOrThrow("rebalance-hotspot-task", 1, 0, 0),
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3),
+            storedemo::RebalanceTaskReason::kHotspot));
+        const auto new_node_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            MakeIdentityOrThrow("rebalance-new-node-task", 1, 0, 0),
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(4),
+            storedemo::RebalanceTaskReason::kNewNodeJoin));
+        const auto draining_result = manager.SubmitTask(MakeRebalanceTaskRequest(
+            MakeIdentityOrThrow("rebalance-draining-task", 1, 0, 0),
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(5),
+            storedemo::RebalanceTaskReason::kDraining));
+        const auto maintenance_result =
+            manager.SubmitTask(MakeRebalanceTaskRequest(
+                MakeIdentityOrThrow("rebalance-maintenance-task", 1, 0, 0),
+                payload,
+                storedemo::test::MakeStorageNodeIdFixture(1),
+                storedemo::test::MakeStorageNodeIdFixture(6),
+                storedemo::RebalanceTaskReason::kMaintenance));
+
+        ASSERT_TRUE(capacity_result.accepted()) << capacity_result.error_detail;
+        ASSERT_TRUE(hotspot_result.accepted()) << hotspot_result.error_detail;
+        ASSERT_TRUE(new_node_result.accepted()) << new_node_result.error_detail;
+        ASSERT_TRUE(draining_result.accepted()) << draining_result.error_detail;
+        ASSERT_TRUE(maintenance_result.accepted())
+            << maintenance_result.error_detail;
+
+        ASSERT_TRUE(capacity_result.task.has_value());
+        EXPECT_EQ(capacity_result.task->source_node,
+                  storedemo::test::MakeStorageNodeIdFixture(1));
+        EXPECT_EQ(capacity_result.task->target_node,
+                  storedemo::test::MakeStorageNodeIdFixture(2));
+        EXPECT_EQ(capacity_result.task->reason,
+                  storedemo::RebalanceTaskReason::kCapacityImbalance);
+        EXPECT_EQ(capacity_result.task->chunk_id,
+                  capacity_result.task->identity.chunk_id);
+        EXPECT_TRUE(
+            ChecksumEquals(capacity_result.task->expected_checksum, checksum));
+        EXPECT_EQ(capacity_result.task->expected_size,
+                  static_cast<std::uint64_t>(payload.size()));
+        EXPECT_EQ(capacity_result.task->state,
+                  storedemo::RebalanceTaskState::kQueued);
+        EXPECT_EQ(capacity_result.task->progress_percent, 0U);
+        EXPECT_EQ(capacity_result.task->attempts, 0U);
+        EXPECT_EQ(capacity_result.task->last_error,
+                  storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(capacity_result.task->last_error_detail.empty());
+        EXPECT_EQ(capacity_result.task->submitted_at_unix_ms, now_unix_ms);
+
+        ASSERT_TRUE(hotspot_result.task.has_value());
+        EXPECT_EQ(hotspot_result.task->reason,
+                  storedemo::RebalanceTaskReason::kHotspot);
+        ASSERT_TRUE(new_node_result.task.has_value());
+        EXPECT_EQ(new_node_result.task->reason,
+                  storedemo::RebalanceTaskReason::kNewNodeJoin);
+        ASSERT_TRUE(draining_result.task.has_value());
+        EXPECT_EQ(draining_result.task->reason,
+                  storedemo::RebalanceTaskReason::kDraining);
+        ASSERT_TRUE(maintenance_result.task.has_value());
+        EXPECT_EQ(maintenance_result.task->reason,
+                  storedemo::RebalanceTaskReason::kMaintenance);
+
+        const auto listed_tasks = manager.ListTasks();
+        ASSERT_EQ(listed_tasks.size(), 5U);
+        EXPECT_TRUE(std::is_sorted(
+            listed_tasks.begin(),
+            listed_tasks.end(),
+            [](const storedemo::RebalanceTask &lhs,
+               const storedemo::RebalanceTask &rhs)
+            { return lhs.task_id < rhs.task_id; }));
+
+        const auto stats = manager.SnapshotStats();
+        EXPECT_EQ(stats.total_tasks, 5U);
+        EXPECT_EQ(stats.queued_tasks, 5U);
+        EXPECT_EQ(stats.submitted_tasks, 5U);
+        EXPECT_EQ(stats.rejected_tasks, 0U);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerRejectsInvalidFactsAndBadSourceTarget)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 60);
+        RegisterNode(3, 100, storedemo::StorageNodeHealth::kUnavailable);
+        RegisterNode(4, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, true);
+        RegisterNode(5, 100, storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kLow, false, 1024, 960);
+        RegisterNode(6, 100);
+
+        const auto identity = MakeIdentityOrThrow("rebalance-invalid-task", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(128, "rebalance-invalid-task");
+
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            storedemo::RebalanceManagerConfig{
+                .max_active_tasks = 8,
+                .max_tasks = 8,
+                .now_unix_ms = [&now_unix_ms]()
+                { return now_unix_ms; }});
+
+        auto missing_chunk_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(6));
+        missing_chunk_request.identity = {};
+        const auto missing_chunk_result = manager.SubmitTask(missing_chunk_request);
+        EXPECT_EQ(missing_chunk_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto missing_checksum_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(6));
+        missing_checksum_request.expected_checksum = {};
+        const auto missing_checksum_result =
+            manager.SubmitTask(missing_checksum_request);
+        EXPECT_EQ(missing_checksum_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto missing_size_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(6));
+        missing_size_request.expected_size = 0;
+        const auto missing_size_result = manager.SubmitTask(missing_size_request);
+        EXPECT_EQ(missing_size_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto same_node_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(1));
+        const auto same_node_result = manager.SubmitTask(same_node_request);
+        EXPECT_EQ(same_node_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto quarantined_source_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(6),
+            storedemo::RebalanceTaskReason::kCapacityImbalance,
+            storedemo::ChunkState::kQuarantined);
+        const auto quarantined_source_result =
+            manager.SubmitTask(quarantined_source_request);
+        EXPECT_EQ(quarantined_source_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto stale_source_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::test::MakeStorageNodeIdFixture(6));
+        const auto stale_source_result = manager.SubmitTask(stale_source_request);
+        EXPECT_EQ(stale_source_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto unhealthy_target_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3));
+        const auto unhealthy_target_result =
+            manager.SubmitTask(unhealthy_target_request);
+        EXPECT_EQ(unhealthy_target_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+
+        auto overloaded_target_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(4));
+        const auto overloaded_target_result =
+            manager.SubmitTask(overloaded_target_request);
+        EXPECT_EQ(overloaded_target_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kOverloaded);
+
+        auto low_capacity_target_request = MakeRebalanceTaskRequest(
+            identity,
+            payload,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(5));
+        const auto low_capacity_target_result =
+            manager.SubmitTask(low_capacity_target_request);
+        EXPECT_EQ(low_capacity_target_result.code,
+                  storedemo::RebalanceManagerSubmitCode::kInvalidArgument);
+    }
+
+    TEST_F(StorageRebalanceTest,
+           ProductionRebalanceManagerDeduplicatesTracksLifecycleAndDoesNotAutoCopy)
+    {
+        auto &source_store = CreateStore(1);
+        auto &target_store = CreateStore(2);
+        (void)target_store;
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity_a = MakeIdentityOrThrow("rebalance-dup-a", 1, 0, 0);
+        const auto identity_b = MakeIdentityOrThrow("rebalance-dup-b", 1, 0, 0);
+        const auto payload_a = storedemo::test::MakeChunkPayload(96, "rebalance-dup-a");
+        const auto payload_b = storedemo::test::MakeChunkPayload(96, "rebalance-dup-b");
+        WriteReplica(source_store, identity_a, payload_a, "rebalance-dup-source-a");
+
+        std::uint64_t now_unix_ms = 110;
+        storedemo::RebalanceManager manager(
+            &registry_,
+            storedemo::RebalanceManagerConfig{
+                .max_active_tasks = 2,
+                .max_tasks = 2,
+                .now_unix_ms = [&now_unix_ms]()
+                { return now_unix_ms; }});
+
+        const auto first_submit = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity_a,
+            payload_a,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::RebalanceTaskReason::kCapacityImbalance));
+        ASSERT_TRUE(first_submit.accepted()) << first_submit.error_detail;
+        ASSERT_TRUE(first_submit.task.has_value());
+
+        const auto duplicate_submit = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity_a,
+            payload_a,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::RebalanceTaskReason::kCapacityImbalance));
+        EXPECT_EQ(duplicate_submit.code,
+                  storedemo::RebalanceManagerSubmitCode::kAlreadyExists);
+        ASSERT_TRUE(duplicate_submit.task.has_value());
+        EXPECT_EQ(duplicate_submit.task->task_id, first_submit.task->task_id);
+
+        const auto second_submit = manager.SubmitTask(MakeRebalanceTaskRequest(
+            identity_b,
+            payload_b,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(3),
+            storedemo::RebalanceTaskReason::kHotspot));
+        ASSERT_TRUE(second_submit.accepted()) << second_submit.error_detail;
+        ASSERT_TRUE(second_submit.task.has_value());
+
+        const auto overloaded_submit = manager.SubmitTask(MakeRebalanceTaskRequest(
+            MakeIdentityOrThrow("rebalance-overloaded-c", 1, 0, 0),
+            payload_b,
+            storedemo::test::MakeStorageNodeIdFixture(1),
+            storedemo::test::MakeStorageNodeIdFixture(2),
+            storedemo::RebalanceTaskReason::kNewNodeJoin));
+        EXPECT_EQ(overloaded_submit.code,
+                  storedemo::RebalanceManagerSubmitCode::kOverloaded);
+
+        const auto missing_target_stat = target_store.StatChunk(
+            MakeStatRequest(identity_a.chunk_id, "rebalance-no-auto-copy-target"));
+        EXPECT_EQ(missing_target_stat.status, storedemo::StorageNodeStatusCode::kNotFound);
+
+        const auto listed_before = manager.ListTasks();
+        ASSERT_EQ(listed_before.size(), 2U);
+        EXPECT_TRUE(std::is_sorted(
+            listed_before.begin(),
+            listed_before.end(),
+            [](const storedemo::RebalanceTask &lhs,
+               const storedemo::RebalanceTask &rhs)
+            { return lhs.task_id < rhs.task_id; }));
+        EXPECT_TRUE(manager.FindTask(first_submit.task->task_id).has_value());
+
+        now_unix_ms = 111;
+        const auto running_result = manager.MarkTaskRunning(first_submit.task->task_id);
+        ASSERT_TRUE(running_result.ok()) << running_result.error_detail;
+        ASSERT_TRUE(running_result.task.has_value());
+        EXPECT_EQ(running_result.task->state, storedemo::RebalanceTaskState::kRunning);
+        EXPECT_EQ(running_result.task->attempts, 1U);
+
+        const auto progress_result =
+            manager.UpdateTaskProgress(first_submit.task->task_id, 35);
+        ASSERT_TRUE(progress_result.ok()) << progress_result.error_detail;
+        ASSERT_TRUE(progress_result.task.has_value());
+        EXPECT_EQ(progress_result.task->progress_percent, 35U);
+
+        now_unix_ms = 112;
+        const auto complete_result = manager.CompleteTask(first_submit.task->task_id);
+        ASSERT_TRUE(complete_result.ok()) << complete_result.error_detail;
+        ASSERT_TRUE(complete_result.task.has_value());
+        EXPECT_EQ(complete_result.task->state,
+                  storedemo::RebalanceTaskState::kCompleted);
+        EXPECT_EQ(complete_result.task->progress_percent, 100U);
+        EXPECT_EQ(complete_result.task->completed_at_unix_ms, now_unix_ms);
+
+        const auto cancel_completed =
+            manager.CancelTask(first_submit.task->task_id);
+        EXPECT_EQ(cancel_completed.code,
+                  storedemo::RebalanceTaskOperationCode::kConflict);
+
+        const auto fail_result = manager.FailTask(second_submit.task->task_id,
+                                                  storedemo::StorageNodeStatusCode::kIoError,
+                                                  "manifest coordination is not wired",
+                                                  false);
+        ASSERT_TRUE(fail_result.ok()) << fail_result.error_detail;
+        ASSERT_TRUE(fail_result.task.has_value());
+        EXPECT_EQ(fail_result.task->state, storedemo::RebalanceTaskState::kFailed);
+        EXPECT_EQ(fail_result.task->last_error,
+                  storedemo::StorageNodeStatusCode::kIoError);
+        EXPECT_EQ(fail_result.task->last_error_detail,
+                  "manifest coordination is not wired");
+
+        const auto retry_result = manager.RetryTask(second_submit.task->task_id);
+        ASSERT_TRUE(retry_result.ok()) << retry_result.error_detail;
+        ASSERT_TRUE(retry_result.task.has_value());
+        EXPECT_EQ(retry_result.task->state,
+                  storedemo::RebalanceTaskState::kRetryPending);
+
+        now_unix_ms = 113;
+        const auto cancel_retry_pending =
+            manager.CancelTask(second_submit.task->task_id);
+        ASSERT_TRUE(cancel_retry_pending.ok()) << cancel_retry_pending.error_detail;
+        ASSERT_TRUE(cancel_retry_pending.task.has_value());
+        EXPECT_EQ(cancel_retry_pending.task->state,
+                  storedemo::RebalanceTaskState::kCancelled);
+
+        const auto stats = manager.SnapshotStats();
+        EXPECT_EQ(stats.submitted_tasks, 2U);
+        EXPECT_EQ(stats.rejected_tasks, 2U);
+        EXPECT_EQ(stats.completed_tasks, 1U);
+        EXPECT_EQ(stats.cancelled_tasks, 1U);
+        EXPECT_EQ(stats.failed_tasks, 0U);
+        EXPECT_EQ(stats.total_attempts, 1U);
+        EXPECT_EQ(stats.last_error_detail, "rebalance task cancelled");
     }
 }

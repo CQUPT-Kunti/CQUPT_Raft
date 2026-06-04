@@ -16,10 +16,15 @@
 - `ScrubManager` bounded background queue 与 scrub facts 聚合
 - `RepairManager` task model、source/target 规划、copy flow 与生命周期状态机
 - under-replicated detection 与 under-replicated fact -> repair task 生成
+- `RebalanceManager` task model、source/target 快照校验与生命周期状态机
 
 当前不负责：
 
-- rebalance
+- rebalance copy / verify
+- metadata manifest coordination
+- source cleanup
+- rebalance 自动后台调度
+- rebalance task persistence
 - metadata / Raft 调用
 
 ## T083 fixed boundary
@@ -40,6 +45,14 @@
 - `RetryPending` 表示 task 需要下一次 repair attempt；retryable failure 由 source/target 校验、RPC/IO 状态和 target durable 结果共同驱动。
 - copy flow 只处理 chunk data-plane payload 和 checksum/size 事实，不调用 metadata / Raft，也不保存 object payload 到 metadata / Raft。
 - under-replicated detection 只依赖 scrub manifest、replica checksum/state 事实和 registry snapshot；不直接修改 metadata manifest，不做 read-side repair，也不把 repair completed 伪装成 manifest 已协调。
+
+## T087 fixed boundary
+
+- T087 新增生产 `RebalanceManager` task model，负责创建并维护 capacity imbalance / hotspot / new node join / draining / maintenance rebalance task。
+- task 固定记录 `task_id/chunk_id/source_node/target_node/reason/expected checksum/expected size/state/progress/attempts/last_error/last_error_detail`，并提供 submit / lookup / list / running / progress / complete / fail / cancel / retry 边界。
+- submit 阶段当前会校验 chunk identity、expected checksum/size、`source != target`、source chunk state，以及 registry snapshot 中 source/target 的 live/health/capacity/load 边界；stale/unavailable/unhealthy source、overloaded/high-disk-pressure/insufficient-capacity target 会被拒绝。
+- `Completed` 当前只表示 rebalance task model 已完成，不代表 rebalance copy、target durable、metadata manifest coordination 或 source cleanup 已执行。
+- 当前不做 rebalance copy/verify、不做 metadata manifest coordination、不做 source cleanup、不做自动后台调度，也不做 task persistence、metadata/Raft 写入或 object payload 持久化。
 
 ## 主要文件
 
@@ -416,6 +429,50 @@
 - 输入：task_id。
 - 输出：更新后的 task snapshot。
 - 边界：只更新 task model，不代表 metadata manifest 已协调或 target durable copy 已完成。
+
+## rebalance_manager.cpp 关键 helper
+
+### `ResolveChunkIdentity(ChunkIdentity*, std::string*)`
+
+- 责任：统一收口 rebalance request 的 `chunk_id` / object identity。
+- 输入：`chunk_id/object_id/version/chunk_index`。
+- 输出：稳定可用的 `identity.chunk_id`。
+- 边界：显式 `chunk_id` 与 object identity 不一致时返回参数错误。
+
+### `ValidateSourceState(ChunkState, std::string*)`
+
+- 责任：固定 rebalance source chunk state 的最小可接受边界。
+- 输入：source chunk state。
+- 输出：`kOk` 或明确 `corrupted/not_found/conflict` 错误。
+- 边界：当前只接受 `kLive`；`corrupted/quarantined/missing/deleted` 不允许进入 task model。
+
+### `ValidateSourceSnapshot(...)` / `ValidateTargetSnapshot(...)`
+
+- 责任：基于 registry snapshot 校验 rebalance source/target 的 liveness、health、disk pressure、write overload 和 capacity。
+- 输入：source 或 target node 的 registry snapshot、expected size。
+- 输出：`kOk` 或明确 `node_unavailable/overloaded/disk_full` 类错误。
+- 边界：这里只做 submit-time 快照校验，不保证后续 copy/manifest 阶段的新鲜度。
+
+### `BuildRebalanceTaskId(...)`
+
+- 责任：为 rebalance task 生成稳定、可重放的幂等 key。
+- 输入：`chunk_id/reason/expected checksum/expected size/source_node/target_node`。
+- 输出：稳定 `task_id`。
+- 边界：幂等 key 只覆盖 task model 维度，不代表 metadata manifest coordination 或 source cleanup 已一致收口。
+
+### `SubmitTask(const RebalanceTaskRequest&)`
+
+- 责任：校验 request、固定 source/target 可观察事实、执行 duplicate/queue/capacity 边界并登记 task。
+- 输入：rebalance task request。
+- 输出：`RebalanceManagerSubmitResult` 和已登记的 task snapshot。
+- 边界：默认不自动 copy、不自动迁移数据，也不接入 metadata / Raft。
+
+### `MarkTaskRunning / UpdateTaskProgress / CompleteTask / FailTask / CancelTask / RetryTask`
+
+- 责任：维护 rebalance task 的 lifecycle、progress、attempts、last_error 和 retry_pending 语义。
+- 输入：task_id 与状态变更参数。
+- 输出：更新后的 task snapshot。
+- 边界：状态迁移只更新 task model，不代表 T088 的 copy/verify/manifest coordination 已执行。
 
 ### task state normalization helper（`NormalizeRecoveredTaskState`）
 
