@@ -210,7 +210,7 @@
 **Purpose**: 收口跨平台、no-KV、高并发和全量验证，不执行新的大范围功能。
 
 - [x] T090 运行 no-KV audit 并修复仅 007 引入的违规；实际修改：`specs/007-storage-node-data-plane/task-reports/t090-no-kv-audit.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：在当前 Linux 环境下执行 `cmake --build --preset debug-ninja-low-parallel --target no_kv_surface_audit`，`no_kv_surface_audit` 直接 PASS，未发现 007 引入的 no-KV 违规，因此未修改生产代码、测试代码、proto、`tests/no_kv_surface_audit.cmake` 或 `common-risk-notes.md`；日志位于 `tmp/007/t090-no-kv-audit.log`；依赖：T089
-- [ ] T091 运行 storage 高并发并行验证；允许修改：无生产文件，仅运行 `ctest -L storage-node-concurrency --output-on-failure`；验收：PASS，日志不含无界队列、deadlock、data race 摘要；依赖：T026、T089
+- [x] T091 运行 storage 高并发并行验证；实际修改：`specs/007-storage-node-data-plane/task-reports/t091-storage-concurrency-validation.md`、`specs/007-storage-node-data-plane/tasks.md`；验收：在当前 Linux 环境下先执行 `ctest --test-dir build/linux -N -L storage-node-concurrency` 确认真实入口为 `store_concurrency_stress`，再执行 `cmake --build --preset debug-ninja-low-parallel` 与 `ctest --test-dir build/linux -L storage-node-concurrency --output-on-failure`，验证 PASS，日志中未发现无界队列 / deadlock / data race / worker 泄漏 / index inconsistency 摘要；未修改生产代码、测试代码、proto 或 `common-risk-notes.md`；日志位于 `tmp/007/t091-storage-concurrency*.log`；依赖：T026、T089
 - [ ] T092 运行 recovery/snapshot/catch-up 低并发回归；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ./test.sh --group persistence`；验收：PASS，不因 StorageNode 影响 Raft recovery/snapshot/catch-up；依赖：T077
 - [ ] T093 运行全量平台中立回归；允许修改：无生产文件，仅运行 `CTEST_PARALLEL_LEVEL=1 ./test.sh --group all`；验收：PASS 或按日志规则输出失败摘要；依赖：T090-T092
 - [ ] T094 [P] 更新 future validation 说明；允许修改：`specs/007-storage-node-data-plane/quickstart.md`；验收：只记录真实实现后的验证命令，不宣称未实现能力已完成；依赖：T089
