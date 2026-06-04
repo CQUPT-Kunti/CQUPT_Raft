@@ -191,6 +191,11 @@
   建议后续在哪类任务处理：在 T081/T087/T088 及后续 production manifest coordination、Rebalance RPC、rebalance task persistence、orphan cleanup persistence 和 Windows 实机文件语义验证任务中继续收口 target durable / manifest update / source cleanup 的一致性与持久化边界。
 
 - 任务编号：T081
-  问题：T081 已补齐 `ScrubChunk` / `RepairChunk` proto schema 与 codegen，并同步最小 fake stub 编译面；但当前仍只完成 schema/codegen，生产 `StorageNodeService::ScrubChunk` / `RepairChunk`、`StorageNodeClient::ScrubChunk` / `RepairChunk`、后台 manager、repair task persistence 和 read-side repair 都未实现。`RepairChunkRequest` 现允许直接承载 chunk bytes，这一边界后续如果接错到 metadata / Raft 或缺少独立 payload size/streaming 约束，仍可能放大对象 payload 泄漏或大报文风险。
-  影响：如果后续把 T081 的通过误读成“ScrubChunk/RepairChunk 已可用”或“schema 已自动保证 payload 不会进入 metadata/Raft”，仍会高估当前系统的 RPC 落地与安全边界；当前保证的是 proto 契约存在、codegen 可用、既有 client/service 测试不被接口扩面打坏，不是生产 scrub/repair flow、payload 约束和 task durability 已落地。
-  建议后续在哪类任务处理：在 T082-T085 及后续 read-side repair、repair task persistence、large-payload/streaming 边界和 Windows codegen/runtime 验证任务中继续收口 fake stub 同步、RepairChunk payload 边界、object commit 决策隔离和真实 service/client 语义。
+  问题：T081 已补齐 `ScrubChunk` / `RepairChunk` proto schema 与 codegen，并同步最小 fake stub 编译面；T082 已补上最小 `ScrubChunk` service/client 适配，但 `RepairChunk` service/client、后台 manager、repair task persistence 和 read-side repair 仍未实现。`RepairChunkRequest` 现允许直接承载 chunk bytes，这一边界后续如果接错到 metadata / Raft 或缺少独立 payload size/streaming 约束，仍可能放大对象 payload 泄漏或大报文风险。
+  影响：如果后续把 T081/T082 的通过误读成“ScrubChunk/RepairChunk 整套流程已可用”或“schema 已自动保证 payload 不会进入 metadata/Raft”，仍会高估当前系统的 RPC 落地与安全边界；当前保证的是 proto 契约存在、`ScrubChunk` 最小适配可用、既有 client/service 测试不被接口扩面打坏，不是生产 repair flow、payload 约束和 task durability 已落地。
+  建议后续在哪类任务处理：在 T083-T085 及后续 read-side repair、repair task persistence、large-payload/streaming 边界和 Windows codegen/runtime 验证任务中继续收口 `RepairChunk`、RepairManager、object commit 决策隔离和真实 repair 语义。
+
+- 任务编号：T082
+  问题：T082 已补上最小 `StorageNodeService::ScrubChunk` / `StorageNodeClient::ScrubChunk` 链路，并固定 healthy/missing/corrupted/quarantined/checksum mismatch 的 service/client 映射；但当前 `ScrubChunk` 仍直接复用 `ChunkStore::StatChunk(verify_checksum=true)`，因此 `quarantine_on_corruption` 不能抑制 T072 的本地 quarantine，`best_effort_cancel` 也仍只是 request/deadline 边界提示，不代表运行中取消传播。当前 expected checksum/size mismatch 仍在 service 侧作为二次比较完成，和 metadata manifest/registry facts 的生产级 freshness 协议尚未接线。
+  影响：如果后续把 T082 的通过误读成“ScrubManager 已完成”或“ScrubChunk 已具备可配置 quarantine、端到端取消传播和全局 freshness 一致性”，仍会高估当前 scrub 事实的新鲜度和控制能力；当前保证的是单节点 RPC 能显式发现坏块并返回 repair-required 事实，不是生产后台 scrub 编排、registry failure cache 或 metadata/registry 一致性协议已落地。
+  建议后续在哪类任务处理：在 T083 及后续 ScrubManager、registry failure cache、metadata manifest freshness、read-side repair 和 Windows quarantine 文件语义验证任务中继续收口 quarantine 开关边界、deadline/cancel 传播和 scrub candidate 一致性。

@@ -10,6 +10,7 @@
 - `StorageNodeService::WriteChunk` 的 gRPC `WriteChunk` 入口
 - `StorageNodeService::ReadChunk` 的 gRPC `ReadChunk` 入口
 - `StorageNodeService::DeleteChunk` 的 gRPC `DeleteChunk` 入口
+- `StorageNodeService::ScrubChunk` 的 gRPC `ScrubChunk` 入口
 - `StorageNodeService::BatchDeleteChunks` 的 gRPC `BatchDeleteChunks` 入口
 - `StorageNodeService::RegisterStorageNode` 的 gRPC `RegisterStorageNode` 入口
 - `StorageNodeService::UpdateStorageNodeHeartbeat` 的 gRPC `UpdateStorageNodeHeartbeat` 入口
@@ -19,6 +20,7 @@
 - `StorageNodeClient::WriteChunk` 的本地请求到 gRPC `WriteChunk` 调用
 - `StorageNodeClient::ReadChunk` 的本地请求到 gRPC `ReadChunk` 调用
 - `StorageNodeClient::DeleteChunk` 的本地请求到 gRPC `DeleteChunk` 调用
+- `StorageNodeClient::ScrubChunk` 的本地请求到 gRPC `ScrubChunk` 调用
 - `StorageNodeClient::BatchDeleteChunks` 的本地请求到 gRPC `BatchDeleteChunks` 调用
 - `StorageNodeClient::RegisterStorageNode` 的本地请求到 gRPC `RegisterStorageNode` 调用
 - `StorageNodeClient::UpdateStorageNodeHeartbeat` 的本地请求到 gRPC `UpdateStorageNodeHeartbeat` 调用
@@ -26,12 +28,15 @@
 - committed manifest 读路径可复用的最小 request builder、错误分类和 replica fallback helper
 - proto `WriteChunkRequest` 到 `ChunkStore::WriteChunk` 的字段转换
 - proto `ReadChunkRequest` 到 `ChunkStore::ReadChunk` 的字段转换
+- proto `ScrubChunkRequest` 到 `ChunkStore::StatChunk` 的字段转换
 - proto `DeleteChunkRequest` / `BatchDeleteChunkRequest` 到 `ChunkStore::DeleteChunk` 的字段转换
 - `ChunkStore` 结果到 `storage_node.proto` 响应的状态码、checksum、state、durable、already_exists 映射
 - `ChunkStore` 的 `ReadChunkResponse` 到 `storage_node.proto::ReadChunkResponse` 的状态码、checksum、state、payload、offset、complete/full_read 映射
+- `ChunkStore` 的 `StatChunk` 结果到 `storage_node.proto::ScrubChunkResponse` 的状态码、checksum、size、state、corrupted/quarantine/missing facts 映射
 - `ChunkStore` 的 `DeleteChunkResponse` 到 `storage_node.proto::DeleteChunkResponse` / `BatchDeleteChunkResult` 的状态码、checksum、state、idempotent、retryable 映射
 - `storage_node.proto`（`package storage`）`WriteChunkResponse` 和 gRPC status 到本地 `storedemo::WriteChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`ReadChunkResponse` 和 gRPC status 到本地 `storedemo::ReadChunkResponse` / `StorageNodeStatusCode` 的映射
+- `storage_node.proto`（`package storage`）`ScrubChunkResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientScrubChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`DeleteChunkResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientDeleteChunkResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`BatchDeleteChunksResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientBatchDeleteChunksResponse` / `StorageNodeStatusCode` 的映射
 - `storage_node.proto`（`package storage`）`RegisterStorageNodeResponse` 和 gRPC status 到本地 `storedemo::StorageNodeClientRegisterStorageNodeResponse` / `StorageNodeStatusCode` 的映射
@@ -539,6 +544,64 @@
 - 输出：本地 `StorageNodeClientBatchDeleteChunksResponse`
 - 边界：不调用 metadata / Raft；不决定 object deleted 可见性；当前不自动重试 retryable item，只把后续重试所需分类事实返回给调用方
 
+## T082 ScrubChunk 适配边界
+
+### `TranslateScrubRequest(const storage::ScrubChunkRequest&, ScrubChunkRequestContext*)`
+
+- 责任：把 proto `ScrubChunkRequest` 转成本地 `StatChunk` 请求上下文
+- 输入：proto scrub request、本地 scrub 请求上下文输出
+- 输出：`request_id/chunk_id`、期望 checksum/size，以及后续 pre-verify/post-stat 复用的 `StatChunkRequest`
+- 边界：当前强制走 checksum verify 路径；`quarantine_on_corruption` 只是 contract 字段透传边界，不能抑制 `LocalDiskChunkStore::StatChunk(verify_checksum=true)` 触发的 T072 quarantine
+
+### `CompareScrubExpectedChecksum(...)`
+
+- 责任：比较 scrub request 的 expected checksum 与已验证的 observed checksum
+- 输入：expected checksum、observed checksum
+- 输出：`OK` 或 `CHECKSUM_MISMATCH`
+- 边界：这里只比较 chunk bytes 事实，不决定 object committed/deleted 可见性，也不把 payload 写入 metadata / Raft
+
+### `FillScrubFact(...)` / `FillScrubResponse(...)`
+
+- 责任：把本地 scrub 结果回填成 proto `ScrubChunkFact` / `ScrubChunkResponse`
+- 输入：proto scrub request、本地 scrub service 结果、configured node id
+- 输出：`chunk_id`、expected/observed checksum/size、`state_before/state_after`、`known_corrupted/known_missing/quarantined`、`repair_required/retryable`
+- 边界：只表达本地 chunk data-plane 事实，不做 repair，不改 metadata manifest，不调用 Raft
+
+### `StorageNodeService::ScrubChunk(...)`
+
+- 责任：按 `pre-stat -> verify-stat -> post-stat` 顺序执行最小生产 scrub 链路，并把 healthy/missing/corrupted/quarantined 边界映射成 proto 响应
+- 输入：gRPC `ScrubChunkRequest`
+- 输出：gRPC `ScrubChunkResponse`
+- 边界：当前通过注入的 `ChunkStore::StatChunk()` 复用本地 checksum/quarantine 语义；missing 返回 `NOT_FOUND`，quarantined/corrupted 归一成不可作为 healthy source 的 `CORRUPTED` 语义；不触碰 metadata / Raft
+
+### `FillProtoScrubRequest(...)`
+
+- 责任：把本地 `StorageNodeClientScrubChunkRequest` 转成 proto `ScrubChunkRequest`
+- 输入：本地 scrub request、client scrub options
+- 输出：带 `timeout_ms/best_effort_cancel/verify_checksum/quarantine_on_corruption` 的 proto request
+- 边界：client 只做字段映射，不伪装 manager、repair 或 manifest coordination 已接线
+
+### `TranslateProtoScrubResponse(...)`
+
+- 责任：把 proto `ScrubChunkResponse` 转回本地 `StorageNodeClientScrubChunkResponse`
+- 输入：本地 scrub request、proto scrub response
+- 输出：本地 `status`、`metadata`、expected/observed checksum/size、before/after state、corrupted/missing/quarantine/repair facts
+- 边界：服务端返回非法 chunk id/checksum/state 会显式映射成 `IO_ERROR`，避免 silent success
+
+### `MakeGrpcScrubFailureResponse(const grpc::Status&)`
+
+- 责任：把非 OK gRPC status 映射成明确的本地 scrub 错误
+- 输入：gRPC status
+- 输出：本地 `StorageNodeClientScrubChunkResponse`
+- 边界：`DEADLINE_EXCEEDED -> TIMEOUT`、`CANCELLED -> CANCELLED`、`UNAVAILABLE -> NODE_UNAVAILABLE`；`best_effort_cancel` 仍不代表运行中取消传播
+
+### `StorageNodeClient::ScrubChunk(...)`
+
+- 责任：组装 proto scrub request、设置 deadline、发起同步 `ScrubChunk` RPC，并把 proto/gRPC 结果转回本地 scrub 响应
+- 输入：本地 `StorageNodeClientScrubChunkRequest`、client scrub options
+- 输出：本地 `StorageNodeClientScrubChunkResponse`
+- 边界：不调用 metadata / Raft；不决定 object committed/deleted 可见性；当前只做单节点 scrub RPC 适配，不伪装生产 ScrubManager 已完成
+
 ## 后续演进
 
-- T045 已补最小 committed-manifest 读 fallback helper；T053 已补 client 侧 `DeleteChunk` / `BatchDeleteChunks` 适配；后续仍需继续补 registry/heartbeat facts 接入、read replica health 演进、生产 GC/restart cleanup，以及 `StatChunk` / `ListChunks`
+- T045 已补最小 committed-manifest 读 fallback helper；T053 已补 client 侧 `DeleteChunk` / `BatchDeleteChunks` 适配；T082 已补最小 `ScrubChunk` service/client 适配；后续仍需继续补 registry/heartbeat facts 接入、`RepairChunk`/manager、read replica health 演进、生产 GC/restart cleanup，以及 `ListChunks`

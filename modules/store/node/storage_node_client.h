@@ -44,6 +44,11 @@ namespace storedemo
         StorageTaskContext context;
     };
 
+    struct StorageNodeClientScrubChunkOptions
+    {
+        StorageTaskContext context;
+    };
+
     struct StorageNodeClientRegistryOptions
     {
         StorageTaskContext context;
@@ -67,6 +72,36 @@ namespace storedemo
         bool deleted{false};
         bool already_missing{false};
         bool already_deleted{false};
+        bool retryable{false};
+    };
+
+    struct StorageNodeClientScrubChunkRequest
+    {
+        std::string request_id;
+        ChunkId chunk_id;
+        std::string object_id;
+        std::uint64_t version{0};
+        std::uint32_t chunk_index{0};
+        std::uint64_t expected_size{0};
+        ChunkChecksum expected_checksum;
+        bool verify_checksum{true};
+        bool quarantine_on_corruption{true};
+    };
+
+    struct StorageNodeClientScrubChunkResponse : ChunkStoreResult
+    {
+        ChunkMetadata metadata;
+        ChunkState state_before{ChunkState::kMissing};
+        ChunkState state_after{ChunkState::kMissing};
+        ChunkChecksum expected_checksum;
+        ChunkChecksum observed_checksum;
+        std::uint64_t expected_size{0};
+        std::uint64_t observed_size{0};
+        bool checksum_verified{false};
+        bool known_corrupted{false};
+        bool known_missing{false};
+        bool quarantined{false};
+        bool repair_required{false};
         bool retryable{false};
     };
 
@@ -233,6 +268,10 @@ namespace storedemo
         ReadChunkResponse ReadChunk(
             const ReadChunkRequest &request,
             StorageNodeClientReadChunkOptions options = {});
+
+        StorageNodeClientScrubChunkResponse ScrubChunk(
+            const StorageNodeClientScrubChunkRequest &request,
+            StorageNodeClientScrubChunkOptions options = {});
 
         StorageNodeClientDeleteChunkResponse DeleteChunk(
             const StorageNodeClientDeleteChunkRequest &request,

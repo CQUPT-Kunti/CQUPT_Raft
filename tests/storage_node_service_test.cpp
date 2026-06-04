@@ -168,6 +168,33 @@ namespace
         return request;
     }
 
+    void FillProtoChecksum(const storedemo::ChunkChecksum &checksum,
+                           storage::StorageChunkChecksum *proto_checksum);
+
+    storage::ScrubChunkRequest MakeProtoScrubRequest(
+        const storedemo::ChunkIdentity &identity,
+        const std::string &request_id,
+        const storedemo::ChunkChecksum *checksum = nullptr,
+        const std::uint64_t expected_size = 0)
+    {
+        storage::ScrubChunkRequest request;
+        request.set_request_id(request_id);
+        request.set_chunk_id(identity.chunk_id);
+        request.set_object_id(identity.object_id);
+        request.set_version(identity.version);
+        request.set_chunk_index(identity.chunk_index);
+        request.set_expected_size(expected_size);
+        if (checksum != nullptr)
+        {
+            FillProtoChecksum(*checksum, request.mutable_expected_checksum());
+        }
+        request.set_timeout_ms(1500);
+        request.set_best_effort_cancel(true);
+        request.set_verify_checksum(true);
+        request.set_quarantine_on_corruption(true);
+        return request;
+    }
+
     std::shared_ptr<storedemo::ShardedChunkIndex> MakeSharedIndex()
     {
         return std::make_shared<storedemo::ShardedChunkIndex>();
@@ -198,6 +225,29 @@ namespace
         {
             throw std::runtime_error("failed to update chunk index entry: " +
                                      update_response.error_detail);
+        }
+    }
+
+    void TamperChunkPayloadOrThrow(storedemo::LocalDiskChunkStore &store,
+                                   const storedemo::ChunkId &chunk_id,
+                                   const std::string &payload)
+    {
+        auto entry = FindIndexEntryOrThrow(*store.chunk_index(), chunk_id);
+        const auto path = store.paths().data_root / entry.final_path;
+
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("failed to open chunk for tamper: " + path.string());
+        }
+
+        output.write(payload.data(),
+                     static_cast<std::streamsize>(payload.size()));
+        output.close();
+        if (!output)
+        {
+            throw std::runtime_error("failed to tamper chunk payload: " +
+                                     path.string());
         }
     }
 
@@ -500,12 +550,15 @@ namespace
         }
 
         storedemo::StatChunkResponse StatChunk(
-            const storedemo::StatChunkRequest &) override
+            const storedemo::StatChunkRequest &request) override
         {
-            storedemo::StatChunkResponse response;
-            response.status = storedemo::StorageNodeStatusCode::kUnsupported;
-            response.error_detail = "not used in RecordingChunkStore";
-            return response;
+            ++stat_calls;
+            last_stat_request = request;
+            if (stat_handler)
+            {
+                return stat_handler(request);
+            }
+            return default_stat_response;
         }
 
         storedemo::ListChunksResponse ListChunks(
@@ -523,15 +576,20 @@ namespace
             read_handler;
         std::function<storedemo::DeleteChunkResponse(const storedemo::DeleteChunkRequest &)>
             delete_handler;
+        std::function<storedemo::StatChunkResponse(const storedemo::StatChunkRequest &)>
+            stat_handler;
         storedemo::WriteChunkRequest last_write_request;
         storedemo::ReadChunkRequest last_read_request;
         storedemo::DeleteChunkRequest last_delete_request;
+        storedemo::StatChunkRequest last_stat_request;
         storedemo::WriteChunkResponse default_write_response;
         storedemo::ReadChunkResponse default_read_response;
         storedemo::DeleteChunkResponse default_delete_response;
+        storedemo::StatChunkResponse default_stat_response;
         std::size_t write_calls{0};
         std::size_t read_calls{0};
         std::size_t delete_calls{0};
+        std::size_t stat_calls{0};
     };
 
     class ForcedDeleteChunkStore final : public storedemo::ChunkStore
@@ -690,6 +748,21 @@ namespace
 
             storage::DeleteChunkResponse response;
             grpc::Status status = stub_->DeleteChunk(&context, request, &response);
+            if (grpc_status != nullptr)
+            {
+                *grpc_status = status;
+            }
+            return response;
+        }
+
+        storage::ScrubChunkResponse ScrubChunk(const storage::ScrubChunkRequest &request,
+                                               grpc::Status *grpc_status = nullptr)
+        {
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 5s);
+
+            storage::ScrubChunkResponse response;
+            grpc::Status status = stub_->ScrubChunk(&context, request, &response);
             if (grpc_status != nullptr)
             {
                 *grpc_status = status;
@@ -1746,6 +1819,216 @@ namespace
         EXPECT_TRUE(response.payload().empty());
         EXPECT_FALSE(response.complete());
         EXPECT_FALSE(response.full_read());
+    }
+
+    TEST_F(StorageNodeServiceTest, ScrubChunkMapsHealthyLiveChunkFacts)
+    {
+        auto recording_store = std::make_shared<RecordingChunkStore>();
+        const auto identity = MakeStoreIdentityOrThrow("obj-t082-scrub-healthy", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(64, "t082-scrub-healthy");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+
+        std::size_t stat_sequence = 0;
+        recording_store->stat_handler =
+            [&](const storedemo::StatChunkRequest &request)
+        {
+            ++stat_sequence;
+            EXPECT_EQ(request.request_id, "scrub-healthy-t082");
+            EXPECT_EQ(request.chunk_id, identity.chunk_id);
+            EXPECT_TRUE(request.include_quarantine);
+            EXPECT_EQ(request.verify_checksum, stat_sequence == 2);
+
+            storedemo::StatChunkResponse response;
+            response.status = storedemo::StorageNodeStatusCode::kOk;
+            response.metadata.identity = identity;
+            response.metadata.node_id = "service-node-t082";
+            response.metadata.size = checksum.size_bytes;
+            response.metadata.checksum = checksum;
+            response.metadata.state = storedemo::ChunkState::kLive;
+            response.verified = request.verify_checksum;
+            return response;
+        };
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(recording_store,
+                                                                       "service-node-t082");
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.ScrubChunk(
+            MakeProtoScrubRequest(identity,
+                                  "scrub-healthy-t082",
+                                  &checksum,
+                                  checksum.size_bytes),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        ASSERT_EQ(recording_store->stat_calls, 3U);
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_OK);
+        EXPECT_EQ(response.summary().request_id(), "scrub-healthy-t082");
+        EXPECT_EQ(response.summary().node_id(), "service-node-t082");
+        EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().expected_size(), checksum.size_bytes);
+        EXPECT_EQ(response.result().fact().observed_size(), checksum.size_bytes);
+        EXPECT_EQ(response.result().fact().expected_checksum().value(), checksum.value);
+        EXPECT_EQ(response.result().fact().observed_checksum().value(), checksum.value);
+        EXPECT_EQ(response.result().fact().state_before(),
+                  storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.result().fact().state_after(),
+                  storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_TRUE(response.result().fact().checksum_verified());
+        EXPECT_FALSE(response.result().fact().known_corrupted());
+        EXPECT_FALSE(response.result().fact().known_missing());
+        EXPECT_FALSE(response.result().fact().quarantined());
+        EXPECT_FALSE(response.result().repair_required());
+        EXPECT_FALSE(response.result().retryable());
+    }
+
+    TEST_F(StorageNodeServiceTest, ScrubChunkMissingChunkReturnsNotFound)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_node_service_scrub_missing");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 82));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t082-scrub-missing", 1, 0, 0);
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.ScrubChunk(
+            MakeProtoScrubRequest(identity, "scrub-missing-t082"),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_NOT_FOUND);
+        EXPECT_EQ(response.summary().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().chunk_id(), identity.chunk_id);
+        EXPECT_EQ(response.result().fact().state_before(),
+                  storage::STORAGE_CHUNK_STATE_MISSING);
+        EXPECT_EQ(response.result().fact().state_after(),
+                  storage::STORAGE_CHUNK_STATE_MISSING);
+        EXPECT_TRUE(response.result().fact().known_missing());
+        EXPECT_FALSE(response.result().fact().known_corrupted());
+        EXPECT_TRUE(response.result().repair_required());
+        EXPECT_FALSE(response.result().fact().checksum_verified());
+    }
+
+    TEST_F(StorageNodeServiceTest, ScrubChunkCorruptedChunkReturnsCorruptedAndQuarantines)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_scrub_corrupted");
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            MakeStoreConfig(temp_dir.root(), 83));
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t082-scrub-corrupted", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(96, "t082-scrub-corrupted");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-scrub-corrupted-t082",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = checksum,
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_NO_THROW(TamperChunkPayloadOrThrow(
+            *store,
+            identity.chunk_id,
+            storedemo::test::MakeChunkPayload(payload.size(), "t082-tampered")));
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.ScrubChunk(
+            MakeProtoScrubRequest(identity,
+                                  "scrub-corrupted-t082",
+                                  &checksum,
+                                  checksum.size_bytes),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_CORRUPTED);
+        EXPECT_EQ(response.result().fact().state_before(),
+                  storage::STORAGE_CHUNK_STATE_LIVE);
+        EXPECT_EQ(response.result().fact().state_after(),
+                  storage::STORAGE_CHUNK_STATE_QUARANTINED);
+        EXPECT_TRUE(response.result().fact().known_corrupted());
+        EXPECT_TRUE(response.result().fact().quarantined());
+        EXPECT_FALSE(response.result().fact().known_missing());
+        EXPECT_TRUE(response.result().repair_required());
+        EXPECT_FALSE(response.result().fact().checksum_verified());
+        EXPECT_TRUE(response.result().fact().observed_checksum().value().empty());
+
+        const auto post_scrub = store->StatChunk(
+            storedemo::StatChunkRequest{
+                .request_id = "scrub-corrupted-post-t082",
+                .chunk_id = identity.chunk_id});
+        ASSERT_EQ(post_scrub.status, storedemo::StorageNodeStatusCode::kOk);
+        EXPECT_EQ(post_scrub.metadata.state, storedemo::ChunkState::kQuarantined);
+    }
+
+    TEST_F(StorageNodeServiceTest, ScrubChunkQuarantinedChunkReturnsCorruptedBoundary)
+    {
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_node_service_scrub_quarantined");
+        auto shared_index = MakeSharedIndex();
+        auto store = std::make_shared<storedemo::LocalDiskChunkStore>(
+            storedemo::LocalDiskChunkStoreConfig{
+                .data_dir = temp_dir.root(),
+                .node_id = storedemo::test::MakeStorageNodeIdFixture(84),
+                .chunk_index = shared_index});
+        ASSERT_EQ(store->Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t082-scrub-quarantined", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(72, "t082-scrub-quarantined");
+        const auto checksum = ComputeStoreChecksumOrThrow(payload);
+        ASSERT_EQ(store->WriteChunk(
+                      storedemo::WriteChunkRequest{
+                          .request_id = "write-scrub-quarantined-t082",
+                          .identity = identity,
+                          .expected_size = static_cast<std::uint64_t>(payload.size()),
+                          .expected_checksum = checksum,
+                          .payload = payload})
+                      .status,
+                  storedemo::StorageNodeStatusCode::kOk);
+        ASSERT_NO_THROW(UpdateIndexStateOrThrow(*shared_index,
+                                               identity.chunk_id,
+                                               storedemo::ChunkState::kQuarantined));
+
+        auto service = std::make_shared<storedemo::StorageNodeService>(
+            store,
+            store->config().node_id);
+        RunningStorageNodeService server(service);
+
+        grpc::Status grpc_status;
+        const auto response = server.ScrubChunk(
+            MakeProtoScrubRequest(identity,
+                                  "scrub-quarantined-t082",
+                                  &checksum,
+                                  checksum.size_bytes),
+            &grpc_status);
+
+        ASSERT_TRUE(grpc_status.ok()) << grpc_status.error_message();
+        EXPECT_EQ(response.summary().code(), storage::STORAGE_NODE_STATUS_CODE_CORRUPTED);
+        EXPECT_EQ(response.result().fact().state_before(),
+                  storage::STORAGE_CHUNK_STATE_QUARANTINED);
+        EXPECT_EQ(response.result().fact().state_after(),
+                  storage::STORAGE_CHUNK_STATE_QUARANTINED);
+        EXPECT_TRUE(response.result().fact().known_corrupted());
+        EXPECT_TRUE(response.result().fact().quarantined());
+        EXPECT_TRUE(response.result().repair_required());
+        EXPECT_FALSE(response.result().fact().checksum_verified());
     }
 
     TEST_F(StorageNodeServiceTest, DeleteChunkMapsFieldsAndRetryableResponseFacts)

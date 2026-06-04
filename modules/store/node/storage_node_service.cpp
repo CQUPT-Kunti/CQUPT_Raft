@@ -202,6 +202,31 @@ namespace storedemo
             }
         }
 
+        struct ScrubChunkRequestContext
+        {
+            StatChunkRequest stat_request;
+            ChunkIdentity identity;
+            ChunkChecksum expected_checksum;
+            std::uint64_t expected_size{0};
+        };
+
+        struct ScrubChunkServiceResult : ChunkStoreResult
+        {
+            ChunkMetadata metadata;
+            ChunkState state_before{ChunkState::kMissing};
+            ChunkState state_after{ChunkState::kMissing};
+            ChunkChecksum expected_checksum;
+            ChunkChecksum observed_checksum;
+            std::uint64_t expected_size{0};
+            std::uint64_t observed_size{0};
+            bool checksum_verified{false};
+            bool known_corrupted{false};
+            bool known_missing{false};
+            bool quarantined{false};
+            bool repair_required{false};
+            bool retryable{false};
+        };
+
         StorageNodeStatusCode FromProtoNodeHealth(const storage::StorageNodeHealth health,
                                                   StorageNodeHealth *out_health,
                                                   std::string *error_detail)
@@ -559,6 +584,72 @@ namespace storedemo
             return !object_id.empty() || version != 0 || chunk_index != 0;
         }
 
+        StorageNodeStatusCode ResolveScrubRequestChunkId(const std::string_view chunk_id,
+                                                         const std::string_view object_id,
+                                                         const std::uint64_t version,
+                                                         const std::uint32_t chunk_index,
+                                                         ChunkId *out_chunk_id,
+                                                         std::string *error_detail)
+        {
+            if (out_chunk_id == nullptr)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "scrub chunk_id output must not be null";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            const bool has_identity = HasObjectIdentity(object_id, version, chunk_index);
+            if (!chunk_id.empty())
+            {
+                *out_chunk_id = std::string(chunk_id);
+                if (!has_identity)
+                {
+                    return StorageNodeStatusCode::kOk;
+                }
+
+                ChunkId derived_chunk_id;
+                const auto derive_status = MakeChunkId(object_id,
+                                                       version,
+                                                       chunk_index,
+                                                       &derived_chunk_id,
+                                                       error_detail);
+                if (derive_status != StorageNodeStatusCode::kOk)
+                {
+                    return derive_status;
+                }
+
+                if (derived_chunk_id != chunk_id)
+                {
+                    if (error_detail != nullptr)
+                    {
+                        *error_detail =
+                            "ScrubChunk chunk_id does not match object identity";
+                    }
+                    return StorageNodeStatusCode::kInvalidArgument;
+                }
+
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (!has_identity)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "ScrubChunk requires chunk_id or object identity";
+                }
+                return StorageNodeStatusCode::kInvalidArgument;
+            }
+
+            return MakeChunkId(object_id,
+                               version,
+                               chunk_index,
+                               out_chunk_id,
+                               error_detail);
+        }
+
         StorageNodeStatusCode ResolveDeleteRequestChunkId(const std::string_view chunk_id,
                                                           const std::string_view object_id,
                                                           const std::uint64_t version,
@@ -716,6 +807,68 @@ namespace storedemo
 
         void FillSummary(const storage::ReadChunkRequest &request,
                          const ReadChunkResponse &store_response,
+                         const std::string &configured_node_id,
+                         storage::StorageNodeResponseSummary *summary)
+        {
+            if (summary == nullptr)
+            {
+                return;
+            }
+
+            summary->set_code(ToProtoStatusCode(store_response.status));
+            summary->set_message(store_response.error_detail);
+            summary->set_request_id(request.request_id());
+
+            if (!store_response.metadata.node_id.empty())
+            {
+                summary->set_node_id(store_response.metadata.node_id);
+            }
+            else
+            {
+                summary->set_node_id(configured_node_id);
+            }
+
+            summary->set_chunk_id(ResolveResponseChunkId(request, store_response));
+            summary->set_retry_after_ms(store_response.retry_after_ms);
+        }
+
+        std::string ResolveResponseChunkId(const storage::ScrubChunkRequest &request,
+                                           const ScrubChunkServiceResult &store_response)
+        {
+            if (!store_response.metadata.identity.chunk_id.empty())
+            {
+                return store_response.metadata.identity.chunk_id;
+            }
+
+            if (!request.chunk_id().empty())
+            {
+                return request.chunk_id();
+            }
+
+            if (!HasObjectIdentity(request.object_id(),
+                                   request.version(),
+                                   request.chunk_index()))
+            {
+                return {};
+            }
+
+            ChunkId chunk_id;
+            std::string error_detail;
+            const auto status = MakeChunkId(request.object_id(),
+                                            request.version(),
+                                            request.chunk_index(),
+                                            &chunk_id,
+                                            &error_detail);
+            if (status != StorageNodeStatusCode::kOk)
+            {
+                return {};
+            }
+
+            return chunk_id;
+        }
+
+        void FillSummary(const storage::ScrubChunkRequest &request,
+                         const ScrubChunkServiceResult &store_response,
                          const std::string &configured_node_id,
                          storage::StorageNodeResponseSummary *summary)
         {
@@ -967,6 +1120,19 @@ namespace storedemo
             return response;
         }
 
+        ScrubChunkServiceResult MakeScrubValidationError(
+            const StorageNodeStatusCode status,
+            std::string error_detail)
+        {
+            ScrubChunkServiceResult response;
+            response.status = status;
+            response.error_detail = std::move(error_detail);
+            response.retryable =
+                response.status != StorageNodeStatusCode::kOk &&
+                IsRetriableStatus(response.status);
+            return response;
+        }
+
         WriteChunkResponse TranslateWriteRequest(const storage::WriteChunkRequest &request,
                                                  WriteChunkRequest *store_request)
         {
@@ -1101,6 +1267,58 @@ namespace storedemo
             return {};
         }
 
+        ScrubChunkServiceResult TranslateScrubRequest(
+            const storage::ScrubChunkRequest &request,
+            ScrubChunkRequestContext *request_context)
+        {
+            if (request_context == nullptr)
+            {
+                return MakeScrubValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "store scrub request output must not be null");
+            }
+
+            if (request.request_id().empty())
+            {
+                return MakeScrubValidationError(
+                    StorageNodeStatusCode::kInvalidArgument,
+                    "ScrubChunk request_id must not be empty");
+            }
+
+            request_context->stat_request.request_id = request.request_id();
+            request_context->stat_request.include_quarantine = true;
+            request_context->stat_request.verify_checksum = false;
+            request_context->expected_size = request.expected_size();
+            request_context->identity.chunk_id = request.chunk_id();
+            request_context->identity.object_id = request.object_id();
+            request_context->identity.version = request.version();
+            request_context->identity.chunk_index = request.chunk_index();
+
+            std::string error_detail;
+            const auto chunk_status = ResolveScrubRequestChunkId(request.chunk_id(),
+                                                                 request.object_id(),
+                                                                 request.version(),
+                                                                 request.chunk_index(),
+                                                                 &request_context->stat_request.chunk_id,
+                                                                 &error_detail);
+            if (chunk_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeScrubValidationError(chunk_status, std::move(error_detail));
+            }
+
+            request_context->identity.chunk_id = request_context->stat_request.chunk_id;
+
+            const auto checksum_status = FromProtoChecksum(request.expected_checksum(),
+                                                           &request_context->expected_checksum,
+                                                           &error_detail);
+            if (checksum_status != StorageNodeStatusCode::kOk)
+            {
+                return MakeScrubValidationError(checksum_status, std::move(error_detail));
+            }
+
+            return {};
+        }
+
         DeleteChunkResponse TranslateBatchDeleteItemRequest(
             const storage::BatchDeleteChunksRequest &request,
             const storage::BatchDeleteChunkRequest &item,
@@ -1229,6 +1447,111 @@ namespace storedemo
             response->set_complete(store_response.status == StorageNodeStatusCode::kOk);
             response->set_full_read(store_response.status == StorageNodeStatusCode::kOk &&
                                     !has_range);
+        }
+
+        StorageNodeStatusCode CompareScrubExpectedChecksum(
+            const ChunkChecksum &expected_checksum,
+            const ChunkChecksum &observed_checksum,
+            std::string *error_detail)
+        {
+            if (!expected_checksum.IsSet())
+            {
+                return StorageNodeStatusCode::kOk;
+            }
+
+            if (!observed_checksum.IsSet())
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail = "ScrubChunk did not produce an observed checksum";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            if (expected_checksum.algorithm != observed_checksum.algorithm)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "ScrubChunk observed checksum algorithm does not match expected checksum";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            if (expected_checksum.value != observed_checksum.value)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "ScrubChunk observed checksum does not match expected checksum";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            if (expected_checksum.size_bytes != 0 &&
+                expected_checksum.size_bytes != observed_checksum.size_bytes)
+            {
+                if (error_detail != nullptr)
+                {
+                    *error_detail =
+                        "ScrubChunk observed checksum size does not match expected checksum size";
+                }
+                return StorageNodeStatusCode::kChecksumMismatch;
+            }
+
+            return StorageNodeStatusCode::kOk;
+        }
+
+        bool IsScrubCorruptedState(const ChunkState state)
+        {
+            return state == ChunkState::kQuarantined ||
+                   state == ChunkState::kCorrupted;
+        }
+
+        void FillScrubFact(const storage::ScrubChunkRequest &request,
+                           const ScrubChunkServiceResult &store_response,
+                           storage::ScrubChunkFact *fact)
+        {
+            if (fact == nullptr)
+            {
+                return;
+            }
+
+            fact->set_chunk_id(ResolveResponseChunkId(request, store_response));
+            fact->set_expected_size(store_response.expected_size);
+            fact->set_observed_size(store_response.observed_size);
+            FillProtoChecksum(store_response.expected_checksum,
+                              fact->mutable_expected_checksum());
+            FillProtoChecksum(store_response.observed_checksum,
+                              fact->mutable_observed_checksum());
+            fact->set_state_before(ToProtoChunkState(store_response.state_before));
+            fact->set_state_after(ToProtoChunkState(store_response.state_after));
+            fact->set_checksum_verified(store_response.checksum_verified);
+            fact->set_known_corrupted(store_response.known_corrupted);
+            fact->set_known_missing(store_response.known_missing);
+            fact->set_quarantined(store_response.quarantined);
+        }
+
+        void FillScrubResponse(const storage::ScrubChunkRequest &request,
+                               const ScrubChunkServiceResult &store_response,
+                               const std::string &configured_node_id,
+                               storage::ScrubChunkResponse *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            FillSummary(request,
+                        store_response,
+                        configured_node_id,
+                        response->mutable_summary());
+            FillScrubFact(request,
+                          store_response,
+                          response->mutable_result()->mutable_fact());
+            response->mutable_result()->set_repair_required(
+                store_response.repair_required);
+            response->mutable_result()->set_retryable(store_response.retryable);
         }
 
         bool IsDeleteIdempotentSuccess(const DeleteChunkResponse &store_response)
@@ -1429,9 +1752,7 @@ namespace storedemo
         std::shared_ptr<ChunkStore> chunk_store,
         std::string node_id,
         std::shared_ptr<StorageNodeRegistry> storage_node_registry)
-        : chunk_store_(std::move(chunk_store))
-        , node_id_(std::move(node_id))
-        , storage_node_registry_(std::move(storage_node_registry))
+        : chunk_store_(std::move(chunk_store)), node_id_(std::move(node_id)), storage_node_registry_(std::move(storage_node_registry))
     {
         if (chunk_store_ == nullptr)
         {
@@ -1493,6 +1814,195 @@ namespace storedemo
         }
 
         FillReadResponse(*request, store_response, node_id_, response);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor *StorageNodeService::ScrubChunk(
+        grpc::CallbackServerContext *context,
+        const storage::ScrubChunkRequest *request,
+        storage::ScrubChunkResponse *response)
+    {
+        auto *reactor = context->DefaultReactor();
+
+        if (request == nullptr || response == nullptr)
+        {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                         "ScrubChunk request/response must not be null"));
+            return reactor;
+        }
+
+        (void)request->timeout_ms();
+        (void)request->best_effort_cancel();
+        (void)request->quarantine_on_corruption();
+
+        ScrubChunkRequestContext request_context;
+        auto store_response = TranslateScrubRequest(*request, &request_context);
+        if (store_response.status == StorageNodeStatusCode::kOk)
+        {
+            store_response.expected_size = request_context.expected_size;
+            store_response.expected_checksum = request_context.expected_checksum;
+            store_response.metadata.identity = request_context.identity;
+
+            auto pre_stat_request = request_context.stat_request;
+            pre_stat_request.verify_checksum = false;
+            const auto pre_stat_response = chunk_store_->StatChunk(pre_stat_request);
+
+            if (pre_stat_response.metadata.identity.chunk_id.empty())
+            {
+                store_response.metadata.identity = request_context.identity;
+            }
+            else
+            {
+                store_response.metadata.identity = pre_stat_response.metadata.identity;
+            }
+
+            if (!pre_stat_response.metadata.node_id.empty())
+            {
+                store_response.metadata.node_id = pre_stat_response.metadata.node_id;
+            }
+
+            store_response.state_before = pre_stat_response.metadata.state;
+            store_response.state_after = pre_stat_response.metadata.state;
+            store_response.metadata.state = pre_stat_response.metadata.state;
+            store_response.metadata.size = pre_stat_response.metadata.size;
+            store_response.metadata.checksum = pre_stat_response.metadata.checksum;
+
+            if (pre_stat_response.status == StorageNodeStatusCode::kNotFound)
+            {
+                store_response.status = StorageNodeStatusCode::kNotFound;
+                store_response.error_detail = pre_stat_response.error_detail;
+                store_response.retry_after_ms = pre_stat_response.retry_after_ms;
+                store_response.known_missing = true;
+                store_response.repair_required = true;
+                store_response.state_before = ChunkState::kMissing;
+                store_response.state_after = ChunkState::kMissing;
+                store_response.metadata.state = ChunkState::kMissing;
+            }
+            else if (!pre_stat_response.ok())
+            {
+                store_response.status = pre_stat_response.status;
+                store_response.error_detail = pre_stat_response.error_detail;
+                store_response.retry_after_ms = pre_stat_response.retry_after_ms;
+            }
+            else if (IsScrubCorruptedState(pre_stat_response.metadata.state))
+            {
+                store_response.status = StorageNodeStatusCode::kCorrupted;
+                store_response.error_detail =
+                    pre_stat_response.metadata.state == ChunkState::kQuarantined
+                        ? "chunk is quarantined"
+                        : "chunk is corrupted";
+                store_response.known_corrupted = true;
+                store_response.quarantined =
+                    pre_stat_response.metadata.state == ChunkState::kQuarantined;
+                store_response.repair_required = true;
+            }
+            else if (!IsReadableChunkState(pre_stat_response.metadata.state))
+            {
+                store_response.status = StorageNodeStatusCode::kConflict;
+                store_response.error_detail =
+                    std::string("ScrubChunk cannot verify non-LIVE chunk state: ") +
+                    ToString(pre_stat_response.metadata.state);
+            }
+            else
+            {
+                auto verify_request = request_context.stat_request;
+                verify_request.verify_checksum = true;
+                const auto verify_response = chunk_store_->StatChunk(verify_request);
+                const auto post_verify_response = chunk_store_->StatChunk(pre_stat_request);
+
+                if (!post_verify_response.metadata.identity.chunk_id.empty())
+                {
+                    store_response.metadata = post_verify_response.metadata;
+                }
+                else
+                {
+                    store_response.metadata.identity = request_context.identity;
+                }
+
+                if (post_verify_response.ok())
+                {
+                    store_response.state_after = post_verify_response.metadata.state;
+                }
+                else if (post_verify_response.status == StorageNodeStatusCode::kNotFound)
+                {
+                    store_response.state_after = ChunkState::kMissing;
+                }
+
+                if (verify_response.ok())
+                {
+                    store_response.status = StorageNodeStatusCode::kOk;
+                    store_response.error_detail.clear();
+                    store_response.retry_after_ms = verify_response.retry_after_ms;
+                    store_response.metadata = verify_response.metadata;
+                    store_response.checksum_verified = verify_response.verified;
+                    store_response.observed_size = verify_response.metadata.size;
+                    store_response.observed_checksum = verify_response.metadata.checksum;
+
+                    std::string mismatch_detail;
+                    if (request_context.expected_size != 0 &&
+                        verify_response.metadata.size != request_context.expected_size)
+                    {
+                        store_response.status =
+                            StorageNodeStatusCode::kChecksumMismatch;
+                        mismatch_detail =
+                            "ScrubChunk observed size does not match expected size";
+                    }
+                    else
+                    {
+                        store_response.status = CompareScrubExpectedChecksum(
+                            request_context.expected_checksum,
+                            verify_response.metadata.checksum,
+                            &mismatch_detail);
+                    }
+
+                    if (store_response.status != StorageNodeStatusCode::kOk)
+                    {
+                        store_response.error_detail = std::move(mismatch_detail);
+                        store_response.repair_required = true;
+                    }
+                }
+                else if (verify_response.status == StorageNodeStatusCode::kNotFound ||
+                         post_verify_response.status == StorageNodeStatusCode::kNotFound)
+                {
+                    store_response.status = StorageNodeStatusCode::kNotFound;
+                    store_response.error_detail = verify_response.error_detail;
+                    if (store_response.error_detail.empty())
+                    {
+                        store_response.error_detail = post_verify_response.error_detail;
+                    }
+                    store_response.retry_after_ms = verify_response.retry_after_ms;
+                    store_response.known_missing = true;
+                    store_response.repair_required = true;
+                    store_response.state_after = ChunkState::kMissing;
+                    store_response.metadata.state = ChunkState::kMissing;
+                }
+                else if (verify_response.status == StorageNodeStatusCode::kCorrupted ||
+                         IsScrubCorruptedState(store_response.state_after))
+                {
+                    store_response.status = StorageNodeStatusCode::kCorrupted;
+                    store_response.error_detail = verify_response.error_detail;
+                    store_response.retry_after_ms = verify_response.retry_after_ms;
+                    store_response.known_corrupted = true;
+                    store_response.quarantined =
+                        store_response.state_after == ChunkState::kQuarantined;
+                    store_response.repair_required = true;
+                }
+                else
+                {
+                    store_response.status = verify_response.status;
+                    store_response.error_detail = verify_response.error_detail;
+                    store_response.retry_after_ms = verify_response.retry_after_ms;
+                }
+            }
+
+            store_response.retryable =
+                store_response.status != StorageNodeStatusCode::kOk &&
+                IsRetriableStatus(store_response.status);
+            store_response.metadata.last_error = store_response.status;
+        }
+
+        FillScrubResponse(*request, store_response, node_id_, response);
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
