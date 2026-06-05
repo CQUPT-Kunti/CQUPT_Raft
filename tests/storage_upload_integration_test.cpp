@@ -78,6 +78,18 @@ namespace
         return count;
     }
 
+    std::string ReadBinaryFileToString(const std::filesystem::path &path)
+    {
+        std::ifstream input(path, std::ios::binary);
+        if (!input.is_open())
+        {
+            throw std::runtime_error("failed to open binary file: " + path.string());
+        }
+
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+    }
+
     FixtureBinaryPayload LoadFixtureBinaryPayload()
     {
         const std::filesystem::path repo_root = RepoRoot();
@@ -550,6 +562,112 @@ namespace
         EXPECT_EQ(local_read_response.payload, payload);
         EXPECT_EQ(CountRegularFilesRecursively(store.paths().live_root), 1U);
         EXPECT_EQ(CountRegularFilesRecursively(store.paths().staging_root), 0U);
+#endif
+    }
+
+    TEST_F(StorageUploadIntegrationTest,
+           DurableChunkPayloadStaysInChunkStoreAndNeverEntersMetadataSerialization)
+    {
+#if !defined(__linux__)
+        GTEST_SKIP() << "T095 manifest boundary integration is validated on Linux";
+#else
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_upload_t095_manifest_boundary");
+        raftdemo::MetadataStateMachine machine;
+        storedemo::LocalDiskChunkStore store(
+            storedemo::test::MakeUploadStoreConfig(temp_dir.Path("stores"), 95));
+        ASSERT_EQ(store.Initialize().status, storedemo::StorageNodeStatusCode::kOk);
+
+        const std::string payload_marker =
+            "T095_PAYLOAD_MUST_STAY_OUT_OF_METADATA_AND_RAFT";
+        const std::string payload =
+            payload_marker + storedemo::test::MakeChunkPayload(160, "t095-manifest");
+
+        std::uint64_t index = 30;
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        raftdemo::test::MakeCreateBucketCommand(
+                            "bucket-t095-boundary",
+                            "create-bucket-t095-boundary"))
+                        .Ok);
+
+        const auto identity = MakeStoreIdentityOrThrow("obj-t095-boundary", 1, 0, 0);
+        ASSERT_TRUE(raftdemo::test::ApplyMetadataCommand(
+                        machine,
+                        index++,
+                        MakeCreateObjectCommandWithSize("bucket-t095-boundary",
+                                                        "uploads/manifest-boundary",
+                                                        identity.object_id,
+                                                        "create-object-t095-boundary",
+                                                        payload.size(),
+                                                        "etag-t095-boundary"))
+                        .Ok);
+
+        const auto write_response = store.WriteChunk(
+            MakeWriteRequest(identity, payload, "write-t095-boundary"));
+        ASSERT_EQ(write_response.status, storedemo::StorageNodeStatusCode::kOk)
+            << write_response.error_detail;
+        ASSERT_TRUE(write_response.durable);
+
+        std::vector<raftdemo::ChunkRef> manifest_chunks{
+            raftdemo::ChunkRef{
+                identity.chunk_id,
+                0,
+                static_cast<std::uint64_t>(payload.size()),
+                {write_response.metadata.node_id},
+                write_response.metadata.checksum.value}};
+        const auto commit_command = MakeCommitObjectCommandWithChunks(
+            "bucket-t095-boundary",
+            "uploads/manifest-boundary",
+            identity.object_id,
+            "commit-object-t095-boundary",
+            payload.size(),
+            "etag-t095-boundary",
+            manifest_chunks);
+        const std::string serialized_commit =
+            raftdemo::SerializeMetadataCommand(commit_command);
+        EXPECT_EQ(serialized_commit.find(payload_marker), std::string::npos);
+
+        const auto commit_apply =
+            raftdemo::test::ApplyMetadataCommand(machine, index++, commit_command);
+        ASSERT_TRUE(commit_apply.Ok) << commit_apply.message;
+
+        const auto head = machine.HeadObject(
+            {.bucket = "bucket-t095-boundary",
+             .object_key = "uploads/manifest-boundary"});
+        ASSERT_EQ(head.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_TRUE(head.record.has_value());
+        EXPECT_TRUE(head.record->IsCommitted());
+        ASSERT_EQ(head.record->chunks.size(), 1U);
+        EXPECT_EQ(head.record->chunks.front().chunk_id, identity.chunk_id);
+        EXPECT_EQ(head.record->chunks.front().offset, 0U);
+        EXPECT_EQ(head.record->chunks.front().size,
+                  static_cast<std::uint64_t>(payload.size()));
+        EXPECT_EQ(head.record->chunks.front().replica_nodes,
+                  std::vector<std::string>{write_response.metadata.node_id});
+        EXPECT_EQ(head.record->chunks.front().checksum,
+                  write_response.metadata.checksum.value);
+
+        const auto list = machine.ListObjects(
+            {.bucket = "bucket-t095-boundary", .prefix = "uploads/"});
+        ASSERT_EQ(list.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_EQ(list.records.size(), 1U);
+        ASSERT_EQ(list.records.front().chunks.size(), 1U);
+        EXPECT_EQ(list.records.front().chunks.front().chunk_id, identity.chunk_id);
+
+        const std::filesystem::path snapshot_path =
+            temp_dir.Path("metadata") / "t095-manifest-boundary.snapshot";
+        const auto save = machine.SaveSnapshot(snapshot_path.string());
+        ASSERT_EQ(save.status, raftdemo::SnapshotStatus::kOk) << save.message;
+
+        const std::string snapshot_bytes = ReadBinaryFileToString(snapshot_path);
+        EXPECT_EQ(snapshot_bytes.find(payload_marker), std::string::npos);
+
+        const auto local_read = store.ReadChunk(
+            MakeReadRequest(identity.chunk_id, "read-t095-boundary"));
+        ASSERT_EQ(local_read.status, storedemo::StorageNodeStatusCode::kOk)
+            << local_read.error_detail;
+        EXPECT_EQ(local_read.payload, payload);
 #endif
     }
 
