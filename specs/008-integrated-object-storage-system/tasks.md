@@ -35,7 +35,7 @@
 - [X] T004 [P] Create `modules/store/transfer/AGENTS.md` and `modules/store/transfer/module-notes.md` documenting client transfer orchestration boundaries
 - [X] T005 Add planned source/header placeholders to `CMakeLists.txt` for `modules/cluster`, `modules/view`, `modules/store/transfer`, and new app targets without changing existing target names
 - [X] T006 Add planned CTest labels and guarded test target entries for 008 tests in `tests/CMakeLists.txt`
-- [ ] T007 [P] Create test helper ownership notes for integrated cluster helpers in `tests/support/integrated_cluster_test_utils.h`
+- [X] T007 [P] Create test helper ownership notes for integrated cluster helpers in `tests/support/integrated_cluster_test_utils.h`
 
 ---
 
