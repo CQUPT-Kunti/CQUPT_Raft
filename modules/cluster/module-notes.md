@@ -46,6 +46,14 @@
   - 重启复用
   - 与配置不一致时显式报错
   - durable write contract
+- 当前 `node_identity.h` 只定义类型和接口边界：
+  - `NodeIdentity` 表达持久身份。
+  - `ExpectedNodeIdentity` 表达启动配置对本地身份的匹配期望。
+  - `NodeIdentityLoadOptions` / `NodeIdentityStoreOptions` 表达 load / store 的输入边界。
+  - `NodeIdentityLoadResult` / `NodeIdentityStoreResult` / `NodeIdentityLoadOrCreateResult` 表达结果、诊断和 durability 状态边界。
+  - `ValidateNodeIdentity` / `ValidateNodeIdentityMatches` / `LoadNodeIdentity` / `StoreNodeIdentity` / `LoadOrCreateNodeIdentity` 仅声明接口，不在头文件实现文件 IO。
+- MetadataNode 必须区分 `node_id` 与 `raft_id`；StorageNode / ViewNode 不应携带 `raft_id`。
+- `node.identity` 已存在且与期望冲突时必须显式失败，不得静默覆盖。
 
 ### `RaftMembership`
 

@@ -16,6 +16,12 @@ ViewNode 的定位是 discovery-only / observation-only：它可以展示观测�
 - `GetClusterView`：返回 ViewNode、MetadataNode、StorageNode 的观测快照，包括 liveness、capacity、leader hint、冲突和 stale 警告。
 - `leader hint`：MetadataNode leader 的非权威观测提示，用于减少 Client 重试成本；过期或错误时不得影响 Raft election 和 commit 安全。
 
+## `view_registry.h` 接口边界
+
+`modules/view/view_registry.h` 只定义 `viewdemo::ViewNodeRegistry` 的类型和接口边界，不包含注册、心跳排序、liveness transition 或 discovery snapshot 的实现。核心类型包括节点类型、liveness、健康状态、MetadataNode 观测角色、membership 观测状态、注册请求、heartbeat 请求、节点快照、diagnostic、metadata/storage discovery 结果和 cluster view 快照。
+
+`ViewNodeRegistry` 对外暴露 `RegisterNode`、`HeartbeatNode`、`LookupNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView`、`size` 和 `config`。查询接口显式接收 `now_unix_ms`，方便后续 T016 使用确定性时间源实现和测试 liveness 计算。该头文件不包含 proto/gRPC 依赖；T018/T019 的 service adapter 负责 proto 字段与 registry 类型之间的映射。
+
 ## Non-Authority Boundary
 
 ViewNode 不保存 object manifest 的一致性权威副本，不决定对象是否 `COMMITTED` 可见，不参与 `CommitObject`，不直接读写 StorageNode chunk 数据。
