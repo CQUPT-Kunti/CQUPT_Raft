@@ -36,10 +36,41 @@ FetchContent_MakeAvailable(googletest)
 #   may still exercise platform-neutral logic, but their operational
 #   interpretation is intentionally different from a pure cross-platform
 #   baseline rerun.
+# - storage-node:
+#   StorageNode / store data-plane baseline bucket. For 007 and later store
+#   tests, this is the primary feature grouping label.
+# - storage-node-concurrency:
+#   StorageNode concurrency / backpressure / bounded-queue tests.
+# - storage-node-recovery:
+#   StorageNode restart / rebuild / staging cleanup / corruption recovery
+#   tests.
+# - storage-node-cross-platform:
+#   StorageNode cross-platform durability and path-behavior contract tests.
 #
 # This file does not rename targets or alter test behavior. It only attaches
 # labeling metadata so ctest discovery and related docs can distinguish the
 # validation scope more clearly.
+set(RAFT_STORE_LABELS_BASELINE
+  "storage-node;platform-neutral")
+set(RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY
+  "storage-node;linux-primary-diagnosis")
+set(RAFT_STORE_LABELS_CONCURRENCY
+  "storage-node;storage-node-concurrency;platform-neutral")
+set(RAFT_STORE_LABELS_CONCURRENCY_LINUX_PRIMARY
+  "storage-node;storage-node-concurrency;linux-primary-diagnosis")
+set(RAFT_STORE_LABELS_RECOVERY
+  "storage-node;storage-node-recovery;platform-neutral")
+set(RAFT_STORE_LABELS_CROSS_PLATFORM
+  "storage-node;storage-node-cross-platform;platform-neutral")
+
+function(add_store_ctest test_name target_name test_labels)
+  add_test(NAME ${test_name}
+    COMMAND ${target_name}
+  )
+  set_tests_properties(${test_name} PROPERTIES
+    LABELS "${test_labels}")
+endfunction()
+
 function(add_raft_gtest target_name source_file test_labels)
   if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
     message(STATUS "Skip ${target_name}: ${source_file} not found")
@@ -250,6 +281,513 @@ add_raft_gtest(test_min_heap_timer test_min_heap_timer.cpp
   "platform-neutral;platform-neutral-fallback")
 add_raft_gtest(test_thread_pool test_thread_pool.cpp
   "platform-neutral;platform-neutral-fallback")
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_types_test.cpp")
+  add_executable(test_store_types
+    store_types_test.cpp
+  )
+
+  target_link_libraries(test_store_types
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_types
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_types test_store_types
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_types: store_types_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_durable_file_test.cpp")
+  add_executable(test_store_durable_file
+    store_durable_file_test.cpp
+  )
+
+  target_link_libraries(test_store_durable_file
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_durable_file
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_durable_file test_store_durable_file
+    "${RAFT_STORE_LABELS_CROSS_PLATFORM}")
+else()
+  message(STATUS "Skip test_store_durable_file: store_durable_file_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_chunk_index_test.cpp")
+  add_executable(test_store_chunk_index
+    store_chunk_index_test.cpp
+  )
+
+  target_link_libraries(test_store_chunk_index
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_chunk_index
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_chunk_index test_store_chunk_index
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_chunk_index: store_chunk_index_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_executor_test.cpp")
+  add_executable(test_store_executor
+    store_executor_test.cpp
+  )
+
+  target_link_libraries(test_store_executor
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_executor
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_executor test_store_executor
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_executor: store_executor_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/local_disk_chunk_store_test.cpp")
+  add_executable(test_local_disk_chunk_store
+    local_disk_chunk_store_test.cpp
+  )
+
+  target_link_libraries(test_local_disk_chunk_store
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_local_disk_chunk_store
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(local_disk_chunk_store test_local_disk_chunk_store
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_local_disk_chunk_store: local_disk_chunk_store_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_node_recovery_test.cpp")
+  add_executable(test_storage_node_recovery
+    storage_node_recovery_test.cpp
+  )
+
+  target_link_libraries(test_storage_node_recovery
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_node_recovery
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_node_recovery test_storage_node_recovery
+    "${RAFT_STORE_LABELS_RECOVERY}")
+else()
+  message(STATUS "Skip test_storage_node_recovery: storage_node_recovery_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_cross_platform_durability_test.cpp")
+  add_executable(test_storage_cross_platform_durability
+    storage_cross_platform_durability_test.cpp
+  )
+
+  target_link_libraries(test_storage_cross_platform_durability
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_cross_platform_durability
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_cross_platform_durability
+    test_storage_cross_platform_durability
+    "${RAFT_STORE_LABELS_CROSS_PLATFORM}")
+else()
+  message(STATUS "Skip test_storage_cross_platform_durability: storage_cross_platform_durability_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_integration_test.cpp")
+  add_executable(test_storage_upload_integration
+    storage_upload_integration_test.cpp
+  )
+
+  target_link_libraries(test_storage_upload_integration
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_upload_integration
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_upload_integration test_storage_upload_integration
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_upload_integration: storage_upload_integration_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_read_integration_test.cpp")
+  add_executable(test_storage_read_integration
+    storage_read_integration_test.cpp
+  )
+
+  target_link_libraries(test_storage_read_integration
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_read_integration
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_read_integration test_storage_read_integration
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_read_integration: storage_read_integration_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_delete_gc_test.cpp")
+  add_executable(test_storage_delete_gc
+    storage_delete_gc_test.cpp
+  )
+
+  target_link_libraries(test_storage_delete_gc
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_delete_gc
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_delete_gc test_storage_delete_gc
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_delete_gc: storage_delete_gc_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_scrub_repair_test.cpp")
+  add_executable(test_storage_scrub_repair
+    storage_scrub_repair_test.cpp
+  )
+
+  target_link_libraries(test_storage_scrub_repair
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_scrub_repair
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_scrub_repair test_storage_scrub_repair
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_scrub_repair: storage_scrub_repair_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_rebalance_test.cpp")
+  add_executable(test_storage_rebalance
+    storage_rebalance_test.cpp
+  )
+
+  target_link_libraries(test_storage_rebalance
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_rebalance
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_rebalance test_storage_rebalance
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_rebalance: storage_rebalance_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_delete_chunk_contract_test.cpp")
+  add_executable(test_storage_delete_chunk_contract
+    storage_delete_chunk_contract_test.cpp
+  )
+
+  target_link_libraries(test_storage_delete_chunk_contract
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_delete_chunk_contract
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_delete_chunk_contract test_storage_delete_chunk_contract
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_delete_chunk_contract: storage_delete_chunk_contract_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_garbage_collector_test.cpp")
+  add_executable(test_storage_garbage_collector
+    storage_garbage_collector_test.cpp
+  )
+
+  target_link_libraries(test_storage_garbage_collector
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_garbage_collector
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_garbage_collector test_storage_garbage_collector
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_garbage_collector: storage_garbage_collector_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_write_chunk_contract_test.cpp")
+  add_executable(test_storage_write_chunk_contract
+    storage_write_chunk_contract_test.cpp
+  )
+
+  target_link_libraries(test_storage_write_chunk_contract
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_write_chunk_contract
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_write_chunk_contract test_storage_write_chunk_contract
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_write_chunk_contract: storage_write_chunk_contract_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_read_chunk_contract_test.cpp")
+  add_executable(test_storage_read_chunk_contract
+    storage_read_chunk_contract_test.cpp
+  )
+
+  target_link_libraries(test_storage_read_chunk_contract
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_read_chunk_contract
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_read_chunk_contract test_storage_read_chunk_contract
+    "${RAFT_STORE_LABELS_BASELINE_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_storage_read_chunk_contract: storage_read_chunk_contract_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_node_service_test.cpp")
+  add_executable(test_storage_node_service
+    storage_node_service_test.cpp
+  )
+
+  target_link_libraries(test_storage_node_service
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_node_service
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_node_service test_storage_node_service
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_node_service: storage_node_service_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_node_client_test.cpp")
+  add_executable(test_storage_node_client
+    storage_node_client_test.cpp
+  )
+
+  target_link_libraries(test_storage_node_client
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_node_client
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_node_client test_storage_node_client
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_node_client: storage_node_client_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_placement_policy_test.cpp")
+  add_executable(test_store_placement_policy
+    store_placement_policy_test.cpp
+  )
+
+  target_link_libraries(test_store_placement_policy
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_placement_policy
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_placement_policy test_store_placement_policy
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_placement_policy: store_placement_policy_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_placement_manager_test.cpp")
+  add_executable(test_store_placement_manager
+    store_placement_manager_test.cpp
+  )
+
+  target_link_libraries(test_store_placement_manager
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_placement_manager
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_placement_manager test_store_placement_manager
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_store_placement_manager: store_placement_manager_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_heartbeat_registry_test.cpp")
+  add_executable(test_storage_heartbeat_registry
+    storage_heartbeat_registry_test.cpp
+  )
+
+  target_link_libraries(test_storage_heartbeat_registry
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_heartbeat_registry
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_heartbeat_registry test_storage_heartbeat_registry
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_heartbeat_registry: storage_heartbeat_registry_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/store_concurrency_stress_test.cpp")
+  add_executable(test_store_concurrency_stress
+    store_concurrency_stress_test.cpp
+  )
+
+  target_link_libraries(test_store_concurrency_stress
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_store_concurrency_stress
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(store_concurrency_stress test_store_concurrency_stress
+    "${RAFT_STORE_LABELS_CONCURRENCY_LINUX_PRIMARY}")
+else()
+  message(STATUS "Skip test_store_concurrency_stress: store_concurrency_stress_test.cpp not found")
+endif()
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_upload_coordinator_test.cpp")
+  add_executable(test_storage_upload_coordinator
+    storage_upload_coordinator_test.cpp
+  )
+
+  target_link_libraries(test_storage_upload_coordinator
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_storage_upload_coordinator
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_store_ctest(storage_upload_coordinator test_storage_upload_coordinator
+    "${RAFT_STORE_LABELS_BASELINE}")
+else()
+  message(STATUS "Skip test_storage_upload_coordinator: storage_upload_coordinator_test.cpp not found")
+endif()
 
 # =========================
 # Platform-neutral baseline:

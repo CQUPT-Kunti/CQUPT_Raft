@@ -14,7 +14,7 @@
 
 ## Failed tests
 
-- 	127 - RaftCommitApplyTest.CommitAndApplyIndexesAdvanceAfterSuccessfulPropose (Subprocess aborted)
+- 	165 - RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot (Failed)
 
 ## Logs
 

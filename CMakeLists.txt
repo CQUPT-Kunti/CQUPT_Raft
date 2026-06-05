@@ -80,14 +80,18 @@ message(STATUS "Using protobuf ${Protobuf_VERSION}")
 message(STATUS "Using gRPC ${gRPC_VERSION}")
 
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+set(STORAGE_NODE_PROTO_RELATIVE proto/storage_node.proto)
+set(STORAGE_NODE_PROTO_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/${STORAGE_NODE_PROTO_RELATIVE})
 set(PROTO_FILES
   ${PROTO_DIR}/common.proto
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GRPC_PROTO_FILES
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(PROJECT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/modules)
@@ -106,19 +110,23 @@ set(PROTO_SRCS
   ${GENERATED_DIR}/common.pb.cc
   ${GENERATED_DIR}/raft.pb.cc
   ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/storage_node.pb.cc
 )
 set(PROTO_HDRS
   ${GENERATED_DIR}/common.pb.h
   ${GENERATED_DIR}/raft.pb.h
   ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/storage_node.pb.h
 )
 set(GRPC_SRCS
   ${GENERATED_DIR}/raft.grpc.pb.cc
   ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/storage_node.grpc.pb.cc
 )
 set(GRPC_HDRS
   ${GENERATED_DIR}/raft.grpc.pb.h
   ${GENERATED_DIR}/metadata.grpc.pb.h
+  ${GENERATED_DIR}/storage_node.grpc.pb.h
 )
 
 add_custom_command(
@@ -202,13 +210,49 @@ target_link_libraries(metadata_proto
     gRPC::grpc++
 )
 
+add_library(storage_node_proto
+  ${GENERATED_DIR}/storage_node.pb.cc
+  ${GENERATED_DIR}/storage_node.pb.h
+  ${GENERATED_DIR}/storage_node.grpc.pb.cc
+  ${GENERATED_DIR}/storage_node.grpc.pb.h
+)
+
+target_include_directories(storage_node_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(storage_node_proto
+  PUBLIC
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
 if(WIN32)
   target_link_libraries(common_proto PUBLIC Ws2_32)
   target_link_libraries(raft_proto PUBLIC Ws2_32)
   target_link_libraries(metadata_proto PUBLIC Ws2_32)
+  target_link_libraries(storage_node_proto PUBLIC Ws2_32)
 endif()
 
 add_library(raft_core
+  modules/store/common/store_types.cpp
+  modules/store/chunk/chunk_store.cpp
+  modules/store/chunk/local_disk_chunk_store.cpp
+  modules/store/io/durable_file.cpp
+  modules/store/index/chunk_index.cpp
+  modules/store/maintenance/garbage_collector.cpp
+  modules/store/maintenance/gc_task_store.cpp
+  modules/store/maintenance/rebalance_manager.cpp
+  modules/store/maintenance/repair_manager.cpp
+  modules/store/maintenance/scrub_manager.cpp
+  modules/store/node/storage_node_client.cpp
+  modules/store/node/storage_node_registry.cpp
+  modules/store/node/storage_node_service.cpp
+  modules/store/placement/placement_manager.cpp
+  modules/store/placement/replica_policy.cpp
+  modules/store/runtime/storage_executor.cpp
+  modules/store/upload/upload_coordinator.cpp
   modules/raft/runtime/min_heap_timer.cpp
   modules/raft/runtime/thread_pool.cpp
   modules/raft/common/command.cpp
@@ -232,6 +276,7 @@ target_include_directories(raft_core
 target_link_libraries(raft_core
   PUBLIC
     raft_proto
+    storage_node_proto
   PRIVATE
     metadata_proto
     Threads::Threads

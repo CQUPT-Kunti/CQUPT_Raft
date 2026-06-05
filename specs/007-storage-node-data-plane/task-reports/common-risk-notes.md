@@ -1,0 +1,236 @@
+# Common Risk Notes
+
+- 任务编号：T001
+  问题：`.specify/scripts/bash/check-prerequisites.sh --json --require-tasks --include-tasks` 当前返回的 `FEATURE_DIR` 是 `specs/006-remove-kv-metadata-state-machine`，与本次执行的 `specs/007-storage-node-data-plane` 不一致。
+  影响：继续依赖该脚本可能把实现流程、自动化检查或扩展 hook 引导到错误 feature 目录。
+  建议后续在哪类任务处理：在后续 speckit 工作流或脚本修正类任务中校正 feature 选择逻辑，避免 007 任务执行时误绑定到 006。
+
+- 任务编号：T009
+  问题：`tests/support/store_test_utils.h` 中的 `MakeChecksumFixture()` 仍返回 `fixture-fnv1a:*` 形式，与当前 `storedemo::ComputeChunkChecksum()` 的 SHA-256 生产语义不一致。
+  影响：后续 storage 集成测试如果继续复用该 helper，可能误把测试夹具摘要当成生产 checksum，导致用例语义漂移或断言失真。
+  建议后续在哪类任务处理：在后续 storage 测试工具或 LocalDiskChunkStore 测试任务中统一切到生产 checksum helper，或显式区分 fixture checksum 与 production checksum。
+
+- 任务编号：T014
+  问题：`WindowsDurableFile` 已完成条件编译实现和 Windows 条件测试，但当前环境没有 Windows 编译/测试能力，`MoveFileExW`、long path、UTF-8 path 和 directory durability 的实机行为仍未验证。
+  影响：如果直接把当前状态当成跨平台实机通过，后续可能在真实 Windows 机器上暴露路径转换、句柄共享或 durability 语义偏差。
+  建议后续在哪类任务处理：执行 `T014-WIN`，在真实 Windows 环境完成 build/test 和必要修正，再关闭该风险。
+
+- 任务编号：T016
+  问题：`ShardedChunkIndex::List()` 当前使用 `chunk_id` 字典序和 `page_token` 继续翻页，但还没有为并发修改提供稳定快照分页保证。
+  影响：T018 已补 per-chunk 串行化和基础容器并发保护，但跨页扫描在并发修改下仍可能出现页边界漂移或重复/漏读，需要明确 snapshot 语义或更强一致性策略。
+  建议后续在哪类任务处理：在后续索引并发/恢复任务中继续收紧分页一致性语义，必要时引入 snapshot pinning 或更强 page token 结构。
+
+- 任务编号：T018
+  问题：T026 已用真实并发压力覆盖 `LocalDiskChunkStore::WriteChunk()` / `DeleteChunk()` 的 chunk guard 主路径，但 `AcquireChunkLock()` 的跨步骤原子性仍依赖未来 repair/rebalance/recovery 等新增业务入口继续显式持有 guard。
+  影响：当前 store 主写删入口的并发串行边界已经被测试固定；如果后续新入口遗漏 guard，只依赖索引内部容器锁，仍可能在多步骤状态转换上出现交错。
+  建议后续在哪类任务处理：在后续 repair/rebalance/recovery/store 业务扩展任务中，继续把 chunk guard 作为多步骤状态切换的固定前置步骤，并补对应测试。
+
+- 任务编号：T019
+  问题：`BoundedStorageExecutor` 已通过 T020 测试固定当前“任务上下文不自动触发运行中取消”的边界，但仍没有实现 deadline 到点取消或任务结果 future 聚合。
+  影响：后续 `LocalDiskChunkStore` 和 StorageNodeService 如果把 timeout/cancellation 当成已生效的运行中中断能力，仍可能高估当前 runtime 的回收与中止能力。
+  建议后续在哪类任务处理：在后续 runtime 接入任务中，继续把 timeout/cancellation 当作扩展点；如需要真正的取消传播，再单独收紧接口和测试。
+
+- 任务编号：T019
+  问题：`BoundedStorageExecutor::Shutdown()` 已通过 T020 测试固定为 owner-thread 模型：worker 回调内部调用会返回明确边界错误，不支持自停或自析构。
+  影响：如果后续业务代码忽略这条约束，仍可能在停机收口或对象生命周期管理上误用执行器。
+  建议后续在哪类任务处理：在后续 store runtime / LocalDiskChunkStore 接入任务中，继续按 owner 线程停机模型使用；如确实需要 worker 内触发停机，再单独演进生命周期协议。
+
+- 任务编号：T021
+  问题：`LocalDiskChunkStore` 现已具备生产 `RebuildIndexFromDisk()`、`Initialize()` 自动 live/quarantine index rebuild、stale staging cleanup，以及 read/stat 发现坏块后的 quarantine；但更强的 metadata freshness 判定、后台 scrub/repair 联动和“从未被标记过的 live 文件损坏”主动发现仍未实现。
+  影响：重启后现在能重新发现 canonical live final chunk、恢复本地 quarantine 事实并清理 stale/partial staging；但 deleted/deleting 等更完整持久状态恢复、元数据事实新鲜度和主动巡检仍未收口。
+  建议后续在哪类任务处理：在后续 scrub/repair、metadata fact source 和 crash matrix 任务中继续收紧 freshness、主动发现和后台治理边界。
+
+- 任务编号：T023
+  问题：`LocalDiskChunkStore::WriteChunk()` 现已接入 durable publish，但当前环境没有 Windows 实机验证能力，而 `WindowsDurableFile::SyncDirectory()` 仍是 explicit unsupported，集成后的真实 Windows 成功/失败语义还未验证。
+  影响：Linux 上的写入链路已经收口，但在真实 Windows 环境中，WriteChunk 可能表现为 explicit unsupported 或暴露额外的 publish / path / handle 语义偏差。
+  建议后续在哪类任务处理：执行 `T023-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
+
+- 任务编号：T024
+  问题：`LocalDiskChunkStore::ReadChunk()` / `StatChunk(verify_checksum=true)` 现在会在发现文件大小或 checksum 与 index metadata 不一致时返回明确错误，并把本地 final chunk 移入 quarantine、更新 index 为 `kQuarantined`；但当前仍没有后台 scrub/failure cache/recent failure scoring，也不会自动修复或向 registry/metadata 传播坏块事实。
+  影响：前台读取已经不会把损坏数据当成功返回，重启后也能恢复本地 quarantine 事实；但后续如果需要跨副本短期记忆、后台治理或统一 control-plane 消费，还需要继续补 failure cache、scrub/repair 和事实传播。
+  建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 registry-facts 任务中继续收口，不要把当前前台 quarantine 误当成完整坏块治理闭环。
+
+- 任务编号：T025
+  问题：`LocalDiskChunkStore::DeleteChunk()` 现已接入真实文件删除和 `DELETED` index 状态更新，但当前环境没有 Windows 实机验证能力，`std::filesystem::remove` 在 sharing violation / open-handle / unlink 语义上的真实行为仍未验证。
+  影响：Linux 上删除、Stat、List 语义已经收口，但在真实 Windows 环境中，DeleteChunk 可能暴露额外的 sharing violation、删除失败分类或文件可见性差异。
+  建议后续在哪类任务处理：执行 `T025-WIN`，在 Windows 环境完成 `local_disk_chunk_store` 相关 build/test 与必要修正，再关闭该风险。
+
+- 任务编号：T026
+  问题：T026 已在 Linux 上覆盖真实 chunk 文件的高并发 write/read/delete/stat/list 压力，但当前环境没有 Windows 编译/测试能力，Windows 下的 sharing violation、open-handle delete、并发读删可见性和 durable publish 后读取差异仍未验证。
+  影响：Linux 上不同 chunk 并行、同 chunk 冲突控制和 bounded backpressure 已有实测证据；如果直接把这组结果外推到 Windows，后续仍可能在真实 NTFS/Win32 文件语义下暴露并发偏差。
+  建议后续在哪类任务处理：执行 `T026-WIN`，在 Windows 环境完成 `store_concurrency_stress` 实机验证，并结合 `T023-WIN` / `T025-WIN` 收口必要修正。
+
+- 任务编号：T027
+  问题：T035 已补最小 `UploadCoordinator`，能够按 `CreateObject -> Placement -> WriteChunk -> CommitObject` 顺序串联 metadata/control-plane 与 StorageNode/data-plane，但当前仍没有 `AbortObject`、GC、重试调度或重启恢复协同。只要 `CreateObject` 已成功而后续 placement/write/commit 失败，对象就可能长期停留在 metadata `PENDING`；只要有 durable chunk 而 `CommitObject` 未成功，就仍可能留下 orphan chunk。
+  影响：仓库现在已经有了明确的 commit gate，不再完全缺少 upload coordinator；但失败路径仍依赖调用方或后续 GC/recovery 任务处理 pending object 和 orphan chunk，尚不能把这部分状态自动收口成生产语义。
+  建议后续在哪类任务处理：T036 已把 commit manifest 必须等于 durable success facts 的契约测试固定，T037 已把“未达到最小成功副本数时生成 cleanup candidate”的边界固定；后续仍需在 abort/GC/recovery 任务中补齐真实 cleanup 执行、pending object 收口和重启恢复协同。
+
+- 任务编号：T045
+  问题：T045 已落地 committed manifest 驱动的最小 read replica selection / fallback，T046 已把测试侧 `ReadObject by manifest` helper 收口到 `tests/support`，T047 固定了 unavailable / not_found / timeout / checksum mismatch fallback，T066 也已把生产 registry facts 接到 read replica selection；但当前仍没有 failure cache、recent failure scoring、corruption 自动状态回写或 repair/scrub 联动。
+  影响：仓库现在已经有了 committed-only 的 metadata gate、registry-aware 的副本排序、逐副本 fallback 和可复用测试 helper；但读路径上的坏块沉淀、后台治理和短期失败记忆仍未形成完整生产闭环。
+  建议后续在哪类任务处理：在 T048/T052 及后续 recovery-scrub/repair 任务中继续补 failure cache、corruption 沉淀与坏块治理；自动状态回写仍按 T024/后续 recovery-scrub 任务统一处理。
+
+- 任务编号：T049
+  问题：T049 已用 `storage_delete_gc_test` 固定 `DeleteObject -> invisible -> test-only cleanup candidate / GC safety helper` 的测试边界，也覆盖了 committed live manifest 保护、重复删除重放和 failed upload orphan candidate；但当前仍不是完整后台 GC 生命周期闭环。
+  影响：如果把 T049 的测试 helper 和定向验证当成 US3 全量生产删除/GC 已完成，后续会高估 metadata tombstone 之后的真实后台回收能力；当前通过的是 metadata-first、candidate generation、metadata-driven safety 和最小 restart resume contract，不是 repair/rebalance/scrub 或全平台删除语义落地。
+  建议后续在哪类任务处理：在后续 Windows 删除语义、timeout/cancellation 运行中传播和更完整后台维护任务中继续收口。
+
+- 任务编号：T055
+  问题：T055 已在生产 `GarbageCollector` 中加入必需的 metadata-driven safety checker gate，并固定“live manifest 引用时不调用 delete handler、checker 暂时不可用时按 retryable 失败处理”的边界；但当前 safety checker 仍依赖调用方注入外部 metadata 事实源，Windows 实机删除验证也未完成。`next_retry_after_ms` 仍只是任务模型扩展点，尚未形成真正的延迟重试调度器；`best_effort_cancel` / timeout 运行中传播同样未打通到 service/store 删除执行。
+  影响：如果把当前 safety gate 通过当成完整生产 GC 已完成，后续会高估延迟重试、跨平台删除验证和 metadata fact freshness 保证能力；另外 live-manifest 保护的正确性仍取决于调用方提供的 metadata 事实源是否新鲜且完整。
+  建议后续在哪类任务处理：在后续真实 metadata fact source 接线、Windows 验证和 timeout/cancellation 运行中传播任务中继续收口。
+
+- 任务编号：T056
+  问题：T056 已补 pending timeout、failed upload、abort cleanup、deleted object cleanup 的 generic candidate generation，并固定 candidate -> `GarbageCollectorTask` 转换、排序和去重边界；但当前 candidate 正确性仍依赖调用方提供足够新鲜的 metadata snapshot、object state 和 timeout 事实。
+  影响：如果调用方在过期 metadata 视图或不稳定时间基准上生成 candidate，仍可能产生重复候选、延迟候选或在 safety gate 阶段再被拒绝。
+  建议后续在哪类任务处理：在后续真实 metadata fact source 接线任务中继续收紧 candidate 生成的快照新鲜度边界。
+
+- 任务编号：T057
+  问题：T057 已补最小 GC task snapshot persistence 和 restart resume，并通过 `DurableFile` staging/publish/sync 收口 Linux 当前路径；T057-FIX 已把保存阶段从“先拼完整 payload”改成 streaming append，降低了保存时的内存峰值，但当前 persistence 仍是 whole-snapshot rewrite，没有 schema migration 机制，也没有多进程并发访问协议。Windows 下 `SyncDirectory()` 仍是 explicit unsupported，真实持久化语义需要单独验证。
+  影响：保存时不再额外构造整份 snapshot 字符串，但后续如果在 schema 演进、跨版本兼容、多进程共享同一 persistence root，或真实 Windows durability 语义上继续扩展，当前实现仍可能暴露 snapshot 覆盖、磁盘写放大、兼容性或 directory durability 边界。
+  建议后续在哪类任务处理：在后续 T057-WIN 或跨平台持久化验证任务中完成 Windows 实机验证，并在需要跨版本演进时补 schema migration / compatibility 策略。
+
+- 任务编号：T059
+  问题：T059 已用 `storage_heartbeat_registry_test` 固定 heartbeat / registry contract；T062-T066 现已落地生产 registry、service、client、write placement 和 read selection 适配，但 clock source 与 sequence 新鲜度仍依赖后续生产路径统一收口。
+  影响：如果把当前 registry + service + client + placement/read selection 单测通过当成整个 heartbeat 生产链路已完成，后续仍可能高估 heartbeat facts 的来源一致性和 stale heartbeat 过滤在真实运行时的完备性。
+  建议后续在哪类任务处理：在后续 control-plane 可靠性或 time-source 规范任务中继续明确时钟与 sequence 生产语义。
+
+- 任务编号：T060
+  问题：T060 已在 `store_placement_policy` / `store_placement_manager` 中固定 health-aware placement contract；T065/T066 已把生产 registry snapshot/facts 分别接到 write-side placement 和 read replica selection，但 failure-domain 更细粒度 spread 以及最终的 overload/hotspot 统一生产打分仍未完成。
+  影响：如果把当前 contract 测试、write placement 和 read selection 接线的通过当成所有副本消费面都已完备，后续仍可能高估 registry facts 在 repair/rebalance 等路径中的新鲜度和排序来源。
+  建议后续在哪类任务处理：在后续 repair/rebalance/read-side 扩展任务中继续复用 registry facts，并保持 T060 固定下来的稳定选择与排除语义。
+
+- 任务编号：T061
+  问题：T061 已在 `proto/storage_node.proto` 中补齐 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` 及其 facts/schema；T062-T066 已把 registry、service、client、write placement 和 read selection 接到生产路径，但 fake stub 后续同步和时间语义兼容风险仍存在。
+  影响：如果把当前 proto/schema、registry、service、client、placement/read selection 单测通过当成 US4 全量完成，后续仍可能在 fake stub 跟随新接口演进或 time-source 规范上暴露兼容风险。
+  建议后续在哪类任务处理：在后续 control-plane 演进任务中继续保持 fake stub 与生成接口同步，并明确时间语义。
+
+- 任务编号：T062
+  问题：T062 已实现生产 in-memory `StorageNodeRegistry`，覆盖 register、heartbeat、partial report merge、sequence/stale 保护、liveness 和稳定 snapshot/list；T063-T066 已把这些语义接到 service、client、write placement 和 read selection 侧，但当前时钟来源仍是调用方传入的 `observed_at/now`。
+  影响：如果调用方使用漂移较大的时钟、乱序 sequence 或不一致的 report/heartbeat 源，registry + service + client + placement/read selection 仍可能把“新鲜度”判断建立在不可靠输入上；另外 load facts 还没有变成跨所有消费面的统一 overload 生产打分。
+  建议后续在哪类任务处理：在后续 control-plane / maintenance 任务中继续统一 freshness 与 overload 的最终消费规则。
+
+- 任务编号：T063
+  问题：T063 已实现 `StorageNodeService` 的 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` gRPC 适配，并把 proto request/response 映射到 `StorageNodeRegistry`；T064/T066 已补齐 client 和 read-side 消费，但 service 仍直接信任请求携带的 `observed_at_unix_ms`、health/disk/load facts 和 sequence。
+  影响：如果后续 client 或调用方在不同时间基准、重复请求、乱序请求或事实缺省策略上不一致，service 虽然会复用 registry 的 stale/idempotent/merge 规则，但整体链路仍可能出现“语义看似一致、输入不够可信”的问题。
+  建议后续在哪类任务处理：在 T066 中继续验证 service 暴露出的 snapshot/facts 是否足够支撑 read-side 消费，并决定最终的 time-source / sequence 生产规范。
+
+- 任务编号：T064
+  问题：T064 已实现 `StorageNodeClient` 的 `RegisterStorageNode`、`UpdateStorageNodeHeartbeat`、`ReportHealth`、`ReportCapacity`、`ReportLoad` gRPC 调用，并把 gRPC status、proto snapshot/facts 映射回本地 response；但 T061 既有 proto 没有这些 control-plane RPC 的 `timeout_ms` / `best_effort_cancel` 字段，因此当前只有 gRPC `ClientContext` deadline，没有真正的 on-wire cancel hint，也没有自动重试策略。
+  影响：如果后续调用方把 T064 误解成已经具备端到端 cancellation propagation、统一重试预算或 service/registry 可观测的 timeout hint，可能高估 control-plane 链路的中断和恢复能力。
+  建议后续在哪类任务处理：在后续 control-plane 可靠性或 proto/schema 演进任务中，评估是否需要显式补充 control-plane timeout/cancel 字段、统一 retry 策略和 sequence/time-source 生成协议；T066 继续只消费当前已经固定的 response/facts contract。
+
+- 任务编号：T065
+  问题：T065 已把生产 `StorageNodeRegistry` snapshot/facts 接到 write-side `PlacementManager`，T066 也把这套 facts 接到了 read replica selection；但当前 failure-domain 仍只消费 `zone/rack` 占位字段，没有更细粒度 spread 策略，新鲜度依旧取决于调用方提供的 `observed_at/now`。
+  影响：如果后续把当前 write/read side 接线误当成所有 placement/read-side/failure-domain 策略都已完备，仍可能高估 zone spread、clock freshness 和 partial facts 在 repair/rebalance 等消费面上的可靠性。
+  建议后续在哪类任务处理：在后续 repair/rebalance/read-side 扩展任务中继续复用 registry facts，并决定是否需要更细粒度 failure-domain 策略和更严格的新鲜度协议。
+
+- 任务编号：T066
+  问题：T066 已把生产 `StorageNodeRegistry` snapshot/facts 接到 read replica selection，并固定了 healthy/fresh/low-load 优先、stale/unavailable/overloaded/corrupted 跳过、high/full disk pressure 降权、unknown facts 保留 manifest fallback 的 contract；但当前仍没有 failure cache、recent failure scoring、corruption 自动状态回写或 registry snapshot freshness 的独立时钟源。
+  影响：如果把当前 registry-aware read selection 当成完整生产读路径治理已完成，后续仍可能在重复失败副本的短期记忆、坏块自动沉淀、以及“snapshot 何时算新鲜”的生产时钟协议上暴露语义缺口。
+  建议后续在哪类任务处理：在后续 read reliability、scrub/repair、failure cache 或 time-source 规范任务中继续收口，不要在 T066 里扩展成 repair / corruption 自动回写。
+
+- 任务编号：T068
+  问题：T068 已用 test-only restart scanner 固定了“只依据本地磁盘事实重建 live ChunkIndex”的最小 contract；T070-T072 也已经把生产 live rebuild、stale staging cleanup 和 quarantine 恢复落地。但当前 `chunks/live/*.chunk` 仍只持久化 payload bytes，本地磁盘上没有额外 sidecar 或状态编码可直接支撑“原始预期 checksum mismatch”“deleted tombstone 持久化”这类恢复判定。
+  影响：如果后续把当前通过误当成“任意 live 文件损坏都能在纯重启扫描阶段自动发现”，仍会高估现有 on-disk facts 的自描述能力；尤其从未被前台读/查触发过的 checksum mismatch，不能仅靠当前 live 文件字节在 rebuild 阶段独立判定。
+  建议后续在哪类任务处理：在后续 scrub/repair 或更强 on-disk state encoding 任务中继续补主动发现和状态编码；不要把当前 quarantine 恢复语义误读成全量 corruption 自发现已完成。
+
+- 任务编号：T069
+  问题：T069 已新增 cross-platform durability matrix test，明确了 Linux 当前已实测的 `fdatasync` / `fsync` / same-filesystem publish / parent directory sync 语义，以及 Windows 当前只能给出 `FlushFileBuffers`、`MoveFileExW`、replace-existing publish contract、directory durability explicit unsupported 的 contract-only / deferred 边界；但当前 Windows publish 生产实现并没有独立 `ReplaceFileW` 路径，directory durability 也仍是 explicit unsupported。
+  影响：如果后续把 T069 的矩阵测试通过误读成“Windows durability 已实机验证完成”，就会高估 `MoveFileExW` replace-existing 与 `ReplaceFileW` 语义等价性，以及目录 durability、sharing violation、long path / UTF-8 path 的真实运行行为。
+  建议后续在哪类任务处理：继续在 `T014-WIN`、`T023-WIN` 及后续 cross-platform/crash matrix 任务里做 Windows 实机验证和必要修正；T069 只固定 contract，不关闭 Windows runtime 风险。
+
+- 任务编号：T070
+  问题：T070 已实现生产 `RebuildIndexFromDisk()`；T071/T072 也已补上 stale staging cleanup 和 quarantine 恢复。但当前恢复仍主要依赖 canonical `chunks/live/*.chunk` 与 `chunks/quarantine/*.chunk` 的 payload facts，`deleted/deleting` 的持久状态与 Windows `std::filesystem` 目录遍历/路径编码实机行为仍未完成。
+  影响：如果后续把当前通过误解成“所有重启恢复语义都已收口”，就会高估 deleted/deleting 等非 live 状态恢复和 Windows 路径语义的完备性；当前保证的是 live final chunk 与已持久化 quarantine facts 可重建。
+  建议后续在哪类任务处理：在后续 Windows 恢复验证、scrub/repair 或更强状态编码任务中继续收口 deleted/deleting 和路径行为边界。
+
+- 任务编号：T071
+  问题：T071 已实现基于 `last_write_time + staging_cleanup_grace_period_ms` 的 stale staging cleanup，但 mtime 精度、未来时间戳、Windows sharing violation / directory delete 行为，以及“阈值内 fresh staging 是否一定代表可保留”仍是后续运行时边界。
+  影响：如果后续把 T071 的通过误解成“所有 staging 恢复和跨平台删除语义都已收口”，就会高估 mtime 判定的稳定性，以及 Windows 上 stale file/empty directory 删除的实机一致性；当前保证的是超过阈值的 staging 能显式清理或显式报错，不是全平台 crash matrix 已完成。
+  建议后续在哪类任务处理：在后续 Windows 恢复验证任务中继续补 sharing violation、mtime 精度、path encoding 与 crash window 语义；如需要更强的新鲜度判定，再单独演进 staging sidecar 或更明确的 recovery facts。
+
+- 任务编号：T072
+  问题：T072 已实现 read/stat 发现坏块后的 quarantine，以及 `RebuildIndexFromDisk()` 对 `chunks/quarantine/` 的恢复；但当前 quarantine 仍依赖前台读/查显式触发，Windows rename/delete/sharing violation 实机行为也未验证。
+  影响：如果后续把 T072 的通过误读成“所有损坏 final chunk 都能在纯重启扫描阶段自动发现并稳定隔离”，就会高估当前主动发现能力和跨平台文件移动语义；当前保证的是坏块一旦被前台发现，会显式隔离且重启后保持不可读。
+  建议后续在哪类任务处理：在 Windows 实机验证和后续 scrub/repair 任务中继续补 crash window、rename/delete 语义与主动巡检发现能力。
+
+- 任务编号：T073
+  问题：T073 已用 test-only crash / recovery matrix 固定了 staging-only、visible live final、stale staging cleanup 顺序、quarantine 恢复等本地目录事实驱动的重启 contract；但当前仍不是 `kill -9` / 断电级 durability 验证，也没有 Windows publish/rename/directory durability 的实机 crash matrix。
+  影响：如果后续把 T073 的测试通过误读成“真实断电级 crash recovery 已完全验证”，就会高估 Linux parent directory sync 与 Windows rename/delete/sharing violation 在真实故障中的运行语义；当前保证的是给定重启后可观察到的本地文件事实，`LocalDiskChunkStore` 如何重建可见性。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN` 及后续 Windows/断电级恢复验证任务中继续补真实 durability crash seam 与平台差异。
+
+- 任务编号：T074
+  问题：T074 已在 cross-platform durability matrix 中补上“rename 后、parent directory sync 前 crash contract”测试，明确 Linux 当前环境下 publish/rename 后 final 文件可见不等于 crash 后 durable，只有 parent directory sync 成功后才把完整 durable-after-crash contract 视为满足；但这仍不是 `kill -9` / 断电级证明，Windows 也仍只有 contract-only / deferred。
+  影响：如果后续把 T074 的通过误读成“Linux 真实断电级语义已完全证明”或“Windows rename/directory durability 已实机验证”，仍会高估 parent directory sync 边界和 Windows publish/runtime 行为的可信度。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN` 及后续真实断电级 durability / Windows crash 验证任务中继续补 runtime 证据和必要修正。
+
+- 任务编号：T075
+  问题：T075 已在 Linux 当前环境下固定 `durable_file` / `LocalDiskChunkStore` 的 path invalid、reserved name、UTF-8 safe path、permission denied 和 disk-full failure-injection contract，并把 Windows long path / UTF-8 / permission denied / disk full / reserved name / sharing violation 继续表达为 contract-only / deferred；但当前仍没有 Windows 实机编译/运行证据，也没有真实磁盘打满或 Windows sharing violation 的 runtime 观测。
+  影响：如果后续把 T075 的通过误读成“Windows 路径/错误分类已实机验证完成”，仍会高估 Win32 路径编码、long path、sharing violation 和磁盘满场景的真实行为；当前保证的是 Linux + contract-only 层面的统一分类，不是 Windows runtime 已收口。
+  建议后续在哪类任务处理：在 `T014-WIN`、`T023-WIN`、`T025-WIN`、`T026-WIN` 及后续 Windows cross-platform/runtime 验证任务中继续补实机证据和必要修正。
+
+- 任务编号：T076
+  问题：T076 已用真实 `GarbageCollector + metadata-driven safety checker + LocalDiskChunkStore::DeleteChunk` 固定 orphan chunk 的 metadata-driven GC 边界：pending-timeout / failed-upload / deleted-object 候选在进入 delete handler 前都必须经过 safety gate，committed live manifest 仍引用时必须阻止删除，metadata 不再引用时才允许删除；但当前 safety checker 仍依赖调用方提供的 metadata 事实源，没有单独证明 metadata snapshot 新鲜度或跨进程/跨节点时间窗。
+  影响：如果后续把 T076 的通过误读成“只要本地看起来 orphan 就能安全删”或“metadata facts 一定足够新鲜”，仍会高估 GC 在陈旧 metadata 视图、竞态窗口和 Windows 删除语义下的可靠性；当前保证的是 delete handler 不得绕过 safety checker，本地 orphan 仍由 metadata live-manifest gate 决定。
+  建议后续在哪类任务处理：在后续真实 metadata fact source、新鲜度协议、Windows 删除语义和更完整后台维护任务中继续收口。
+
+- 任务编号：T078
+  问题：T078 已新增 test-only ScrubManager contract 测试，固定了“background checksum validation 发现 corrupted replica -> quarantine / unhealthy fact -> 产出 repair candidate”的最小语义；但当前 repair candidate 仍只基于 test-only manifest、实时 registry snapshot 和本地 quarantine / missing 事实组合推导，尚未定义生产级 freshness boundary、registry failure cache 或 scrub-task persistence。
+  影响：如果后续把 T078 的通过误读成“生产 ScrubManager 已完成”或“repair candidate 与 metadata manifest / registry facts / quarantine 状态天然一致”，仍会高估跨快照时间窗内 candidate 的可靠性；当前保证的是 contract 测试存在，不是生产后台 scrub / repair 编排已落地。
+  建议后续在哪类任务处理：在 T079/T083 及后续 registry failure cache、ScrubChunk RPC、RepairManager、生产 scrub queue 任务中继续收口 candidate freshness、一致性边界和后台执行语义。
+
+- 任务编号：T079
+  问题：T079 已新增 test-only RepairManager contract 测试，固定了“选择 healthy source / healthy target、target durable success 后才更新 replica facts、durable 失败不更新 facts、already-exists 同 checksum 视为 idempotent success”的最小语义；但当前 repair source / target 选择仍依赖 test-only manifest、实时 registry snapshot 和现有 `PlacementManager`/`ReplicaPolicy` 规则，没有生产级 repair task persistence、failure cache 或 durable-after-write facts publish 协议。
+  影响：如果后续把 T079 的通过误读成“生产 RepairManager 已完成”或“repair facts 与 metadata manifest / registry facts / target durable 顺序天然一致”，仍会高估 repair source/target 选择在快照新鲜度漂移、重复失败 target 和记账时序上的可靠性；当前保证的是 contract 测试存在，不是生产 repair 编排、task persistence 和事实传播已落地。
+  建议后续在哪类任务处理：在 T080/T084/T085 及后续 registry failure cache、RepairChunk RPC、repair task persistence、生产 repair state/facts publish 任务中继续收口 source/target 选择新鲜度、durable-after-write facts 更新顺序和后台执行语义。
+
+- 任务编号：T080
+  问题：T080 已新增 test-only RebalanceManager contract 测试骨架，固定了 target durable -> manifest coordination -> source cleanup 三阶段顺序，以及 target durable 失败、manifest update 失败、cleanup retry、bad source/target 过滤、already-exists durable 幂等和 repeated rebalance 幂等边界；但当前 rebalance 仍只依赖 test-only manifest ledger、实时 registry snapshot 和本地 chunk facts，没有生产级 manifest coordination、rebalance task persistence 或 target durable 后 orphan cleanup 持久化协议。
+  影响：如果后续把 T080 的通过误读成“生产 RebalanceManager 已完成”或“target durable / manifest update / source cleanup 三阶段在多进程、多节点和快照新鲜度漂移下天然一致”，仍会高估 half-migrated target、cleanup candidate 和记账顺序的可靠性；当前保证的是 contract 测试存在，不是生产 rebalance 编排、manifest 接线、task persistence 和 orphan cleanup 持久化已落地。
+  建议后续在哪类任务处理：在 T081/T087/T088 及后续 production manifest coordination、Rebalance RPC、rebalance task persistence、orphan cleanup persistence 和 Windows 实机文件语义验证任务中继续收口 target durable / manifest update / source cleanup 的一致性与持久化边界。
+
+- 任务编号：T081
+  问题：T081 已补齐 `ScrubChunk` / `RepairChunk` proto schema 与 codegen，并同步最小 fake stub 编译面；T082 已补上最小 `ScrubChunk` service/client 适配，但 `RepairChunk` service/client、后台 manager、repair task persistence 和 read-side repair 仍未实现。`RepairChunkRequest` 现允许直接承载 chunk bytes，这一边界后续如果接错到 metadata / Raft 或缺少独立 payload size/streaming 约束，仍可能放大对象 payload 泄漏或大报文风险。
+  影响：如果后续把 T081/T082 的通过误读成“ScrubChunk/RepairChunk 整套流程已可用”或“schema 已自动保证 payload 不会进入 metadata/Raft”，仍会高估当前系统的 RPC 落地与安全边界；当前保证的是 proto 契约存在、`ScrubChunk` 最小适配可用、既有 client/service 测试不被接口扩面打坏，不是生产 repair flow、payload 约束和 task durability 已落地。
+  建议后续在哪类任务处理：在 T083-T085 及后续 read-side repair、repair task persistence、large-payload/streaming 边界和 Windows codegen/runtime 验证任务中继续收口 `RepairChunk`、RepairManager、object commit 决策隔离和真实 repair 语义。
+
+- 任务编号：T082
+  问题：T082 已补上最小 `StorageNodeService::ScrubChunk` / `StorageNodeClient::ScrubChunk` 链路，并固定 healthy/missing/corrupted/quarantined/checksum mismatch 的 service/client 映射；但当前 `ScrubChunk` 仍直接复用 `ChunkStore::StatChunk(verify_checksum=true)`，因此 `quarantine_on_corruption` 不能抑制 T072 的本地 quarantine，`best_effort_cancel` 也仍只是 request/deadline 边界提示，不代表运行中取消传播。当前 expected checksum/size mismatch 仍在 service 侧作为二次比较完成，和 metadata manifest/registry facts 的生产级 freshness 协议尚未接线。
+  影响：如果后续把 T082 的通过误读成“ScrubManager 已完成”或“ScrubChunk 已具备可配置 quarantine、端到端取消传播和全局 freshness 一致性”，仍会高估当前 scrub 事实的新鲜度和控制能力；当前保证的是单节点 RPC 能显式发现坏块并返回 repair-required 事实，不是生产后台 scrub 编排、registry failure cache 或 metadata/registry 一致性协议已落地。
+  建议后续在哪类任务处理：在 T083 及后续 ScrubManager、registry failure cache、metadata manifest freshness、read-side repair 和 Windows quarantine 文件语义验证任务中继续收口 quarantine 开关边界、deadline/cancel 传播和 scrub candidate 一致性。
+
+- 任务编号：T083
+  问题：T083 已补上生产 `ScrubManager` 的 bounded background queue、task submit/drain/stop/query、真实 `ChunkStore::StatChunk` checksum validation、corrupted/lost/under-replicated facts 和 repair candidate 产出；但当前实现仍是进程内 `ChunkStore*` + registry snapshot 编排，不包含 scrub task persistence / restart resume、registry failure cache、跨节点 `ScrubChunk` fan-out 或 metadata manifest freshness 协议。`CancelPending` 也只取消尚未开始的 queued task，运行中任务仍按 best-effort 自然收口。
+  影响：如果后续把 T083 的通过误读成“scrub 后台工业化已全部完成”或“repair candidate 与 metadata manifest / registry facts / quarantine 状态已经具备持久化和全局一致性保证”，仍会高估当前后台 scrub 在进程重启、快照漂移、跨节点故障缓存和 Windows quarantine 文件语义上的可靠性；当前保证的是 bounded queue + task state + candidate 发现链路成立，不是 repair orchestration、task durability 和 freshness protocol 已收口。
+  建议后续在哪类任务处理：在 T084/T085 及后续 RepairManager、RepairChunk copy flow、repair task persistence、registry failure cache、metadata manifest freshness、read-side repair 和 Windows quarantine/runtime 验证任务中继续收口 scrub/repair 协调、新鲜度和重启恢复边界。
+
+- 任务编号：T084
+  问题：T084 已补上生产 `RepairManager` task model，固定了从 scrub/repair candidate 生成 repair task、source_node/target_node 规划、稳定 task_id、state/progress/attempts/last_error 生命周期，以及 submit / lookup / list / cancel / retry / complete / fail 边界；但当前实现仍只做 task model，不执行 `RepairChunk` copy flow、不做 target durable write、不做 metadata manifest coordination，也没有 repair task persistence、failure cache 或 source/target revalidation。
+  影响：如果后续把 T084 的通过误读成“生产 repair 已可执行”或“source/target 规划一旦入 task 就天然持久可靠”，仍会高估 repair 在进程重启、registry facts 漂移、target durable 失败、manifest coordination 和 Windows runtime 语义下的可用性；当前保证的是 repair 生命周期模型和可观察计划事实，不是 copy、durable、metadata 协调或 read-side repair 已落地。
+  建议后续在哪类任务处理：在 T085/T086 及后续 RepairChunk copy flow、under-replicated detection、repair task persistence、metadata manifest coordination、registry failure cache、read-side repair 和 Windows 实机验证任务中继续收口真实 repair 执行、新鲜度和持久化边界。
+
+- 任务编号：T085
+  问题：T085 已补上 `StorageNodeService::RepairChunk` / `StorageNodeClient::RepairChunk` 和生产 `RepairManager::RunTask()` 最小 copy flow，固定了 source checksum/size 验证、target durable 后才 completed、already_exists 同 checksum 幂等成功、冲突/坏源/坏目标显式失败的边界；但当前仍没有 metadata manifest coordination、repair task persistence、restart resume、read-side repair、failure cache 或大 payload/streaming 优化，source/target 仍依赖运行时 registry snapshot 与调用方提供的 manifest/candidate 新鲜度。
+  影响：如果后续把 T085 的通过误读成“repair 已完整闭环”或“task completed 已等价于 manifest 完成协调”，仍会高估 target durable 与 metadata 更新之间时间窗、重启后的任务恢复、跨节点 freshness 漂移以及 Windows 文件 copy/rename/durable 语义下的可靠性；当前保证的是 data-plane copy / durable write 边界成立，不是 metadata 协调、持久化编排或 source cleanup 已落地。
+  建议后续在哪类任务处理：在 T086-T088 及后续 metadata manifest coordination、repair task persistence、read-side repair、registry failure cache、large-payload/streaming 和 Windows 实机验证任务中继续收口 durable-after-write 之后的一致性、恢复和平台语义边界。
+
+- 任务编号：T086
+  问题：T086 已把 `ScrubManager` 的 under-replicated 判断收口为 healthy replica count / required replica count / missing replica count，并新增 `RepairManager::SubmitUnderReplicatedTask()` 把 completed scrub task 转成 repair task；但当前 under-replicated detection 仍依赖 scrub manifest、registry snapshot 和 placement 结果的运行时新鲜度，没有 metadata manifest coordination、repair task persistence、restart resume、failure cache 或 source cleanup 一致性协议。
+  影响：如果后续把 T086 的通过误读成“欠副本治理已完整闭环”或“repeated under-replicated scan 在 manifest/registry 漂移下天然稳定”，仍会高估 repair task 幂等 key、source/target 规划和 target durable 之后的一致性；当前保证的是 under-replicated fact -> repair task 的生产入口存在，不是 metadata 更新、持久化恢复、read-side repair 或 rebalance 已落地。
+  建议后续在哪类任务处理：在 T087/T088 及后续 metadata manifest coordination、repair task persistence、read-side repair、registry failure cache、rebalance/source cleanup 一致性和 Windows 实机验证任务中继续收口 under-replicated fact 的新鲜度、幂等性和 durable-after-write 之后的状态协调。
+
+- 任务编号：T087
+  问题：T087 已新增生产 `RebalanceManager` task model，固定了 capacity/hotspot/new-node-join/draining/maintenance task 的 submit / lookup / list / cancel / fail / complete / retry 边界，以及 source/target registry snapshot 校验、稳定 task_id、queue/task capacity overload 和“默认不自动 copy”语义；T088 又补上了最小 `RunTask()` 占位流程，但 task 仍然没有 persistence、自动后台调度、真实 metadata manifest update 或 crash recovery。
+  影响：如果后续把 T087/T088 的通过误读成“rebalance 后台工业化已全部完成”，仍会高估 task 在进程重启、registry facts 漂移和 source cleanup crash window 下的可靠性；当前保证的是 task model 与占位阶段流程存在，不是自动调度、持久化恢复和真实 metadata 协调已落地。
+  建议后续在哪类任务处理：在 T089 及后续 rebalance task persistence、自动后台调度、registry failure cache、manifest freshness 和 Windows 实机验证任务中继续收口任务恢复与调度边界。
+
+- 任务编号：T088
+  问题：T088 已把生产 `RebalanceManager::RunTask()` 收口为 `target durable -> verify -> manifest coordination callback -> source cleanup` 的最小占位流程，并固定 manifest 失败时生成 cleanup/orphan candidate、cleanup 失败时进入 retryable cleanup 状态、repeated rebalance 跳过已成功阶段；但当前 manifest coordination 仍只是注入式 callback，不是真实 metadata manifest update / Raft 提交，cleanup candidate 也没有持久化协议，source cleanup crash recovery 和 half-migrated target 收口仍未完成。阶段推进仍依赖运行时 registry snapshot、task 内存状态和调用方注入 callbacks 的新鲜度。
+  影响：如果后续把 T088 的通过误读成“rebalance 与 metadata manifest 已完整闭环”或“target durable 后的一致性和 source cleanup crash recovery 已被证明”，仍会高估 manifest/update/source-cleanup 在进程重启、跨节点快照漂移和 Windows 文件语义下的可靠性；当前保证的是阶段顺序与最小 retry/idempotency contract，不是 Raft/metadata 真正接线、持久化恢复或 source cleanup 崩溃恢复已落地。
+  建议后续在哪类任务处理：在 T089 及后续真实 metadata manifest coordination / Raft 提交、rebalance task persistence、source cleanup crash recovery、cleanup candidate persistence、registry failure cache 和 Windows 实机验证任务中继续收口 durable-before-manifest、half-migrated target 与 cleanup 一致性边界。
+
+- 任务编号：T093
+  问题：`RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot` 在早先全量单线程汇总中曾失败，并表现出对运行目录、测试顺序或恢复时序的敏感性：失败后删除其对应的 `build/linux/tests/raft_test_data/raft_snapshot_diagnosis_...` 目录，单线程单测可恢复 PASS。本轮 follow-up 采用“全量前清理测试残留 + 在易错测试 165 开跑前再次删除 diagnosis snapshot/runtime 目录”的方式，分段单线程覆盖完整 225 个测试后已全部 PASS。
+  影响：该问题当前不再阻塞 T093 的 Linux 收口，但仍说明 snapshot diagnosis 路径对运行目录/恢复时序存在敏感性；后续再次执行整套 Linux 全量验证时，如果直接沿用单次大串行命令而不做预清理，仍可能重新暴露同类波动。
+  建议后续在哪类任务处理：在后续最终回归或 CI 稳定性工作中，继续保留“全量前清理测试 runtime 残留”和“对易错 diagnosis 用例做定点清理”的步骤；如果未来在完全无清理干预的全量单线程运行中仍出现复发，再进入专门的 snapshot diagnosis / restart recovery 修复任务继续收紧 fallback / tail replay / `last_applied` 边界。
