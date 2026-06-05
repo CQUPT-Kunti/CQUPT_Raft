@@ -231,6 +231,6 @@
   建议后续在哪类任务处理：在 T089 及后续真实 metadata manifest coordination / Raft 提交、rebalance task persistence、source cleanup crash recovery、cleanup candidate persistence、registry failure cache 和 Windows 实机验证任务中继续收口 durable-before-manifest、half-migrated target 与 cleanup 一致性边界。
 
 - 任务编号：T093
-  问题：在“先清理 snapshot / recovery / runtime 残留，再单线程全量验证”的条件下，`MetadataConcurrencyStressTest.AdmissionRejectsWhenInflightLimitIsReached` 与 `RaftSnapshotRecoveryTest.StandaloneRestartFallsBackToOlderTrustedSnapshotWhenNewestSnapshotIsCorrupted` 已恢复通过；完整汇总只剩 `RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot` 失败。该用例曾出现两种失败形态：一次是在回退旧 snapshot 后 replay committed tail 时抛出 `object does not exist`，另一次是 replay 完成但 `LastAppliedIndex()` 为 `97` 而测试期望 `95`。但在删除该失败用例对应的 `build/linux/tests/raft_test_data/raft_snapshot_diagnosis_...` 目录后，单线程单测复跑又恢复 PASS。
-  影响：当前更像是 snapshot diagnosis 测试对运行目录、测试顺序、恢复时序或场景非确定性敏感，而不是已经确认存在稳定的生产逻辑错误；但由于还没有在这次 targeted cleanup 之后重新执行整套 T093 全量验证，Linux 最终验证仍不能直接宣称完全通过。
-  建议后续在哪类任务处理：优先再执行一次清理后的 T093 全量单线程验证；如果仍复现，再进入专门的 snapshot diagnosis / restart recovery 修复任务，继续收紧 corrupted-newest-snapshot fallback 后的 trusted boundary、tail replay 和 `last_applied` 恢复语义。
+  问题：`RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot` 在早先全量单线程汇总中曾失败，并表现出对运行目录、测试顺序或恢复时序的敏感性：失败后删除其对应的 `build/linux/tests/raft_test_data/raft_snapshot_diagnosis_...` 目录，单线程单测可恢复 PASS。本轮 follow-up 采用“全量前清理测试残留 + 在易错测试 165 开跑前再次删除 diagnosis snapshot/runtime 目录”的方式，分段单线程覆盖完整 225 个测试后已全部 PASS。
+  影响：该问题当前不再阻塞 T093 的 Linux 收口，但仍说明 snapshot diagnosis 路径对运行目录/恢复时序存在敏感性；后续再次执行整套 Linux 全量验证时，如果直接沿用单次大串行命令而不做预清理，仍可能重新暴露同类波动。
+  建议后续在哪类任务处理：在后续最终回归或 CI 稳定性工作中，继续保留“全量前清理测试 runtime 残留”和“对易错 diagnosis 用例做定点清理”的步骤；如果未来在完全无清理干预的全量单线程运行中仍出现复发，再进入专门的 snapshot diagnosis / restart recovery 修复任务继续收紧 fallback / tail replay / `last_applied` 边界。
