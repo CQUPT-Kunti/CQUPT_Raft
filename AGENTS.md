@@ -187,5 +187,5 @@ CTEST_PARALLEL_LEVEL=1 ./test.sh --group all
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read
-`specs/006-remove-kv-metadata-state-machine/plan.md`
+`specs/008-integrated-object-storage-system/plan.md`
 <!-- SPECKIT END -->
