@@ -45,7 +45,7 @@
 
 **CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T008 [P] Add additive ViewNode protobuf contract in `proto/view.proto` with RegisterNode, HeartbeatNode, DiscoverMetadata, DiscoverStorage, and GetClusterView messages
+- [X] T008 [P] Add additive ViewNode protobuf contract in `proto/view.proto` with RegisterNode, HeartbeatNode, DiscoverMetadata, DiscoverStorage, and GetClusterView messages
 - [ ] T009 Update root `CMakeLists.txt` to generate and link `view_proto` while preserving existing `raft_proto`, `metadata_proto`, and `storage_node_proto` semantics
 - [ ] T010 [P] Define cluster config data structures and validation interfaces in `modules/cluster/cluster_config.h`
 - [ ] T011 Implement cluster config validation and deterministic generation in `modules/cluster/cluster_config.cpp`
