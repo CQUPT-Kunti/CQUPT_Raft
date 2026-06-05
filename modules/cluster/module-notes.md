@@ -52,6 +52,7 @@
   - `NodeIdentityLoadOptions` / `NodeIdentityStoreOptions` 表达 load / store 的输入边界。
   - `NodeIdentityLoadResult` / `NodeIdentityStoreResult` / `NodeIdentityLoadOrCreateResult` 表达结果、诊断和 durability 状态边界。
   - `ValidateNodeIdentity` / `ValidateNodeIdentityMatches` / `LoadNodeIdentity` / `StoreNodeIdentity` / `LoadOrCreateNodeIdentity` 仅声明接口，不在头文件实现文件 IO。
+- `node.identity` 当前采用稳定的文本 `key=value` 格式，至少包含 `identity_version`、`cluster_id`、`node_id`、`node_type`、`raft_id`、`created_at_unix_ms`、`source` 字段；格式损坏、缺字段、重复字段或与期望配置冲突时必须返回明确诊断，不能静默覆盖。
 - MetadataNode 必须区分 `node_id` 与 `raft_id`；StorageNode / ViewNode 不应携带 `raft_id`。
 - `node.identity` 已存在且与期望冲突时必须显式失败，不得静默覆盖。
 
@@ -67,6 +68,8 @@
 - endpoint 用于统一描述节点监听地址和服务发现入口。
 - 本模块负责 endpoint 唯一性、格式合理性、角色归属的一致性校验。
 - 本模块不负责 endpoint 健康状态观测，也不负责发现结果分发。
+- 当前 `ClusterConfig` 只有单一 `endpoint` 字段，因此配置生成阶段不能静默分裂 `bind_host` / `advertise_host`。
+- 在未引入独立 listen/advertise 字段前，生成器应要求 `advertise_host` 为空或与 `bind_host` 一致，并对不一致输入返回明确错误。
 
 ### `data_dir`
 
@@ -109,7 +112,8 @@
 
 - 路径处理应优先使用跨平台语义，不把 Linux 专有路径假设写死进共享配置逻辑。
 - Linux 上，如果 contract 声明要求 durable publish，应明确 file flush 和 directory durability 的要求。
-- Windows 上，应明确等价 flush / publish 行为，或者返回明确错误 / 记录较弱保证，不能静默成功。
+- Linux 当前实现边界是：临时文件写入 -> 文件 `fsync` -> 原子 publish -> `data_dir` 目录 `fsync`，只有全部完成后才可报告 durable success。
+- Windows 当前实现边界是：临时文件写入 -> `FlushFileBuffers` -> `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 发布；由于独立目录 durability 还没有等价实现，`required` 模式必须返回明确 `durability_error`，只允许 `best_effort_for_tests` 以 `durable=false` 成功返回，禁止静默伪装成 durable success。
 - identity 文件写入必须有“写入中”和“已发布”边界，避免崩溃后把半写状态当成有效身份。
 - `data_dir`、identity 文件名和路径拼接规则必须保持可诊断，避免平台差异导致身份漂移。
 

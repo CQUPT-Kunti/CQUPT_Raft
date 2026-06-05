@@ -48,19 +48,19 @@
 - [X] T008 [P] Add additive ViewNode protobuf contract in `proto/view.proto` with RegisterNode, HeartbeatNode, DiscoverMetadata, DiscoverStorage, and GetClusterView messages
 - [X] T009 Update root `CMakeLists.txt` to generate and link `view_proto` while preserving existing `raft_proto`, `metadata_proto`, and `storage_node_proto` semantics
 - [X] T010 [P] Define cluster config data structures and validation interfaces in `modules/cluster/cluster_config.h`
-- [ ] T011 Implement cluster config validation and deterministic generation in `modules/cluster/cluster_config.cpp`
+- [X] T011 Implement cluster config validation and deterministic generation in `modules/cluster/cluster_config.cpp`
 - [X] T012 [P] Define durable node identity types and load/store interfaces in `modules/cluster/node_identity.h`
-- [ ] T013 Implement durable `node.identity` load/store with explicit Linux/Windows durability contracts in `modules/cluster/node_identity.cpp`
+- [X] T013 Implement durable `node.identity` load/store with explicit Linux/Windows durability contracts in `modules/cluster/node_identity.cpp`
 - [ ] T014 [P] Add node identity unit tests in `tests/node_identity_test.cpp`
 - [X] T015 [P] Define ViewNode registry and role/status types in `modules/view/view_registry.h`
-- [ ] T016 Implement ViewNode registry registration, heartbeat sequencing, liveness transitions, and discovery snapshots in `modules/view/view_registry.cpp`
+- [X] T016 Implement ViewNode registry registration, heartbeat sequencing, liveness transitions, and discovery snapshots in `modules/view/view_registry.cpp`
 - [ ] T017 [P] Add ViewNode registry unit tests in `tests/view_node_discovery_test.cpp`
 - [ ] T018 Add ViewNode gRPC service adapter declarations in `modules/view/view_service_impl.h`
 - [ ] T019 Implement ViewNode gRPC service adapter in `modules/view/view_service_impl.cpp`
 - [X] T020 [P] Define ViewNode client adapter in `modules/view/view_client.h`
 - [ ] T021 Implement ViewNode client adapter in `modules/view/view_client.cpp`
 - [X] T022 [P] Add payload boundary audit test in `tests/integrated_object_storage_e2e_test.cpp` ensuring metadata commands/manifests never include raw file payload
-- [ ] T023 Replace full-object buffering checksum path with streaming/bounded checksum interfaces in `modules/store/upload/upload_coordinator.h`
+- [X] T023 Replace full-object buffering checksum path with streaming/bounded checksum interfaces in `modules/store/upload/upload_coordinator.h`
 - [ ] T024 Implement streaming/bounded checksum behavior in `modules/store/upload/upload_coordinator.cpp`
 - [ ] T025 Update upload coordinator tests for bounded checksum behavior in `tests/storage_upload_coordinator_test.cpp`
 

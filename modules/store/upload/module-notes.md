@@ -35,6 +35,16 @@
 
 ## 主要结构
 
+### `UploadObjectChecksumFacts`
+
+- 描述对象级 metadata facts：
+  - `size`
+  - `checksum`
+  - `etag`
+- 这些 facts 应由上层 streaming / bounded checksum 路径产出。
+- 真实 payload 不得为了计算对象级 checksum 或 etag 在 coordinator 内拼成整对象。
+- `size` / `checksum` / `etag` 可以进入 WritePlan / CommitObject 这类 metadata/control-plane 请求；chunk bytes 和完整文件内容不能进入 metadata / Raft。
+
 ### `UploadChunkInput`
 
 - 描述单个待上传 chunk 的输入
@@ -44,6 +54,8 @@
   - `payload`
   - `expected_size`
   - `expected_checksum`
+- `payload` 只能表示单个 bounded chunk 的 data-plane buffer，不能承载完整对象常驻内存。
+- `expected_checksum` 可由调用方按 chunk streaming / bounded 路径预先填充；如果后续实现需要现算，也只能对当前 chunk 计算，不能拼接整对象。
 
 ### `UploadCommittedChunk`
 
@@ -87,12 +99,14 @@
   - `object_id`
   - `version`
   - `etag`
+  - `object_checksum`
   - `chunks`
   - `replica_policy`
   - `candidates`
   - `excluded_nodes`
   - `context`
   - `client_time_unix_ms`
+- `etag` 保留为现有 metadata 字段兼容入口；008 新路径应优先使用 `object_checksum` 中由 streaming / bounded 路径产出的对象级 facts。
 
 ### `UploadCoordinatorResult`
 
@@ -243,11 +257,17 @@
 
 - 作用：
   - 决定 `CreateObject` / `CommitObject` 里使用的对象级 `etag`
+- T023 接口边界：
+  - 新调用方应通过 `UploadCoordinatorRequest.object_checksum` 提供对象级 checksum / etag facts
+  - coordinator 不应为了生成 `etag` 把所有 chunk payload 拼接为整对象
+  - 对象级 checksum 的 streaming / bounded 行为由 T024 在 `.cpp` 中落地
 - 当前逻辑：
   - 如果请求已经带了 `etag`，直接使用
   - 否则把所有 chunk payload 按输入顺序拼接后，调用 `ComputeChunkChecksum(...)` 生成一个对象级摘要字符串
 - 边界：
   - 这里只生成 metadata 里的 `etag`，不会把 payload 写进 metadata 或 Raft
+- 风险：
+  - 上述 fallback 是 T024 需要移除或替换的 legacy full-object buffering 实现债，不再是 008 后续 upload 接口契约。
 
 ### `ComputeObjectSize(const UploadCoordinatorRequest&)`
 
