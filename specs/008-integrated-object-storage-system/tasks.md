@@ -29,10 +29,10 @@
 
 **Purpose**: 建立本阶段共享构建、契约和测试入口，不实现业务逻辑。
 
-- [ ] T001 Confirm affected module notes and append 008 ownership boundaries in `modules/store/upload/module-notes.md`, `modules/store/placement/module-notes.md`, `modules/store/node/module-notes.md`
-- [ ] T002 [P] Create `modules/cluster/AGENTS.md` and `modules/cluster/module-notes.md` documenting config/identity ownership and durability boundaries
-- [ ] T003 [P] Create `modules/view/AGENTS.md` and `modules/view/module-notes.md` documenting ViewNode discovery-only authority boundaries
-- [ ] T004 [P] Create `modules/store/transfer/AGENTS.md` and `modules/store/transfer/module-notes.md` documenting client transfer orchestration boundaries
+- [x] T001 Confirm affected module notes and append 008 ownership boundaries in `modules/store/upload/module-notes.md`, `modules/store/placement/module-notes.md`, `modules/store/node/module-notes.md`
+- [X] T002 [P] Create `modules/cluster/AGENTS.md` and `modules/cluster/module-notes.md` documenting config/identity ownership and durability boundaries
+- [x] T003 [P] Create `modules/view/AGENTS.md` and `modules/view/module-notes.md` documenting ViewNode discovery-only authority boundaries
+- [X] T004 [P] Create `modules/store/transfer/AGENTS.md` and `modules/store/transfer/module-notes.md` documenting client transfer orchestration boundaries
 - [ ] T005 Add planned source/header placeholders to `CMakeLists.txt` for `modules/cluster`, `modules/view`, `modules/store/transfer`, and new app targets without changing existing target names
 - [ ] T006 Add planned CTest labels and guarded test target entries for 008 tests in `tests/CMakeLists.txt`
 - [ ] T007 [P] Create test helper ownership notes for integrated cluster helpers in `tests/support/integrated_cluster_test_utils.h`
