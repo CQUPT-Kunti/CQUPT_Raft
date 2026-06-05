@@ -105,15 +105,19 @@ message(STATUS "Using gRPC ${gRPC_VERSION}")
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(STORAGE_NODE_PROTO_RELATIVE proto/storage_node.proto)
 set(STORAGE_NODE_PROTO_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/${STORAGE_NODE_PROTO_RELATIVE})
+set(VIEW_PROTO_RELATIVE proto/view.proto)
+set(VIEW_PROTO_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/${VIEW_PROTO_RELATIVE})
 set(PROTO_FILES
   ${PROTO_DIR}/common.proto
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${VIEW_PROTO_SCHEMA}
   ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GRPC_PROTO_FILES
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${VIEW_PROTO_SCHEMA}
   ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -133,22 +137,26 @@ set(PROTO_SRCS
   ${GENERATED_DIR}/common.pb.cc
   ${GENERATED_DIR}/raft.pb.cc
   ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/view.pb.cc
   ${GENERATED_DIR}/storage_node.pb.cc
 )
 set(PROTO_HDRS
   ${GENERATED_DIR}/common.pb.h
   ${GENERATED_DIR}/raft.pb.h
   ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/view.pb.h
   ${GENERATED_DIR}/storage_node.pb.h
 )
 set(GRPC_SRCS
   ${GENERATED_DIR}/raft.grpc.pb.cc
   ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/view.grpc.pb.cc
   ${GENERATED_DIR}/storage_node.grpc.pb.cc
 )
 set(GRPC_HDRS
   ${GENERATED_DIR}/raft.grpc.pb.h
   ${GENERATED_DIR}/metadata.grpc.pb.h
+  ${GENERATED_DIR}/view.grpc.pb.h
   ${GENERATED_DIR}/storage_node.grpc.pb.h
 )
 
@@ -233,6 +241,24 @@ target_link_libraries(metadata_proto
     gRPC::grpc++
 )
 
+add_library(view_proto
+  ${GENERATED_DIR}/view.pb.cc
+  ${GENERATED_DIR}/view.pb.h
+  ${GENERATED_DIR}/view.grpc.pb.cc
+  ${GENERATED_DIR}/view.grpc.pb.h
+)
+
+target_include_directories(view_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(view_proto
+  PUBLIC
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
 add_library(storage_node_proto
   ${GENERATED_DIR}/storage_node.pb.cc
   ${GENERATED_DIR}/storage_node.pb.h
@@ -255,6 +281,7 @@ if(WIN32)
   target_link_libraries(common_proto PUBLIC Ws2_32)
   target_link_libraries(raft_proto PUBLIC Ws2_32)
   target_link_libraries(metadata_proto PUBLIC Ws2_32)
+  target_link_libraries(view_proto PUBLIC Ws2_32)
   target_link_libraries(storage_node_proto PUBLIC Ws2_32)
 endif()
 
