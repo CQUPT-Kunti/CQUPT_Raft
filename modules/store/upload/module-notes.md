@@ -4,6 +4,15 @@
 
 `modules/store/upload` 承载最小 upload coordinator / helper。
 
+### 008 阶段边界补充
+
+- 本模块负责 upload 协调、WritePlan 执行衔接、chunk 写入结果收集、checksum 边界表达，以及 commit 前后的 data-plane 协作事实汇总。
+- 本模块服务于 Raft metadata control-plane 与 StorageNode data-plane 的接线，但不是对象元数据权威。
+- 本模块可以消费上层给出的 WritePlan、placement 结果、chunk 写入回执和 cleanup candidate，不直接拥有 object manifest 的一致性真相。
+- 本模块不得修改 Raft quorum、leader election、membership change，也不得把任何节点注册结果解释为 Raft voter membership。
+- 本模块不得把完整 payload、chunk bytes 或整对象内容写入 metadata、Raft log、Raft snapshot 或 metadata snapshot。
+- 008 后续演进里，本模块应优先支持 bounded / streaming checksum 与分块文件处理，避免为了对象级 checksum 把整文件一次性放入内存。
+
 当前只负责：
 
 - `CreateObject -> Placement -> WriteChunk -> CommitObject` 的协调顺序
@@ -20,6 +29,9 @@
 - heartbeat / registry
 - Raft 提案逻辑
 - 真实 metadata gRPC client 或真实 StorageNode registry
+- 对象是否可见的最终判定
+- object manifest 的权威持久化
+- ViewNode、cluster config、node.identity 的所有权逻辑
 
 ## 主要结构
 

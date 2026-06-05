@@ -4,6 +4,15 @@
 
 `modules/store/placement` 负责 StorageNode 副本候选节点的本地选择策略。
 
+### 008 阶段边界补充
+
+- 本模块负责基于健康、容量、负载、failure domain 和 replica policy 生成 StorageNode placement 决策。
+- 本模块可以消费 ViewNode 或 `StorageNodeRegistry` 观测到的 StorageNode snapshot，但这些 snapshot 只是 placement 输入事实，不是对象元数据或一致性权威。
+- placement 结果最终服务于 MetadataNode 生成 WritePlan / manifest；本模块本身不决定对象提交或对象可见性。
+- 本模块不得把 ViewNode 注册、StorageNode 健康事实或任何服务发现结果解释为 Raft voter membership。
+- 本模块应持续保留 `excluded_nodes`、`reasons`、决策纪元等 decision reason，便于测试、排障和后续工业化观测。
+- 本模块保持纯策略计算边界，不把写入执行、metadata commit、Raft 共识或真实 payload 处理混进来。
+
 当前只负责：
 
 - `StorageNodePlacementCandidate` 候选节点模型
@@ -22,6 +31,8 @@
 - metadata `CommitObject`
 - Repair / Rebalance / GC
 - Raft / metadata / RPC 接入
+- ViewNode 权威状态管理
+- 对象 manifest 持久化或 commit 决策
 
 ## 枚举与辅助函数
 
