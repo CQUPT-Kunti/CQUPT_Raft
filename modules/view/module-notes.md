@@ -22,6 +22,21 @@ ViewNode 的定位是 discovery-only / observation-only：它可以展示观测�
 
 `ViewNodeRegistry` 对外暴露 `RegisterNode`、`HeartbeatNode`、`LookupNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView`、`size` 和 `config`。查询接口显式接收 `now_unix_ms`，方便后续 T016 使用确定性时间源实现和测试 liveness 计算。该头文件不包含 proto/gRPC 依赖；T018/T019 的 service adapter 负责 proto 字段与 registry 类型之间的映射。
 
+## `view_service_impl.h` 接口边界
+
+`modules/view/view_service_impl.h` 只定义 `view::ViewNodeService::Service` 到 `viewdemo::ViewNodeRegistry` 的 gRPC adapter 声明，不实现 RPC 逻辑。它应：
+
+- 通过依赖注入持有 `ViewNodeRegistry`
+- 为 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 预留同步 unary RPC 处理边界
+- 允许注入确定性时间源，便于后续 T019 和测试控制 `now_unix_ms`
+
+它不负责：
+
+- 修改 Raft membership 或缩小 quorum
+- 决定对象 `COMMITTED` 可见性
+- 读写 StorageNode chunk payload
+- 承载 `view_node_app` 启动和进程生命周期编排
+
 ## `view_registry.cpp` 实现边界
 
 `modules/view/view_registry.cpp` 实现内存 registry，不做持久化、RPC 适配或 app 启动逻辑。当前实现负责注册幂等检查、同 cluster endpoint 冲突诊断、heartbeat sequence 去旧、观测事实刷新、按 `stale_timeout` / `suspect_timeout` / `dead_timeout` 计算 `LIVE` / `STALE` / `SUSPECT` / `DEAD`，以及生成 MetadataNode、StorageNode 和 ClusterView 快照。

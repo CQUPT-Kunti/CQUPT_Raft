@@ -253,28 +253,24 @@
   - 优先使用调用方传入的 `expected_size`
   - 否则退回 `payload.size()`
 
-### `ComputeObjectEtag(const UploadCoordinatorRequest&, std::string*, std::string*)`
+### `ResolveObjectChecksumFacts(const UploadCoordinatorRequest&, UploadObjectChecksumFacts*, std::string*)`
 
 - 作用：
-  - 决定 `CreateObject` / `CommitObject` 里使用的对象级 `etag`
-- T023 接口边界：
-  - 新调用方应通过 `UploadCoordinatorRequest.object_checksum` 提供对象级 checksum / etag facts
-  - coordinator 不应为了生成 `etag` 把所有 chunk payload 拼接为整对象
-  - 对象级 checksum 的 streaming / bounded 行为由 T024 在 `.cpp` 中落地
+  - 生成 `CreateObject` / `CommitObject` 里使用的对象级 `size` / `checksum` / `etag`
+- T024 bounded 实现：
+  - 按 chunk 顺序增量更新对象级 SHA-256，不拼接整对象 payload
+  - 如果 `request.object_checksum.checksum` 已给出，则把增量计算结果与其比对
+  - 如果 `request.object_checksum.size` 已给出，则校验其与所有 chunk payload 大小之和一致
+  - `etag` 选择顺序：
+    - `request.object_checksum.etag`
+    - `request.etag`
+    - 增量计算得到的对象级 checksum 字符串
 - 当前逻辑：
-  - 如果请求已经带了 `etag`，直接使用
-  - 否则把所有 chunk payload 按输入顺序拼接后，调用 `ComputeChunkChecksum(...)` 生成一个对象级摘要字符串
+  - 对每个 chunk 的 `payload` 做 bounded 更新
+  - 最终只产出对象级 metadata facts，不保留整对象 buffer
 - 边界：
-  - 这里只生成 metadata 里的 `etag`，不会把 payload 写进 metadata 或 Raft
-- 风险：
-  - 上述 fallback 是 T024 需要移除或替换的 legacy full-object buffering 实现债，不再是 008 后续 upload 接口契约。
-
-### `ComputeObjectSize(const UploadCoordinatorRequest&)`
-
-- 作用：
-  - 统计对象总大小
-- 当前逻辑：
-  - 累加所有 `chunk.payload.size()`
+  - 这里只生成 metadata facts，不会把 payload 写进 metadata 或 Raft
+  - checksum mismatch 返回可诊断失败，避免带错 metadata facts 进入后续 `CommitObject`
 
 ### `IsDurableWriteSuccess(const WriteChunkResponse&)`
 
@@ -359,8 +355,8 @@
 
 ### 2. 计算对象级 metadata facts
 
-- 先通过 `ComputeObjectSize(...)` 统计对象总大小
-- 再通过 `ComputeObjectEtag(...)` 决定要写进 metadata 的 `etag`
+- 通过 `ResolveObjectChecksumFacts(...)` 按 chunk 顺序增量计算对象级 `size` / `checksum` / `etag`
+- 不拼接整对象 payload，只把最终对象级 metadata facts 带入 `CreateObject` / `CommitObject`
 
 ### 3. 先创建 pending object
 
