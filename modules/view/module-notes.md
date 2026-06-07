@@ -37,6 +37,38 @@ ViewNode 的定位是 discovery-only / observation-only：它可以展示观测�
 - 读写 StorageNode chunk payload
 - 承载 `view_node_app` 启动和进程生命周期编排
 
+## `view_client.h` / `view_client.cpp` 边界
+
+`modules/view/view_client.h` / `modules/view/view_client.cpp` 负责把调用方的 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 请求映射到 `ViewNodeService` unary RPC，并把 proto response 转回本地 `viewdemo` 结果类型。当前实现支持：
+
+- 按 RPC 类型应用默认 timeout，并允许单次调用覆盖 timeout / `wait_for_ready`
+- 返回 transport 诊断（gRPC status code、message、details、effective timeout、retryable）
+- 把 summary / snapshot / warning 转为本地结果与 diagnostics
+
+它不负责：
+
+- 对 leader hint 做强一致解释
+- 决定对象 `COMMITTED` 可见性
+- 修改 Raft membership 或 quorum
+- 操作 StorageNode payload
+- 实现 upload/download 编排或 app 注册/心跳循环
+
+## `view_service_impl.cpp` 实现边界
+
+`modules/view/view_service_impl.cpp` 负责把 `proto/view.proto` 请求映射到 `ViewNodeRegistry`，并把 registry 结果映射回 gRPC response。它应：
+
+- 保持 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 的同步 unary adapter 实现
+- 返回可诊断的 summary、snapshot、warning 和 leader hint 观测信息
+- 支持注入 `now_unix_ms`，避免 discovery / cluster view 实现偷偷依赖不可控全局时间
+- 把 registry 异常收敛为明确的 gRPC internal failure，而不是静默吞掉
+
+它不负责：
+
+- 把注册结果解释为已提交 Raft membership
+- 把 leader hint 当成强一致 leader authority
+- 把 StorageNode discovery 结果解释为对象可见性
+- 保存 object manifest 或 chunk payload
+
 ## `view_registry.cpp` 实现边界
 
 `modules/view/view_registry.cpp` 实现内存 registry，不做持久化、RPC 适配或 app 启动逻辑。当前实现负责注册幂等检查、同 cluster endpoint 冲突诊断、heartbeat sequence 去旧、观测事实刷新、按 `stale_timeout` / `suspect_timeout` / `dead_timeout` 计算 `LIVE` / `STALE` / `SUSPECT` / `DEAD`，以及生成 MetadataNode、StorageNode 和 ClusterView 快照。

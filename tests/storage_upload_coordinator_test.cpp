@@ -73,6 +73,42 @@ namespace
         return request;
     }
 
+    storedemo::UploadCoordinatorRequest MakeChunkedRequest(
+        const std::vector<std::string> &payloads)
+    {
+        storedemo::UploadCoordinatorRequest request;
+        request.request_id = "upload-t025";
+        request.bucket = "bucket-t025";
+        request.object_key = "objects/streaming-boundary.bin";
+        request.object_id = "obj-t025";
+        request.version = 2;
+        request.replica_policy = MakeReplicaPolicy(2, 2);
+        request.candidates = MakeCandidates();
+        request.client_time_unix_ms = 1712002500;
+
+        std::uint64_t offset = 0;
+        for (std::size_t index = 0; index < payloads.size(); ++index)
+        {
+            request.chunks.push_back(storedemo::UploadChunkInput{
+                .chunk_index = static_cast<std::uint32_t>(index),
+                .offset = offset,
+                .payload = payloads[index]});
+            offset += static_cast<std::uint64_t>(payloads[index].size());
+        }
+
+        return request;
+    }
+
+    std::string JoinPayloads(const std::vector<std::string> &payloads)
+    {
+        std::string joined;
+        for (const auto &payload : payloads)
+        {
+            joined += payload;
+        }
+        return joined;
+    }
+
     storedemo::UploadCoordinatorRequest MakeRequestWithPolicy(
         const std::string &payload,
         const std::size_t replica_count,
@@ -271,6 +307,217 @@ namespace
                   result.committed_chunks.front().identity.chunk_id);
         EXPECT_EQ(result.cleanup_candidates.front().chunk.replica_nodes,
                   result.committed_chunks.front().replica_nodes);
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           UploadStreamingChecksumFactsPropagateWithoutPayloadEnteringMetadata)
+    {
+        const std::vector<std::string> payloads = {
+            "streaming-boundary-alpha-0123456789",
+            "streaming-boundary-beta-abcdefghijklmnopqrstuvwxyz"};
+        const auto full_payload = JoinPayloads(payloads);
+        const auto object_checksum =
+            storedemo::test::ComputeStoreChecksumOrThrow(full_payload);
+
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_upload_coordinator_streaming_checksum");
+        auto store1 = MakeStore(temp_dir.Path("stores"), 1);
+        auto store2 = MakeStore(temp_dir.Path("stores"), 2);
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeChunkedRequest(payloads);
+        request.request_id = "upload-t025-streaming";
+        request.bucket = "bucket-t025-streaming";
+        request.object_key = "objects/streaming-boundary.bin";
+        request.object_id = "obj-t025-streaming";
+        request.object_checksum = storedemo::UploadObjectChecksumFacts{
+            .size = static_cast<std::uint64_t>(full_payload.size()),
+            .checksum = object_checksum,
+            .etag = "etag-from-object-checksum"};
+        request.etag = "legacy-etag-should-not-win";
+
+        const auto result = coordinator.UploadObject(request);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_TRUE(metadata_client_->last_create_request().has_value());
+        ASSERT_TRUE(metadata_client_->last_commit_request().has_value());
+
+        const auto &create_request = *metadata_client_->last_create_request();
+        const auto &commit_request = *metadata_client_->last_commit_request();
+        EXPECT_EQ(create_request.size,
+                  static_cast<std::uint64_t>(full_payload.size()));
+        EXPECT_EQ(commit_request.size,
+                  static_cast<std::uint64_t>(full_payload.size()));
+        EXPECT_EQ(create_request.etag, "etag-from-object-checksum");
+        EXPECT_EQ(commit_request.etag, "etag-from-object-checksum");
+        ASSERT_EQ(commit_request.chunks.size(), payloads.size());
+
+        ASSERT_EQ(chunk_writer_->history_for(store1->config().node_id).size(), payloads.size());
+        ASSERT_EQ(chunk_writer_->history_for(store2->config().node_id).size(), payloads.size());
+        EXPECT_EQ(chunk_writer_->history_for(store1->config().node_id)[0].payload,
+                  payloads[0]);
+        EXPECT_EQ(chunk_writer_->history_for(store1->config().node_id)[1].payload,
+                  payloads[1]);
+        EXPECT_NE(chunk_writer_->history_for(store1->config().node_id)[0].payload,
+                  full_payload);
+        EXPECT_NE(chunk_writer_->history_for(store1->config().node_id)[1].payload,
+                  full_payload);
+
+        const auto serialized_create = raftdemo::SerializeMetadataCommand(
+            storedemo::test::MakeCreateObjectCommandWithSizeVersion(
+                create_request.bucket,
+                create_request.object_key,
+                create_request.object_id,
+                create_request.version,
+                create_request.request_id,
+                create_request.size,
+                create_request.etag,
+                create_request.client_time_unix_ms));
+        const auto serialized_commit = raftdemo::SerializeMetadataCommand(
+            storedemo::test::MakeCommitObjectCommandWithChunksVersion(
+                commit_request.bucket,
+                commit_request.object_key,
+                commit_request.object_id,
+                commit_request.version,
+                commit_request.request_id,
+                commit_request.size,
+                commit_request.etag,
+                {
+                    raftdemo::ChunkRef{
+                        .chunk_id = commit_request.chunks[0].identity.chunk_id,
+                        .offset = commit_request.chunks[0].offset,
+                        .size = commit_request.chunks[0].size,
+                        .replica_nodes = commit_request.chunks[0].replica_nodes,
+                        .checksum = commit_request.chunks[0].checksum.value},
+                    raftdemo::ChunkRef{
+                        .chunk_id = commit_request.chunks[1].identity.chunk_id,
+                        .offset = commit_request.chunks[1].offset,
+                        .size = commit_request.chunks[1].size,
+                        .replica_nodes = commit_request.chunks[1].replica_nodes,
+                        .checksum = commit_request.chunks[1].checksum.value}},
+                commit_request.client_time_unix_ms));
+        EXPECT_EQ(serialized_create.find(payloads[0]), std::string::npos);
+        EXPECT_EQ(serialized_create.find(payloads[1]), std::string::npos);
+        EXPECT_EQ(serialized_commit.find(payloads[0]), std::string::npos);
+        EXPECT_EQ(serialized_commit.find(payloads[1]), std::string::npos);
+        EXPECT_EQ(serialized_commit.find(full_payload), std::string::npos);
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           UploadWithoutExplicitEtagUsesStreamingObjectChecksumAsMetadataFact)
+    {
+        const std::vector<std::string> payloads = {
+            "chunk-a-bounded-checksum",
+            "chunk-b-bounded-checksum",
+            "chunk-c-bounded-checksum"};
+        const auto full_payload = JoinPayloads(payloads);
+        const auto expected_checksum =
+            storedemo::test::ComputeStoreChecksumOrThrow(full_payload);
+
+        storedemo::test::ScopedStoreTestDir temp_dir(
+            "storage_upload_coordinator_computed_etag");
+        auto store1 = MakeStore(temp_dir.Path("stores"), 1);
+        auto store2 = MakeStore(temp_dir.Path("stores"), 2);
+        (void)store1;
+        (void)store2;
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeChunkedRequest(payloads);
+        request.request_id = "upload-t025-computed-etag";
+        request.bucket = "bucket-t025-computed-etag";
+        request.object_key = "objects/computed-etag.bin";
+        request.object_id = "obj-t025-computed-etag";
+
+        const auto result = coordinator.UploadObject(request);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_TRUE(metadata_client_->last_create_request().has_value());
+        ASSERT_TRUE(metadata_client_->last_commit_request().has_value());
+        EXPECT_EQ(metadata_client_->last_create_request()->etag,
+                  expected_checksum.value);
+        EXPECT_EQ(metadata_client_->last_commit_request()->etag,
+                  expected_checksum.value);
+        EXPECT_EQ(metadata_client_->last_create_request()->size,
+                  static_cast<std::uint64_t>(full_payload.size()));
+        EXPECT_EQ(metadata_client_->last_commit_request()->size,
+                  static_cast<std::uint64_t>(full_payload.size()));
+
+        const auto head = machine_.HeadObject(
+            {.bucket = request.bucket, .object_key = request.object_key});
+        ASSERT_EQ(head.result.code, raftdemo::MetadataStatusCode::kOk);
+        ASSERT_TRUE(head.record.has_value());
+        EXPECT_EQ(head.record->etag, expected_checksum.value);
+        EXPECT_EQ(head.record->size, full_payload.size());
+        ASSERT_EQ(head.record->chunks.size(), payloads.size());
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           ObjectChecksumMismatchFailsBeforeMetadataCreateOrChunkWrite)
+    {
+        const std::vector<std::string> payloads = {
+            "checksum-mismatch-alpha",
+            "checksum-mismatch-beta"};
+        const auto full_payload = JoinPayloads(payloads);
+        auto wrong_checksum =
+            storedemo::test::ComputeStoreChecksumOrThrow(full_payload);
+        wrong_checksum.value.front() =
+            wrong_checksum.value.front() == '0' ? '1' : '0';
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeChunkedRequest(payloads);
+        request.request_id = "upload-t025-mismatch";
+        request.bucket = "bucket-t025-mismatch";
+        request.object_key = "objects/checksum-mismatch.bin";
+        request.object_id = "obj-t025-mismatch";
+        request.object_checksum = storedemo::UploadObjectChecksumFacts{
+            .size = static_cast<std::uint64_t>(full_payload.size()),
+            .checksum = wrong_checksum,
+            .etag = "etag-ignored-on-mismatch"};
+
+        const auto result = coordinator.UploadObject(request);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kChecksumMismatch);
+        EXPECT_EQ(result.error_detail, "object checksum mismatch");
+        EXPECT_EQ(metadata_client_->create_calls(), 0U);
+        EXPECT_EQ(metadata_client_->commit_calls(), 0U);
+        EXPECT_EQ(chunk_writer_->write_calls(), 0U);
+        EXPECT_FALSE(metadata_client_->last_create_request().has_value());
+        EXPECT_FALSE(metadata_client_->last_commit_request().has_value());
+    }
+
+    TEST_F(StorageUploadCoordinatorTest,
+           ObjectChecksumSizeMismatchFailsBeforeMetadataCreateOrChunkWrite)
+    {
+        const std::vector<std::string> payloads = {
+            "checksum-size-alpha",
+            "checksum-size-beta"};
+        const auto full_payload = JoinPayloads(payloads);
+        auto object_checksum =
+            storedemo::test::ComputeStoreChecksumOrThrow(full_payload);
+
+        storedemo::UploadCoordinator coordinator(metadata_client_, chunk_writer_);
+        auto request = MakeChunkedRequest(payloads);
+        request.request_id = "upload-t025-size-mismatch";
+        request.bucket = "bucket-t025-size-mismatch";
+        request.object_key = "objects/checksum-size-mismatch.bin";
+        request.object_id = "obj-t025-size-mismatch";
+        request.object_checksum = storedemo::UploadObjectChecksumFacts{
+            .size = static_cast<std::uint64_t>(full_payload.size() + 1U),
+            .checksum = object_checksum,
+            .etag = "etag-ignored-on-size-mismatch"};
+
+        const auto result = coordinator.UploadObject(request);
+
+        EXPECT_EQ(result.status, storedemo::StorageNodeStatusCode::kInvalidArgument);
+        EXPECT_EQ(result.error_detail,
+                  "object_checksum.size must match summed chunk payload size");
+        EXPECT_EQ(metadata_client_->create_calls(), 0U);
+        EXPECT_EQ(metadata_client_->commit_calls(), 0U);
+        EXPECT_EQ(chunk_writer_->write_calls(), 0U);
+        EXPECT_FALSE(metadata_client_->last_create_request().has_value());
+        EXPECT_FALSE(metadata_client_->last_commit_request().has_value());
     }
 
     TEST_F(StorageUploadCoordinatorTest, PlacementFailureSkipsWritesAndCommit)
