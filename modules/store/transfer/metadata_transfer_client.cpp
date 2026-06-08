@@ -13,6 +13,9 @@ namespace storedemo
 {
     namespace
     {
+        // NOT_LEADER 只做一次基于 leader hint 的有限重试，避免无界阻塞。
+        constexpr int kMaxMetadataNotLeaderAttempts = 2;
+
         bool IsRetryableGrpcFailure(const grpc::StatusCode code)
         {
             return code == grpc::StatusCode::DEADLINE_EXCEEDED ||
@@ -50,6 +53,20 @@ namespace storedemo
         {
             return message.find("majority") != std::string_view::npos ||
                    message.find("quorum") != std::string_view::npos;
+        }
+
+        std::string AppendMessageDetail(const std::string_view message,
+                                        const std::string_view detail)
+        {
+            if (detail.empty())
+            {
+                return std::string(message);
+            }
+            if (message.empty())
+            {
+                return std::string(detail);
+            }
+            return std::string(message) + " [" + std::string(detail) + "]";
         }
 
         MetadataTransferStatusCode FromProtoStatusCode(
@@ -549,6 +566,59 @@ namespace storedemo
             }
             return grpc::InsecureChannelCredentials();
         }
+
+        std::unique_ptr<raft::MetadataService::StubInterface>
+        MakeMetadataStubForEndpoint(const std::string &target_endpoint,
+                                    const MetadataTransferClientConfig &config)
+        {
+            auto channel = grpc::CreateChannel(target_endpoint,
+                                               ResolveCredentials(config));
+            return MakeMetadataStub(std::move(channel));
+        }
+
+        std::optional<std::string> ResolveRedirectedMetadataEndpoint(
+            const MetadataTransferSummary &summary,
+            const std::string_view current_endpoint,
+            std::string *reason)
+        {
+            // leader hint 只是候选 endpoint；缺失、为空或指回当前地址都视为不可安全重试。
+            if (!summary.leader_hint.has_value())
+            {
+                if (reason != nullptr)
+                {
+                    *reason =
+                        "MetadataService returned NOT_LEADER without a usable leader hint; metadata_transfer_client will not guess a new leader";
+                }
+                return std::nullopt;
+            }
+
+            const std::string_view hinted_endpoint =
+                summary.leader_hint->leader_address;
+            if (hinted_endpoint.empty())
+            {
+                if (reason != nullptr)
+                {
+                    *reason =
+                        "MetadataService returned NOT_LEADER but leader hint endpoint is empty; metadata_transfer_client will stop without discovery fallback";
+                }
+                return std::nullopt;
+            }
+            if (hinted_endpoint == current_endpoint)
+            {
+                if (reason != nullptr)
+                {
+                    *reason =
+                        "MetadataService returned NOT_LEADER but leader hint still points to the current endpoint; treating leader hint as stale";
+                }
+                return std::nullopt;
+            }
+
+            if (reason != nullptr)
+            {
+                reason->clear();
+            }
+            return std::string(hinted_endpoint);
+        }
     }
 
     MetadataTransferClient::MetadataTransferClient(
@@ -624,65 +694,134 @@ namespace storedemo
         proto_request.set_etag(request.expected_object_checksum.etag);
         proto_request.set_client_time_unix_ms(request.client_time_unix_ms);
 
-        grpc::ClientContext context;
-        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+        std::string current_endpoint = target_endpoint_;
+        std::unique_ptr<raft::MetadataService::StubInterface> redirected_stub;
 
-        raft::CreateObjectResponse proto_response;
-        const grpc::Status grpc_status =
-            stub_->CreateObject(&context, proto_request, &proto_response);
-        if (!grpc_status.ok())
+        for (int attempt = 0; attempt < kMaxMetadataNotLeaderAttempts; ++attempt)
         {
-            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
-            FillTransportFailureSummary(call_result.rpc,
-                                        "CreateObject RPC failed: " +
-                                            grpc_status.error_message(),
-                                        &call_result.result.summary);
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                                 request.bucket,
+                                                 request.object_key,
+                                                 request.object_id,
+                                                 current_endpoint,
+                                                 effective_timeout,
+                                                 wait_for_ready);
+
+            grpc::ClientContext context;
+            ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+            raft::CreateObjectResponse proto_response;
+            auto *stub = redirected_stub != nullptr ? redirected_stub.get()
+                                                    : stub_.get();
+            const grpc::Status grpc_status =
+                stub->CreateObject(&context, proto_request, &proto_response);
+            if (!grpc_status.ok())
+            {
+                FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+                FillTransportFailureSummary(call_result.rpc,
+                                            "CreateObject RPC failed: " +
+                                                grpc_status.error_message(),
+                                            &call_result.result.summary);
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+                return call_result;
+            }
+
+            FillSummaryFromProto(proto_response.summary(),
+                                 &call_result.result.summary);
+            call_result.result.idempotent =
+                call_result.result.summary.status ==
+                MetadataTransferStatusCode::kIdempotentReplay;
+
+            if (call_result.result.summary.status ==
+                MetadataTransferStatusCode::kNotLeader)
+            {
+                std::string retry_reason;
+                const auto redirected_endpoint =
+                    ResolveRedirectedMetadataEndpoint(call_result.result.summary,
+                                                      current_endpoint,
+                                                      &retry_reason);
+                MetadataTransferDiagnostic diagnostic =
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc);
+                if (redirected_endpoint.has_value() &&
+                    attempt + 1 < kMaxMetadataNotLeaderAttempts)
+                {
+                    diagnostic.message = AppendMessageDetail(
+                        diagnostic.message,
+                        "metadata_transfer_client will retry against leader hint endpoint " +
+                            *redirected_endpoint + " (attempt " +
+                            std::to_string(attempt + 2) + "/" +
+                            std::to_string(kMaxMetadataNotLeaderAttempts) + ")");
+                    call_result.result.diagnostics.push_back(
+                        std::move(diagnostic));
+                    redirected_stub = MakeMetadataStubForEndpoint(
+                        *redirected_endpoint,
+                        config_);
+                    current_endpoint = *redirected_endpoint;
+                    continue;
+                }
+
+                if (redirected_endpoint.has_value())
+                {
+                    retry_reason = "MetadataService kept returning NOT_LEADER after " +
+                                   std::to_string(kMaxMetadataNotLeaderAttempts) +
+                                   " attempts; latest leader hint endpoint=" +
+                                   *redirected_endpoint;
+                }
+                diagnostic.message = AppendMessageDetail(diagnostic.message,
+                                                         retry_reason);
+                call_result.result.summary.message = diagnostic.message;
+                call_result.result.diagnostics.push_back(
+                    std::move(diagnostic));
+                return call_result;
+            }
+
+            call_result.result.created_pending = call_result.result.summary.ok();
+            if (call_result.result.summary.ok())
+            {
+                TransferWritePlan write_plan;
+                write_plan.request_id = request.request_id;
+                write_plan.bucket = request.bucket;
+                write_plan.object_key = request.object_key;
+                write_plan.object_id = request.object_id;
+                write_plan.version = proto_response.object().version();
+                write_plan.object_checksum = request.expected_object_checksum;
+                if (!proto_response.object().etag().empty())
+                {
+                    write_plan.object_checksum.etag =
+                        proto_response.object().etag();
+                }
+                if (proto_response.object().size() != 0)
+                {
+                    write_plan.object_checksum.size =
+                        proto_response.object().size();
+                }
+                if (!write_plan.object_checksum.checksum.IsSet() &&
+                    LooksLikeSha256Hex(write_plan.object_checksum.etag))
+                {
+                    write_plan.object_checksum.checksum =
+                        InferChunkChecksum(write_plan.object_checksum.size,
+                                           write_plan.object_checksum.etag);
+                }
+                write_plan.created_at_unix_ms =
+                    proto_response.object().create_time();
+                write_plan.expires_at_unix_ms = 0;
+                call_result.result.write_plan = std::move(write_plan);
+            }
+
+            if (redirected_stub != nullptr)
+            {
+                stub_ = std::move(redirected_stub);
+                target_endpoint_ = current_endpoint;
+            }
+
+            if (!call_result.result.summary.ok() ||
+                call_result.result.summary.leader_hint.has_value())
+            {
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            }
             return call_result;
-        }
-
-        FillSummaryFromProto(proto_response.summary(),
-                             &call_result.result.summary);
-        call_result.result.created_pending = call_result.result.summary.ok();
-        call_result.result.idempotent =
-            call_result.result.summary.status ==
-            MetadataTransferStatusCode::kIdempotentReplay;
-
-        if (call_result.result.summary.ok())
-        {
-            TransferWritePlan write_plan;
-            write_plan.request_id = request.request_id;
-            write_plan.bucket = request.bucket;
-            write_plan.object_key = request.object_key;
-            write_plan.object_id = request.object_id;
-            write_plan.version = proto_response.object().version();
-            write_plan.object_checksum = request.expected_object_checksum;
-            if (!proto_response.object().etag().empty())
-            {
-                write_plan.object_checksum.etag = proto_response.object().etag();
-            }
-            if (proto_response.object().size() != 0)
-            {
-                write_plan.object_checksum.size = proto_response.object().size();
-            }
-            if (!write_plan.object_checksum.checksum.IsSet() &&
-                LooksLikeSha256Hex(write_plan.object_checksum.etag))
-            {
-                write_plan.object_checksum.checksum =
-                    InferChunkChecksum(write_plan.object_checksum.size,
-                                       write_plan.object_checksum.etag);
-            }
-            write_plan.created_at_unix_ms = proto_response.object().create_time();
-            write_plan.expires_at_unix_ms = 0;
-            call_result.result.write_plan = std::move(write_plan);
-        }
-
-        if (!call_result.result.summary.ok() ||
-            call_result.result.summary.leader_hint.has_value())
-        {
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
         }
 
         return call_result;
@@ -744,44 +883,111 @@ namespace storedemo
             proto_chunk->set_checksum(chunk.checksum.value);
         }
 
-        grpc::ClientContext context;
-        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+        std::string current_endpoint = target_endpoint_;
+        std::unique_ptr<raft::MetadataService::StubInterface> redirected_stub;
 
-        raft::CommitObjectResponse proto_response;
-        const grpc::Status grpc_status =
-            stub_->CommitObject(&context, proto_request, &proto_response);
-        if (!grpc_status.ok())
+        for (int attempt = 0; attempt < kMaxMetadataNotLeaderAttempts; ++attempt)
         {
-            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
-            FillTransportFailureSummary(call_result.rpc,
-                                        "CommitObject RPC failed: " +
-                                            grpc_status.error_message(),
-                                        &call_result.result.summary);
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                                 request.bucket,
+                                                 request.object_key,
+                                                 request.object_id,
+                                                 current_endpoint,
+                                                 effective_timeout,
+                                                 wait_for_ready);
+
+            grpc::ClientContext context;
+            ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+            raft::CommitObjectResponse proto_response;
+            auto *stub = redirected_stub != nullptr ? redirected_stub.get()
+                                                    : stub_.get();
+            const grpc::Status grpc_status =
+                stub->CommitObject(&context, proto_request, &proto_response);
+            if (!grpc_status.ok())
+            {
+                FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+                FillTransportFailureSummary(call_result.rpc,
+                                            "CommitObject RPC failed: " +
+                                                grpc_status.error_message(),
+                                            &call_result.result.summary);
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+                return call_result;
+            }
+
+            FillSummaryFromProto(proto_response.summary(),
+                                 &call_result.result.summary);
+            call_result.result.idempotent =
+                call_result.result.summary.status ==
+                MetadataTransferStatusCode::kIdempotentReplay;
+
+            if (call_result.result.summary.status ==
+                MetadataTransferStatusCode::kNotLeader)
+            {
+                std::string retry_reason;
+                const auto redirected_endpoint =
+                    ResolveRedirectedMetadataEndpoint(call_result.result.summary,
+                                                      current_endpoint,
+                                                      &retry_reason);
+                MetadataTransferDiagnostic diagnostic =
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc);
+                if (redirected_endpoint.has_value() &&
+                    attempt + 1 < kMaxMetadataNotLeaderAttempts)
+                {
+                    diagnostic.message = AppendMessageDetail(
+                        diagnostic.message,
+                        "metadata_transfer_client will retry against leader hint endpoint " +
+                            *redirected_endpoint + " (attempt " +
+                            std::to_string(attempt + 2) + "/" +
+                            std::to_string(kMaxMetadataNotLeaderAttempts) + ")");
+                    call_result.result.diagnostics.push_back(
+                        std::move(diagnostic));
+                    redirected_stub = MakeMetadataStubForEndpoint(
+                        *redirected_endpoint,
+                        config_);
+                    current_endpoint = *redirected_endpoint;
+                    continue;
+                }
+
+                if (redirected_endpoint.has_value())
+                {
+                    retry_reason = "MetadataService kept returning NOT_LEADER after " +
+                                   std::to_string(kMaxMetadataNotLeaderAttempts) +
+                                   " attempts; latest leader hint endpoint=" +
+                                   *redirected_endpoint;
+                }
+                diagnostic.message = AppendMessageDetail(diagnostic.message,
+                                                         retry_reason);
+                call_result.result.summary.message = diagnostic.message;
+                call_result.result.diagnostics.push_back(
+                    std::move(diagnostic));
+                return call_result;
+            }
+
+            if (call_result.result.summary.ok() &&
+                proto_response.object().state() ==
+                    raft::METADATA_OBJECT_STATE_COMMITTED)
+            {
+                call_result.result.committed_manifest =
+                    BuildCommittedManifest(proto_response.object());
+                call_result.result.committed = true;
+                call_result.result.visible_for_read = true;
+            }
+
+            if (redirected_stub != nullptr)
+            {
+                stub_ = std::move(redirected_stub);
+                target_endpoint_ = current_endpoint;
+            }
+
+            if (!call_result.result.summary.ok() ||
+                call_result.result.summary.leader_hint.has_value())
+            {
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            }
             return call_result;
-        }
-
-        FillSummaryFromProto(proto_response.summary(),
-                             &call_result.result.summary);
-        call_result.result.idempotent =
-            call_result.result.summary.status ==
-            MetadataTransferStatusCode::kIdempotentReplay;
-
-        if (call_result.result.summary.ok() &&
-            proto_response.object().state() == raft::METADATA_OBJECT_STATE_COMMITTED)
-        {
-            call_result.result.committed_manifest =
-                BuildCommittedManifest(proto_response.object());
-            call_result.result.committed = true;
-            call_result.result.visible_for_read = true;
-        }
-
-        if (!call_result.result.summary.ok() ||
-            call_result.result.summary.leader_hint.has_value())
-        {
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
         }
 
         return call_result;
@@ -834,39 +1040,109 @@ namespace storedemo
             proto_request.set_version(*request.version);
         }
 
-        grpc::ClientContext context;
-        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+        std::string current_endpoint = target_endpoint_;
+        std::unique_ptr<raft::MetadataService::StubInterface> redirected_stub;
 
-        raft::HeadObjectResponse proto_response;
-        const grpc::Status grpc_status =
-            stub_->HeadObject(&context, proto_request, &proto_response);
-        if (!grpc_status.ok())
+        for (int attempt = 0; attempt < kMaxMetadataNotLeaderAttempts; ++attempt)
         {
-            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
-            FillTransportFailureSummary(call_result.rpc,
-                                        "HeadObject RPC failed: " +
-                                            grpc_status.error_message(),
-                                        &call_result.result.summary);
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                                 request.bucket,
+                                                 request.object_key,
+                                                 request.object_id,
+                                                 current_endpoint,
+                                                 effective_timeout,
+                                                 wait_for_ready);
+
+            grpc::ClientContext context;
+            ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+            raft::HeadObjectResponse proto_response;
+            auto *stub = redirected_stub != nullptr ? redirected_stub.get()
+                                                    : stub_.get();
+            const grpc::Status grpc_status =
+                stub->HeadObject(&context, proto_request, &proto_response);
+            if (!grpc_status.ok())
+            {
+                FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+                FillTransportFailureSummary(call_result.rpc,
+                                            "HeadObject RPC failed: " +
+                                                grpc_status.error_message(),
+                                            &call_result.result.summary);
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+                return call_result;
+            }
+
+            FillSummaryFromProto(proto_response.summary(),
+                                 &call_result.result.summary);
+            if (call_result.result.summary.status ==
+                MetadataTransferStatusCode::kNotLeader)
+            {
+                std::string retry_reason;
+                const auto redirected_endpoint =
+                    ResolveRedirectedMetadataEndpoint(call_result.result.summary,
+                                                      current_endpoint,
+                                                      &retry_reason);
+                MetadataTransferDiagnostic diagnostic =
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc);
+                if (redirected_endpoint.has_value() &&
+                    attempt + 1 < kMaxMetadataNotLeaderAttempts)
+                {
+                    diagnostic.message = AppendMessageDetail(
+                        diagnostic.message,
+                        "metadata_transfer_client will retry against leader hint endpoint " +
+                            *redirected_endpoint + " (attempt " +
+                            std::to_string(attempt + 2) + "/" +
+                            std::to_string(kMaxMetadataNotLeaderAttempts) + ")");
+                    call_result.result.diagnostics.push_back(
+                        std::move(diagnostic));
+                    redirected_stub = MakeMetadataStubForEndpoint(
+                        *redirected_endpoint,
+                        config_);
+                    current_endpoint = *redirected_endpoint;
+                    continue;
+                }
+
+                if (redirected_endpoint.has_value())
+                {
+                    retry_reason = "MetadataService kept returning NOT_LEADER after " +
+                                   std::to_string(kMaxMetadataNotLeaderAttempts) +
+                                   " attempts; latest leader hint endpoint=" +
+                                   *redirected_endpoint;
+                }
+                diagnostic.message = AppendMessageDetail(diagnostic.message,
+                                                         retry_reason);
+                call_result.result.summary.message = diagnostic.message;
+                call_result.result.diagnostics.push_back(
+                    std::move(diagnostic));
+                return call_result;
+            }
+
+            call_result.result.found = proto_response.found();
+            if (proto_response.found())
+            {
+                call_result.result.object =
+                    BuildTransferObjectHead(proto_response.object());
+                call_result.result.visible_for_read =
+                    call_result.result.object->state ==
+                    raftdemo::ObjectState::COMMITTED;
+            }
+
+            if (redirected_stub != nullptr)
+            {
+                stub_ = std::move(redirected_stub);
+                target_endpoint_ = current_endpoint;
+            }
+
+            if (!call_result.result.summary.ok() ||
+                call_result.result.summary.leader_hint.has_value())
+            {
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            }
+
+            (void)request.require_committed_visible;
             return call_result;
-        }
-
-        FillSummaryFromProto(proto_response.summary(),
-                             &call_result.result.summary);
-        call_result.result.found = proto_response.found();
-        if (proto_response.found())
-        {
-            call_result.result.object = BuildTransferObjectHead(proto_response.object());
-            call_result.result.visible_for_read =
-                call_result.result.object->state == raftdemo::ObjectState::COMMITTED;
-        }
-
-        if (!call_result.result.summary.ok() ||
-            call_result.result.summary.leader_hint.has_value())
-        {
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
         }
 
         (void)request.require_committed_visible;
@@ -920,39 +1196,107 @@ namespace storedemo
             proto_request.set_version(*request.version);
         }
 
-        grpc::ClientContext context;
-        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+        std::string current_endpoint = target_endpoint_;
+        std::unique_ptr<raft::MetadataService::StubInterface> redirected_stub;
 
-        raft::HeadObjectResponse proto_response;
-        const grpc::Status grpc_status =
-            stub_->HeadObject(&context, proto_request, &proto_response);
-        if (!grpc_status.ok())
+        for (int attempt = 0; attempt < kMaxMetadataNotLeaderAttempts; ++attempt)
         {
-            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
-            FillTransportFailureSummary(call_result.rpc,
-                                        "HeadObject RPC failed: " +
-                                            grpc_status.error_message(),
-                                        &call_result.result.summary);
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                                 request.bucket,
+                                                 request.object_key,
+                                                 request.object_id,
+                                                 current_endpoint,
+                                                 effective_timeout,
+                                                 wait_for_ready);
+
+            grpc::ClientContext context;
+            ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+            raft::HeadObjectResponse proto_response;
+            auto *stub = redirected_stub != nullptr ? redirected_stub.get()
+                                                    : stub_.get();
+            const grpc::Status grpc_status =
+                stub->HeadObject(&context, proto_request, &proto_response);
+            if (!grpc_status.ok())
+            {
+                FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+                FillTransportFailureSummary(call_result.rpc,
+                                            "HeadObject RPC failed: " +
+                                                grpc_status.error_message(),
+                                            &call_result.result.summary);
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+                return call_result;
+            }
+
+            FillSummaryFromProto(proto_response.summary(),
+                                 &call_result.result.summary);
+            if (call_result.result.summary.status ==
+                MetadataTransferStatusCode::kNotLeader)
+            {
+                std::string retry_reason;
+                const auto redirected_endpoint =
+                    ResolveRedirectedMetadataEndpoint(call_result.result.summary,
+                                                      current_endpoint,
+                                                      &retry_reason);
+                MetadataTransferDiagnostic diagnostic =
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc);
+                if (redirected_endpoint.has_value() &&
+                    attempt + 1 < kMaxMetadataNotLeaderAttempts)
+                {
+                    diagnostic.message = AppendMessageDetail(
+                        diagnostic.message,
+                        "metadata_transfer_client will retry against leader hint endpoint " +
+                            *redirected_endpoint + " (attempt " +
+                            std::to_string(attempt + 2) + "/" +
+                            std::to_string(kMaxMetadataNotLeaderAttempts) + ")");
+                    call_result.result.diagnostics.push_back(
+                        std::move(diagnostic));
+                    redirected_stub = MakeMetadataStubForEndpoint(
+                        *redirected_endpoint,
+                        config_);
+                    current_endpoint = *redirected_endpoint;
+                    continue;
+                }
+
+                if (redirected_endpoint.has_value())
+                {
+                    retry_reason = "MetadataService kept returning NOT_LEADER after " +
+                                   std::to_string(kMaxMetadataNotLeaderAttempts) +
+                                   " attempts; latest leader hint endpoint=" +
+                                   *redirected_endpoint;
+                }
+                diagnostic.message = AppendMessageDetail(diagnostic.message,
+                                                         retry_reason);
+                call_result.result.summary.message = diagnostic.message;
+                call_result.result.diagnostics.push_back(
+                    std::move(diagnostic));
+                return call_result;
+            }
+
+            call_result.result.found = proto_response.found();
+            if (proto_response.found())
+            {
+                call_result.result.manifest =
+                    BuildCommittedManifest(proto_response.object());
+                call_result.result.visible_for_read = true;
+            }
+
+            if (redirected_stub != nullptr)
+            {
+                stub_ = std::move(redirected_stub);
+                target_endpoint_ = current_endpoint;
+            }
+
+            if (!call_result.result.summary.ok() ||
+                call_result.result.summary.leader_hint.has_value())
+            {
+                call_result.result.diagnostics.push_back(
+                    MakeDiagnostic(call_result.result.summary, call_result.rpc));
+            }
+
+            (void)request.require_committed_visible;
             return call_result;
-        }
-
-        FillSummaryFromProto(proto_response.summary(),
-                             &call_result.result.summary);
-        call_result.result.found = proto_response.found();
-        if (proto_response.found())
-        {
-            call_result.result.manifest =
-                BuildCommittedManifest(proto_response.object());
-            call_result.result.visible_for_read = true;
-        }
-
-        if (!call_result.result.summary.ok() ||
-            call_result.result.summary.leader_hint.has_value())
-        {
-            call_result.result.diagnostics.push_back(
-                MakeDiagnostic(call_result.result.summary, call_result.rpc));
         }
 
         (void)request.require_committed_visible;

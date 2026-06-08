@@ -44,6 +44,10 @@ T032 当前实现采用“现有 MetadataService 边界内的最小映射”：
 - `CommitObject` 通过现有 `CommitObject` RPC 提交 chunk manifest facts，不提交 payload。
 - `GetObjectManifest` 通过现有 `HeadObject` RPC 读取 COMMITTED `ObjectRecord` 并转换为 transfer manifest facts。
 - 由于当前 `HeadObject` 只暴露 COMMITTED 对象，adapter 不能从现有 service 中区分“对象真实不存在”和“PENDING 但对普通读不可见”的全部细粒度状态。
+- T066 在此基础上补充了 `NOT_LEADER` 有限重试边界：
+  - 同一次 metadata RPC 最多只做一次基于 `leader_hint.leader_address` 的 endpoint 刷新重试。
+  - `leader_hint` 只作为候选地址使用；最终仍必须由目标 `MetadataService` 自己接受请求。
+  - 如果 `leader_hint` 缺失、为空、仍指向当前 endpoint，或重试后仍返回 `NOT_LEADER`，adapter 会停止重试并返回清晰诊断，不做无界猜测或 discovery 生产逻辑。
 
 ### `StorageTransferClient`
 

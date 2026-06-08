@@ -626,7 +626,9 @@ namespace
             << "  storage_client download --config <path> --bucket <bucket>"
             << " --object <key> --out <destination>"
             << " [--object-id <id>] [--version <n>] [--request-id <id>]"
-            << " [--concurrency <n>]\n";
+            << " [--concurrency <n>]\n"
+            << "  storage_client status --config <path>"
+            << " [--request-id <id>]\n";
     }
 
     [[noreturn]] void ExitUsageError(const std::string &message)
@@ -655,7 +657,7 @@ namespace
             std::exit(static_cast<int>(CliExitCode::kOk));
         }
         if (args.command != "generate-config" && args.command != "upload" &&
-            args.command != "download")
+            args.command != "download" && args.command != "status")
         {
             ExitUsageError("unsupported command: " + args.command);
         }
@@ -906,6 +908,20 @@ namespace
         {
             ExitUsageError(
                 "upload/download does not accept generate-config-specific arguments");
+        }
+        if (args.command == "status")
+        {
+            if (!args.bucket.empty() || !args.object_key.empty() ||
+                !args.object_id.empty() || !args.source_path.empty() ||
+                !args.destination_path.empty() || args.version.has_value() ||
+                args.chunk_size.has_value() || args.replica_count.has_value() ||
+                args.minimum_successful_writes.has_value() ||
+                args.concurrency.has_value())
+            {
+                ExitUsageError(
+                    "status does not accept upload/download-specific arguments");
+            }
+            return args;
         }
         if (args.bucket.empty())
         {
@@ -1186,6 +1202,7 @@ namespace
     {
         viewdemo::ViewNodeClientConfig client_config;
         client_config.discovery_timeout = config.discovery_timeout;
+        client_config.cluster_view_timeout = config.discovery_timeout;
         return std::make_shared<viewdemo::ViewNodeClient>(
             grpc::CreateChannel(config.view_endpoint,
                                 grpc::InsecureChannelCredentials()),
@@ -1341,6 +1358,317 @@ namespace
         PrintDiagnostics(result.diagnostics);
         return static_cast<int>(CliExitCode::kOk);
     }
+
+    [[nodiscard]] int ExitCodeForViewRegistryStatus(
+        const viewdemo::ViewRegistryStatusCode status)
+    {
+        switch (status)
+        {
+        case viewdemo::ViewRegistryStatusCode::kOk:
+        case viewdemo::ViewRegistryStatusCode::kIdempotentReplay:
+        case viewdemo::ViewRegistryStatusCode::kStaleIgnored:
+            return static_cast<int>(CliExitCode::kOk);
+        case viewdemo::ViewRegistryStatusCode::kInvalidArgument:
+        case viewdemo::ViewRegistryStatusCode::kNotFound:
+        case viewdemo::ViewRegistryStatusCode::kConflict:
+            return static_cast<int>(CliExitCode::kConfigError);
+        case viewdemo::ViewRegistryStatusCode::kUnsupported:
+            return static_cast<int>(CliExitCode::kUnsupported);
+        case viewdemo::ViewRegistryStatusCode::kTimeout:
+        case viewdemo::ViewRegistryStatusCode::kOverloaded:
+        case viewdemo::ViewRegistryStatusCode::kServiceUnavailable:
+            return static_cast<int>(CliExitCode::kTransferFailure);
+        case viewdemo::ViewRegistryStatusCode::kInternalError:
+        default:
+            return static_cast<int>(CliExitCode::kInternalError);
+        }
+    }
+
+    void PrintViewDiagnostics(
+        const std::vector<viewdemo::ViewRegistryDiagnostic> &diagnostics)
+    {
+        for (const auto &diagnostic : diagnostics)
+        {
+            std::cerr << "diagnostic"
+                      << " request_id=" << diagnostic.request_id
+                      << " status=" << viewdemo::ToString(diagnostic.code);
+            if (!diagnostic.cluster_id.empty())
+            {
+                std::cerr << " cluster_id=" << diagnostic.cluster_id;
+            }
+            if (!diagnostic.node_id.empty())
+            {
+                std::cerr << " node_id=" << diagnostic.node_id;
+            }
+            if (!diagnostic.endpoint.empty())
+            {
+                std::cerr << " endpoint=" << diagnostic.endpoint;
+            }
+            if (diagnostic.sequence != 0)
+            {
+                std::cerr << " sequence=" << diagnostic.sequence;
+            }
+            if (!diagnostic.message.empty())
+            {
+                std::cerr << " message=" << diagnostic.message;
+            }
+            std::cerr << '\n';
+        }
+    }
+
+    void AppendLeaderHintFields(
+        std::ostream &out,
+        const std::optional<viewdemo::MetadataLeaderHint> &leader_hint)
+    {
+        if (!leader_hint.has_value())
+        {
+            return;
+        }
+
+        out << " leader_hint.node_id=" << leader_hint->node_id;
+        if (leader_hint->raft_id.has_value())
+        {
+            out << " leader_hint.raft_id=" << *leader_hint->raft_id;
+        }
+        if (!leader_hint->endpoint.empty())
+        {
+            out << " leader_hint.endpoint=" << leader_hint->endpoint;
+        }
+        if (leader_hint->observed_term != 0)
+        {
+            out << " leader_hint.term=" << leader_hint->observed_term;
+        }
+        if (leader_hint->observed_at_unix_ms != 0)
+        {
+            out << " leader_hint.observed_at_unix_ms="
+                << leader_hint->observed_at_unix_ms;
+        }
+    }
+
+    void PrintViewNodeSnapshot(std::string_view prefix,
+                               const viewdemo::ViewNodeSnapshot &node)
+    {
+        std::cout << prefix
+                  << " node_id=" << node.node_id
+                  << " node_type=" << viewdemo::ToString(node.node_type)
+                  << " endpoint=" << node.endpoint
+                  << " liveness=" << viewdemo::ToString(node.liveness)
+                  << " health=" << viewdemo::ToString(node.health.health)
+                  << " disk_pressure="
+                  << viewdemo::ToString(node.health.disk_pressure)
+                  << " last_seen_unix_ms=" << node.last_seen_unix_ms
+                  << " last_sequence=" << node.last_sequence;
+
+        if (!node.control_plane_endpoint.empty())
+        {
+            std::cout << " control_plane_endpoint="
+                      << node.control_plane_endpoint;
+        }
+        if (!node.data_plane_endpoint.empty())
+        {
+            std::cout << " data_plane_endpoint="
+                      << node.data_plane_endpoint;
+        }
+        if (!node.failure_domain.zone.empty())
+        {
+            std::cout << " zone=" << node.failure_domain.zone;
+        }
+        if (!node.failure_domain.rack.empty())
+        {
+            std::cout << " rack=" << node.failure_domain.rack;
+        }
+        std::cout << '\n';
+    }
+
+    void PrintMetadataNodeSnapshot(const viewdemo::ViewNodeSnapshot &node)
+    {
+        std::cout << "metadata_node"
+                  << " node_id=" << node.node_id
+                  << " endpoint=" << node.endpoint
+                  << " liveness=" << viewdemo::ToString(node.liveness)
+                  << " health=" << viewdemo::ToString(node.health.health)
+                  << " disk_pressure="
+                  << viewdemo::ToString(node.health.disk_pressure)
+                  << " last_seen_unix_ms=" << node.last_seen_unix_ms
+                  << " last_sequence=" << node.last_sequence;
+
+        if (node.metadata.has_value())
+        {
+            const auto &metadata = *node.metadata;
+            if (metadata.raft_id.has_value())
+            {
+                std::cout << " raft_id=" << *metadata.raft_id;
+            }
+            std::cout << " raft_role="
+                      << viewdemo::ToString(metadata.raft_role)
+                      << " membership_observation="
+                      << viewdemo::ToString(metadata.membership_state);
+            if (metadata.observed_term != 0)
+            {
+                std::cout << " observed_term=" << metadata.observed_term;
+            }
+            if (metadata.commit_index != 0)
+            {
+                std::cout << " commit_index=" << metadata.commit_index;
+            }
+            if (metadata.membership_epoch != 0)
+            {
+                std::cout << " membership_epoch="
+                          << metadata.membership_epoch;
+            }
+            AppendLeaderHintFields(std::cout, metadata.leader_hint);
+        }
+
+        std::cout << '\n';
+    }
+
+    void PrintStorageNodeSnapshot(const viewdemo::ViewNodeSnapshot &node)
+    {
+        std::cout << "storage_node"
+                  << " node_id=" << node.node_id
+                  << " endpoint=" << node.endpoint
+                  << " liveness=" << viewdemo::ToString(node.liveness)
+                  << " health=" << viewdemo::ToString(node.health.health)
+                  << " disk_pressure="
+                  << viewdemo::ToString(node.health.disk_pressure)
+                  << " total_capacity_bytes="
+                  << node.capacity.total_capacity_bytes
+                  << " used_capacity_bytes="
+                  << node.capacity.used_capacity_bytes
+                  << " available_capacity_bytes="
+                  << node.capacity.available_capacity_bytes
+                  << " chunk_count=" << node.capacity.chunk_count
+                  << " active_reads=" << node.load.active_reads
+                  << " active_writes=" << node.load.active_writes
+                  << " queued_ops=" << node.load.queued_ops
+                  << " write_admission_overloaded="
+                  << (node.load.write_admission_overloaded ? "true" : "false")
+                  << " read_admission_overloaded="
+                  << (node.load.read_admission_overloaded ? "true" : "false")
+                  << " last_seen_unix_ms=" << node.last_seen_unix_ms
+                  << " last_sequence=" << node.last_sequence;
+
+        if (!node.failure_domain.zone.empty())
+        {
+            std::cout << " zone=" << node.failure_domain.zone;
+        }
+        if (!node.failure_domain.rack.empty())
+        {
+            std::cout << " rack=" << node.failure_domain.rack;
+        }
+        std::cout << '\n';
+    }
+
+    [[nodiscard]] int RunStatus(const ParsedArgs &args,
+                                const ClientConfig &config)
+    {
+        const std::string request_id =
+            args.request_id.empty()
+                ? GenerateRequestId("status", config.cluster_id)
+                : args.request_id;
+
+        auto client = CreateViewClient(config);
+        // status 只读取 ViewNode cluster view 做 discovery/observation 诊断，
+        // 不能把这些观测结果解释为 Raft membership 或 object manifest authority。
+        const auto result = client->GetClusterView(
+            viewdemo::GetClusterViewRequest{
+                .request_id = request_id,
+                .cluster_id = config.cluster_id,
+                .include_dead_nodes = true,
+                .include_warnings = true,
+            });
+
+        if (!result.transport_ok())
+        {
+            std::cerr << "status FAILED"
+                      << " request_id=" << request_id
+                      << " target_endpoint=" << config.view_endpoint
+                      << " grpc_code="
+                      << static_cast<int>(result.rpc.grpc_status_code)
+                      << " retryable="
+                      << (result.rpc.retryable ? "true" : "false")
+                      << " message=" << result.rpc.grpc_error_message
+                      << '\n';
+            return static_cast<int>(CliExitCode::kTransferFailure);
+        }
+
+        if (!result.result.ok())
+        {
+            std::cerr << "status FAILED"
+                      << " request_id=" << request_id
+                      << " cluster_id=" << config.cluster_id
+                      << " target_endpoint=" << config.view_endpoint
+                      << " status="
+                      << viewdemo::ToString(result.result.summary.status)
+                      << " message=" << result.result.summary.message
+                      << '\n';
+            PrintViewDiagnostics(result.result.snapshot.diagnostics);
+            return ExitCodeForViewRegistryStatus(
+                result.result.summary.status);
+        }
+
+        const auto &snapshot = result.result.snapshot;
+        if (snapshot.view_nodes.empty() && snapshot.metadata_nodes.empty() &&
+            snapshot.storage_nodes.empty())
+        {
+            std::cerr << "status FAILED"
+                      << " request_id=" << request_id
+                      << " cluster_id=" << config.cluster_id
+                      << " target_endpoint=" << config.view_endpoint
+                      << " status=EMPTY_CLUSTER_VIEW"
+                      << " message=ViewNode returned an empty observed cluster view"
+                      << '\n';
+            PrintViewDiagnostics(snapshot.diagnostics);
+            return static_cast<int>(CliExitCode::kTransferFailure);
+        }
+
+        std::cout << "status OK"
+                  << " request_id=" << request_id
+                  << " cluster_id=" << config.cluster_id
+                  << " target_endpoint=" << config.view_endpoint
+                  << " observed_at_unix_ms=" << snapshot.observed_at_unix_ms
+                  << " view_nodes=" << snapshot.view_nodes.size()
+                  << " metadata_nodes=" << snapshot.metadata_nodes.size()
+                  << " storage_nodes=" << snapshot.storage_nodes.size()
+                  << '\n';
+
+        if (result.result.summary.retry_after_ms != 0)
+        {
+            std::cout << "status_hint"
+                      << " request_id=" << request_id
+                      << " retry_after_ms="
+                      << result.result.summary.retry_after_ms << '\n';
+        }
+
+        if (snapshot.leader_hint.has_value())
+        {
+            std::cout << "leader_hint";
+            AppendLeaderHintFields(std::cout, snapshot.leader_hint);
+            std::cout << '\n';
+        }
+
+        std::cout << "non_authority_boundary"
+                  << " membership_observation_source=view_node"
+                  << " raft_membership_authority=false"
+                  << " object_manifest_authority=false"
+                  << '\n';
+
+        for (const auto &node : snapshot.view_nodes)
+        {
+            PrintViewNodeSnapshot("view_node", node);
+        }
+        for (const auto &node : snapshot.metadata_nodes)
+        {
+            PrintMetadataNodeSnapshot(node);
+        }
+        for (const auto &node : snapshot.storage_nodes)
+        {
+            PrintStorageNodeSnapshot(node);
+        }
+
+        PrintViewDiagnostics(snapshot.diagnostics);
+        return static_cast<int>(CliExitCode::kOk);
+    }
 } // namespace
 
 int main(int argc, char **argv)
@@ -1362,6 +1690,10 @@ int main(int argc, char **argv)
         if (args.command == "download")
         {
             return RunDownload(args, config);
+        }
+        if (args.command == "status")
+        {
+            return RunStatus(args, config);
         }
 
         std::cerr << "unsupported command: " << args.command << '\n';

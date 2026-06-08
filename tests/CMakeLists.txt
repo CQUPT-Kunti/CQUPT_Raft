@@ -917,6 +917,12 @@ add_raft_gtest(test_integrated_object_storage_concurrency
 add_raft_gtest(test_view_node_discovery
   view_node_discovery_test.cpp
   "${RAFT_008_LABELS_VIEW_NODE}")
+if(TARGET test_view_node_discovery)
+  target_link_libraries(test_view_node_discovery
+    PRIVATE
+      view_proto
+  )
+endif()
 add_raft_gtest(test_node_identity
   node_identity_test.cpp
   "${RAFT_008_LABELS_NODE_IDENTITY}")

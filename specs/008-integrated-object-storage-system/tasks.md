@@ -156,18 +156,18 @@
 
 ### Tests for User Story 3
 
-- [ ] T058 [P] [US3] Add ViewNode discovery integration tests for metadata and storage endpoints in `tests/view_node_discovery_test.cpp`
-- [ ] T059 [P] [US3] Add heartbeat timeout and liveness transition tests in `tests/view_node_discovery_test.cpp`
-- [ ] T060 [P] [US3] Add placement excludes dead ViewNode-observed StorageNode test in `tests/store_placement_manager_test.cpp`
+- [X] T058 [P] [US3] Add ViewNode discovery integration tests for metadata and storage endpoints in `tests/view_node_discovery_test.cpp`
+- [X] T059 [P] [US3] Add heartbeat timeout and liveness transition tests in `tests/view_node_discovery_test.cpp`
+- [X] T060 [P] [US3] Add placement excludes dead ViewNode-observed StorageNode test in `tests/store_placement_manager_test.cpp`
 
 ### Implementation for User Story 3
 
 - [ ] T061 [US3] Add node registration client loop for MetadataNode startup in `apps/metadata_node_app.cpp`
 - [ ] T062 [US3] Add node registration and heartbeat loop for StorageNode startup in `apps/storage_node_app.cpp`
-- [ ] T063 [US3] Add ViewNode-backed StorageNode snapshot adapter for placement in `modules/store/placement/placement_manager.h`
-- [ ] T064 [US3] Implement ViewNode-backed StorageNode snapshot adapter in `modules/store/placement/placement_manager.cpp`
-- [ ] T065 [US3] Add `storage_client status` command using ViewNode cluster view in `apps/storage_client.cpp`
-- [ ] T066 [US3] Add leader hint refresh and NOT_LEADER retry boundary in `modules/store/transfer/metadata_transfer_client.cpp`
+- [X] T063 [US3] Add ViewNode-backed StorageNode snapshot adapter for placement in `modules/store/placement/placement_manager.h`
+- [X] T064 [US3] Implement ViewNode-backed StorageNode snapshot adapter in `modules/store/placement/placement_manager.cpp`
+- [X] T065 [US3] Add `storage_client status` command using ViewNode cluster view in `apps/storage_client.cpp`
+- [X] T066 [US3] Add leader hint refresh and NOT_LEADER retry boundary in `modules/store/transfer/metadata_transfer_client.cpp`
 
 **Checkpoint**: User Story 3 provides discovery and observation without turning ViewNode into a consistency authority.
 

@@ -672,4 +672,108 @@ namespace
         EXPECT_TRUE(ContainsReason(result.decision.reasons,
                                    "placement_manager registry snapshot kept 3 live candidates after liveness/facts filtering"));
     }
+
+    TEST(StorePlacementManagerTest,
+         ViewObservedStorageSnapshotOnlySelectsLiveHealthyFreshCapacityValidNodes)
+    {
+        storedemo::StorageNodeRegistrySnapshotResult registry_snapshot;
+        registry_snapshot.status = storedemo::StorageNodeStatusCode::kOk;
+        registry_snapshot.generated_at_unix_ms = 4'242;
+
+        // 当前测试先复用 registry snapshot 作为 ViewNode-observed StorageNode
+        // 事实输入的最小替身；T063/T064 再单独接入正式 adapter。
+        storedemo::StorageNodeRegistryNodeSnapshot healthy_selected;
+        healthy_selected.node_id = storedemo::test::MakeStorageNodeIdFixture(41);
+        healthy_selected.endpoint = "127.0.0.1:8041";
+        healthy_selected.last_sequence = 10;
+        healthy_selected.last_seen_unix_ms = 4'230;
+        healthy_selected.liveness = storedemo::StorageNodeRegistryLiveness::kLive;
+        healthy_selected.facts = MakeRegistryFacts(41, 32'768, 4'096);
+        healthy_selected.facts.failure_domain.zone = "zone-a";
+        healthy_selected.facts.load.load.active_reads = 0;
+        healthy_selected.facts.load.load.active_writes = 1;
+        healthy_selected.facts.load.load.queued_ops = 0;
+
+        storedemo::StorageNodeRegistryNodeSnapshot stale_snapshot;
+        stale_snapshot.node_id = storedemo::test::MakeStorageNodeIdFixture(42);
+        stale_snapshot.endpoint = "127.0.0.1:8042";
+        stale_snapshot.last_sequence = 11;
+        stale_snapshot.last_seen_unix_ms = 4'100;
+        stale_snapshot.liveness = storedemo::StorageNodeRegistryLiveness::kStale;
+        stale_snapshot.facts = MakeRegistryFacts(42, 65'536, 4'096);
+
+        storedemo::StorageNodeRegistryNodeSnapshot dead_snapshot;
+        dead_snapshot.node_id = storedemo::test::MakeStorageNodeIdFixture(43);
+        dead_snapshot.endpoint = "127.0.0.1:8043";
+        dead_snapshot.last_sequence = 12;
+        dead_snapshot.last_seen_unix_ms = 4'000;
+        dead_snapshot.liveness = storedemo::StorageNodeRegistryLiveness::kDead;
+        dead_snapshot.facts = MakeRegistryFacts(43, 65'536, 4'096);
+
+        storedemo::StorageNodeRegistryNodeSnapshot invalid_capacity;
+        invalid_capacity.node_id = storedemo::test::MakeStorageNodeIdFixture(44);
+        invalid_capacity.endpoint = "127.0.0.1:8044";
+        invalid_capacity.last_sequence = 13;
+        invalid_capacity.last_seen_unix_ms = 4'231;
+        invalid_capacity.liveness = storedemo::StorageNodeRegistryLiveness::kLive;
+        invalid_capacity.facts = MakeRegistryFacts(44, 16'384, 4'096);
+        invalid_capacity.facts.capacity.total_capacity_bytes = 0;
+        invalid_capacity.facts.capacity.available_capacity_bytes = 12'288;
+
+        storedemo::StorageNodeRegistryNodeSnapshot readonly_live;
+        readonly_live.node_id = storedemo::test::MakeStorageNodeIdFixture(45);
+        readonly_live.endpoint = "127.0.0.1:8045";
+        readonly_live.last_sequence = 14;
+        readonly_live.last_seen_unix_ms = 4'232;
+        readonly_live.liveness = storedemo::StorageNodeRegistryLiveness::kLive;
+        readonly_live.facts = MakeRegistryFacts(45,
+                                                24'576,
+                                                4'096,
+                                                storedemo::StorageNodeHealth::kReadOnly);
+
+        registry_snapshot.nodes = {healthy_selected,
+                                   stale_snapshot,
+                                   dead_snapshot,
+                                   invalid_capacity,
+                                   readonly_live};
+
+        storedemo::PlacementManager manager;
+        auto request = MakeRequest(1, 1, 512);
+        request.policy.reserve_capacity_bytes = 256;
+
+        const auto result = manager.SelectPlacement(request, registry_snapshot);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.replica_nodes.size(), 1U);
+        EXPECT_EQ(result.decision.replica_nodes.front().node_id,
+                  healthy_selected.node_id);
+
+        const auto *stale_exclusion =
+            FindExclusion(result.decision.excluded_nodes, stale_snapshot.node_id);
+        ASSERT_NE(stale_exclusion, nullptr);
+        EXPECT_EQ(stale_exclusion->reason, "node registry facts are not live: Stale");
+
+        const auto *dead_exclusion =
+            FindExclusion(result.decision.excluded_nodes, dead_snapshot.node_id);
+        ASSERT_NE(dead_exclusion, nullptr);
+        EXPECT_EQ(dead_exclusion->reason, "node registry facts are not live: Dead");
+
+        const auto *invalid_capacity_exclusion =
+            FindExclusion(result.decision.excluded_nodes, invalid_capacity.node_id);
+        ASSERT_NE(invalid_capacity_exclusion, nullptr);
+        EXPECT_EQ(invalid_capacity_exclusion->reason,
+                  "node registry capacity facts are incomplete or invalid");
+
+        const auto *readonly_exclusion =
+            FindExclusion(result.decision.excluded_nodes, readonly_live.node_id);
+        ASSERT_NE(readonly_exclusion, nullptr);
+        EXPECT_EQ(readonly_exclusion->reason,
+                  "node health is not writable: ReadOnly");
+
+        EXPECT_TRUE(ContainsReason(result.decision.reasons,
+                                   "placement_manager evaluated 5 registry snapshot nodes"));
+        EXPECT_TRUE(ContainsReason(result.decision.reasons,
+                                   "placement_manager registry snapshot kept 2 live candidates after liveness/facts filtering"));
+    }
 }

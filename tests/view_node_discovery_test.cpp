@@ -2,11 +2,16 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 
+#include <grpcpp/grpcpp.h>
+
+#include "view/view_client.h"
 #include "view/view_registry.h"
+#include "view/view_service_impl.h"
 
 namespace
 {
@@ -23,8 +28,12 @@ namespace
     using viewdemo::RegisterNodeRequest;
     using viewdemo::ViewNodeDiskPressure;
     using viewdemo::ViewNodeHealth;
+    using viewdemo::ViewNodeClient;
+    using viewdemo::ViewNodeClientConfig;
     using viewdemo::ViewNodeLivenessState;
     using viewdemo::ViewNodeRegistry;
+    using viewdemo::ViewNodeServiceImpl;
+    using viewdemo::ViewNodeServiceImplConfig;
     using viewdemo::ViewNodeType;
     using viewdemo::ViewRegistryConfig;
     using viewdemo::ViewRegistryIssueCode;
@@ -92,6 +101,93 @@ namespace
         request.registration = std::move(registration);
         return request;
     }
+
+    class RunningViewNodeDiscoveryService
+    {
+    public:
+        explicit RunningViewNodeDiscoveryService(
+            ViewRegistryConfig registry_config = {},
+            const std::uint64_t now_unix_ms = kNow)
+            : now_unix_ms_(now_unix_ms),
+              registry_(std::make_shared<ViewNodeRegistry>(registry_config)),
+              service_(registry_,
+                       ViewNodeServiceImplConfig{
+                           .now_unix_ms = [this]() {
+                               return now_unix_ms_;
+                           }})
+        {
+            grpc::ServerBuilder builder;
+            builder.AddListeningPort("127.0.0.1:0",
+                                     grpc::InsecureServerCredentials(),
+                                     &selected_port_);
+            builder.RegisterService(&service_);
+            server_ = builder.BuildAndStart();
+            if (server_ == nullptr || selected_port_ <= 0)
+            {
+                throw std::runtime_error(
+                    "failed to start ViewNode discovery integration service");
+            }
+
+            endpoint_ = "127.0.0.1:" + std::to_string(selected_port_);
+            auto channel = grpc::CreateChannel(endpoint_,
+                                               grpc::InsecureChannelCredentials());
+            if (!channel->WaitForConnected(std::chrono::system_clock::now() +
+                                           std::chrono::seconds(5)))
+            {
+                throw std::runtime_error(
+                    "ViewNode discovery integration channel did not connect");
+            }
+
+            client_ = std::make_unique<ViewNodeClient>(
+                std::move(channel),
+                endpoint_,
+                ViewNodeClientConfig{
+                    .register_timeout = std::chrono::seconds(5),
+                    .heartbeat_timeout = std::chrono::seconds(5),
+                    .discovery_timeout = std::chrono::seconds(5),
+                    .cluster_view_timeout = std::chrono::seconds(5),
+                    .wait_for_ready = true,
+                });
+        }
+
+        ~RunningViewNodeDiscoveryService()
+        {
+            if (server_ != nullptr)
+            {
+                server_->Shutdown();
+                server_->Wait();
+            }
+        }
+
+        RunningViewNodeDiscoveryService(
+            const RunningViewNodeDiscoveryService &) = delete;
+        RunningViewNodeDiscoveryService &operator=(
+            const RunningViewNodeDiscoveryService &) = delete;
+
+        [[nodiscard]] ViewNodeClient &client() const
+        {
+            return *client_;
+        }
+
+        [[nodiscard]] const std::string &endpoint() const
+        {
+            return endpoint_;
+        }
+
+        void set_now_unix_ms(const std::uint64_t now_unix_ms)
+        {
+            now_unix_ms_ = now_unix_ms;
+        }
+
+    private:
+        std::uint64_t now_unix_ms_{kNow};
+        std::shared_ptr<ViewNodeRegistry> registry_;
+        ViewNodeServiceImpl service_;
+        int selected_port_{0};
+        std::string endpoint_;
+        std::unique_ptr<grpc::Server> server_;
+        std::unique_ptr<ViewNodeClient> client_;
+    };
 
     HeartbeatNodeRequest MakeHeartbeatRequest(const ViewNodeType node_type,
                                               std::string node_id,
@@ -573,6 +669,287 @@ namespace
         EXPECT_EQ(result.snapshot.diagnostics[0].code,
                   ViewRegistryIssueCode::kLivenessExcluded);
         EXPECT_EQ(result.snapshot.diagnostics[1].code,
+                  ViewRegistryIssueCode::kLivenessExcluded);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationMetadataDiscoveryReturnsEndpointAndObservedState)
+    {
+        RunningViewNodeDiscoveryService service;
+
+        auto metadata =
+            MakeRegistration(ViewNodeType::kMetadata, "meta-1", 9701, 190);
+        metadata.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            8,
+            14,
+            MetadataLeaderHint{.node_id = "meta-1",
+                               .raft_id = std::optional<std::int32_t>{1},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 14,
+                               .observed_at_unix_ms = 191});
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(metadata, "integration-register-meta"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(register_result.result.created);
+        ASSERT_TRUE(register_result.result.snapshot.has_value());
+
+        DiscoverMetadataRequest request;
+        request.request_id = "integration-discover-metadata";
+        request.cluster_id = kClusterId;
+        request.prefer_leader = true;
+        request.live_only = true;
+
+        const auto discover_result = service.client().DiscoverMetadata(request);
+        ASSERT_TRUE(discover_result.transport_ok());
+        ASSERT_EQ(discover_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(discover_result.result.metadata_nodes.size(), 1U);
+        EXPECT_EQ(discover_result.result.metadata_nodes[0].node_id, "meta-1");
+        EXPECT_EQ(discover_result.result.metadata_nodes[0].endpoint,
+                  metadata.endpoint);
+        ASSERT_TRUE(discover_result.result.metadata_nodes[0].metadata.has_value());
+        EXPECT_EQ(discover_result.result.metadata_nodes[0].metadata->raft_role,
+                  MetadataRaftObservedRole::kLeader);
+        EXPECT_EQ(
+            discover_result.result.metadata_nodes[0].metadata->membership_state,
+            MetadataMembershipObservedState::kVoter);
+        EXPECT_EQ(discover_result.result.membership_epoch, 8U);
+        ASSERT_TRUE(discover_result.result.leader_hint.has_value());
+        EXPECT_EQ(discover_result.result.leader_hint->node_id, "meta-1");
+        EXPECT_EQ(discover_result.result.leader_hint->endpoint,
+                  metadata.endpoint);
+        EXPECT_EQ(discover_result.result.leader_hint->observed_term, 14U);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationStorageDiscoveryReturnsEndpointAndObservedState)
+    {
+        RunningViewNodeDiscoveryService service;
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-1", 9702, 192);
+        storage.failure_domain.zone = "zone-c";
+        storage.failure_domain.rack = "rack-9";
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+        storage.health.health = ViewNodeHealth::kHealthy;
+        storage.load.active_reads = 7;
+        storage.load.active_writes = 5;
+        storage.load.queued_ops = 11;
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(storage, "integration-register-store"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(register_result.result.created);
+        ASSERT_TRUE(register_result.result.snapshot.has_value());
+
+        DiscoverStorageRequest request;
+        request.request_id = "integration-discover-storage";
+        request.cluster_id = kClusterId;
+        request.live_only = true;
+        request.minimum_available_capacity_bytes = 8'192;
+        request.zone = "zone-c";
+        request.rack = "rack-9";
+        request.require_writable = true;
+
+        const auto discover_result = service.client().DiscoverStorage(request);
+        ASSERT_TRUE(discover_result.transport_ok());
+        ASSERT_EQ(discover_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(discover_result.result.storage_nodes.size(), 1U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].node_id, "store-1");
+        EXPECT_EQ(discover_result.result.storage_nodes[0].endpoint,
+                  storage.endpoint);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].failure_domain.zone,
+                  "zone-c");
+        EXPECT_EQ(discover_result.result.storage_nodes[0].failure_domain.rack,
+                  "rack-9");
+        EXPECT_EQ(
+            discover_result.result.storage_nodes[0].capacity.available_capacity_bytes,
+            12'288U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationHeartbeatRefreshesStateAndRejectsStaleUpdates)
+    {
+        RunningViewNodeDiscoveryService service;
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-2", 9703, 180);
+        storage.capacity.total_capacity_bytes = 8'192;
+        storage.capacity.used_capacity_bytes = 2'048;
+        storage.capacity.available_capacity_bytes = 6'144;
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(storage, "integration-register-store-2"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        auto fresh = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                          "store-2",
+                                          9703,
+                                          7,
+                                          220);
+        fresh.observation.health.health = ViewNodeHealth::kDegraded;
+        fresh.observation.capacity.total_capacity_bytes = 16'384;
+        fresh.observation.capacity.used_capacity_bytes = 4'096;
+        fresh.observation.capacity.available_capacity_bytes = 12'288;
+        fresh.observation.load.active_reads = 9;
+        fresh.observation.load.active_writes = 6;
+        fresh.observation.load.queued_ops = 15;
+
+        const auto fresh_result = service.client().HeartbeatNode(fresh);
+        ASSERT_TRUE(fresh_result.transport_ok());
+        ASSERT_EQ(fresh_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(fresh_result.result.applied);
+        EXPECT_EQ(fresh_result.result.accepted_sequence, 7U);
+
+        auto stale_sequence = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                   "store-2",
+                                                   9703,
+                                                   6,
+                                                   230);
+        stale_sequence.observation.health.health = ViewNodeHealth::kHealthy;
+        stale_sequence.observation.capacity.available_capacity_bytes = 256;
+        stale_sequence.observation.load.queued_ops = 1;
+        const auto stale_sequence_result =
+            service.client().HeartbeatNode(stale_sequence);
+        ASSERT_TRUE(stale_sequence_result.transport_ok());
+        ASSERT_EQ(stale_sequence_result.result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_sequence_result.result.stale_ignored);
+        EXPECT_EQ(stale_sequence_result.result.accepted_sequence, 7U);
+
+        auto stale_observed_at = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                      "store-2",
+                                                      9703,
+                                                      8,
+                                                      210);
+        stale_observed_at.observation.health.health = ViewNodeHealth::kReadOnly;
+        stale_observed_at.observation.capacity.available_capacity_bytes = 128;
+        stale_observed_at.observation.load.queued_ops = 0;
+        const auto stale_observed_result =
+            service.client().HeartbeatNode(stale_observed_at);
+        ASSERT_TRUE(stale_observed_result.transport_ok());
+        ASSERT_EQ(stale_observed_result.result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_observed_result.result.stale_ignored);
+        EXPECT_EQ(stale_observed_result.result.accepted_sequence, 7U);
+
+        DiscoverStorageRequest discover_request;
+        discover_request.request_id = "integration-discover-store-2";
+        discover_request.cluster_id = kClusterId;
+        discover_request.live_only = true;
+        discover_request.minimum_available_capacity_bytes = 8'192;
+        discover_request.require_writable = false;
+
+        const auto discover_result =
+            service.client().DiscoverStorage(discover_request);
+        ASSERT_TRUE(discover_result.transport_ok());
+        ASSERT_EQ(discover_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(discover_result.result.storage_nodes.size(), 1U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].node_id, "store-2");
+        EXPECT_EQ(discover_result.result.storage_nodes[0].health.health,
+                  ViewNodeHealth::kDegraded);
+        EXPECT_EQ(
+            discover_result.result.storage_nodes[0].capacity.available_capacity_bytes,
+            12'288U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].load.active_reads, 9U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].load.active_writes, 6U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].load.queued_ops, 15U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].last_sequence, 7U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].last_seen_unix_ms, 220U);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationLivenessTransitionsAppearInDiscoveryAndClusterView)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        RunningViewNodeDiscoveryService service(config, 100);
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-3", 9704, 100);
+        storage.capacity.total_capacity_bytes = 4'096;
+        storage.capacity.used_capacity_bytes = 1'024;
+        storage.capacity.available_capacity_bytes = 3'072;
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(storage, "integration-register-store-3"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        DiscoverStorageRequest discover_request;
+        discover_request.request_id = "integration-discover-store-3";
+        discover_request.cluster_id = kClusterId;
+        discover_request.live_only = true;
+
+        auto discover_result = service.client().DiscoverStorage(discover_request);
+        ASSERT_TRUE(discover_result.transport_ok());
+        ASSERT_EQ(discover_result.result.storage_nodes.size(), 1U);
+        EXPECT_EQ(discover_result.result.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+
+        service.set_now_unix_ms(131);
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "integration-cluster-store-3-stale";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        auto cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kStale);
+
+        discover_result = service.client().DiscoverStorage(discover_request);
+        ASSERT_TRUE(discover_result.transport_ok());
+        EXPECT_TRUE(discover_result.result.storage_nodes.empty());
+        ASSERT_FALSE(discover_result.result.diagnostics.empty());
+        EXPECT_EQ(discover_result.result.diagnostics[0].code,
+                  ViewRegistryIssueCode::kLivenessExcluded);
+
+        service.set_now_unix_ms(161);
+        cluster_request.request_id = "integration-cluster-store-3-suspect";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kSuspect);
+
+        service.set_now_unix_ms(191);
+        cluster_request.request_id = "integration-cluster-store-3-dead";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kDead);
+
+        cluster_request.include_dead_nodes = false;
+        cluster_request.request_id = "integration-cluster-store-3-dead-hidden";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        EXPECT_TRUE(cluster_result.result.snapshot.storage_nodes.empty());
+        ASSERT_FALSE(cluster_result.result.snapshot.diagnostics.empty());
+        EXPECT_EQ(cluster_result.result.snapshot.diagnostics[0].code,
                   ViewRegistryIssueCode::kLivenessExcluded);
     }
 } // namespace

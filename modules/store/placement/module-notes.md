@@ -21,7 +21,11 @@
 - `PlacementRequest` 到 `PlacementDecisionResult` 的纯策略计算
 - `ReadReplicaSelectionRequest` 到 `ReadReplicaSelectionResult` 的纯策略计算
 - `PlacementManager` 对静态候选集和生产 `StorageNodeRegistry` snapshot 的最小协调
+- `ViewNodeBackedStorageNodeSnapshotAdapter` / `ViewNodeBackedStorageNodeSnapshotResult`
+  的接口边界，供后续把 ViewNode StorageNode 观测事实适配到 placement
 - 节点筛除原因记录、确定性排序和最小 zone spread 语义
+- ViewNode snapshot 路径上的 live/facts/capacity/freshness 保守过滤，以及后续交给
+  `ReplicaPolicySelector` 的兼容策略接线
 
 当前不负责：
 
@@ -32,6 +36,7 @@
 - Repair / Rebalance / GC
 - Raft / metadata / RPC 接入
 - ViewNode 权威状态管理
+- COMMITTED object visibility authority
 - 对象 manifest 持久化或 commit 决策
 
 ## 枚举与辅助函数
