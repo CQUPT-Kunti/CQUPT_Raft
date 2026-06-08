@@ -37,6 +37,7 @@ function(raft_collect_existing_sources out_var)
 endfunction()
 
 function(raft_add_optional_app_target target_name source_file)
+  set(optional_private_libs ${ARGN})
   if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
     message(STATUS "Skip planned target ${target_name}: ${source_file} not found yet")
     return()
@@ -46,6 +47,7 @@ function(raft_add_optional_app_target target_name source_file)
   target_link_libraries(${target_name}
     PRIVATE
       raft_core
+      ${optional_private_libs}
   )
 endfunction()
 
@@ -381,28 +383,25 @@ target_link_libraries(raft_metadata_client
 # 仅当对应入口文件存在时才创建 target，避免当前阶段因占位路径缺失而破坏构建。
 raft_add_optional_app_target(view_node_app
   apps/view_node_app.cpp
+  view_proto
 )
 
 raft_add_optional_app_target(metadata_node_app
   apps/metadata_node_app.cpp
+  metadata_proto
 )
 
 raft_add_optional_app_target(storage_node_app
   apps/storage_node_app.cpp
+  storage_node_proto
 )
 
 raft_add_optional_app_target(storage_client
   apps/storage_client.cpp
+  view_proto
+  metadata_proto
+  storage_node_proto
 )
-
-if(TARGET storage_client)
-  target_link_libraries(storage_client
-    PRIVATE
-      view_proto
-      metadata_proto
-      storage_node_proto
-  )
-endif()
 
 raft_add_optional_app_target(storage_bench
   apps/storage_bench.cpp

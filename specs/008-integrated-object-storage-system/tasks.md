@@ -117,8 +117,8 @@
 - [X] T045 [P] [US2] Implement thin `view_node_app` startup in `apps/view_node_app.cpp`
 - [X] T046 [P] [US2] Implement thin `metadata_node_app` startup in `apps/metadata_node_app.cpp`
 - [X] T047 [P] [US2] Implement thin `storage_node_app` startup in `apps/storage_node_app.cpp`
-- [ ] T048 [US2] Wire `view_node_app`, `metadata_node_app`, and `storage_node_app` targets in `CMakeLists.txt`
-- [ ] T049 [US2] Update `quickstart.md` command examples after final app argument names are implemented in `specs/008-integrated-object-storage-system/quickstart.md`
+- [X] T048 [US2] Wire `view_node_app`, `metadata_node_app`, and `storage_node_app` targets in `CMakeLists.txt`
+- [X] T049 [US2] Update `quickstart.md` command examples after final app argument names are implemented in `specs/008-integrated-object-storage-system/quickstart.md`
 
 **Checkpoint**: User Story 2 can start a configurable local cluster without code changes.
 
