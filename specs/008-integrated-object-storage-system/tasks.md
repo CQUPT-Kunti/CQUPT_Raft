@@ -140,9 +140,9 @@
 
 - [X] T053 [US5] Expose read-only committed membership/quorum summary for diagnostics in `modules/raft/node/raft_node.h`
 - [X] T054 [US5] Implement quorum summary without changing election or commit behavior in `modules/raft/node/raft_node.cpp`
-- [ ] T055 [US5] Map quorum and leader diagnostics into MetadataService responses where needed in `modules/raft/service/metadata_service_impl.cpp`
+- [X] T055 [US5] Map quorum and leader diagnostics into MetadataService responses where needed in `modules/raft/service/metadata_service_impl.cpp`
 - [X] T056 [US5] Add ViewNode Raft observation status mapping without membership authority in `modules/view/view_registry.cpp`
-- [ ] T057 [US5] Wire `integrated_object_storage_quorum` test target in `tests/CMakeLists.txt`
+- [X] T057 [US5] Wire `integrated_object_storage_quorum` test target in `tests/CMakeLists.txt`
 
 **Checkpoint**: User Story 5 proves no availability shortcut can shrink Raft quorum.
 

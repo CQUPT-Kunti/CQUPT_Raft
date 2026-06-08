@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -105,6 +106,14 @@ namespace raftdemo
         return raft::METADATA_STATUS_CODE_OVERLOADED;
       case ProposeStatus::kNodeStopping:
         return raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
+      case ProposeStatus::kReplicationFailed:
+        if (MessageStartsWith(result.message, "failed to replicate log entry to majority"))
+        {
+          return raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
+        }
+        return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
+      case ProposeStatus::kCommitFailed:
+        return raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
       case ProposeStatus::kApplyFailed:
         if (MessageStartsWith(result.message, "invalid metadata command:"))
         {
@@ -123,22 +132,122 @@ namespace raftdemo
           return raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT;
         }
         return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
-      case ProposeStatus::kReplicationFailed:
-      case ProposeStatus::kCommitFailed:
       default:
         return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
       }
     }
 
+    const char *CommittedMembershipRoleName(const CommittedMembershipRole role)
+    {
+      switch (role)
+      {
+      case CommittedMembershipRole::kVoter:
+        return "voter";
+      case CommittedMembershipRole::kLearner:
+        return "learner";
+      case CommittedMembershipRole::kNonMember:
+        return "non_member";
+      case CommittedMembershipRole::kUnknown:
+      default:
+        return "unknown";
+      }
+    }
+
+    bool ShouldAttachWriteDiagnostics(const ProposeResult &result)
+    {
+      switch (result.status)
+      {
+      case ProposeStatus::kNotLeader:
+      case ProposeStatus::kTimeout:
+      case ProposeStatus::kNodeStopping:
+      case ProposeStatus::kCommitFailed:
+        return true;
+      case ProposeStatus::kReplicationFailed:
+        return MessageStartsWith(result.message, "failed to replicate log entry to majority");
+      default:
+        return false;
+      }
+    }
+
+    int ResolveLeaderHintId(const NodeStatusSnapshot &status,
+                            const std::optional<int> fallback_leader_id)
+    {
+      if (status.leader_id >= 0)
+      {
+        return status.leader_id;
+      }
+      if (fallback_leader_id.has_value())
+      {
+        return *fallback_leader_id;
+      }
+      return -1;
+    }
+
+    std::string BuildDiagnosticMessage(
+        const std::string &base_message,
+        const NodeStatusSnapshot &status,
+        const CommittedMembershipQuorumSummary &quorum_summary,
+        const std::optional<int> fallback_leader_id,
+        const bool emphasize_quorum_boundary)
+    {
+      std::ostringstream oss;
+      oss << base_message
+          << "; leader_hint_id=" << ResolveLeaderHintId(status, fallback_leader_id)
+          << "; leader_hint_address=" << status.leader_address
+          << "; committed_voter_count=" << quorum_summary.voter_count
+          << "; committed_quorum_size=" << quorum_summary.quorum_size
+          << "; local_committed_membership_role="
+          << CommittedMembershipRoleName(quorum_summary.local_role)
+          << "; committed_membership_index=" << quorum_summary.committed_log_index
+          << "; committed_membership_term=" << quorum_summary.committed_term
+          << "; committed_voter_ids=[";
+      for (std::size_t index = 0; index < quorum_summary.voter_ids.size(); ++index)
+      {
+        if (index > 0)
+        {
+          oss << ",";
+        }
+        oss << quorum_summary.voter_ids[index];
+      }
+      oss << "]";
+      if (emphasize_quorum_boundary)
+      {
+        // 只读诊断必须明确说明 quorum 来源于 committed membership，不能按 live 节点或
+        // ViewNode 观测结果改变写路径共识规则。
+        oss << "; quorum_rule=committed_membership_majority_only";
+      }
+      return oss.str();
+    }
+
     void FillLeaderHint(const NodeStatusSnapshot &status,
+                        const std::optional<int> fallback_leader_id,
                         raft::MetadataLeaderHint *leader_hint)
     {
       if (leader_hint == nullptr)
       {
         return;
       }
-      leader_hint->set_leader_id(status.leader_id);
+      leader_hint->set_leader_id(ResolveLeaderHintId(status, fallback_leader_id));
       leader_hint->set_leader_address(status.leader_address);
+    }
+
+    void DecorateSummaryWithDiagnostics(
+        const NodeStatusSnapshot &status,
+        const CommittedMembershipQuorumSummary &quorum_summary,
+        const std::optional<int> fallback_leader_id,
+        const bool emphasize_quorum_boundary,
+        raft::MetadataResponseSummary *summary)
+    {
+      if (summary == nullptr)
+      {
+        return;
+      }
+      summary->set_message(BuildDiagnosticMessage(summary->message(),
+                                                 status,
+                                                 quorum_summary,
+                                                 fallback_leader_id,
+                                                 emphasize_quorum_boundary));
+      FillLeaderHint(status, fallback_leader_id, summary->mutable_leader_hint());
     }
 
     void FillBucketRecord(const BucketRecord &record, raft::BucketRecord *out)
@@ -219,7 +328,7 @@ namespace raftdemo
                                        : raft::METADATA_OBJECT_STATE_UNSPECIFIED);
       out->set_log_index(log_index.value_or(0));
       out->set_term(term.value_or(status.term));
-      FillLeaderHint(status, out->mutable_leader_hint());
+      FillLeaderHint(status, std::nullopt, out->mutable_leader_hint());
     }
 
     void FillSummary(const NodeStatusSnapshot &status,
@@ -248,6 +357,7 @@ namespace raftdemo
     }
 
     void FillWriteSummary(const NodeStatusSnapshot &status,
+                          const CommittedMembershipQuorumSummary &quorum_summary,
                           const ProposeResult &result,
                           const std::string &request_id,
                           const std::string &bucket,
@@ -267,6 +377,16 @@ namespace raftdemo
                   result.log_index,
                   result.term,
                   out);
+      if (ShouldAttachWriteDiagnostics(result))
+      {
+        DecorateSummaryWithDiagnostics(status,
+                                       quorum_summary,
+                                       result.leader_id >= 0
+                                           ? std::optional<int>(result.leader_id)
+                                           : std::nullopt,
+                                       true,
+                                       out);
+      }
     }
 
     template <typename Response>
@@ -311,6 +431,36 @@ namespace raftdemo
     }
 
     template <typename Response>
+    grpc::ServerUnaryReactor *FinishReadAdmissionErrorWithDiagnostics(
+        grpc::CallbackServerContext *context,
+        const NodeStatusSnapshot &status,
+        const CommittedMembershipQuorumSummary &quorum_summary,
+        const raft::MetadataStatusCode code,
+        const std::string &message,
+        const std::string &bucket,
+        const std::string &object_key,
+        const std::string &object_id,
+        Response *response)
+    {
+      auto *reactor = FinishReadError(context,
+                                      status,
+                                      code,
+                                      message,
+                                      bucket,
+                                      object_key,
+                                      object_id,
+                                      response);
+      DecorateSummaryWithDiagnostics(status,
+                                     quorum_summary,
+                                     status.leader_id >= 0
+                                         ? std::optional<int>(status.leader_id)
+                                         : std::nullopt,
+                                     true,
+                                     response->mutable_summary());
+      return reactor;
+    }
+
+    template <typename Response>
     grpc::ServerUnaryReactor *FinishReadAdmissionIfRejected(
         const RaftNode &node,
         grpc::CallbackServerContext *context,
@@ -320,40 +470,45 @@ namespace raftdemo
         const std::string &object_id,
         Response *response)
     {
+      const CommittedMembershipQuorumSummary quorum_summary =
+          node.GetCommittedMembershipQuorumSummary();
       if (IsDeadlineExpired(context))
       {
-        return FinishReadError(context,
-                               status,
-                               raft::METADATA_STATUS_CODE_TIMEOUT,
-                               "read deadline already expired before admission",
-                               bucket,
-                               object_key,
-                               object_id,
-                               response);
+        return FinishReadAdmissionErrorWithDiagnostics(context,
+                                                       status,
+                                                       quorum_summary,
+                                                       raft::METADATA_STATUS_CODE_TIMEOUT,
+                                                       "read deadline already expired before admission",
+                                                       bucket,
+                                                       object_key,
+                                                       object_id,
+                                                       response);
       }
 
       if (!node.IsRunning())
       {
-        return FinishReadError(context,
-                               status,
-                               raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE,
-                               "node is stopping",
-                               bucket,
-                               object_key,
-                               object_id,
-                               response);
+        return FinishReadAdmissionErrorWithDiagnostics(context,
+                                                       status,
+                                                       quorum_summary,
+                                                       raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE,
+                                                       "node is stopping",
+                                                       bucket,
+                                                       object_key,
+                                                       object_id,
+                                                       response);
       }
 
       if (status.role != "Leader")
       {
-        return FinishReadError(context,
-                               status,
-                               raft::METADATA_STATUS_CODE_NOT_LEADER,
-                               "node is not the leader",
-                               bucket,
-                               object_key,
-                               object_id,
-                               response);
+        return FinishReadAdmissionErrorWithDiagnostics(context,
+                                                       status,
+                                                       quorum_summary,
+                                                       raft::METADATA_STATUS_CODE_NOT_LEADER,
+                                                       "node is not the leader",
+                                                       bucket,
+                                                       object_key,
+                                                       object_id,
+                                                       response);
       }
 
       return nullptr;
@@ -616,7 +771,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
@@ -667,7 +825,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
@@ -718,7 +879,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
@@ -770,7 +934,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
@@ -822,7 +989,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
@@ -874,7 +1044,10 @@ namespace raftdemo
 
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
     FillWriteSummary(latest_status,
+                     quorum_summary,
                      result,
                      request->request_id(),
                      request->bucket(),
