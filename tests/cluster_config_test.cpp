@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cluster/cluster_config.h"
@@ -85,6 +86,34 @@ namespace clusterdemo
                 }
             }
             return false;
+        }
+
+        std::string BuildEndpointAllocationSignature(
+            const ClusterEndpointAllocationResult &allocation)
+        {
+            std::ostringstream oss;
+            for (const ClusterEndpointAssignment &assignment : allocation.assignments)
+            {
+                oss << ToString(assignment.node_type) << '|'
+                    << assignment.node_id << '|'
+                    << assignment.ordinal << '|'
+                    << assignment.endpoint << '\n';
+            }
+            return oss.str();
+        }
+
+        std::size_t CountAssignments(const ClusterEndpointAllocationResult &allocation,
+                                     const ClusterNodeType node_type)
+        {
+            std::size_t count = 0;
+            for (const ClusterEndpointAssignment &assignment : allocation.assignments)
+            {
+                if (assignment.node_type == node_type)
+                {
+                    ++count;
+                }
+            }
+            return count;
         }
 
         std::string BuildConfigSignature(const ClusterConfig &config)
@@ -283,6 +312,245 @@ namespace clusterdemo
             EXPECT_FALSE(generated.validation.ok());
             EXPECT_TRUE(ContainsIssue(generated.validation,
                                       ClusterConfigIssueCode::kInvalidCapacity));
+        }
+
+        TEST(cluster_config_endpoint_allocation_test,
+             allocates_stable_role_specific_endpoints_from_request)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.fixed_view_node_ids = {"view-fixed-a"};
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+            };
+            request.fixed_storage_node_ids = {
+                "store-fixed-a",
+                "store-fixed-b",
+                "store-fixed-c",
+            };
+
+            const ClusterEndpointAllocationResult first =
+                AllocateClusterEndpoints(request);
+            const ClusterEndpointAllocationResult second =
+                AllocateClusterEndpoints(request);
+
+            ASSERT_TRUE(first.ok()) << first.error_detail;
+            ASSERT_TRUE(second.ok()) << second.error_detail;
+            EXPECT_EQ(CountAssignments(first, ClusterNodeType::kView), 1U);
+            EXPECT_EQ(CountAssignments(first, ClusterNodeType::kMetadata), 3U);
+            EXPECT_EQ(CountAssignments(first, ClusterNodeType::kStorage), 3U);
+            EXPECT_EQ(BuildEndpointAllocationSignature(first),
+                      BuildEndpointAllocationSignature(second));
+        }
+
+        TEST(cluster_config_endpoint_allocation_test,
+             reports_duplicate_endpoint_conflicts_from_overlapping_port_ranges)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(1);
+            request.view_port_base = 25000;
+            request.metadata_port_base = 25000;
+            request.storage_port_base = 25000;
+
+            const ClusterEndpointAllocationResult allocation =
+                AllocateClusterEndpoints(request);
+
+            EXPECT_FALSE(allocation.ok());
+            EXPECT_EQ(allocation.status, ClusterConfigStatusCode::kConflict);
+            EXPECT_TRUE(ContainsIssue(allocation.validation,
+                                      ClusterConfigIssueCode::kDuplicateEndpoint));
+        }
+
+        TEST(cluster_config_resolution_test,
+             resolves_view_metadata_and_storage_nodes_by_role_and_node_id)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.fixed_view_node_ids = {"view-fixed-a"};
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+            };
+            request.fixed_storage_node_ids = {
+                "store-fixed-a",
+                "store-fixed-b",
+                "store-fixed-c",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            const ClusterNodeResolutionResult view_result =
+                ResolveClusterNodeConfig(generated.config,
+                                         ClusterNodeType::kView,
+                                         "view-fixed-a");
+            ASSERT_TRUE(view_result.ok()) << view_result.error_detail;
+            ASSERT_TRUE(view_result.resolved.has_value());
+            EXPECT_EQ(view_result.resolved->node_type, ClusterNodeType::kView);
+            EXPECT_EQ(view_result.resolved->endpoint, "127.0.0.1:21300");
+            EXPECT_EQ(view_result.resolved->data_dir,
+                      request.base_dir / "view" / "view-fixed-a");
+            EXPECT_FALSE(view_result.resolved->snapshot_dir.has_value());
+            EXPECT_FALSE(view_result.resolved->raft_id.has_value());
+
+            const ClusterNodeResolutionResult metadata_result =
+                ResolveClusterNodeConfig(generated.config,
+                                         ClusterNodeType::kMetadata,
+                                         "meta-fixed-b");
+            ASSERT_TRUE(metadata_result.ok()) << metadata_result.error_detail;
+            ASSERT_TRUE(metadata_result.resolved.has_value());
+            EXPECT_EQ(metadata_result.resolved->node_type,
+                      ClusterNodeType::kMetadata);
+            EXPECT_EQ(metadata_result.resolved->endpoint, "127.0.0.1:22301");
+            EXPECT_EQ(metadata_result.resolved->raft_id, 2);
+            EXPECT_EQ(metadata_result.resolved->metadata_initial_role,
+                      MetadataNodeInitialRole::kVoter);
+            EXPECT_TRUE(metadata_result.resolved->snapshot_dir.has_value());
+
+            const ClusterNodeResolutionResult storage_result =
+                ResolveClusterNodeConfig(generated.config,
+                                         ClusterNodeType::kStorage,
+                                         "store-fixed-c");
+            ASSERT_TRUE(storage_result.ok()) << storage_result.error_detail;
+            ASSERT_TRUE(storage_result.resolved.has_value());
+            EXPECT_EQ(storage_result.resolved->node_type, ClusterNodeType::kStorage);
+            EXPECT_EQ(storage_result.resolved->endpoint, "127.0.0.1:23302");
+            EXPECT_EQ(storage_result.resolved->capacity_bytes,
+                      kDefaultStorageCapacityBytes);
+            EXPECT_FALSE(storage_result.resolved->snapshot_dir.has_value());
+            EXPECT_FALSE(storage_result.resolved->raft_id.has_value());
+        }
+
+        TEST(cluster_config_resolution_test,
+             rejects_missing_node_and_role_mismatch_without_fallback)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+            };
+            request.fixed_storage_node_ids = {
+                "store-fixed-a",
+                "store-fixed-b",
+                "store-fixed-c",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            const ClusterNodeResolutionResult role_mismatch =
+                ResolveClusterNodeConfig(generated.config,
+                                         ClusterNodeType::kMetadata,
+                                         "store-fixed-a");
+            EXPECT_FALSE(role_mismatch.ok());
+            EXPECT_EQ(role_mismatch.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_FALSE(role_mismatch.resolved.has_value());
+            EXPECT_TRUE(ContainsIssue(role_mismatch.validation,
+                                      ClusterConfigIssueCode::kInvalidNodeType));
+
+            const ClusterNodeResolutionResult missing_node =
+                ResolveClusterNodeConfig(generated.config,
+                                         ClusterNodeType::kStorage,
+                                         "store-missing");
+            EXPECT_FALSE(missing_node.ok());
+            EXPECT_EQ(missing_node.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_FALSE(missing_node.resolved.has_value());
+            EXPECT_TRUE(ContainsIssue(missing_node.validation,
+                                      ClusterConfigIssueCode::kInvalidNodeId));
+        }
+
+        TEST(cluster_config_quorum_helper_test,
+             computes_majority_quorum_for_1_3_5_7_initial_voters)
+        {
+            for (const auto &[voter_count, expected_quorum] :
+                 std::array<std::pair<std::size_t, std::size_t>, 4>{
+                     std::pair<std::size_t, std::size_t>{1, 1},
+                     {3, 2},
+                     {5, 3},
+                     {7, 4},
+                 })
+            {
+                SCOPED_TRACE("voter_count=" + std::to_string(voter_count));
+                const ClusterConfigGenerationResult generated =
+                    GenerateDeterministicClusterConfig(
+                        MakeGenerationRequest(voter_count));
+                ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+                const InitialRaftQuorumComputationResult from_config =
+                    ComputeInitialRaftQuorum(generated.config);
+                ASSERT_TRUE(from_config.ok()) << from_config.error_detail;
+                ASSERT_TRUE(from_config.summary.has_value());
+                EXPECT_EQ(from_config.summary->voter_count, voter_count);
+                EXPECT_EQ(from_config.summary->election_quorum, expected_quorum);
+                EXPECT_EQ(from_config.summary->commit_quorum, expected_quorum);
+                EXPECT_EQ(from_config.summary->voter_raft_ids,
+                          generated.config.initial_raft_membership.voter_raft_ids);
+
+                EXPECT_EQ(
+                    ComputeInitialRaftQuorumSize(generated.config.initial_raft_membership),
+                    expected_quorum);
+            }
+        }
+
+        TEST(cluster_config_quorum_helper_test,
+             rejects_empty_or_learner_only_membership_with_diagnostics)
+        {
+            const InitialRaftMembershipConfig empty_membership{
+                .voter_raft_ids = {},
+                .learner_raft_ids = {},
+                .membership_epoch = 1,
+            };
+            const InitialRaftQuorumComputationResult empty_result =
+                ComputeInitialRaftQuorum(empty_membership);
+            EXPECT_FALSE(empty_result.ok());
+            EXPECT_EQ(empty_result.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_FALSE(empty_result.summary.has_value());
+            EXPECT_TRUE(ContainsIssue(empty_result.validation,
+                                      ClusterConfigIssueCode::kInvalidRaftVoterCount));
+
+            const InitialRaftMembershipConfig learner_only_membership{
+                .voter_raft_ids = {},
+                .learner_raft_ids = {11, 13},
+                .membership_epoch = 2,
+            };
+            const InitialRaftQuorumComputationResult learner_only_result =
+                ComputeInitialRaftQuorum(learner_only_membership);
+            EXPECT_FALSE(learner_only_result.ok());
+            EXPECT_EQ(learner_only_result.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_FALSE(learner_only_result.summary.has_value());
+            EXPECT_TRUE(ContainsIssue(learner_only_result.validation,
+                                      ClusterConfigIssueCode::kInvalidRaftVoterCount));
+        }
+
+        TEST(cluster_config_quorum_helper_test,
+             rejects_duplicate_and_overlapping_membership_entries)
+        {
+            const InitialRaftMembershipConfig duplicate_voters{
+                .voter_raft_ids = {21, 21, 23},
+                .learner_raft_ids = {},
+                .membership_epoch = 3,
+            };
+            const InitialRaftQuorumComputationResult duplicate_result =
+                ComputeInitialRaftQuorum(duplicate_voters);
+            EXPECT_FALSE(duplicate_result.ok());
+            EXPECT_EQ(duplicate_result.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_TRUE(ContainsIssue(duplicate_result.validation,
+                                      ClusterConfigIssueCode::kInvalidInitialMembership));
+
+            const InitialRaftMembershipConfig overlapping_membership{
+                .voter_raft_ids = {31, 33, 35},
+                .learner_raft_ids = {35, 37},
+                .membership_epoch = 4,
+            };
+            const InitialRaftQuorumComputationResult overlapping_result =
+                ComputeInitialRaftQuorum(overlapping_membership);
+            EXPECT_FALSE(overlapping_result.ok());
+            EXPECT_EQ(overlapping_result.status, ClusterConfigStatusCode::kInvalidArgument);
+            EXPECT_TRUE(ContainsIssue(overlapping_result.validation,
+                                      ClusterConfigIssueCode::kInvalidInitialMembership));
         }
     } // namespace
 } // namespace clusterdemo

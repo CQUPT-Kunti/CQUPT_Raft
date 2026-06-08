@@ -111,8 +111,8 @@
 
 ### Implementation for User Story 2
 
-- [ ] T042 [US2] Implement per-node config resolution and endpoint allocation in `modules/cluster/cluster_config.cpp`
-- [ ] T043 [US2] Add quorum calculation helpers based on initial Raft voters in `modules/cluster/cluster_config.cpp`
+- [X] T042 [US2] Implement per-node config resolution and endpoint allocation in `modules/cluster/cluster_config.cpp`
+- [X] T043 [US2] Add quorum calculation helpers based on initial Raft voters in `modules/cluster/cluster_config.cpp`
 - [X] T044 [P] [US2] Implement config generator command in `apps/storage_client.cpp`
 - [ ] T045 [P] [US2] Implement thin `view_node_app` startup in `apps/view_node_app.cpp`
 - [ ] T046 [P] [US2] Implement thin `metadata_node_app` startup in `apps/metadata_node_app.cpp`

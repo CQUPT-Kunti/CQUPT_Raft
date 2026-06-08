@@ -209,14 +209,107 @@ namespace clusterdemo
         }
     };
 
+    struct ClusterEndpointAssignment
+    {
+        ClusterNodeType node_type{ClusterNodeType::kUnknown};
+        ClusterNodeId node_id;
+        std::size_t ordinal{0};
+        std::string endpoint;
+    };
+
+    struct ClusterEndpointAllocationResult
+    {
+        ClusterConfigStatusCode status{ClusterConfigStatusCode::kOk};
+        std::string error_detail;
+        std::vector<ClusterEndpointAssignment> assignments;
+        ClusterConfigValidationResult validation;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == ClusterConfigStatusCode::kOk &&
+                   validation.ok();
+        }
+    };
+
+    struct ResolvedClusterNodeConfig
+    {
+        ClusterNodeType node_type{ClusterNodeType::kUnknown};
+        ClusterNodeId node_id;
+        std::string endpoint;
+        std::filesystem::path data_dir;
+        std::optional<std::filesystem::path> snapshot_dir;
+        std::optional<std::int32_t> raft_id;
+        std::optional<MetadataNodeInitialRole> metadata_initial_role;
+        std::optional<std::uint64_t> capacity_bytes;
+        FailureDomainConfig failure_domain;
+    };
+
+    struct ClusterNodeResolutionResult
+    {
+        ClusterConfigStatusCode status{ClusterConfigStatusCode::kOk};
+        std::string error_detail;
+        std::optional<ResolvedClusterNodeConfig> resolved;
+        ClusterConfigValidationResult validation;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == ClusterConfigStatusCode::kOk &&
+                   validation.ok() &&
+                   resolved.has_value();
+        }
+    };
+
+    struct InitialRaftQuorumSummary
+    {
+        std::size_t voter_count{0};
+        std::size_t election_quorum{0};
+        std::size_t commit_quorum{0};
+        std::vector<std::int32_t> voter_raft_ids;
+    };
+
+    struct InitialRaftQuorumComputationResult
+    {
+        ClusterConfigStatusCode status{ClusterConfigStatusCode::kOk};
+        std::string error_detail;
+        std::optional<InitialRaftQuorumSummary> summary;
+        ClusterConfigValidationResult validation;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == ClusterConfigStatusCode::kOk &&
+                   validation.ok() &&
+                   summary.has_value();
+        }
+    };
+
     [[nodiscard]] ClusterConfigValidationResult ValidateClusterConfig(
         const ClusterConfig &config);
 
     [[nodiscard]] ClusterConfigValidationResult ValidateInitialRaftMembership(
         const ClusterConfig &config);
 
+    // endpoint 分配只基于配置输入生成稳定结果，不负责 app startup、
+    // 真实节点启动或运行时服务发现。
+    [[nodiscard]] ClusterEndpointAllocationResult AllocateClusterEndpoints(
+        const ClusterConfigGenerationRequest &request);
+
     [[nodiscard]] ClusterConfigGenerationResult GenerateDeterministicClusterConfig(
         const ClusterConfigGenerationRequest &request);
+
+    // 单节点解析必须显式按 role + node_id 命中，不允许静默 fallback
+    // 到“第一个节点”或任何默认 demo 拓扑。
+    [[nodiscard]] ClusterNodeResolutionResult ResolveClusterNodeConfig(
+        const ClusterConfig &config,
+        ClusterNodeType node_type,
+        std::string_view node_id);
+
+    // 只根据 initial voter membership 计算 quorum，用于配置校验、测试和诊断；
+    // 它不是运行时 Raft membership authority，也不会改变 election / commit 行为。
+    [[nodiscard]] InitialRaftQuorumComputationResult ComputeInitialRaftQuorum(
+        const InitialRaftMembershipConfig &membership);
+
+    [[nodiscard]] InitialRaftQuorumComputationResult ComputeInitialRaftQuorum(
+        const ClusterConfig &config);
 
     // quorum 必须基于初始 voter 总数计算，不因当前存活节点减少而缩小。
     [[nodiscard]] std::size_t ComputeInitialRaftQuorumSize(

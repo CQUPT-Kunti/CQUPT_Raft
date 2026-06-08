@@ -488,6 +488,249 @@ namespace clusterdemo
             ++(*cursor);
             return selected;
         }
+
+        std::string BuildValidationErrorDetail(
+            const ClusterConfigValidationResult &validation)
+        {
+            std::vector<std::string> descriptions;
+            descriptions.reserve(validation.issues.size());
+            for (const ClusterConfigValidationIssue &issue : validation.issues)
+            {
+                descriptions.push_back(DescribeClusterConfigIssue(issue));
+            }
+            return JoinMessages(descriptions);
+        }
+
+        std::string AllocationFieldPath(const ClusterNodeType node_type,
+                                        const std::size_t ordinal)
+        {
+            switch (node_type)
+            {
+            case ClusterNodeType::kView:
+                return "view_nodes[" + std::to_string(ordinal) + "].endpoint";
+            case ClusterNodeType::kMetadata:
+                return "metadata_nodes[" + std::to_string(ordinal) + "].endpoint";
+            case ClusterNodeType::kStorage:
+                return "storage_nodes[" + std::to_string(ordinal) + "].endpoint";
+            case ClusterNodeType::kUnknown:
+            default:
+                return "endpoint";
+            }
+        }
+
+        ClusterNodeId ResolveRequestedNodeId(const ClusterNodeType node_type,
+                                             const ClusterConfigGenerationRequest &request,
+                                             const std::size_t ordinal)
+        {
+            switch (node_type)
+            {
+            case ClusterNodeType::kView:
+                return ordinal < request.fixed_view_node_ids.size()
+                           ? request.fixed_view_node_ids[ordinal]
+                           : MakeDefaultNodeId(kViewNodeIdPrefix, ordinal + 1);
+            case ClusterNodeType::kMetadata:
+                return ordinal < request.fixed_metadata_node_ids.size()
+                           ? request.fixed_metadata_node_ids[ordinal]
+                           : MakeDefaultNodeId(kMetadataNodeIdPrefix, ordinal + 1);
+            case ClusterNodeType::kStorage:
+                return ordinal < request.fixed_storage_node_ids.size()
+                           ? request.fixed_storage_node_ids[ordinal]
+                           : MakeDefaultNodeId(kStorageNodeIdPrefix, ordinal + 1);
+            case ClusterNodeType::kUnknown:
+            default:
+                return {};
+            }
+        }
+
+        const ClusterEndpointAssignment *FindAssignment(
+            const std::vector<ClusterEndpointAssignment> &assignments,
+            const ClusterNodeType node_type,
+            const std::size_t ordinal)
+        {
+            for (const ClusterEndpointAssignment &assignment : assignments)
+            {
+                if (assignment.node_type == node_type &&
+                    assignment.ordinal == ordinal)
+                {
+                    return &assignment;
+                }
+            }
+            return nullptr;
+        }
+
+        std::vector<std::string> ValidateGenerationRequest(
+            const ClusterConfigGenerationRequest &request)
+        {
+            std::vector<std::string> request_errors;
+            if (request.cluster_id.empty() || IsBlank(request.cluster_id))
+            {
+                request_errors.push_back("cluster_id must not be empty");
+            }
+            if (request.base_dir.empty())
+            {
+                request_errors.push_back("base_dir must not be empty");
+            }
+            if (request.bind_host.empty() || IsBlank(request.bind_host))
+            {
+                request_errors.push_back("bind_host must not be empty");
+            }
+            if (!request.advertise_host.empty() &&
+                request.advertise_host != request.bind_host)
+            {
+                // 当前 ClusterConfig 只有单一 endpoint 字段，不能静默分裂监听地址和对外地址。
+                request_errors.push_back(
+                    "advertise_host must be empty or equal to bind_host until the config model exposes separate bind/advertise endpoints");
+            }
+            if (request.view_node_count == 0)
+            {
+                request_errors.push_back("view_node_count must be > 0");
+            }
+            if (request.metadata_node_count == 0)
+            {
+                request_errors.push_back("metadata_node_count must be > 0");
+            }
+            if (request.storage_node_count == 0)
+            {
+                request_errors.push_back("storage_node_count must be > 0");
+            }
+            if (request.metadata_voter_count == 0)
+            {
+                request_errors.push_back("metadata_voter_count must be > 0");
+            }
+            else if (request.metadata_voter_count > request.metadata_node_count)
+            {
+                request_errors.push_back(
+                    "metadata_voter_count must not exceed metadata_node_count");
+            }
+            else if ((request.metadata_voter_count % 2U) == 0U)
+            {
+                request_errors.push_back(
+                    "metadata_voter_count must be odd to support 1/3/5/7 voter layouts");
+            }
+            if (request.fixed_view_node_ids.size() > request.view_node_count)
+            {
+                request_errors.push_back(
+                    "fixed_view_node_ids size must not exceed view_node_count");
+            }
+            if (request.fixed_metadata_node_ids.size() > request.metadata_node_count)
+            {
+                request_errors.push_back(
+                    "fixed_metadata_node_ids size must not exceed metadata_node_count");
+            }
+            if (request.fixed_metadata_raft_ids.size() > request.metadata_node_count)
+            {
+                request_errors.push_back(
+                    "fixed_metadata_raft_ids size must not exceed metadata_node_count");
+            }
+            if (request.fixed_storage_node_ids.size() > request.storage_node_count)
+            {
+                request_errors.push_back(
+                    "fixed_storage_node_ids size must not exceed storage_node_count");
+            }
+            if (request.storage_capacity_overrides_bytes.size() >
+                request.storage_node_count)
+            {
+                request_errors.push_back(
+                    "storage_capacity_overrides_bytes size must not exceed storage_node_count");
+            }
+            if (request.generation_seed.has_value() && *request.generation_seed == 0)
+            {
+                request_errors.push_back(
+                    "generation_seed must be > 0 when provided");
+            }
+
+            ValidatePortRange(request.view_port_base,
+                              request.view_node_count,
+                              "view_port_base",
+                              &request_errors);
+            ValidatePortRange(request.metadata_port_base,
+                              request.metadata_node_count,
+                              "metadata_port_base",
+                              &request_errors);
+            ValidatePortRange(request.storage_port_base,
+                              request.storage_node_count,
+                              "storage_port_base",
+                              &request_errors);
+            return request_errors;
+        }
+
+        ClusterConfigValidationResult ValidateInitialQuorumMembershipOnly(
+            const InitialRaftMembershipConfig &membership)
+        {
+            ClusterConfigValidationResult validation;
+            if (membership.voter_raft_ids.empty())
+            {
+                AppendIssue(&validation,
+                            ClusterConfigIssueCode::kInvalidRaftVoterCount,
+                            "initial_raft_membership.voter_raft_ids",
+                            "at least one voter raft_id must be configured");
+                return validation;
+            }
+
+            if ((membership.voter_raft_ids.size() % 2U) == 0U)
+            {
+                AppendIssue(&validation,
+                            ClusterConfigIssueCode::kInvalidRaftVoterCount,
+                            "initial_raft_membership.voter_raft_ids",
+                            "voter count must be odd to support 1/3/5/7 style quorum layouts");
+            }
+
+            std::unordered_set<std::int32_t> seen_voters;
+            std::unordered_set<std::int32_t> seen_learners;
+
+            for (std::size_t index = 0; index < membership.voter_raft_ids.size(); ++index)
+            {
+                const std::int32_t raft_id = membership.voter_raft_ids[index];
+                const std::string field_path =
+                    "initial_raft_membership.voter_raft_ids[" + std::to_string(index) + "]";
+                if (raft_id <= 0)
+                {
+                    AppendIssue(&validation,
+                                ClusterConfigIssueCode::kInvalidRaftId,
+                                field_path,
+                                "voter raft_id must be > 0");
+                    continue;
+                }
+                if (!seen_voters.insert(raft_id).second)
+                {
+                    AppendIssue(&validation,
+                                ClusterConfigIssueCode::kInvalidInitialMembership,
+                                field_path,
+                                "voter raft_id must not be duplicated");
+                }
+            }
+
+            for (std::size_t index = 0; index < membership.learner_raft_ids.size(); ++index)
+            {
+                const std::int32_t raft_id = membership.learner_raft_ids[index];
+                const std::string field_path =
+                    "initial_raft_membership.learner_raft_ids[" + std::to_string(index) + "]";
+                if (raft_id <= 0)
+                {
+                    AppendIssue(&validation,
+                                ClusterConfigIssueCode::kInvalidRaftId,
+                                field_path,
+                                "learner raft_id must be > 0");
+                    continue;
+                }
+                if (!seen_learners.insert(raft_id).second)
+                {
+                    AppendIssue(&validation,
+                                ClusterConfigIssueCode::kInvalidInitialMembership,
+                                field_path,
+                                "learner raft_id must not be duplicated");
+                }
+                if (seen_voters.find(raft_id) != seen_voters.end())
+                {
+                    AppendIssue(&validation,
+                                ClusterConfigIssueCode::kInvalidInitialMembership,
+                                field_path,
+                                "raft_id must not appear in both voter and learner membership");
+                }
+            }
+
+            return validation;
+        }
     } // namespace
 
     ClusterConfigValidationResult ValidateClusterConfig(const ClusterConfig &config)
@@ -1011,102 +1254,12 @@ namespace clusterdemo
         return result;
     }
 
-    ClusterConfigGenerationResult GenerateDeterministicClusterConfig(
+    ClusterEndpointAllocationResult AllocateClusterEndpoints(
         const ClusterConfigGenerationRequest &request)
     {
-        ClusterConfigGenerationResult result;
-
-        std::vector<std::string> request_errors;
-        if (request.cluster_id.empty() || IsBlank(request.cluster_id))
-        {
-            request_errors.push_back("cluster_id must not be empty");
-        }
-        if (request.base_dir.empty())
-        {
-            request_errors.push_back("base_dir must not be empty");
-        }
-        if (request.bind_host.empty() || IsBlank(request.bind_host))
-        {
-            request_errors.push_back("bind_host must not be empty");
-        }
-        if (!request.advertise_host.empty() &&
-            request.advertise_host != request.bind_host)
-        {
-            // 当前 ClusterConfig 只有单一 endpoint 字段，不能静默分裂监听地址和对外地址。
-            request_errors.push_back(
-                "advertise_host must be empty or equal to bind_host until the config model exposes separate bind/advertise endpoints");
-        }
-        if (request.view_node_count == 0)
-        {
-            request_errors.push_back("view_node_count must be > 0");
-        }
-        if (request.metadata_node_count == 0)
-        {
-            request_errors.push_back("metadata_node_count must be > 0");
-        }
-        if (request.storage_node_count == 0)
-        {
-            request_errors.push_back("storage_node_count must be > 0");
-        }
-        if (request.metadata_voter_count == 0)
-        {
-            request_errors.push_back("metadata_voter_count must be > 0");
-        }
-        else if (request.metadata_voter_count > request.metadata_node_count)
-        {
-            request_errors.push_back(
-                "metadata_voter_count must not exceed metadata_node_count");
-        }
-        else if ((request.metadata_voter_count % 2U) == 0U)
-        {
-            request_errors.push_back(
-                "metadata_voter_count must be odd to support 1/3/5/7 voter layouts");
-        }
-        if (request.fixed_view_node_ids.size() > request.view_node_count)
-        {
-            request_errors.push_back(
-                "fixed_view_node_ids size must not exceed view_node_count");
-        }
-        if (request.fixed_metadata_node_ids.size() > request.metadata_node_count)
-        {
-            request_errors.push_back(
-                "fixed_metadata_node_ids size must not exceed metadata_node_count");
-        }
-        if (request.fixed_metadata_raft_ids.size() > request.metadata_node_count)
-        {
-            request_errors.push_back(
-                "fixed_metadata_raft_ids size must not exceed metadata_node_count");
-        }
-        if (request.fixed_storage_node_ids.size() > request.storage_node_count)
-        {
-            request_errors.push_back(
-                "fixed_storage_node_ids size must not exceed storage_node_count");
-        }
-        if (request.storage_capacity_overrides_bytes.size() >
-            request.storage_node_count)
-        {
-            request_errors.push_back(
-                "storage_capacity_overrides_bytes size must not exceed storage_node_count");
-        }
-        if (request.generation_seed.has_value() && *request.generation_seed == 0)
-        {
-            request_errors.push_back(
-                "generation_seed must be > 0 when provided");
-        }
-
-        ValidatePortRange(request.view_port_base,
-                          request.view_node_count,
-                          "view_port_base",
-                          &request_errors);
-        ValidatePortRange(request.metadata_port_base,
-                          request.metadata_node_count,
-                          "metadata_port_base",
-                          &request_errors);
-        ValidatePortRange(request.storage_port_base,
-                          request.storage_node_count,
-                          "storage_port_base",
-                          &request_errors);
-
+        ClusterEndpointAllocationResult result;
+        const std::vector<std::string> request_errors =
+            ValidateGenerationRequest(request);
         if (!request_errors.empty())
         {
             result.status = ClusterConfigStatusCode::kInvalidArgument;
@@ -1115,6 +1268,92 @@ namespace clusterdemo
         }
 
         const std::string endpoint_host = request.bind_host;
+        result.assignments.reserve(request.view_node_count +
+                                   request.metadata_node_count +
+                                   request.storage_node_count);
+
+        auto append_assignment = [&](const ClusterNodeType node_type,
+                                     const std::size_t ordinal,
+                                     const std::uint16_t port_base) {
+            const ClusterNodeId node_id =
+                ResolveRequestedNodeId(node_type, request, ordinal);
+            result.assignments.push_back(ClusterEndpointAssignment{
+                .node_type = node_type,
+                .node_id = node_id,
+                .ordinal = ordinal,
+                .endpoint = MakeEndpoint(
+                    endpoint_host,
+                    static_cast<std::uint16_t>(port_base + ordinal)),
+            });
+        };
+
+        for (std::size_t index = 0; index < request.view_node_count; ++index)
+        {
+            append_assignment(ClusterNodeType::kView, index, request.view_port_base);
+        }
+        for (std::size_t index = 0; index < request.metadata_node_count; ++index)
+        {
+            append_assignment(ClusterNodeType::kMetadata,
+                              index,
+                              request.metadata_port_base);
+        }
+        for (std::size_t index = 0; index < request.storage_node_count; ++index)
+        {
+            append_assignment(ClusterNodeType::kStorage,
+                              index,
+                              request.storage_port_base);
+        }
+
+        std::unordered_set<std::string> seen_endpoints;
+        for (const ClusterEndpointAssignment &assignment : result.assignments)
+        {
+            if (!ParseEndpoint(assignment.endpoint, nullptr, nullptr))
+            {
+                AppendIssue(&result.validation,
+                            ClusterConfigIssueCode::kInvalidEndpoint,
+                            AllocationFieldPath(assignment.node_type, assignment.ordinal),
+                            "generated endpoint must use host:port format with port in 1..65535",
+                            assignment.node_type,
+                            assignment.node_id,
+                            assignment.endpoint);
+                continue;
+            }
+
+            if (!seen_endpoints.insert(assignment.endpoint).second)
+            {
+                // endpoint allocation 必须显式报告冲突，不能静默跳到其它端口。
+                AppendIssue(&result.validation,
+                            ClusterConfigIssueCode::kDuplicateEndpoint,
+                            AllocationFieldPath(assignment.node_type, assignment.ordinal),
+                            "generated endpoint collides with another configured node",
+                            assignment.node_type,
+                            assignment.node_id,
+                            assignment.endpoint);
+            }
+        }
+
+        result.status = DeriveGenerationStatus(result.validation);
+        if (!result.validation.ok())
+        {
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+        }
+        return result;
+    }
+
+    ClusterConfigGenerationResult GenerateDeterministicClusterConfig(
+        const ClusterConfigGenerationRequest &request)
+    {
+        ClusterConfigGenerationResult result;
+        const ClusterEndpointAllocationResult allocation =
+            AllocateClusterEndpoints(request);
+        if (!allocation.ok())
+        {
+            result.status = allocation.status;
+            result.error_detail = allocation.error_detail;
+            result.validation = allocation.validation;
+            return result;
+        }
+
         ClusterConfig config;
         config.cluster_id = request.cluster_id;
         config.base_dir = request.base_dir;
@@ -1124,17 +1363,24 @@ namespace clusterdemo
         config.view_nodes.reserve(request.view_node_count);
         for (std::size_t index = 0; index < request.view_node_count; ++index)
         {
-            const ClusterNodeId node_id =
-                index < request.fixed_view_node_ids.size()
-                    ? request.fixed_view_node_ids[index]
-                    : MakeDefaultNodeId(kViewNodeIdPrefix, index + 1);
+            const ClusterEndpointAssignment *assignment =
+                FindAssignment(allocation.assignments,
+                               ClusterNodeType::kView,
+                               index);
+            if (assignment == nullptr)
+            {
+                result.status = ClusterConfigStatusCode::kInternalError;
+                result.error_detail =
+                    "internal error: missing ViewNode endpoint allocation";
+                return result;
+            }
 
             config.view_nodes.push_back(ViewNodeConfig{
-                .node_id = node_id,
-                .endpoint = MakeEndpoint(
-                    endpoint_host,
-                    static_cast<std::uint16_t>(request.view_port_base + index)),
-                .data_dir = MakeRoleDataDir(request.base_dir, "view", node_id),
+                .node_id = assignment->node_id,
+                .endpoint = assignment->endpoint,
+                .data_dir = MakeRoleDataDir(request.base_dir,
+                                            "view",
+                                            assignment->node_id),
             });
         }
 
@@ -1148,10 +1394,17 @@ namespace clusterdemo
 
         for (std::size_t index = 0; index < request.metadata_node_count; ++index)
         {
-            const ClusterNodeId node_id =
-                index < request.fixed_metadata_node_ids.size()
-                    ? request.fixed_metadata_node_ids[index]
-                    : MakeDefaultNodeId(kMetadataNodeIdPrefix, index + 1);
+            const ClusterEndpointAssignment *assignment =
+                FindAssignment(allocation.assignments,
+                               ClusterNodeType::kMetadata,
+                               index);
+            if (assignment == nullptr)
+            {
+                result.status = ClusterConfigStatusCode::kInternalError;
+                result.error_detail =
+                    "internal error: missing MetadataNode endpoint allocation";
+                return result;
+            }
 
             const std::int32_t raft_id =
                 index < request.fixed_metadata_raft_ids.size()
@@ -1159,13 +1412,13 @@ namespace clusterdemo
                     : NextGeneratedRaftId(reserved_raft_ids, &next_generated_raft_id);
 
             config.metadata_nodes.push_back(MetadataNodeConfig{
-                .node_id = node_id,
+                .node_id = assignment->node_id,
                 .raft_id = raft_id,
-                .endpoint = MakeEndpoint(
-                    endpoint_host,
-                    static_cast<std::uint16_t>(request.metadata_port_base + index)),
-                .data_dir = MakeMetadataDataDir(request.base_dir, node_id),
-                .snapshot_dir = MakeMetadataSnapshotDir(request.base_dir, node_id),
+                .endpoint = assignment->endpoint,
+                .data_dir = MakeMetadataDataDir(request.base_dir,
+                                                assignment->node_id),
+                .snapshot_dir = MakeMetadataSnapshotDir(request.base_dir,
+                                                        assignment->node_id),
                 .initial_role =
                     index < request.metadata_voter_count
                         ? MetadataNodeInitialRole::kVoter
@@ -1181,21 +1434,28 @@ namespace clusterdemo
         config.storage_nodes.reserve(request.storage_node_count);
         for (std::size_t index = 0; index < request.storage_node_count; ++index)
         {
-            const ClusterNodeId node_id =
-                index < request.fixed_storage_node_ids.size()
-                    ? request.fixed_storage_node_ids[index]
-                    : MakeDefaultNodeId(kStorageNodeIdPrefix, index + 1);
+            const ClusterEndpointAssignment *assignment =
+                FindAssignment(allocation.assignments,
+                               ClusterNodeType::kStorage,
+                               index);
+            if (assignment == nullptr)
+            {
+                result.status = ClusterConfigStatusCode::kInternalError;
+                result.error_detail =
+                    "internal error: missing StorageNode endpoint allocation";
+                return result;
+            }
             const std::uint64_t capacity_bytes =
                 index < request.storage_capacity_overrides_bytes.size()
                     ? request.storage_capacity_overrides_bytes[index]
                     : request.default_storage_capacity_bytes;
 
             config.storage_nodes.push_back(StorageNodeConfig{
-                .node_id = node_id,
-                .endpoint = MakeEndpoint(
-                    endpoint_host,
-                    static_cast<std::uint16_t>(request.storage_port_base + index)),
-                .data_dir = MakeRoleDataDir(request.base_dir, "storage", node_id),
+                .node_id = assignment->node_id,
+                .endpoint = assignment->endpoint,
+                .data_dir = MakeRoleDataDir(request.base_dir,
+                                            "storage",
+                                            assignment->node_id),
                 .capacity_bytes = capacity_bytes,
                 .failure_domain = {},
             });
@@ -1220,14 +1480,209 @@ namespace clusterdemo
         result.status = DeriveGenerationStatus(result.validation);
         if (!result.validation.ok())
         {
-            std::vector<std::string> descriptions;
-            descriptions.reserve(result.validation.issues.size());
-            for (const ClusterConfigValidationIssue &issue :
-                 result.validation.issues)
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+        }
+
+        return result;
+    }
+
+    ClusterNodeResolutionResult ResolveClusterNodeConfig(
+        const ClusterConfig &config,
+        const ClusterNodeType node_type,
+        const std::string_view node_id)
+    {
+        ClusterNodeResolutionResult result;
+        result.validation = ValidateClusterConfig(config);
+        if (!result.validation.ok())
+        {
+            result.status = DeriveGenerationStatus(result.validation);
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+            return result;
+        }
+
+        if (node_type == ClusterNodeType::kUnknown)
+        {
+            AppendIssue(&result.validation,
+                        ClusterConfigIssueCode::kInvalidNodeType,
+                        "node_type",
+                        "node_type must be view, metadata or storage");
+            result.status = ClusterConfigStatusCode::kInvalidArgument;
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+            return result;
+        }
+
+        if (!IsValidNodeId(node_id))
+        {
+            AppendIssue(&result.validation,
+                        ClusterConfigIssueCode::kInvalidNodeId,
+                        "node_id",
+                        "node_id must not be empty and must use safe characters");
+            result.status = ClusterConfigStatusCode::kInvalidArgument;
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+            return result;
+        }
+
+        // 按 role + node_id 精确命中，解析失败必须显式报错，不能 fallback。
+        if (node_type == ClusterNodeType::kView)
+        {
+            for (const ViewNodeConfig &node : config.view_nodes)
             {
-                descriptions.push_back(DescribeClusterConfigIssue(issue));
+                if (node.node_id.has_value() && *node.node_id == node_id)
+                {
+                    result.resolved = ResolvedClusterNodeConfig{
+                        .node_type = ClusterNodeType::kView,
+                        .node_id = *node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                        .snapshot_dir = std::nullopt,
+                        .raft_id = std::nullopt,
+                        .metadata_initial_role = std::nullopt,
+                        .capacity_bytes = std::nullopt,
+                        .failure_domain = {},
+                    };
+                    return result;
+                }
             }
-            result.error_detail = JoinMessages(descriptions);
+        }
+        else if (node_type == ClusterNodeType::kMetadata)
+        {
+            for (const MetadataNodeConfig &node : config.metadata_nodes)
+            {
+                if (node.node_id == node_id)
+                {
+                    result.resolved = ResolvedClusterNodeConfig{
+                        .node_type = ClusterNodeType::kMetadata,
+                        .node_id = node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                        .snapshot_dir = node.snapshot_dir,
+                        .raft_id = node.raft_id,
+                        .metadata_initial_role = node.initial_role,
+                        .capacity_bytes = std::nullopt,
+                        .failure_domain = {},
+                    };
+                    return result;
+                }
+            }
+        }
+        else if (node_type == ClusterNodeType::kStorage)
+        {
+            for (const StorageNodeConfig &node : config.storage_nodes)
+            {
+                if (node.node_id.has_value() && *node.node_id == node_id)
+                {
+                    result.resolved = ResolvedClusterNodeConfig{
+                        .node_type = ClusterNodeType::kStorage,
+                        .node_id = *node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                        .snapshot_dir = std::nullopt,
+                        .raft_id = std::nullopt,
+                        .metadata_initial_role = std::nullopt,
+                        .capacity_bytes = node.capacity_bytes,
+                        .failure_domain = node.failure_domain,
+                    };
+                    return result;
+                }
+            }
+        }
+
+        ClusterNodeType actual_node_type = ClusterNodeType::kUnknown;
+        for (const ViewNodeConfig &node : config.view_nodes)
+        {
+            if (node.node_id.has_value() && *node.node_id == node_id)
+            {
+                actual_node_type = ClusterNodeType::kView;
+                break;
+            }
+        }
+        if (actual_node_type == ClusterNodeType::kUnknown)
+        {
+            for (const MetadataNodeConfig &node : config.metadata_nodes)
+            {
+                if (node.node_id == node_id)
+                {
+                    actual_node_type = ClusterNodeType::kMetadata;
+                    break;
+                }
+            }
+        }
+        if (actual_node_type == ClusterNodeType::kUnknown)
+        {
+            for (const StorageNodeConfig &node : config.storage_nodes)
+            {
+                if (node.node_id.has_value() && *node.node_id == node_id)
+                {
+                    actual_node_type = ClusterNodeType::kStorage;
+                    break;
+                }
+            }
+        }
+
+        if (actual_node_type != ClusterNodeType::kUnknown)
+        {
+            AppendIssue(&result.validation,
+                        ClusterConfigIssueCode::kInvalidNodeType,
+                        "node_type",
+                        "node_id exists but belongs to a different role in cluster config",
+                        actual_node_type,
+                        std::string(node_id));
+        }
+        else
+        {
+            AppendIssue(&result.validation,
+                        ClusterConfigIssueCode::kInvalidNodeId,
+                        "node_id",
+                        "node_id does not exist for the requested role",
+                        node_type,
+                        std::string(node_id));
+        }
+
+        result.status = ClusterConfigStatusCode::kInvalidArgument;
+        result.error_detail = BuildValidationErrorDetail(result.validation);
+        return result;
+    }
+
+    InitialRaftQuorumComputationResult ComputeInitialRaftQuorum(
+        const InitialRaftMembershipConfig &membership)
+    {
+        InitialRaftQuorumComputationResult result;
+        result.validation = ValidateInitialQuorumMembershipOnly(membership);
+        if (!result.validation.ok())
+        {
+            result.status = DeriveGenerationStatus(result.validation);
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+            return result;
+        }
+
+        const std::size_t quorum_size =
+            ComputeInitialRaftQuorumSize(membership.voter_raft_ids.size());
+        result.summary = InitialRaftQuorumSummary{
+            .voter_count = membership.voter_raft_ids.size(),
+            // election quorum 和 commit quorum 都是 initial voters 的 majority。
+            .election_quorum = quorum_size,
+            .commit_quorum = quorum_size,
+            .voter_raft_ids = membership.voter_raft_ids,
+        };
+        return result;
+    }
+
+    InitialRaftQuorumComputationResult ComputeInitialRaftQuorum(
+        const ClusterConfig &config)
+    {
+        InitialRaftQuorumComputationResult result;
+        result.validation = ValidateClusterConfig(config);
+        if (!result.validation.ok())
+        {
+            result.status = DeriveGenerationStatus(result.validation);
+            result.error_detail = BuildValidationErrorDetail(result.validation);
+            return result;
+        }
+
+        result = ComputeInitialRaftQuorum(config.initial_raft_membership);
+        if (!result.ok())
+        {
+            return result;
         }
 
         return result;
@@ -1246,7 +1701,9 @@ namespace clusterdemo
     std::size_t ComputeInitialRaftQuorumSize(
         const InitialRaftMembershipConfig &membership)
     {
-        return ComputeInitialRaftQuorumSize(membership.voter_raft_ids.size());
+        const InitialRaftQuorumComputationResult result =
+            ComputeInitialRaftQuorum(membership);
+        return result.ok() ? result.summary->commit_quorum : 0U;
     }
 
     std::string SerializeClusterConfigToJson(const ClusterConfig &config)
