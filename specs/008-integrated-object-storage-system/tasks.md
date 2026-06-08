@@ -106,14 +106,14 @@
 
 ### Tests for User Story 2
 
-- [ ] T040 [P] [US2] Add cluster config generation tests for 1/3/5/7 Raft voters in `tests/cluster_config_test.cpp`
-- [ ] T041 [P] [US2] Add app config parsing smoke tests in `tests/integrated_object_storage_e2e_test.cpp`
+- [X] T040 [P] [US2] Add cluster config generation tests for 1/3/5/7 Raft voters in `tests/cluster_config_test.cpp`
+- [X] T041 [P] [US2] Add app config parsing smoke tests in `tests/integrated_object_storage_e2e_test.cpp`
 
 ### Implementation for User Story 2
 
 - [ ] T042 [US2] Implement per-node config resolution and endpoint allocation in `modules/cluster/cluster_config.cpp`
 - [ ] T043 [US2] Add quorum calculation helpers based on initial Raft voters in `modules/cluster/cluster_config.cpp`
-- [ ] T044 [P] [US2] Implement config generator command in `apps/storage_client.cpp`
+- [X] T044 [P] [US2] Implement config generator command in `apps/storage_client.cpp`
 - [ ] T045 [P] [US2] Implement thin `view_node_app` startup in `apps/view_node_app.cpp`
 - [ ] T046 [P] [US2] Implement thin `metadata_node_app` startup in `apps/metadata_node_app.cpp`
 - [ ] T047 [P] [US2] Implement thin `storage_node_app` startup in `apps/storage_node_app.cpp`

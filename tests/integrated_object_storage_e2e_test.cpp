@@ -1,6 +1,7 @@
 #include "raft/common/metadata_command.h"
 #include "raft/state_machine/metadata_state_machine.h"
 #include "support/metadata_test_utils.h"
+#include "cluster/cluster_config.h"
 
 #include "metadata.pb.h"
 #include "store/common/store_types.h"
@@ -17,6 +18,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -304,7 +306,417 @@ namespace
             EXPECT_EQ(actual[index].checksum, expected[index].checksum);
         }
     }
+
+    struct AppConfigNodeSmokeView
+    {
+        clusterdemo::ClusterNodeType node_type{clusterdemo::ClusterNodeType::kUnknown};
+        std::string cluster_id;
+        std::string node_id;
+        std::string endpoint;
+        std::filesystem::path data_dir;
+        std::optional<std::filesystem::path> snapshot_dir;
+        std::optional<std::int32_t> raft_id;
+        std::optional<clusterdemo::MetadataNodeInitialRole> metadata_initial_role;
+    };
+
+    struct StorageClientConfigSmokeView
+    {
+        std::string cluster_id;
+        std::vector<std::string> view_endpoints;
+        clusterdemo::ChunkPolicyConfig chunk_policy;
+        clusterdemo::ClusterTimeoutConfig timeouts;
+    };
+
+    struct AppConfigSmokeResult
+    {
+        bool ok{false};
+        std::string diagnostic;
+        std::optional<AppConfigNodeSmokeView> node;
+        std::optional<StorageClientConfigSmokeView> client;
+    };
+
+    clusterdemo::ClusterTimeoutConfig MakeValidAppSmokeTimeoutConfig()
+    {
+        return clusterdemo::ClusterTimeoutConfig{
+            .discovery_rpc_timeout = std::chrono::milliseconds(500),
+            .metadata_rpc_timeout = std::chrono::milliseconds(800),
+            .storage_rpc_timeout = std::chrono::milliseconds(1200),
+            .heartbeat_interval = std::chrono::milliseconds(1000),
+            .registration_timeout = std::chrono::milliseconds(3000),
+            .commit_deadline = std::chrono::milliseconds(5000),
+            .liveness_stale_timeout = std::chrono::milliseconds(4000),
+            .liveness_dead_timeout = std::chrono::milliseconds(9000),
+        };
+    }
+
+    clusterdemo::ChunkPolicyConfig MakeValidAppSmokeChunkPolicy()
+    {
+        return clusterdemo::ChunkPolicyConfig{
+            .chunk_size_bytes = 4ULL * 1024ULL * 1024ULL,
+            .replica_count = 3,
+            .minimum_successful_writes = 2,
+            .checksum_algorithm = clusterdemo::ClusterChecksumAlgorithm::kSha256,
+        };
+    }
+
+    clusterdemo::ClusterConfigGenerationRequest MakeAppConfigSmokeGenerationRequest()
+    {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        return clusterdemo::ClusterConfigGenerationRequest{
+            .cluster_id = "app-config-smoke-cluster",
+            .base_dir = std::filesystem::temp_directory_path() /
+                        "cqupt_raft_integrated_app_config_smoke" /
+                        ("case-" + std::to_string(now_ns)),
+            .bind_host = "127.0.0.1",
+            .advertise_host = "",
+            .view_node_count = 1,
+            .metadata_node_count = 3,
+            .metadata_voter_count = 3,
+            .storage_node_count = 2,
+            .view_port_base = 31000,
+            .metadata_port_base = 32000,
+            .storage_port_base = 33000,
+            .default_storage_capacity_bytes = 64ULL * 1024ULL * 1024ULL,
+            .chunk_policy = MakeValidAppSmokeChunkPolicy(),
+            .timeouts = MakeValidAppSmokeTimeoutConfig(),
+            .fixed_view_node_ids = {"view-main"},
+            .fixed_metadata_node_ids = {"meta-a", "meta-b", "meta-c"},
+            .fixed_metadata_raft_ids = {11, 13, 17},
+            .fixed_storage_node_ids = {"store-a", "store-b"},
+            .storage_capacity_overrides_bytes = {96ULL * 1024ULL * 1024ULL},
+            .generation_seed = 2026041,
+        };
+    }
+
+    std::string DescribeClusterValidationIssues(
+        const clusterdemo::ClusterConfigValidationResult &validation)
+    {
+        std::ostringstream oss;
+        bool first = true;
+        for (const auto &issue : validation.issues)
+        {
+            if (!first)
+            {
+                oss << " | ";
+            }
+            first = false;
+            oss << clusterdemo::DescribeClusterConfigIssue(issue);
+        }
+        return oss.str();
+    }
+
+    AppConfigSmokeResult ResolveNodeAppConfigSmoke(
+        const clusterdemo::ClusterConfig &config,
+        const clusterdemo::ClusterNodeType expected_role,
+        const std::string_view node_id)
+    {
+        const auto validation = clusterdemo::ValidateClusterConfig(config);
+        if (!validation.ok())
+        {
+            return AppConfigSmokeResult{
+                .ok = false,
+                .diagnostic = "invalid cluster config: " +
+                              DescribeClusterValidationIssues(validation),
+            };
+        }
+
+        if (node_id.empty())
+        {
+            return AppConfigSmokeResult{
+                .ok = false,
+                .diagnostic = "node_id must not be empty for role=" +
+                              std::string(clusterdemo::ToString(expected_role)),
+            };
+        }
+
+        auto make_result = [&](AppConfigNodeSmokeView view)
+        {
+            AppConfigSmokeResult result;
+            result.ok = true;
+            result.node = std::move(view);
+            return result;
+        };
+
+        if (expected_role == clusterdemo::ClusterNodeType::kView)
+        {
+            for (const auto &node : config.view_nodes)
+            {
+                if (node.node_id.has_value() && *node.node_id == node_id)
+                {
+                    return make_result(AppConfigNodeSmokeView{
+                        .node_type = expected_role,
+                        .cluster_id = config.cluster_id,
+                        .node_id = *node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                    });
+                }
+            }
+        }
+        else if (expected_role == clusterdemo::ClusterNodeType::kMetadata)
+        {
+            for (const auto &node : config.metadata_nodes)
+            {
+                if (node.node_id == node_id)
+                {
+                    return make_result(AppConfigNodeSmokeView{
+                        .node_type = expected_role,
+                        .cluster_id = config.cluster_id,
+                        .node_id = node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                        .snapshot_dir = node.snapshot_dir,
+                        .raft_id = node.raft_id,
+                        .metadata_initial_role = node.initial_role,
+                    });
+                }
+            }
+        }
+        else if (expected_role == clusterdemo::ClusterNodeType::kStorage)
+        {
+            for (const auto &node : config.storage_nodes)
+            {
+                if (node.node_id.has_value() && *node.node_id == node_id)
+                {
+                    return make_result(AppConfigNodeSmokeView{
+                        .node_type = expected_role,
+                        .cluster_id = config.cluster_id,
+                        .node_id = *node.node_id,
+                        .endpoint = node.endpoint,
+                        .data_dir = node.data_dir,
+                    });
+                }
+            }
+        }
+
+        const auto node_id_text = std::string(node_id);
+        for (const auto &node : config.view_nodes)
+        {
+            if (node.node_id.has_value() && *node.node_id == node_id_text)
+            {
+                return AppConfigSmokeResult{
+                    .ok = false,
+                    .diagnostic = "node_id=" + node_id_text +
+                                  " belongs to role=view, requested_role=" +
+                                  std::string(clusterdemo::ToString(expected_role)),
+                };
+            }
+        }
+        for (const auto &node : config.metadata_nodes)
+        {
+            if (node.node_id == node_id_text)
+            {
+                return AppConfigSmokeResult{
+                    .ok = false,
+                    .diagnostic = "node_id=" + node_id_text +
+                                  " belongs to role=metadata, requested_role=" +
+                                  std::string(clusterdemo::ToString(expected_role)),
+                };
+            }
+        }
+        for (const auto &node : config.storage_nodes)
+        {
+            if (node.node_id.has_value() && *node.node_id == node_id_text)
+            {
+                return AppConfigSmokeResult{
+                    .ok = false,
+                    .diagnostic = "node_id=" + node_id_text +
+                                  " belongs to role=storage, requested_role=" +
+                                  std::string(clusterdemo::ToString(expected_role)),
+                };
+            }
+        }
+
+        return AppConfigSmokeResult{
+            .ok = false,
+            .diagnostic = "node_id=" + node_id_text +
+                          " not found for role=" +
+                          std::string(clusterdemo::ToString(expected_role)),
+        };
+    }
+
+    AppConfigSmokeResult ResolveStorageClientConfigSmoke(
+        const clusterdemo::ClusterConfig &config)
+    {
+        // storage_client 的配置解析首先关心 discovery 入口是否存在；
+        // 这里优先给出缺少 ViewNode 的明确 smoke 诊断，再落到通用配置校验。
+        if (config.view_nodes.empty())
+        {
+            return AppConfigSmokeResult{
+                .ok = false,
+                .diagnostic = "storage_client requires at least one view node endpoint",
+            };
+        }
+
+        const auto validation = clusterdemo::ValidateClusterConfig(config);
+        if (!validation.ok())
+        {
+            return AppConfigSmokeResult{
+                .ok = false,
+                .diagnostic = "invalid cluster config: " +
+                              DescribeClusterValidationIssues(validation),
+            };
+        }
+
+        StorageClientConfigSmokeView client_view;
+        client_view.cluster_id = config.cluster_id;
+        client_view.chunk_policy = config.chunk_policy;
+        client_view.timeouts = config.timeouts;
+        client_view.view_endpoints.reserve(config.view_nodes.size());
+        for (const auto &node : config.view_nodes)
+        {
+            client_view.view_endpoints.push_back(node.endpoint);
+        }
+
+        AppConfigSmokeResult result;
+        result.ok = true;
+        result.client = std::move(client_view);
+        return result;
+    }
 } // namespace
+
+TEST(IntegratedObjectStorageE2ETest,
+     AppConfigParsingSmokeResolvesViewMetadataStorageAndClientBootstrapFromUnifiedClusterConfig)
+{
+    const auto request = MakeAppConfigSmokeGenerationRequest();
+    const auto generated =
+        clusterdemo::GenerateDeterministicClusterConfig(request);
+
+    ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+    const auto view =
+        ResolveNodeAppConfigSmoke(generated.config,
+                                  clusterdemo::ClusterNodeType::kView,
+                                  "view-main");
+    ASSERT_TRUE(view.ok) << view.diagnostic;
+    ASSERT_TRUE(view.node.has_value());
+    EXPECT_EQ(view.node->cluster_id, request.cluster_id);
+    EXPECT_EQ(view.node->node_id, "view-main");
+    EXPECT_EQ(view.node->endpoint, "127.0.0.1:31000");
+    EXPECT_EQ(view.node->data_dir,
+              request.base_dir / "view" / "view-main");
+
+    const auto metadata =
+        ResolveNodeAppConfigSmoke(generated.config,
+                                  clusterdemo::ClusterNodeType::kMetadata,
+                                  "meta-b");
+    ASSERT_TRUE(metadata.ok) << metadata.diagnostic;
+    ASSERT_TRUE(metadata.node.has_value());
+    EXPECT_EQ(metadata.node->cluster_id, request.cluster_id);
+    EXPECT_EQ(metadata.node->node_id, "meta-b");
+    EXPECT_EQ(metadata.node->endpoint, "127.0.0.1:32001");
+    ASSERT_TRUE(metadata.node->snapshot_dir.has_value());
+    EXPECT_EQ(*metadata.node->snapshot_dir,
+              request.base_dir / "metadata" / "meta-b" / "snapshots");
+    ASSERT_TRUE(metadata.node->raft_id.has_value());
+    EXPECT_EQ(*metadata.node->raft_id, 13);
+    ASSERT_TRUE(metadata.node->metadata_initial_role.has_value());
+    EXPECT_EQ(*metadata.node->metadata_initial_role,
+              clusterdemo::MetadataNodeInitialRole::kVoter);
+
+    const auto storage =
+        ResolveNodeAppConfigSmoke(generated.config,
+                                  clusterdemo::ClusterNodeType::kStorage,
+                                  "store-a");
+    ASSERT_TRUE(storage.ok) << storage.diagnostic;
+    ASSERT_TRUE(storage.node.has_value());
+    EXPECT_EQ(storage.node->cluster_id, request.cluster_id);
+    EXPECT_EQ(storage.node->node_id, "store-a");
+    EXPECT_EQ(storage.node->endpoint, "127.0.0.1:33000");
+    EXPECT_EQ(storage.node->data_dir,
+              request.base_dir / "storage" / "store-a");
+
+    const auto client = ResolveStorageClientConfigSmoke(generated.config);
+    ASSERT_TRUE(client.ok) << client.diagnostic;
+    ASSERT_TRUE(client.client.has_value());
+    EXPECT_EQ(client.client->cluster_id, request.cluster_id);
+    ASSERT_EQ(client.client->view_endpoints.size(), 1U);
+    EXPECT_EQ(client.client->view_endpoints.front(), "127.0.0.1:31000");
+    EXPECT_EQ(client.client->chunk_policy.replica_count,
+              request.chunk_policy.replica_count);
+    EXPECT_EQ(client.client->timeouts.discovery_rpc_timeout,
+              request.timeouts.discovery_rpc_timeout);
+}
+
+TEST(IntegratedObjectStorageE2ETest,
+     AppConfigParsingSmokeRejectsUnknownNodeIdAndRoleMismatchWithClearDiagnostics)
+{
+    const auto request = MakeAppConfigSmokeGenerationRequest();
+    const auto generated =
+        clusterdemo::GenerateDeterministicClusterConfig(request);
+    ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+    const auto wrong_role =
+        ResolveNodeAppConfigSmoke(generated.config,
+                                  clusterdemo::ClusterNodeType::kMetadata,
+                                  "store-a");
+    EXPECT_FALSE(wrong_role.ok);
+    EXPECT_NE(wrong_role.diagnostic.find("node_id=store-a"), std::string::npos);
+    EXPECT_NE(wrong_role.diagnostic.find("requested_role=metadata"),
+              std::string::npos);
+
+    const auto missing =
+        ResolveNodeAppConfigSmoke(generated.config,
+                                  clusterdemo::ClusterNodeType::kStorage,
+                                  "store-missing");
+    EXPECT_FALSE(missing.ok);
+    EXPECT_NE(missing.diagnostic.find("node_id=store-missing"),
+              std::string::npos);
+    EXPECT_NE(missing.diagnostic.find("role=storage"), std::string::npos);
+}
+
+TEST(IntegratedObjectStorageE2ETest,
+     AppConfigParsingSmokeRejectsEndpointAndDataDirConflictsBeforeBootstrap)
+{
+    const auto request = MakeAppConfigSmokeGenerationRequest();
+    const auto generated =
+        clusterdemo::GenerateDeterministicClusterConfig(request);
+    ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+    auto conflicting = generated.config;
+    conflicting.storage_nodes.front().endpoint =
+        conflicting.metadata_nodes.front().endpoint;
+    conflicting.storage_nodes.front().data_dir =
+        conflicting.metadata_nodes.front().data_dir;
+
+    const auto resolved =
+        ResolveNodeAppConfigSmoke(conflicting,
+                                  clusterdemo::ClusterNodeType::kStorage,
+                                  "store-a");
+    EXPECT_FALSE(resolved.ok);
+    EXPECT_NE(resolved.diagnostic.find("duplicate_endpoint"), std::string::npos);
+    EXPECT_NE(resolved.diagnostic.find("shared_data_dir"), std::string::npos);
+}
+
+TEST(IntegratedObjectStorageE2ETest,
+     AppConfigParsingSmokeRejectsMissingViewDiscoveryForStorageClient)
+{
+    const auto request = MakeAppConfigSmokeGenerationRequest();
+    const auto generated =
+        clusterdemo::GenerateDeterministicClusterConfig(request);
+    ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+    auto no_view = generated.config;
+    no_view.view_nodes.clear();
+
+    const auto client = ResolveStorageClientConfigSmoke(no_view);
+    EXPECT_FALSE(client.ok);
+    EXPECT_NE(client.diagnostic.find("at least one view node endpoint"),
+              std::string::npos);
+}
+
+TEST(IntegratedObjectStorageE2ETest,
+     DISABLED_AppConfigParsingSmokeCliOverridesMustRespectDurableIdentityAndStartupContracts)
+{
+    GTEST_SKIP()
+        << "T041 先锁定 unified cluster config parsing smoke 边界。"
+        << "启用 CLI override 与 durable identity 冲突路径，需要后续任务完成："
+        << "T042 per-node config resolution、T045/T046/T047 thin app startup、"
+        << "以及 app 层对 --node_id/--data_dir/--listen override 的显式拒绝语义。";
+}
 
 TEST(IntegratedObjectStorageE2ETest,
      PayloadBoundaryAuditMetadataControlPlaneDescriptorsExcludeRawPayloadBytes)

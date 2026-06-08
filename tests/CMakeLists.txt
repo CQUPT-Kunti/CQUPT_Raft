@@ -920,3 +920,6 @@ add_raft_gtest(test_view_node_discovery
 add_raft_gtest(test_node_identity
   node_identity_test.cpp
   "${RAFT_008_LABELS_NODE_IDENTITY}")
+add_raft_gtest(cluster_config_test
+  cluster_config_test.cpp
+  "${RAFT_008_LABELS_BASELINE}")

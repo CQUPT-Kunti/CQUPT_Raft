@@ -225,6 +225,11 @@ namespace clusterdemo
     [[nodiscard]] std::size_t ComputeInitialRaftQuorumSize(
         const InitialRaftMembershipConfig &membership);
 
+    // 生成器输出的文本配置只描述 cluster/config 边界，不承载 app startup
+    // 或运行时 discovery / quorum authority。
+    [[nodiscard]] std::string SerializeClusterConfigToJson(
+        const ClusterConfig &config);
+
     [[nodiscard]] const char *ToString(ClusterNodeType node_type);
     [[nodiscard]] const char *ToString(MetadataNodeInitialRole role);
     [[nodiscard]] const char *ToString(ClusterChecksumAlgorithm algorithm);

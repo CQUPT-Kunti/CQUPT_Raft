@@ -23,6 +23,20 @@
 
 ## Client Commands
 
+### generate-config
+
+```text
+storage_client generate-config --out <path> --base-dir <dir>
+```
+
+**Expected behavior**:
+
+- Parse local cluster topology parameters such as cluster_id, node counts, port bases, chunk policy, replica policy, storage capacity, and timeout policy.
+- Delegate cluster topology generation and validation to the shared cluster config module.
+- Write a reusable local cluster config file for later ViewNode / MetadataNode / StorageNode / storage_client startup.
+- Print clear success summary including output path, node counts, and initial metadata quorum.
+- Return non-zero on invalid arguments, validation failure, or output path write failure.
+
 ### upload
 
 ```text

@@ -98,6 +98,60 @@ namespace clusterdemo
             return oss.str();
         }
 
+        std::string EscapeJsonString(const std::string_view value)
+        {
+            std::string escaped;
+            escaped.reserve(value.size());
+            for (const char ch : value)
+            {
+                switch (ch)
+                {
+                case '\\':
+                    escaped += "\\\\";
+                    break;
+                case '"':
+                    escaped += "\\\"";
+                    break;
+                case '\b':
+                    escaped += "\\b";
+                    break;
+                case '\f':
+                    escaped += "\\f";
+                    break;
+                case '\n':
+                    escaped += "\\n";
+                    break;
+                case '\r':
+                    escaped += "\\r";
+                    break;
+                case '\t':
+                    escaped += "\\t";
+                    break;
+                default:
+                    escaped.push_back(ch);
+                    break;
+                }
+            }
+            return escaped;
+        }
+
+        std::string JsonString(const std::string_view value)
+        {
+            return "\"" + EscapeJsonString(value) + "\"";
+        }
+
+        std::string JsonPath(const std::filesystem::path &path)
+        {
+            return JsonString(path.string());
+        }
+
+        std::uint64_t ToMillis(const std::chrono::milliseconds value)
+        {
+            return value.count() > 0
+                       ? static_cast<std::uint64_t>(value.count())
+                       : 0ULL;
+        }
+
         void AppendIssue(ClusterConfigValidationResult *result,
                          const ClusterConfigIssueCode code,
                          std::string field_path,
@@ -1193,6 +1247,153 @@ namespace clusterdemo
         const InitialRaftMembershipConfig &membership)
     {
         return ComputeInitialRaftQuorumSize(membership.voter_raft_ids.size());
+    }
+
+    std::string SerializeClusterConfigToJson(const ClusterConfig &config)
+    {
+        std::ostringstream oss;
+        oss << "{\n";
+        oss << "  \"cluster_id\": " << JsonString(config.cluster_id) << ",\n";
+        oss << "  \"base_dir\": " << JsonPath(config.base_dir) << ",\n";
+
+        oss << "  \"view_nodes\": [\n";
+        for (std::size_t index = 0; index < config.view_nodes.size(); ++index)
+        {
+            const auto &node = config.view_nodes[index];
+            oss << "    {\n";
+            if (node.node_id.has_value())
+            {
+                oss << "      \"node_id\": " << JsonString(*node.node_id) << ",\n";
+            }
+            else
+            {
+                oss << "      \"node_id\": null,\n";
+            }
+            oss << "      \"endpoint\": " << JsonString(node.endpoint) << ",\n";
+            oss << "      \"data_dir\": " << JsonPath(node.data_dir) << "\n";
+            oss << "    }";
+            if (index + 1 != config.view_nodes.size())
+            {
+                oss << ",";
+            }
+            oss << "\n";
+        }
+        oss << "  ],\n";
+
+        oss << "  \"metadata_nodes\": [\n";
+        for (std::size_t index = 0; index < config.metadata_nodes.size(); ++index)
+        {
+            const auto &node = config.metadata_nodes[index];
+            oss << "    {\n";
+            oss << "      \"node_id\": " << JsonString(node.node_id) << ",\n";
+            oss << "      \"raft_id\": " << node.raft_id << ",\n";
+            oss << "      \"endpoint\": " << JsonString(node.endpoint) << ",\n";
+            oss << "      \"data_dir\": " << JsonPath(node.data_dir) << ",\n";
+            oss << "      \"snapshot_dir\": " << JsonPath(node.snapshot_dir)
+                << ",\n";
+            oss << "      \"initial_role\": "
+                << JsonString(ToString(node.initial_role)) << "\n";
+            oss << "    }";
+            if (index + 1 != config.metadata_nodes.size())
+            {
+                oss << ",";
+            }
+            oss << "\n";
+        }
+        oss << "  ],\n";
+
+        oss << "  \"storage_nodes\": [\n";
+        for (std::size_t index = 0; index < config.storage_nodes.size(); ++index)
+        {
+            const auto &node = config.storage_nodes[index];
+            oss << "    {\n";
+            if (node.node_id.has_value())
+            {
+                oss << "      \"node_id\": " << JsonString(*node.node_id) << ",\n";
+            }
+            else
+            {
+                oss << "      \"node_id\": null,\n";
+            }
+            oss << "      \"endpoint\": " << JsonString(node.endpoint) << ",\n";
+            oss << "      \"data_dir\": " << JsonPath(node.data_dir) << ",\n";
+            oss << "      \"capacity_bytes\": " << node.capacity_bytes << ",\n";
+            oss << "      \"failure_domain\": {\n";
+            oss << "        \"zone\": "
+                << JsonString(node.failure_domain.zone) << ",\n";
+            oss << "        \"rack\": "
+                << JsonString(node.failure_domain.rack) << "\n";
+            oss << "      }\n";
+            oss << "    }";
+            if (index + 1 != config.storage_nodes.size())
+            {
+                oss << ",";
+            }
+            oss << "\n";
+        }
+        oss << "  ],\n";
+
+        oss << "  \"initial_raft_membership\": {\n";
+        oss << "    \"membership_epoch\": "
+            << config.initial_raft_membership.membership_epoch << ",\n";
+        oss << "    \"voter_raft_ids\": [";
+        for (std::size_t index = 0;
+             index < config.initial_raft_membership.voter_raft_ids.size();
+             ++index)
+        {
+            if (index != 0)
+            {
+                oss << ", ";
+            }
+            oss << config.initial_raft_membership.voter_raft_ids[index];
+        }
+        oss << "],\n";
+        oss << "    \"learner_raft_ids\": [";
+        for (std::size_t index = 0;
+             index < config.initial_raft_membership.learner_raft_ids.size();
+             ++index)
+        {
+            if (index != 0)
+            {
+                oss << ", ";
+            }
+            oss << config.initial_raft_membership.learner_raft_ids[index];
+        }
+        oss << "]\n";
+        oss << "  },\n";
+
+        oss << "  \"chunk_policy\": {\n";
+        oss << "    \"chunk_size_bytes\": "
+            << config.chunk_policy.chunk_size_bytes << ",\n";
+        oss << "    \"replica_count\": " << config.chunk_policy.replica_count
+            << ",\n";
+        oss << "    \"minimum_successful_writes\": "
+            << config.chunk_policy.minimum_successful_writes << ",\n";
+        oss << "    \"checksum_algorithm\": "
+            << JsonString(ToString(config.chunk_policy.checksum_algorithm))
+            << "\n";
+        oss << "  },\n";
+
+        oss << "  \"timeouts\": {\n";
+        oss << "    \"discovery_rpc_timeout_ms\": "
+            << ToMillis(config.timeouts.discovery_rpc_timeout) << ",\n";
+        oss << "    \"metadata_rpc_timeout_ms\": "
+            << ToMillis(config.timeouts.metadata_rpc_timeout) << ",\n";
+        oss << "    \"storage_rpc_timeout_ms\": "
+            << ToMillis(config.timeouts.storage_rpc_timeout) << ",\n";
+        oss << "    \"heartbeat_interval_ms\": "
+            << ToMillis(config.timeouts.heartbeat_interval) << ",\n";
+        oss << "    \"registration_timeout_ms\": "
+            << ToMillis(config.timeouts.registration_timeout) << ",\n";
+        oss << "    \"commit_deadline_ms\": "
+            << ToMillis(config.timeouts.commit_deadline) << ",\n";
+        oss << "    \"liveness_stale_timeout_ms\": "
+            << ToMillis(config.timeouts.liveness_stale_timeout) << ",\n";
+        oss << "    \"liveness_dead_timeout_ms\": "
+            << ToMillis(config.timeouts.liveness_dead_timeout) << "\n";
+        oss << "  }\n";
+        oss << "}\n";
+        return oss.str();
     }
 
     const char *ToString(const ClusterNodeType node_type)

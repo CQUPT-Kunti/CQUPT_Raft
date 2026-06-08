@@ -1,3 +1,4 @@
+#include "cluster/cluster_config.h"
 #include "store/transfer/object_transfer.h"
 
 #include "store/transfer/metadata_transfer_client.h"
@@ -17,12 +18,14 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -55,9 +58,14 @@ namespace
     {
         std::string command;
         std::filesystem::path config_path;
+        std::filesystem::path output_path;
+        std::filesystem::path base_dir;
         std::string bucket;
         std::string object_key;
         std::string object_id;
+        std::string cluster_id;
+        std::string bind_host;
+        std::string advertise_host;
         std::filesystem::path source_path;
         std::filesystem::path destination_path;
         std::optional<std::uint64_t> version;
@@ -66,6 +74,23 @@ namespace
         std::optional<std::uint32_t> replica_count;
         std::optional<std::uint32_t> minimum_successful_writes;
         std::optional<std::uint32_t> concurrency;
+        std::optional<std::size_t> view_node_count;
+        std::optional<std::size_t> metadata_node_count;
+        std::optional<std::size_t> metadata_voter_count;
+        std::optional<std::size_t> storage_node_count;
+        std::optional<std::uint16_t> view_port_base;
+        std::optional<std::uint16_t> metadata_port_base;
+        std::optional<std::uint16_t> storage_port_base;
+        std::optional<std::uint64_t> storage_capacity_bytes;
+        std::optional<std::uint64_t> discovery_timeout_ms;
+        std::optional<std::uint64_t> metadata_timeout_ms;
+        std::optional<std::uint64_t> storage_timeout_ms;
+        std::optional<std::uint64_t> heartbeat_interval_ms;
+        std::optional<std::uint64_t> registration_timeout_ms;
+        std::optional<std::uint64_t> commit_deadline_ms;
+        std::optional<std::uint64_t> liveness_stale_timeout_ms;
+        std::optional<std::uint64_t> liveness_dead_timeout_ms;
+        std::optional<std::uint64_t> generation_seed;
     };
 
     enum class CliExitCode : int
@@ -405,6 +430,48 @@ namespace
         }
     }
 
+    [[nodiscard]] std::uint32_t ParseUint32OrDie(const std::string &value,
+                                                 const char *name)
+    {
+        const std::uint64_t parsed = ParseUnsignedOrDie(value, name);
+        if (parsed > static_cast<std::uint64_t>(
+                         std::numeric_limits<std::uint32_t>::max()))
+        {
+            std::cerr << "numeric value out of range for " << name << ": "
+                      << value << '\n';
+            std::exit(static_cast<int>(CliExitCode::kInvalidArgument));
+        }
+        return static_cast<std::uint32_t>(parsed);
+    }
+
+    [[nodiscard]] std::uint16_t ParseUint16OrDie(const std::string &value,
+                                                 const char *name)
+    {
+        const std::uint64_t parsed = ParseUnsignedOrDie(value, name);
+        if (parsed > static_cast<std::uint64_t>(
+                         std::numeric_limits<std::uint16_t>::max()))
+        {
+            std::cerr << "numeric value out of range for " << name << ": "
+                      << value << '\n';
+            std::exit(static_cast<int>(CliExitCode::kInvalidArgument));
+        }
+        return static_cast<std::uint16_t>(parsed);
+    }
+
+    [[nodiscard]] std::size_t ParseSizeOrDie(const std::string &value,
+                                             const char *name)
+    {
+        const std::uint64_t parsed = ParseUnsignedOrDie(value, name);
+        if (parsed >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            std::cerr << "numeric value out of range for " << name << ": "
+                      << value << '\n';
+            std::exit(static_cast<int>(CliExitCode::kInvalidArgument));
+        }
+        return static_cast<std::size_t>(parsed);
+    }
+
     [[nodiscard]] std::string SanitizeToken(std::string_view value)
     {
         std::string sanitized;
@@ -534,6 +601,23 @@ namespace
     {
         std::cerr
             << "Usage:\n"
+            << "  storage_client generate-config --out <path> --base-dir <dir>"
+            << " [--cluster-id <id>] [--bind-host <host>]"
+            << " [--advertise-host <host>] [--view-count <n>]"
+            << " [--metadata-count <n>] [--metadata-voters <n>]"
+            << " [--storage-count <n>] [--view-port-base <port>]"
+            << " [--metadata-port-base <port>] [--storage-port-base <port>]"
+            << " [--storage-capacity <bytes>] [--chunk-size <bytes>]"
+            << " [--replicas <n>] [--min-writes <n>]"
+            << " [--discovery-timeout-ms <ms>]"
+            << " [--metadata-timeout-ms <ms>]"
+            << " [--storage-timeout-ms <ms>]"
+            << " [--heartbeat-interval-ms <ms>]"
+            << " [--registration-timeout-ms <ms>]"
+            << " [--commit-deadline-ms <ms>]"
+            << " [--liveness-stale-timeout-ms <ms>]"
+            << " [--liveness-dead-timeout-ms <ms>]"
+            << " [--generation-seed <n>]\n"
             << "  storage_client upload --config <path> --bucket <bucket>"
             << " --object <key> --file <source>"
             << " [--object-id <id>] [--request-id <id>]"
@@ -570,10 +654,10 @@ namespace
             PrintUsage();
             std::exit(static_cast<int>(CliExitCode::kOk));
         }
-        if (args.command != "upload" && args.command != "download")
+        if (args.command != "generate-config" && args.command != "upload" &&
+            args.command != "download")
         {
-            ExitUsageError("unsupported command: " + args.command +
-                           " (T037 only implements upload/download)");
+            ExitUsageError("unsupported command: " + args.command);
         }
 
         for (int index = 2; index < argc; ++index)
@@ -593,6 +677,22 @@ namespace
             {
                 args.config_path = require_value("--config");
             }
+            else if (flag == "--base-dir")
+            {
+                args.base_dir = require_value("--base-dir");
+            }
+            else if (flag == "--cluster-id")
+            {
+                args.cluster_id = require_value("--cluster-id");
+            }
+            else if (flag == "--bind-host")
+            {
+                args.bind_host = require_value("--bind-host");
+            }
+            else if (flag == "--advertise-host")
+            {
+                args.advertise_host = require_value("--advertise-host");
+            }
             else if (flag == "--bucket")
             {
                 args.bucket = require_value("--bucket");
@@ -607,7 +707,14 @@ namespace
             }
             else if (flag == "--out")
             {
-                args.destination_path = require_value("--out");
+                if (args.command == "generate-config")
+                {
+                    args.output_path = require_value("--out");
+                }
+                else
+                {
+                    args.destination_path = require_value("--out");
+                }
             }
             else if (flag == "--object-id")
             {
@@ -622,6 +729,47 @@ namespace
                 args.version =
                     ParseUnsignedOrDie(require_value("--version"), "--version");
             }
+            else if (flag == "--view-count")
+            {
+                args.view_node_count =
+                    ParseSizeOrDie(require_value("--view-count"), "--view-count");
+            }
+            else if (flag == "--metadata-count")
+            {
+                args.metadata_node_count = ParseSizeOrDie(
+                    require_value("--metadata-count"), "--metadata-count");
+            }
+            else if (flag == "--metadata-voters")
+            {
+                args.metadata_voter_count = ParseSizeOrDie(
+                    require_value("--metadata-voters"), "--metadata-voters");
+            }
+            else if (flag == "--storage-count")
+            {
+                args.storage_node_count = ParseSizeOrDie(
+                    require_value("--storage-count"), "--storage-count");
+            }
+            else if (flag == "--view-port-base")
+            {
+                args.view_port_base = ParseUint16OrDie(
+                    require_value("--view-port-base"), "--view-port-base");
+            }
+            else if (flag == "--metadata-port-base")
+            {
+                args.metadata_port_base = ParseUint16OrDie(
+                    require_value("--metadata-port-base"),
+                    "--metadata-port-base");
+            }
+            else if (flag == "--storage-port-base")
+            {
+                args.storage_port_base = ParseUint16OrDie(
+                    require_value("--storage-port-base"), "--storage-port-base");
+            }
+            else if (flag == "--storage-capacity")
+            {
+                args.storage_capacity_bytes = ParseUnsignedOrDie(
+                    require_value("--storage-capacity"), "--storage-capacity");
+            }
             else if (flag == "--chunk-size")
             {
                 args.chunk_size =
@@ -630,21 +778,71 @@ namespace
             }
             else if (flag == "--replicas")
             {
-                args.replica_count = static_cast<std::uint32_t>(
-                    ParseUnsignedOrDie(require_value("--replicas"),
-                                       "--replicas"));
+                args.replica_count =
+                    ParseUint32OrDie(require_value("--replicas"), "--replicas");
             }
             else if (flag == "--min-writes")
             {
-                args.minimum_successful_writes = static_cast<std::uint32_t>(
-                    ParseUnsignedOrDie(require_value("--min-writes"),
-                                       "--min-writes"));
+                args.minimum_successful_writes = ParseUint32OrDie(
+                    require_value("--min-writes"), "--min-writes");
             }
             else if (flag == "--concurrency")
             {
-                args.concurrency = static_cast<std::uint32_t>(
-                    ParseUnsignedOrDie(require_value("--concurrency"),
-                                       "--concurrency"));
+                args.concurrency = ParseUint32OrDie(
+                    require_value("--concurrency"), "--concurrency");
+            }
+            else if (flag == "--discovery-timeout-ms")
+            {
+                args.discovery_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--discovery-timeout-ms"),
+                    "--discovery-timeout-ms");
+            }
+            else if (flag == "--metadata-timeout-ms")
+            {
+                args.metadata_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--metadata-timeout-ms"),
+                    "--metadata-timeout-ms");
+            }
+            else if (flag == "--storage-timeout-ms")
+            {
+                args.storage_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--storage-timeout-ms"),
+                    "--storage-timeout-ms");
+            }
+            else if (flag == "--heartbeat-interval-ms")
+            {
+                args.heartbeat_interval_ms = ParseUnsignedOrDie(
+                    require_value("--heartbeat-interval-ms"),
+                    "--heartbeat-interval-ms");
+            }
+            else if (flag == "--registration-timeout-ms")
+            {
+                args.registration_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--registration-timeout-ms"),
+                    "--registration-timeout-ms");
+            }
+            else if (flag == "--commit-deadline-ms")
+            {
+                args.commit_deadline_ms = ParseUnsignedOrDie(
+                    require_value("--commit-deadline-ms"),
+                    "--commit-deadline-ms");
+            }
+            else if (flag == "--liveness-stale-timeout-ms")
+            {
+                args.liveness_stale_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--liveness-stale-timeout-ms"),
+                    "--liveness-stale-timeout-ms");
+            }
+            else if (flag == "--liveness-dead-timeout-ms")
+            {
+                args.liveness_dead_timeout_ms = ParseUnsignedOrDie(
+                    require_value("--liveness-dead-timeout-ms"),
+                    "--liveness-dead-timeout-ms");
+            }
+            else if (flag == "--generation-seed")
+            {
+                args.generation_seed = ParseUnsignedOrDie(
+                    require_value("--generation-seed"), "--generation-seed");
             }
             else if (flag == "--help" || flag == "-h")
             {
@@ -657,9 +855,57 @@ namespace
             }
         }
 
+        if (args.command == "generate-config")
+        {
+            if (args.output_path.empty())
+            {
+                ExitUsageError("generate-config requires --out");
+            }
+            if (args.base_dir.empty())
+            {
+                ExitUsageError("generate-config requires --base-dir");
+            }
+            if (!args.config_path.empty())
+            {
+                ExitUsageError("generate-config does not accept --config");
+            }
+            if (!args.bucket.empty() || !args.object_key.empty() ||
+                !args.object_id.empty() || !args.request_id.empty() ||
+                !args.source_path.empty() || !args.destination_path.empty() ||
+                args.version.has_value() || args.concurrency.has_value())
+            {
+                ExitUsageError(
+                    "generate-config does not accept upload/download-specific arguments");
+            }
+            return args;
+        }
+
         if (args.config_path.empty())
         {
             ExitUsageError("--config is required");
+        }
+        if (!args.output_path.empty() || !args.base_dir.empty() ||
+            !args.cluster_id.empty() || !args.bind_host.empty() ||
+            !args.advertise_host.empty() || args.view_node_count.has_value() ||
+            args.metadata_node_count.has_value() ||
+            args.metadata_voter_count.has_value() ||
+            args.storage_node_count.has_value() ||
+            args.view_port_base.has_value() ||
+            args.metadata_port_base.has_value() ||
+            args.storage_port_base.has_value() ||
+            args.storage_capacity_bytes.has_value() ||
+            args.discovery_timeout_ms.has_value() ||
+            args.metadata_timeout_ms.has_value() ||
+            args.storage_timeout_ms.has_value() ||
+            args.heartbeat_interval_ms.has_value() ||
+            args.registration_timeout_ms.has_value() ||
+            args.commit_deadline_ms.has_value() ||
+            args.liveness_stale_timeout_ms.has_value() ||
+            args.liveness_dead_timeout_ms.has_value() ||
+            args.generation_seed.has_value())
+        {
+            ExitUsageError(
+                "upload/download does not accept generate-config-specific arguments");
         }
         if (args.bucket.empty())
         {
@@ -743,6 +989,196 @@ namespace
             }
             std::cerr << '\n';
         }
+    }
+
+    void PrintClusterConfigIssues(
+        const clusterdemo::ClusterConfigValidationResult &validation)
+    {
+        for (const auto &issue : validation.issues)
+        {
+            std::cerr << "diagnostic status="
+                      << clusterdemo::ToString(
+                             clusterdemo::ClusterConfigStatusCode::kInvalidArgument)
+                      << " issue="
+                      << clusterdemo::DescribeClusterConfigIssue(issue) << '\n';
+        }
+    }
+
+    [[nodiscard]] clusterdemo::ChunkPolicyConfig MakeChunkPolicy(
+        const ParsedArgs &args)
+    {
+        clusterdemo::ChunkPolicyConfig policy;
+        policy.chunk_size_bytes =
+            args.chunk_size.value_or(4ULL * 1024ULL * 1024ULL);
+        policy.replica_count = args.replica_count.value_or(3U);
+        policy.minimum_successful_writes =
+            args.minimum_successful_writes.value_or(2U);
+        policy.checksum_algorithm = clusterdemo::ClusterChecksumAlgorithm::kSha256;
+        return policy;
+    }
+
+    [[nodiscard]] clusterdemo::ClusterTimeoutConfig MakeClusterTimeoutConfig(
+        const ParsedArgs &args)
+    {
+        clusterdemo::ClusterTimeoutConfig timeouts;
+        timeouts.discovery_rpc_timeout = std::chrono::milliseconds(
+            args.discovery_timeout_ms.value_or(3000ULL));
+        timeouts.metadata_rpc_timeout = std::chrono::milliseconds(
+            args.metadata_timeout_ms.value_or(3000ULL));
+        timeouts.storage_rpc_timeout = std::chrono::milliseconds(
+            args.storage_timeout_ms.value_or(3000ULL));
+        timeouts.heartbeat_interval = std::chrono::milliseconds(
+            args.heartbeat_interval_ms.value_or(1000ULL));
+        timeouts.registration_timeout = std::chrono::milliseconds(
+            args.registration_timeout_ms.value_or(3000ULL));
+        timeouts.commit_deadline = std::chrono::milliseconds(
+            args.commit_deadline_ms.value_or(5000ULL));
+        timeouts.liveness_stale_timeout = std::chrono::milliseconds(
+            args.liveness_stale_timeout_ms.value_or(5000ULL));
+        timeouts.liveness_dead_timeout = std::chrono::milliseconds(
+            args.liveness_dead_timeout_ms.value_or(15000ULL));
+        return timeouts;
+    }
+
+    [[nodiscard]] clusterdemo::ClusterConfigGenerationRequest
+    MakeGenerationRequest(const ParsedArgs &args)
+    {
+        const std::size_t metadata_node_count =
+            args.metadata_node_count.value_or(3U);
+
+        clusterdemo::ClusterConfigGenerationRequest request;
+        request.cluster_id =
+            args.cluster_id.empty() ? "cluster-008-local" : args.cluster_id;
+        request.base_dir = args.base_dir;
+        request.bind_host =
+            args.bind_host.empty() ? "127.0.0.1" : args.bind_host;
+        request.advertise_host = args.advertise_host;
+        request.view_node_count = args.view_node_count.value_or(1U);
+        request.metadata_node_count = metadata_node_count;
+        request.metadata_voter_count =
+            args.metadata_voter_count.value_or(metadata_node_count);
+        request.storage_node_count = args.storage_node_count.value_or(3U);
+        request.view_port_base = args.view_port_base.value_or(7001U);
+        request.metadata_port_base = args.metadata_port_base.value_or(7101U);
+        request.storage_port_base = args.storage_port_base.value_or(7201U);
+        request.default_storage_capacity_bytes =
+            args.storage_capacity_bytes.value_or(64ULL * 1024ULL * 1024ULL *
+                                                 1024ULL);
+        request.chunk_policy = MakeChunkPolicy(args);
+        request.timeouts = MakeClusterTimeoutConfig(args);
+        request.generation_seed = args.generation_seed;
+        return request;
+    }
+
+    void WriteTextFile(const std::filesystem::path &path,
+                       const std::string &content)
+    {
+        // CLI 只负责跨平台路径创建和文本写盘，不接管 cluster/config 业务逻辑。
+        if (!path.has_parent_path())
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output.is_open())
+            {
+                throw std::runtime_error("failed to open output file: " +
+                                         path.string());
+            }
+            output << content;
+            if (!output.good())
+            {
+                throw std::runtime_error("failed to write output file: " +
+                                         path.string());
+            }
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec)
+        {
+            throw std::runtime_error("failed to create output directory: " +
+                                     path.parent_path().string() +
+                                     " reason=" + ec.message());
+        }
+
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("failed to open output file: " +
+                                     path.string());
+        }
+        output << content;
+        if (!output.good())
+        {
+            throw std::runtime_error("failed to write output file: " +
+                                     path.string());
+        }
+    }
+
+    [[nodiscard]] int ExitCodeForClusterConfigStatus(
+        const clusterdemo::ClusterConfigStatusCode status)
+    {
+        switch (status)
+        {
+        case clusterdemo::ClusterConfigStatusCode::kOk:
+            return static_cast<int>(CliExitCode::kOk);
+        case clusterdemo::ClusterConfigStatusCode::kUnsupported:
+            return static_cast<int>(CliExitCode::kUnsupported);
+        case clusterdemo::ClusterConfigStatusCode::kInvalidArgument:
+        case clusterdemo::ClusterConfigStatusCode::kConflict:
+            return static_cast<int>(CliExitCode::kInvalidArgument);
+        case clusterdemo::ClusterConfigStatusCode::kInternalError:
+        default:
+            return static_cast<int>(CliExitCode::kInternalError);
+        }
+    }
+
+    [[nodiscard]] int RunGenerateConfig(const ParsedArgs &args)
+    {
+        const auto request = MakeGenerationRequest(args);
+        const auto result =
+            clusterdemo::GenerateDeterministicClusterConfig(request);
+        if (!result.ok())
+        {
+            std::cerr << "generate-config FAILED"
+                      << " status=" << clusterdemo::ToString(result.status)
+                      << " message=" << result.error_detail << '\n';
+            PrintClusterConfigIssues(result.validation);
+            return ExitCodeForClusterConfigStatus(result.status);
+        }
+
+        const std::string content =
+            clusterdemo::SerializeClusterConfigToJson(result.config);
+        try
+        {
+            WriteTextFile(args.output_path, content);
+        }
+        catch (const std::exception &ex)
+        {
+            std::cerr << "generate-config FAILED"
+                      << " status=file_write_error"
+                      << " message=" << ex.what() << '\n';
+            return static_cast<int>(CliExitCode::kConfigError);
+        }
+
+        std::cout << "generate-config OK"
+                  << " cluster_id=" << result.config.cluster_id
+                  << " output=" << args.output_path.string()
+                  << " view_nodes=" << result.config.view_nodes.size()
+                  << " metadata_nodes=" << result.config.metadata_nodes.size()
+                  << " storage_nodes=" << result.config.storage_nodes.size()
+                  << " metadata_voters="
+                  << result.config.initial_raft_membership.voter_raft_ids.size()
+                  << " quorum="
+                  << clusterdemo::ComputeInitialRaftQuorumSize(
+                         result.config.initial_raft_membership)
+                  << '\n';
+        if (!result.config.view_nodes.empty())
+        {
+            std::cout << "leader_discovery_seed"
+                      << " endpoint=" << result.config.view_nodes.front().endpoint
+                      << '\n';
+        }
+        return static_cast<int>(CliExitCode::kOk);
     }
 
     [[nodiscard]] std::shared_ptr<viewdemo::ViewNodeClient> CreateViewClient(
@@ -912,6 +1348,11 @@ int main(int argc, char **argv)
     try
     {
         const ParsedArgs args = ParseArgs(argc, argv);
+        if (args.command == "generate-config")
+        {
+            return RunGenerateConfig(args);
+        }
+
         const ClientConfig config = LoadClientConfig(args.config_path);
 
         if (args.command == "upload")
