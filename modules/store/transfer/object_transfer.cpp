@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -509,6 +511,7 @@ namespace storedemo
             const std::string &cluster_id,
             const std::uint64_t minimum_available_capacity_bytes,
             const std::uint32_t limit,
+            const bool require_writable,
             const std::shared_ptr<viewdemo::ViewNodeClient> &view_client,
             std::vector<ObjectTransferDiagnostic> *diagnostics,
             ObjectTransferStatusCode *status,
@@ -533,7 +536,7 @@ namespace storedemo
                  .minimum_available_capacity_bytes =
                      minimum_available_capacity_bytes,
                  .limit = limit,
-                 .require_writable = true});
+                 .require_writable = require_writable});
             AppendViewDiagnostics(discovery_call.result.diagnostics,
                                   request_id,
                                   diagnostics);
@@ -594,6 +597,177 @@ namespace storedemo
                 *status = ObjectTransferStatusCode::kOk;
             }
             return targets;
+        }
+
+        [[nodiscard]] ObjectTransferStatusCode MapStorageStatus(
+            const StorageNodeStatusCode status)
+        {
+            switch (status)
+            {
+            case StorageNodeStatusCode::kOk:
+                return ObjectTransferStatusCode::kOk;
+            case StorageNodeStatusCode::kNotFound:
+                return ObjectTransferStatusCode::kNotFound;
+            case StorageNodeStatusCode::kInvalidArgument:
+                return ObjectTransferStatusCode::kInvalidArgument;
+            case StorageNodeStatusCode::kChecksumMismatch:
+            case StorageNodeStatusCode::kCorrupted:
+                return ObjectTransferStatusCode::kChecksumMismatch;
+            case StorageNodeStatusCode::kTimeout:
+                return ObjectTransferStatusCode::kTimeout;
+            case StorageNodeStatusCode::kCancelled:
+                return ObjectTransferStatusCode::kCancelled;
+            case StorageNodeStatusCode::kUnsupported:
+                return ObjectTransferStatusCode::kUnsupported;
+            case StorageNodeStatusCode::kConflict:
+                return ObjectTransferStatusCode::kConflict;
+            case StorageNodeStatusCode::kAlreadyExists:
+            case StorageNodeStatusCode::kDiskFull:
+            case StorageNodeStatusCode::kPermissionDenied:
+            case StorageNodeStatusCode::kIoError:
+            case StorageNodeStatusCode::kOverloaded:
+            case StorageNodeStatusCode::kNodeUnavailable:
+            default:
+                return ObjectTransferStatusCode::kStorageRejected;
+            }
+        }
+
+        [[nodiscard]] std::string SanitizePathToken(std::string_view value)
+        {
+            std::string sanitized;
+            sanitized.reserve(value.size());
+            for (const unsigned char ch : value)
+            {
+                if (std::isalnum(ch) != 0 || ch == '-' || ch == '_')
+                {
+                    sanitized.push_back(static_cast<char>(ch));
+                }
+                else
+                {
+                    sanitized.push_back('_');
+                }
+            }
+            if (sanitized.empty())
+            {
+                sanitized = "request";
+            }
+            return sanitized;
+        }
+
+        [[nodiscard]] std::filesystem::path MakeTemporaryDownloadPath(
+            const std::filesystem::path &destination_path,
+            const std::string &request_id)
+        {
+            auto temp_path = destination_path;
+            temp_path += ".";
+            temp_path += SanitizePathToken(request_id);
+            temp_path += ".part";
+            return temp_path;
+        }
+
+        void RemovePathIfExists(const std::filesystem::path &path)
+        {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+
+        [[nodiscard]] std::optional<std::string> ValidateObjectChecksumFacts(
+            const TransferObjectChecksumFacts &actual,
+            const TransferObjectChecksumFacts &expected)
+        {
+            if (expected.size != 0 && actual.size != expected.size)
+            {
+                return "downloaded object size does not match expected checksum facts";
+            }
+            if (expected.checksum.IsSet())
+            {
+                if (actual.checksum.algorithm != expected.checksum.algorithm ||
+                    actual.checksum.value != expected.checksum.value)
+                {
+                    return "downloaded object checksum does not match expected checksum facts";
+                }
+            }
+            if (!expected.etag.empty() && actual.etag != expected.etag)
+            {
+                return "downloaded object etag does not match expected checksum facts";
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<std::string> ValidateManifestLayout(
+            const TransferCommittedManifest &manifest,
+            std::vector<TransferCommittedChunk> *ordered_chunks)
+        {
+            if (ordered_chunks == nullptr)
+            {
+                return std::string("ordered_chunks output must not be null");
+            }
+
+            *ordered_chunks = manifest.chunks;
+            std::sort(ordered_chunks->begin(),
+                      ordered_chunks->end(),
+                      [](const TransferCommittedChunk &lhs,
+                         const TransferCommittedChunk &rhs)
+                      {
+                          if (lhs.identity.offset != rhs.identity.offset)
+                          {
+                              return lhs.identity.offset < rhs.identity.offset;
+                          }
+                          return lhs.identity.chunk_index < rhs.identity.chunk_index;
+                      });
+
+            if (!manifest.object_checksum.checksum.IsSet())
+            {
+                return "manifest does not contain verifiable object checksum facts";
+            }
+
+            std::uint64_t expected_offset = 0;
+            for (const auto &chunk : *ordered_chunks)
+            {
+                if (chunk.identity.offset != expected_offset)
+                {
+                    return "manifest chunk offsets are not contiguous";
+                }
+                if (chunk.size == 0 && manifest.object_checksum.size != 0)
+                {
+                    return "manifest contains zero-sized chunk for non-empty object";
+                }
+                if (chunk.size != 0 && !chunk.checksum.IsSet())
+                {
+                    return "manifest chunk is missing checksum facts";
+                }
+                if (chunk.size != 0 && chunk.replica_nodes.empty())
+                {
+                    return "manifest chunk does not contain replica node ids";
+                }
+                expected_offset += chunk.size;
+            }
+
+            if (manifest.object_checksum.size != 0 &&
+                expected_offset != manifest.object_checksum.size)
+            {
+                return "manifest chunk sizes do not match object size";
+            }
+            if (manifest.object_checksum.size == 0 && !ordered_chunks->empty())
+            {
+                return "empty object manifest must not contain chunks";
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<StorageTransferTarget> ResolveReplicaTarget(
+            const TransferCommittedChunk &chunk,
+            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets)
+        {
+            for (const auto &replica_node_id : chunk.replica_nodes)
+            {
+                const auto it = storage_targets.find(replica_node_id);
+                if (it != storage_targets.end() && !it->second.endpoint.empty())
+                {
+                    return it->second;
+                }
+            }
+            return std::nullopt;
         }
 
         class FileTransferChunkReader final : public TransferChunkReader
@@ -1174,6 +1348,7 @@ namespace storedemo
                     request_.cluster_id,
                     finalize_result.object_checksum.size,
                     request_.desired_replica_count,
+                    true,
                     view_client_,
                     &result.diagnostics,
                     &discovery_status,
@@ -1343,10 +1518,12 @@ namespace storedemo
             BasicDownloadTransferSession(
                 DownloadObjectRequest request,
                 std::shared_ptr<MetadataTransferClient> metadata_client,
+                std::shared_ptr<StorageTransferClient> storage_client,
                 std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
                   request_(std::move(request)),
                   metadata_client_(std::move(metadata_client)),
+                  storage_client_(std::move(storage_client)),
                   view_client_(std::move(view_client))
             {
             }
@@ -1372,26 +1549,15 @@ namespace storedemo
             }
 
             DownloadObjectResult Execute(
-                TransferChecksumState & /*checksum_state*/) override
+                TransferChecksumState &checksum_state) override
             {
                 DownloadObjectResult result;
                 result.session = Snapshot();
 
-                if (request_.request_id.empty() || request_.cluster_id.empty() ||
-                    request_.bucket.empty() || request_.object_key.empty())
+                const auto validation_status = ValidateRequest(&result.error_detail);
+                if (validation_status != ObjectTransferStatusCode::kOk)
                 {
-                    result.status = ObjectTransferStatusCode::kInvalidArgument;
-                    result.error_detail =
-                        "request_id, cluster_id, bucket and object_key are required";
-                    TransferFailureSummary failure;
-                    failure.status = result.status;
-                    failure.error_detail = result.error_detail;
-                    SetFailure(failure);
-                    result.session = Snapshot();
-                    result.diagnostics.push_back(
-                        MakeDiagnostic(result.status,
-                                       result.error_detail,
-                                       request_.request_id));
+                    Fail(&result, validation_status, result.error_detail);
                     return result;
                 }
 
@@ -1461,29 +1627,318 @@ namespace storedemo
                 }
 
                 result.manifest = manifest_call.result.manifest;
+                mutable_snapshot().object_id = result.manifest->object_id;
+                mutable_snapshot().version = result.manifest->version;
+                mutable_snapshot().committed_visible = true;
+                mutable_snapshot().total_bytes =
+                    result.manifest->object_checksum.size;
+                mutable_snapshot().total_chunks = static_cast<std::uint32_t>(
+                    result.manifest->chunks.size());
+
+                std::vector<TransferCommittedChunk> ordered_chunks;
+                if (const auto layout_error = ValidateManifestLayout(
+                        *result.manifest,
+                        &ordered_chunks);
+                    layout_error.has_value())
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kConflict,
+                         "COMMITTED manifest layout is invalid: " + *layout_error);
+                    return result;
+                }
 
                 std::string storage_discovery_error;
-                (void)DiscoverStorageTargets(request_.request_id,
-                                             request_.cluster_id,
-                                             0,
-                                             0,
-                                             view_client_,
-                                             &result.diagnostics,
-                                             &discovery_status,
-                                             &storage_discovery_error);
+                const auto storage_targets = DiscoverStorageTargets(
+                    request_.request_id,
+                    request_.cluster_id,
+                    0,
+                    0,
+                    false,
+                    view_client_,
+                    &result.diagnostics,
+                    &discovery_status,
+                    &storage_discovery_error);
+                if (storage_targets.empty())
+                {
+                    Fail(&result, discovery_status, std::move(storage_discovery_error));
+                    return result;
+                }
 
-                result.status = ObjectTransferStatusCode::kUnsupported;
-                result.error_detail =
-                    "manifest fetched via ViewNode-discovered MetadataNode; chunk reconstruction and final checksum verification remain in T036";
-                TransferFailureSummary failure;
-                failure.status = result.status;
-                failure.error_detail = result.error_detail;
-                SetFailure(failure);
+                const auto temp_path = MakeTemporaryDownloadPath(
+                    request_.destination_path,
+                    request_.request_id);
+                const auto cleanup_temp = [&temp_path]()
+                {
+                    RemovePathIfExists(temp_path);
+                };
+
+                std::error_code path_ec;
+                const auto parent_path = request_.destination_path.parent_path();
+                if (!parent_path.empty() &&
+                    !std::filesystem::exists(parent_path, path_ec))
+                {
+                    Fail(&result,
+                         path_ec ? ObjectTransferStatusCode::kIoError
+                                 : ObjectTransferStatusCode::kNotFound,
+                         path_ec ? "failed to access destination directory: " +
+                                       path_ec.message()
+                                 : "destination directory does not exist");
+                    return result;
+                }
+                if (path_ec)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kIoError,
+                         "failed to access destination directory: " +
+                             path_ec.message());
+                    return result;
+                }
+                if (std::filesystem::exists(request_.destination_path, path_ec))
+                {
+                    if (path_ec)
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kIoError,
+                             "failed to inspect destination_path: " +
+                                 path_ec.message());
+                    }
+                    else
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kConflict,
+                             "destination_path already exists");
+                    }
+                    return result;
+                }
+                RemovePathIfExists(temp_path);
+
+                checksum_state.Reset();
+                SetStage(ObjectTransferStage::kDownloadingChunks);
+                result.session = Snapshot();
+
+                std::ofstream output(temp_path,
+                                     std::ios::binary | std::ios::trunc);
+                if (!output.is_open())
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kIoError,
+                         "failed to open temporary download file for writing");
+                    cleanup_temp();
+                    return result;
+                }
+                const auto close_output = [&output]()
+                {
+                    if (output.is_open())
+                    {
+                        output.close();
+                    }
+                };
+
+                for (const auto &chunk : ordered_chunks)
+                {
+                    const auto target = ResolveReplicaTarget(chunk, storage_targets);
+                    if (!target.has_value())
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kDiscoveryUnavailable,
+                             "ViewNode did not provide a readable endpoint for manifest replica_nodes",
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    const auto read_result = storage_client_->ReadChunk(
+                        {.request_id = request_.request_id,
+                         .target = *target,
+                         .identity = chunk.identity,
+                         .expected_checksum = chunk.checksum,
+                         .verify_checksum = true});
+                    if (!read_result.ok())
+                    {
+                        const auto status = MapStorageStatus(read_result.status);
+                        Fail(&result,
+                             status,
+                             "StorageNode ReadChunk failed: " +
+                                 read_result.error_detail,
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset,
+                             target->node_id,
+                             target->endpoint,
+                             chunk.identity.chunk_id,
+                             read_result.retryable);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    if (static_cast<std::uint64_t>(read_result.payload.size()) !=
+                        chunk.size)
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kConflict,
+                             "StorageNode returned payload size inconsistent with COMMITTED manifest",
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset,
+                             target->node_id,
+                             target->endpoint,
+                             chunk.identity.chunk_id,
+                             false);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    const auto checksum_update = checksum_state.Append(
+                        {.chunk_index = chunk.identity.chunk_index,
+                         .offset = chunk.identity.offset,
+                         .payload = read_result.payload,
+                         .expected_chunk_checksum = chunk.checksum});
+                    if (!checksum_update.ok())
+                    {
+                        Fail(&result,
+                             checksum_update.status,
+                             checksum_update.error_detail,
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset,
+                             target->node_id,
+                             target->endpoint,
+                             chunk.identity.chunk_id,
+                             false);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    output.seekp(static_cast<std::streamoff>(chunk.identity.offset),
+                                 std::ios::beg);
+                    if (!output)
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kIoError,
+                             "failed to seek temporary download file",
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset,
+                             target->node_id,
+                             target->endpoint,
+                             chunk.identity.chunk_id,
+                             false);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    output.write(read_result.payload.data(),
+                                 static_cast<std::streamsize>(
+                                     read_result.payload.size()));
+                    if (!output)
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kIoError,
+                             "failed to write chunk payload into temporary download file",
+                             chunk.identity.chunk_index,
+                             chunk.identity.offset,
+                             target->node_id,
+                             target->endpoint,
+                             chunk.identity.chunk_id,
+                             false);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+
+                    mutable_snapshot().bytes_completed += chunk.size;
+                    mutable_snapshot().chunks_completed += 1;
+                    result.session = Snapshot();
+                }
+
+                output.flush();
+                if (!output)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kIoError,
+                         "failed to flush temporary download file");
+                    close_output();
+                    cleanup_temp();
+                    return result;
+                }
+                close_output();
+                if (!output)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kIoError,
+                         "failed to finalize temporary download file");
+                    cleanup_temp();
+                    return result;
+                }
+
+                SetStage(ObjectTransferStage::kVerifyingChecksums);
+                result.session = Snapshot();
+
+                const auto finalize_result = checksum_state.Finalize();
+                if (!finalize_result.ok())
+                {
+                    Fail(&result,
+                         finalize_result.status,
+                         finalize_result.error_detail);
+                    close_output();
+                    cleanup_temp();
+                    return result;
+                }
+
+                result.downloaded_object_checksum = finalize_result.object_checksum;
+                if (const auto mismatch_reason = ValidateObjectChecksumFacts(
+                        finalize_result.object_checksum,
+                        result.manifest->object_checksum);
+                    mismatch_reason.has_value())
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kChecksumMismatch,
+                         *mismatch_reason);
+                    close_output();
+                    cleanup_temp();
+                    return result;
+                }
+                if (request_.expected_object_checksum.has_value())
+                {
+                    if (const auto mismatch_reason = ValidateObjectChecksumFacts(
+                            finalize_result.object_checksum,
+                            *request_.expected_object_checksum);
+                        mismatch_reason.has_value())
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kChecksumMismatch,
+                             *mismatch_reason);
+                        close_output();
+                        cleanup_temp();
+                        return result;
+                    }
+                }
+
+                std::filesystem::rename(temp_path,
+                                        request_.destination_path,
+                                        path_ec);
+                if (path_ec)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kIoError,
+                         "failed to publish temporary download file: " +
+                             path_ec.message());
+                    cleanup_temp();
+                    return result;
+                }
+
+                mutable_snapshot().final_checksum_verified = true;
+                result.checksum_verified = true;
+                result.status = ObjectTransferStatusCode::kOk;
+                MarkCompleted();
                 result.session = Snapshot();
                 result.diagnostics.push_back(
-                    MakeDiagnostic(result.status,
-                                   result.error_detail,
-                                   request_.request_id));
+                    MakeDiagnostic(
+                        ObjectTransferStatusCode::kOk,
+                        "download reconstructed from MetadataNode COMMITTED manifest with per-chunk and final object checksum verification",
+                        request_.request_id));
                 return result;
             }
 
@@ -1505,8 +1960,93 @@ namespace storedemo
                 return snapshot;
             }
 
+            [[nodiscard]] ObjectTransferStatusCode ValidateRequest(
+                std::string *error_detail) const
+            {
+                if (request_.request_id.empty())
+                {
+                    SetErrorDetail(error_detail, "request_id is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.cluster_id.empty())
+                {
+                    SetErrorDetail(error_detail, "cluster_id is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.bucket.empty())
+                {
+                    SetErrorDetail(error_detail, "bucket is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.object_key.empty())
+                {
+                    SetErrorDetail(error_detail, "object_key is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.destination_path.empty())
+                {
+                    SetErrorDetail(error_detail, "destination_path is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.concurrency == 0)
+                {
+                    SetErrorDetail(error_detail, "concurrency must be greater than 0");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (storage_client_ == nullptr)
+                {
+                    SetErrorDetail(error_detail,
+                                   "storage_client is required for manifest-driven download");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                return ObjectTransferStatusCode::kOk;
+            }
+
+            void Fail(DownloadObjectResult *result,
+                      const ObjectTransferStatusCode status,
+                      std::string message,
+                      const std::uint32_t chunk_index = 0,
+                      const std::uint64_t offset = 0,
+                      std::string node_id = {},
+                      std::string endpoint = {},
+                      ChunkId chunk_id = {},
+                      const bool retryable = false)
+            {
+                if (result == nullptr)
+                {
+                    return;
+                }
+
+                TransferFailureSummary failure;
+                failure.status = status;
+                failure.error_detail = message;
+                failure.node_id = node_id;
+                failure.endpoint = endpoint;
+                failure.chunk_id = chunk_id;
+                failure.chunk_index = chunk_index;
+                failure.offset = offset;
+                failure.retryable = retryable;
+                SetFailure(failure);
+
+                result->status = status;
+                result->error_detail = std::move(message);
+                result->session = Snapshot();
+
+                auto diagnostic = MakeDiagnostic(result->status,
+                                                 result->error_detail,
+                                                 request_.request_id,
+                                                 chunk_index,
+                                                 offset,
+                                                 chunk_id,
+                                                 retryable);
+                diagnostic.node_id = std::move(node_id);
+                diagnostic.endpoint = std::move(endpoint);
+                result->diagnostics.push_back(std::move(diagnostic));
+            }
+
             DownloadObjectRequest request_;
             std::shared_ptr<MetadataTransferClient> metadata_client_;
+            std::shared_ptr<StorageTransferClient> storage_client_;
             std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
         };
     } // namespace
@@ -1561,6 +2101,7 @@ namespace storedemo
     {
         return std::make_unique<BasicDownloadTransferSession>(request,
                                                               metadata_client_,
+                                                              storage_client_,
                                                               view_client_);
     }
 

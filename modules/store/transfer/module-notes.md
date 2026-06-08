@@ -128,6 +128,14 @@ upload 失败时，transfer 可以产生清理候选或失败摘要，但不能�
 - transfer 可以用 `DiscoverStorage` 记录 StorageNode endpoint / 健康 / 容量观测，用于后续把 `WritePlan` 或 manifest 中的 node_id 解析到 data-plane endpoint。
 - `DiscoverStorage` 返回的是观测事实，不是对象 manifest，不是对象可见性权威，也不能替代 MetadataNode 的 COMMITTED manifest。
 
+## T036 下载重建边界
+
+- download 只接受 MetadataNode 返回的 COMMITTED manifest，不能根据 ViewNode 观测或 StorageNode 本地 live chunk 推断对象可见。
+- chunk 必须按 manifest 顺序和 offset 重建到临时输出文件，保持 bounded memory；每次只持有单个 bounded chunk payload。
+- 每个 chunk 都必须校验 manifest checksum；任何 checksum mismatch、payload size 不一致、chunk 缺失或输出文件 IO 失败都必须 fail-fast。
+- 所有 chunk 成功后必须再做一次对象级 checksum 校验；成功后才把临时文件 publish 到最终 `destination_path`。
+- 失败时不得把部分文件声明为成功；临时输出文件应清理，避免把损坏下载结果伪装成已完成对象。
+
 ## Payload boundary
 
 - 真实文件数据、chunk bytes、完整文件 buffer 只能经过 StorageNode data-plane。
