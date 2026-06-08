@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cctype>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -538,6 +539,16 @@ namespace storedemo
             }
             return raft::MetadataService::NewStub(std::move(channel));
         }
+
+        std::shared_ptr<grpc::ChannelCredentials> ResolveCredentials(
+            const MetadataTransferClientConfig &config)
+        {
+            if (config.channel_credentials != nullptr)
+            {
+                return config.channel_credentials;
+            }
+            return grpc::InsecureChannelCredentials();
+        }
     }
 
     MetadataTransferClient::MetadataTransferClient(
@@ -956,5 +967,16 @@ namespace storedemo
     const MetadataTransferClientConfig &MetadataTransferClient::config() const
     {
         return config_;
+    }
+
+    std::shared_ptr<MetadataTransferClient> CreateGrpcMetadataTransferClient(
+        std::string target_endpoint,
+        MetadataTransferClientConfig config)
+    {
+        auto channel = grpc::CreateChannel(target_endpoint,
+                                           ResolveCredentials(config));
+        return std::make_shared<MetadataTransferClient>(std::move(channel),
+                                                        std::move(target_endpoint),
+                                                        std::move(config));
     }
 }

@@ -88,6 +88,7 @@ T032 当前实现采用“现有 MetadataService 边界内的最小映射”：
 - `TransferPreparedChunk`，表达 upload 本地读取后得到的 chunk index/offset/size/checksum facts
 - `TransferWritePlan`、`TransferCommittedChunk`、`TransferCommittedManifest` 这些 metadata facts 边界
 - 与 `MetadataTransferClient`、`StorageTransferClient`、`ViewNodeClient` 的依赖注入边界
+- `UploadObjectRequest` / `DownloadObjectRequest` 中的 `cluster_id`，用于显式绑定 ViewNode discovery 范围，避免硬编码 demo 拓扑
 
 它不负责：
 
@@ -119,6 +120,13 @@ upload 失败时，transfer 可以产生清理候选或失败摘要，但不能�
 7. 任一 chunk checksum mismatch、对象 checksum mismatch、IO failure 或 manifest 与实际数据不一致，都必须显式失败。
 
 下载路径不能依赖 ViewNode 的观测信息判断对象是否可见；ViewNode 最多用于发现 MetadataNode 或解析 StorageNode endpoint 候选。
+
+## T035 discovery 集成边界
+
+- transfer 可以用 ViewNode 的 `DiscoverMetadata` 选择 MetadataNode endpoint 候选，并用 leader hint 作为重试优化信息。
+- 该 endpoint 只是候选地址，MetadataService 仍必须自己返回 `NOT_LEADER` / quorum / 可见性权威结果。
+- transfer 可以用 `DiscoverStorage` 记录 StorageNode endpoint / 健康 / 容量观测，用于后续把 `WritePlan` 或 manifest 中的 node_id 解析到 data-plane endpoint。
+- `DiscoverStorage` 返回的是观测事实，不是对象 manifest，不是对象可见性权威，也不能替代 MetadataNode 的 COMMITTED manifest。
 
 ## Payload boundary
 

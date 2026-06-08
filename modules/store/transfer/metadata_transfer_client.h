@@ -88,6 +88,8 @@ namespace storedemo
         std::chrono::milliseconds head_object_timeout{0};
         std::chrono::milliseconds get_manifest_timeout{0};
         bool wait_for_ready{false};
+        // 为空时默认使用 insecure channel credentials。
+        std::shared_ptr<grpc::ChannelCredentials> channel_credentials;
     };
 
     struct MetadataTransferClientCallOptions
@@ -317,5 +319,11 @@ namespace storedemo
         std::string target_endpoint_;
         MetadataTransferClientConfig config_;
     };
+
+    // 返回一个基于 MetadataService gRPC control-plane 的 transfer adapter。
+    // 它只负责单 endpoint 的 metadata RPC 映射，不负责 ViewNode discovery 或 upload/download 编排。
+    std::shared_ptr<MetadataTransferClient> CreateGrpcMetadataTransferClient(
+        std::string target_endpoint,
+        MetadataTransferClientConfig config = {});
 
 } // namespace storedemo

@@ -1,5 +1,9 @@
 #include "store/transfer/object_transfer.h"
 
+#include "store/transfer/metadata_transfer_client.h"
+#include "store/transfer/storage_transfer_client.h"
+#include "view/view_client.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -7,7 +11,9 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 namespace storedemo
@@ -255,6 +261,339 @@ namespace storedemo
             diagnostic.chunk_id = chunk_id;
             diagnostic.retryable = retryable;
             return diagnostic;
+        }
+
+        [[nodiscard]] ObjectTransferStatusCode MapViewStatus(
+            const viewdemo::ViewRegistryStatusCode status)
+        {
+            switch (status)
+            {
+            case viewdemo::ViewRegistryStatusCode::kOk:
+            case viewdemo::ViewRegistryStatusCode::kIdempotentReplay:
+                return ObjectTransferStatusCode::kOk;
+            case viewdemo::ViewRegistryStatusCode::kInvalidArgument:
+                return ObjectTransferStatusCode::kInvalidArgument;
+            case viewdemo::ViewRegistryStatusCode::kNotFound:
+                return ObjectTransferStatusCode::kNotFound;
+            case viewdemo::ViewRegistryStatusCode::kTimeout:
+                return ObjectTransferStatusCode::kTimeout;
+            case viewdemo::ViewRegistryStatusCode::kOverloaded:
+            case viewdemo::ViewRegistryStatusCode::kServiceUnavailable:
+                return ObjectTransferStatusCode::kDiscoveryUnavailable;
+            case viewdemo::ViewRegistryStatusCode::kConflict:
+                return ObjectTransferStatusCode::kConflict;
+            case viewdemo::ViewRegistryStatusCode::kUnsupported:
+                return ObjectTransferStatusCode::kUnsupported;
+            case viewdemo::ViewRegistryStatusCode::kStaleIgnored:
+            case viewdemo::ViewRegistryStatusCode::kInternalError:
+            default:
+                return ObjectTransferStatusCode::kDiscoveryUnavailable;
+            }
+        }
+
+        [[nodiscard]] ObjectTransferStatusCode MapMetadataStatus(
+            const MetadataTransferStatusCode status)
+        {
+            switch (status)
+            {
+            case MetadataTransferStatusCode::kOk:
+            case MetadataTransferStatusCode::kIdempotentReplay:
+                return ObjectTransferStatusCode::kOk;
+            case MetadataTransferStatusCode::kInvalidArgument:
+                return ObjectTransferStatusCode::kInvalidArgument;
+            case MetadataTransferStatusCode::kNotFound:
+                return ObjectTransferStatusCode::kNotFound;
+            case MetadataTransferStatusCode::kNotLeader:
+                return ObjectTransferStatusCode::kMetadataNotLeader;
+            case MetadataTransferStatusCode::kTimeout:
+                return ObjectTransferStatusCode::kTimeout;
+            case MetadataTransferStatusCode::kUnsupported:
+                return ObjectTransferStatusCode::kUnsupported;
+            case MetadataTransferStatusCode::kServiceUnavailable:
+            case MetadataTransferStatusCode::kOverloaded:
+            case MetadataTransferStatusCode::kQuorumUnavailable:
+                return ObjectTransferStatusCode::kMetadataRejected;
+            case MetadataTransferStatusCode::kIdempotencyConflict:
+            case MetadataTransferStatusCode::kStateConflict:
+                return ObjectTransferStatusCode::kConflict;
+            case MetadataTransferStatusCode::kObjectNotVisible:
+                return ObjectTransferStatusCode::kNotFound;
+            case MetadataTransferStatusCode::kInternalError:
+            default:
+                return ObjectTransferStatusCode::kInternalError;
+            }
+        }
+
+        [[nodiscard]] std::string SelectMetadataEndpoint(
+            const viewdemo::DiscoverMetadataResult &discovery)
+        {
+            if (discovery.leader_hint.has_value() &&
+                !discovery.leader_hint->endpoint.empty())
+            {
+                return discovery.leader_hint->endpoint;
+            }
+
+            for (const auto &snapshot : discovery.metadata_nodes)
+            {
+                if (!snapshot.control_plane_endpoint.empty())
+                {
+                    return snapshot.control_plane_endpoint;
+                }
+                if (!snapshot.endpoint.empty())
+                {
+                    return snapshot.endpoint;
+                }
+            }
+
+            return {};
+        }
+
+        [[nodiscard]] StorageTransferTarget MakeStorageTargetFromSnapshot(
+            const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            StorageTransferTarget target;
+            target.node_id = snapshot.node_id;
+            if (!snapshot.data_plane_endpoint.empty())
+            {
+                target.endpoint = snapshot.data_plane_endpoint;
+            }
+            else
+            {
+                target.endpoint = snapshot.endpoint;
+            }
+            return target;
+        }
+
+        template <typename DiagnosticsContainer>
+        void AppendViewDiagnostics(
+            const std::vector<viewdemo::ViewRegistryDiagnostic> &view_diagnostics,
+            const std::string &request_id,
+            DiagnosticsContainer *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &item : view_diagnostics)
+            {
+                ObjectTransferDiagnostic diagnostic;
+                diagnostic.status = ObjectTransferStatusCode::kDiscoveryUnavailable;
+                diagnostic.message = item.message;
+                diagnostic.request_id = request_id;
+                diagnostic.node_id = item.node_id;
+                diagnostic.endpoint = item.endpoint;
+                diagnostics->push_back(std::move(diagnostic));
+            }
+        }
+
+        template <typename DiagnosticsContainer>
+        void AppendMetadataDiagnostics(
+            const std::vector<MetadataTransferDiagnostic> &metadata_diagnostics,
+            DiagnosticsContainer *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &item : metadata_diagnostics)
+            {
+                ObjectTransferDiagnostic diagnostic;
+                diagnostic.status = MapMetadataStatus(item.status);
+                diagnostic.message = item.message;
+                diagnostic.request_id = item.request_id;
+                diagnostic.endpoint = item.endpoint;
+                diagnostic.retryable = item.retryable;
+                diagnostics->push_back(std::move(diagnostic));
+            }
+        }
+
+        [[nodiscard]] std::shared_ptr<MetadataTransferClient> DiscoverMetadataClient(
+            const std::string &request_id,
+            const std::string &cluster_id,
+            const std::shared_ptr<MetadataTransferClient> &metadata_client_seed,
+            const std::shared_ptr<viewdemo::ViewNodeClient> &view_client,
+            std::vector<ObjectTransferDiagnostic> *diagnostics,
+            ObjectTransferStatusCode *status,
+            std::string *error_detail)
+        {
+            if (view_client == nullptr)
+            {
+                if (status != nullptr)
+                {
+                    *status = ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(error_detail,
+                               "ViewNode discovery is required but view_client is null");
+                return nullptr;
+            }
+
+            const auto discovery_call = view_client->DiscoverMetadata(
+                {.request_id = request_id,
+                 .cluster_id = cluster_id,
+                 .prefer_leader = true,
+                 .live_only = true,
+                 .limit = 3});
+            AppendViewDiagnostics(discovery_call.result.diagnostics,
+                                  request_id,
+                                  diagnostics);
+
+            if (!discovery_call.transport_ok() || !discovery_call.result.ok())
+            {
+                if (status != nullptr)
+                {
+                    *status = discovery_call.transport_ok()
+                                  ? MapViewStatus(
+                                        discovery_call.result.summary.status)
+                                  : ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(
+                    error_detail,
+                    discovery_call.transport_ok()
+                        ? "ViewNode DiscoverMetadata failed: " +
+                              discovery_call.result.summary.message
+                        : "ViewNode DiscoverMetadata RPC failed: " +
+                              discovery_call.rpc.grpc_error_message);
+                return nullptr;
+            }
+
+            const std::string endpoint = SelectMetadataEndpoint(
+                discovery_call.result);
+            if (endpoint.empty())
+            {
+                if (status != nullptr)
+                {
+                    *status = ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(error_detail,
+                               "ViewNode returned no usable MetadataNode endpoint");
+                return nullptr;
+            }
+
+            if (diagnostics != nullptr)
+            {
+                diagnostics->push_back(MakeDiagnostic(
+                    ObjectTransferStatusCode::kOk,
+                    discovery_call.result.leader_hint.has_value()
+                            ? "ViewNode leader hint selected as MetadataNode endpoint candidate; MetadataService remains authority"
+                            : "ViewNode metadata snapshot selected endpoint candidate; MetadataService remains authority",
+                    request_id,
+                    0,
+                    0,
+                    ChunkId(),
+                    false));
+                diagnostics->back().endpoint = endpoint;
+                if (discovery_call.result.leader_hint.has_value())
+                {
+                    diagnostics->back().node_id =
+                        discovery_call.result.leader_hint->node_id;
+                }
+            }
+
+            MetadataTransferClientConfig config;
+            if (metadata_client_seed != nullptr)
+            {
+                config = metadata_client_seed->config();
+            }
+            if (status != nullptr)
+            {
+                *status = ObjectTransferStatusCode::kOk;
+            }
+            return CreateGrpcMetadataTransferClient(endpoint, std::move(config));
+        }
+
+        [[nodiscard]] std::unordered_map<StorageNodeId, StorageTransferTarget>
+        DiscoverStorageTargets(
+            const std::string &request_id,
+            const std::string &cluster_id,
+            const std::uint64_t minimum_available_capacity_bytes,
+            const std::uint32_t limit,
+            const std::shared_ptr<viewdemo::ViewNodeClient> &view_client,
+            std::vector<ObjectTransferDiagnostic> *diagnostics,
+            ObjectTransferStatusCode *status,
+            std::string *error_detail)
+        {
+            std::unordered_map<StorageNodeId, StorageTransferTarget> targets;
+            if (view_client == nullptr)
+            {
+                if (status != nullptr)
+                {
+                    *status = ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(error_detail,
+                               "ViewNode discovery is required but view_client is null");
+                return targets;
+            }
+
+            const auto discovery_call = view_client->DiscoverStorage(
+                {.request_id = request_id,
+                 .cluster_id = cluster_id,
+                 .live_only = true,
+                 .minimum_available_capacity_bytes =
+                     minimum_available_capacity_bytes,
+                 .limit = limit,
+                 .require_writable = true});
+            AppendViewDiagnostics(discovery_call.result.diagnostics,
+                                  request_id,
+                                  diagnostics);
+
+            if (!discovery_call.transport_ok() || !discovery_call.result.ok())
+            {
+                if (status != nullptr)
+                {
+                    *status = discovery_call.transport_ok()
+                                  ? MapViewStatus(
+                                        discovery_call.result.summary.status)
+                                  : ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(
+                    error_detail,
+                    discovery_call.transport_ok()
+                        ? "ViewNode DiscoverStorage failed: " +
+                              discovery_call.result.summary.message
+                        : "ViewNode DiscoverStorage RPC failed: " +
+                              discovery_call.rpc.grpc_error_message);
+                return targets;
+            }
+
+            for (const auto &snapshot : discovery_call.result.storage_nodes)
+            {
+                StorageTransferTarget target = MakeStorageTargetFromSnapshot(snapshot);
+                if (target.node_id.empty() || target.endpoint.empty())
+                {
+                    continue;
+                }
+                targets.emplace(target.node_id, target);
+
+                if (diagnostics != nullptr)
+                {
+                    auto diagnostic = MakeDiagnostic(
+                        ObjectTransferStatusCode::kOk,
+                        "ViewNode storage snapshot recorded for data-plane endpoint resolution only; it does not imply object visibility",
+                        request_id);
+                    diagnostic.node_id = target.node_id;
+                    diagnostic.endpoint = target.endpoint;
+                    diagnostics->push_back(std::move(diagnostic));
+                }
+            }
+
+            if (targets.empty())
+            {
+                if (status != nullptr)
+                {
+                    *status = ObjectTransferStatusCode::kDiscoveryUnavailable;
+                }
+                SetErrorDetail(error_detail,
+                               "ViewNode returned no usable StorageNode endpoint");
+                return targets;
+            }
+
+            if (status != nullptr)
+            {
+                *status = ObjectTransferStatusCode::kOk;
+            }
+            return targets;
         }
 
         class FileTransferChunkReader final : public TransferChunkReader
@@ -584,9 +923,16 @@ namespace storedemo
                                                  private BasicTransferSession
         {
         public:
-            explicit BasicUploadTransferSession(UploadObjectRequest request)
+            BasicUploadTransferSession(
+                UploadObjectRequest request,
+                std::shared_ptr<MetadataTransferClient> metadata_client,
+                std::shared_ptr<StorageTransferClient> storage_client,
+                std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
-                  request_(std::move(request))
+                  request_(std::move(request)),
+                  metadata_client_(std::move(metadata_client)),
+                  storage_client_(std::move(storage_client)),
+                  view_client_(std::move(view_client))
             {
             }
 
@@ -638,9 +984,6 @@ namespace storedemo
                     Fail(&result, open_status, std::move(open_error));
                     return result;
                 }
-
-                SetStage(ObjectTransferStage::kUploadingChunks);
-                result.session = Snapshot();
 
                 std::uint64_t expected_offset = 0;
                 std::uint32_t expected_chunk_index = 0;
@@ -767,13 +1110,92 @@ namespace storedemo
                     }
                 }
 
+                SetStage(ObjectTransferStage::kDiscoveringMetadata);
+                result.session = Snapshot();
+
+                ObjectTransferStatusCode discovery_status =
+                    ObjectTransferStatusCode::kOk;
+                std::string discovery_error;
+                const auto discovered_metadata_client = DiscoverMetadataClient(
+                    request_.request_id,
+                    request_.cluster_id,
+                    metadata_client_,
+                    view_client_,
+                    &result.diagnostics,
+                    &discovery_status,
+                    &discovery_error);
+                if (discovered_metadata_client == nullptr)
+                {
+                    Fail(&result, discovery_status, std::move(discovery_error));
+                    return result;
+                }
+
+                SetStage(ObjectTransferStage::kPlanningWrite);
+                result.session = Snapshot();
+
+                const auto create_plan_call =
+                    discovered_metadata_client->CreateWritePlan(
+                        {.request_id = request_.request_id,
+                         .bucket = request_.bucket,
+                         .object_key = request_.object_key,
+                         .object_id = request_.object_id,
+                         .expected_object_checksum =
+                             finalize_result.object_checksum,
+                         .chunk_size = request_.chunk_size,
+                         .desired_replica_count =
+                             request_.desired_replica_count,
+                         .minimum_successful_writes =
+                             request_.minimum_successful_writes,
+                         .client_time_unix_ms =
+                             request_.client_time_unix_ms});
+                AppendMetadataDiagnostics(create_plan_call.result.diagnostics,
+                                          &result.diagnostics);
+                if (!create_plan_call.transport_ok() ||
+                    !create_plan_call.result.ok() ||
+                    !create_plan_call.result.write_plan.has_value())
+                {
+                    Fail(&result,
+                         !create_plan_call.transport_ok()
+                             ? ObjectTransferStatusCode::kMetadataRejected
+                             : MapMetadataStatus(
+                                   create_plan_call.result.summary.status),
+                         !create_plan_call.transport_ok()
+                             ? "Metadata CreateWritePlan RPC failed: " +
+                                   create_plan_call.rpc.grpc_error_message
+                             : "Metadata CreateWritePlan failed: " +
+                                   create_plan_call.result.summary.message);
+                    return result;
+                }
+                result.write_plan = create_plan_call.result.write_plan;
+
+                std::string storage_discovery_error;
+                const auto storage_targets = DiscoverStorageTargets(
+                    request_.request_id,
+                    request_.cluster_id,
+                    finalize_result.object_checksum.size,
+                    request_.desired_replica_count,
+                    view_client_,
+                    &result.diagnostics,
+                    &discovery_status,
+                    &storage_discovery_error);
+                if (storage_targets.empty())
+                {
+                    Fail(&result,
+                         discovery_status,
+                         std::move(storage_discovery_error));
+                    return result;
+                }
+
+                (void)storage_client_;
+
                 MarkCompleted();
                 result.status = ObjectTransferStatusCode::kOk;
                 result.session = Snapshot();
                 result.diagnostics.push_back(
-                    MakeDiagnostic(ObjectTransferStatusCode::kOk,
-                                   "bounded upload session prepared chunk facts only; no metadata or storage RPC executed",
-                                   request_.request_id));
+                    MakeDiagnostic(
+                        ObjectTransferStatusCode::kOk,
+                        "ViewNode discovery resolved metadata/storage candidates and MetadataNode accepted CreateWritePlan; chunk write and CommitObject remain later stages",
+                        request_.request_id));
                 return result;
             }
 
@@ -785,6 +1207,7 @@ namespace storedemo
                 snapshot.direction = ObjectTransferDirection::kUpload;
                 snapshot.stage = ObjectTransferStage::kPreparing;
                 snapshot.request_id = request.request_id;
+                snapshot.cluster_id = request.cluster_id;
                 snapshot.bucket = request.bucket;
                 snapshot.object_key = request.object_key;
                 snapshot.object_id = request.object_id;
@@ -800,6 +1223,11 @@ namespace storedemo
                 if (request_.request_id.empty())
                 {
                     SetErrorDetail(error_detail, "request_id is required");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.cluster_id.empty())
+                {
+                    SetErrorDetail(error_detail, "cluster_id is required");
                     return ObjectTransferStatusCode::kInvalidArgument;
                 }
                 if (request_.bucket.empty())
@@ -825,6 +1253,20 @@ namespace storedemo
                 if (request_.concurrency == 0)
                 {
                     SetErrorDetail(error_detail, "concurrency must be greater than 0");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.desired_replica_count == 0)
+                {
+                    SetErrorDetail(error_detail,
+                                   "desired_replica_count must be greater than 0");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.minimum_successful_writes == 0 ||
+                    request_.minimum_successful_writes >
+                        request_.desired_replica_count)
+                {
+                    SetErrorDetail(error_detail,
+                                   "minimum_successful_writes must be in [1, desired_replica_count]");
                     return ObjectTransferStatusCode::kInvalidArgument;
                 }
                 return ObjectTransferStatusCode::kOk;
@@ -870,7 +1312,9 @@ namespace storedemo
                 failure.chunk_index = chunk_index;
                 failure.offset = offset;
                 failure.retryable = status == ObjectTransferStatusCode::kIoError ||
-                                    status == ObjectTransferStatusCode::kTimeout;
+                                    status == ObjectTransferStatusCode::kTimeout ||
+                                    status == ObjectTransferStatusCode::kDiscoveryUnavailable ||
+                                    status == ObjectTransferStatusCode::kMetadataNotLeader;
                 SetFailure(failure);
 
                 result->status = status;
@@ -887,15 +1331,23 @@ namespace storedemo
             }
 
             UploadObjectRequest request_;
+            std::shared_ptr<MetadataTransferClient> metadata_client_;
+            std::shared_ptr<StorageTransferClient> storage_client_;
+            std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
         };
 
         class BasicDownloadTransferSession final : public DownloadTransferSession,
                                                    private BasicTransferSession
         {
         public:
-            explicit BasicDownloadTransferSession(DownloadObjectRequest request)
+            BasicDownloadTransferSession(
+                DownloadObjectRequest request,
+                std::shared_ptr<MetadataTransferClient> metadata_client,
+                std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
-                  request_(std::move(request))
+                  request_(std::move(request)),
+                  metadata_client_(std::move(metadata_client)),
+                  view_client_(std::move(view_client))
             {
             }
 
@@ -923,18 +1375,115 @@ namespace storedemo
                 TransferChecksumState & /*checksum_state*/) override
             {
                 DownloadObjectResult result;
+                result.session = Snapshot();
+
+                if (request_.request_id.empty() || request_.cluster_id.empty() ||
+                    request_.bucket.empty() || request_.object_key.empty())
+                {
+                    result.status = ObjectTransferStatusCode::kInvalidArgument;
+                    result.error_detail =
+                        "request_id, cluster_id, bucket and object_key are required";
+                    TransferFailureSummary failure;
+                    failure.status = result.status;
+                    failure.error_detail = result.error_detail;
+                    SetFailure(failure);
+                    result.session = Snapshot();
+                    result.diagnostics.push_back(
+                        MakeDiagnostic(result.status,
+                                       result.error_detail,
+                                       request_.request_id));
+                    return result;
+                }
+
+                SetStage(ObjectTransferStage::kDiscoveringMetadata);
+                result.session = Snapshot();
+
+                ObjectTransferStatusCode discovery_status =
+                    ObjectTransferStatusCode::kOk;
+                std::string discovery_error;
+                const auto discovered_metadata_client = DiscoverMetadataClient(
+                    request_.request_id,
+                    request_.cluster_id,
+                    metadata_client_,
+                    view_client_,
+                    &result.diagnostics,
+                    &discovery_status,
+                    &discovery_error);
+                if (discovered_metadata_client == nullptr)
+                {
+                    TransferFailureSummary failure;
+                    failure.status = discovery_status;
+                    failure.error_detail = discovery_error;
+                    failure.retryable = discovery_status ==
+                                            ObjectTransferStatusCode::kDiscoveryUnavailable;
+                    SetFailure(failure);
+                    result.status = discovery_status;
+                    result.error_detail = std::move(discovery_error);
+                    result.session = Snapshot();
+                    return result;
+                }
+
+                SetStage(ObjectTransferStage::kFetchingManifest);
+                result.session = Snapshot();
+
+                const auto manifest_call = discovered_metadata_client->GetObjectManifest(
+                    {.request_id = request_.request_id,
+                     .bucket = request_.bucket,
+                     .object_key = request_.object_key,
+                     .object_id = request_.object_id,
+                     .version = request_.version,
+                     .require_committed_visible = true});
+                AppendMetadataDiagnostics(manifest_call.result.diagnostics,
+                                          &result.diagnostics);
+                if (!manifest_call.transport_ok() || !manifest_call.result.ok() ||
+                    !manifest_call.result.manifest.has_value())
+                {
+                    const auto status = !manifest_call.transport_ok()
+                                            ? ObjectTransferStatusCode::kMetadataRejected
+                                            : MapMetadataStatus(
+                                                  manifest_call.result.summary.status);
+                    const std::string error =
+                        !manifest_call.transport_ok()
+                            ? "Metadata GetObjectManifest RPC failed: " +
+                                  manifest_call.rpc.grpc_error_message
+                            : "Metadata GetObjectManifest failed: " +
+                                  manifest_call.result.summary.message;
+                    TransferFailureSummary failure;
+                    failure.status = status;
+                    failure.error_detail = error;
+                    failure.retryable = status ==
+                                            ObjectTransferStatusCode::kMetadataNotLeader;
+                    SetFailure(failure);
+                    result.status = status;
+                    result.error_detail = error;
+                    result.session = Snapshot();
+                    return result;
+                }
+
+                result.manifest = manifest_call.result.manifest;
+
+                std::string storage_discovery_error;
+                (void)DiscoverStorageTargets(request_.request_id,
+                                             request_.cluster_id,
+                                             0,
+                                             0,
+                                             view_client_,
+                                             &result.diagnostics,
+                                             &discovery_status,
+                                             &storage_discovery_error);
+
                 result.status = ObjectTransferStatusCode::kUnsupported;
                 result.error_detail =
-                    "download transfer session is not implemented until manifest/adapter tasks";
-
+                    "manifest fetched via ViewNode-discovered MetadataNode; chunk reconstruction and final checksum verification remain in T036";
                 TransferFailureSummary failure;
                 failure.status = result.status;
                 failure.error_detail = result.error_detail;
                 SetFailure(failure);
-
                 result.session = Snapshot();
                 result.diagnostics.push_back(
-                    MakeDiagnostic(result.status, result.error_detail, request_.request_id));
+                    MakeDiagnostic(result.status,
+                                   result.error_detail,
+                                   request_.request_id));
                 return result;
             }
 
@@ -946,6 +1495,7 @@ namespace storedemo
                 snapshot.direction = ObjectTransferDirection::kDownload;
                 snapshot.stage = ObjectTransferStage::kPreparing;
                 snapshot.request_id = request.request_id;
+                snapshot.cluster_id = request.cluster_id;
                 snapshot.bucket = request.bucket;
                 snapshot.object_key = request.object_key;
                 snapshot.object_id = request.object_id;
@@ -956,6 +1506,8 @@ namespace storedemo
             }
 
             DownloadObjectRequest request_;
+            std::shared_ptr<MetadataTransferClient> metadata_client_;
+            std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
         };
     } // namespace
 
@@ -998,13 +1550,18 @@ namespace storedemo
     std::unique_ptr<UploadTransferSession> ObjectTransfer::StartUploadSession(
         const UploadObjectRequest &request) const
     {
-        return std::make_unique<BasicUploadTransferSession>(request);
+        return std::make_unique<BasicUploadTransferSession>(request,
+                                                            metadata_client_,
+                                                            storage_client_,
+                                                            view_client_);
     }
 
     std::unique_ptr<DownloadTransferSession> ObjectTransfer::StartDownloadSession(
         const DownloadObjectRequest &request) const
     {
-        return std::make_unique<BasicDownloadTransferSession>(request);
+        return std::make_unique<BasicDownloadTransferSession>(request,
+                                                              metadata_client_,
+                                                              view_client_);
     }
 
     const std::shared_ptr<MetadataTransferClient> &ObjectTransfer::metadata_client()

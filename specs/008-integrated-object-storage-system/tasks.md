@@ -88,7 +88,7 @@
 - [X] T032 [US1] Implement metadata transfer adapter over MetadataService in `modules/store/transfer/metadata_transfer_client.cpp`
 - [X] T033 [P] [US1] Define StorageNode chunk read/write adapter interface in `modules/store/transfer/storage_transfer_client.h`
 - [X] T034 [US1] Implement StorageNode chunk read/write adapter in `modules/store/transfer/storage_transfer_client.cpp`
-- [ ] T035 [US1] Integrate ViewNode discovery into transfer orchestration in `modules/store/transfer/object_transfer.cpp`
+- [X] T035 [US1] Integrate ViewNode discovery into transfer orchestration in `modules/store/transfer/object_transfer.cpp`
 - [ ] T036 [US1] Add manifest-driven download reconstruction and final SHA-256 verification in `modules/store/transfer/object_transfer.cpp`
 - [ ] T037 [US1] Implement `storage_client upload` and `storage_client download` commands in `apps/storage_client.cpp`
 - [ ] T038 [US1] Wire `storage_client` target and dependencies in `CMakeLists.txt`

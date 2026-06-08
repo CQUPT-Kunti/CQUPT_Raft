@@ -168,6 +168,7 @@ namespace storedemo
         ObjectTransferDirection direction{ObjectTransferDirection::kUnknown};
         ObjectTransferStage stage{ObjectTransferStage::kUnknown};
         std::string request_id;
+        std::string cluster_id;
         std::string bucket;
         std::string object_key;
         std::string object_id;
@@ -189,18 +190,29 @@ namespace storedemo
     struct UploadObjectRequest
     {
         std::string request_id;
+        // transfer 必须通过 ViewNode 在指定 cluster 内做 discovery，
+        // 不能依赖硬编码 MetadataNode / StorageNode 地址。
+        std::string cluster_id;
         std::string bucket;
         std::string object_key;
         std::string object_id;
         std::filesystem::path source_path;
         std::uint64_t chunk_size{0};
         std::uint32_t concurrency{1};
+        // 这些副本策略是 CreateWritePlan 的 metadata facts 输入，
+        // 不是本地自行决定对象可见性的 authority。
+        std::uint32_t desired_replica_count{0};
+        std::uint32_t minimum_successful_writes{0};
+        std::uint64_t client_time_unix_ms{0};
         std::optional<TransferObjectChecksumFacts> expected_object_checksum;
     };
 
     struct DownloadObjectRequest
     {
         std::string request_id;
+        // download 也必须先在指定 cluster 内发现 MetadataNode，
+        // 对象可见性仍只能来自 MetadataNode 的 COMMITTED manifest。
+        std::string cluster_id;
         std::string bucket;
         std::string object_key;
         std::string object_id;
