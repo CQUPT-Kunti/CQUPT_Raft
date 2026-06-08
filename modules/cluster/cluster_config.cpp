@@ -3,13 +3,17 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace clusterdemo
@@ -730,6 +734,596 @@ namespace clusterdemo
             }
 
             return validation;
+        }
+
+        struct JsonValue
+        {
+            using Object = std::map<std::string, JsonValue>;
+            using Array = std::vector<JsonValue>;
+
+            std::variant<std::nullptr_t, std::string, std::uint64_t, bool, Object, Array>
+                storage;
+        };
+
+        class JsonParser
+        {
+        public:
+            explicit JsonParser(std::string_view input)
+                : input_(input)
+            {
+            }
+
+            [[nodiscard]] JsonValue Parse()
+            {
+                SkipWhitespace();
+                JsonValue value = ParseValue();
+                SkipWhitespace();
+                if (position_ != input_.size())
+                {
+                    throw std::runtime_error("unexpected trailing content");
+                }
+                return value;
+            }
+
+        private:
+            [[nodiscard]] std::string DescribeChar(const char ch) const
+            {
+                if (ch == '\0')
+                {
+                    return "eof";
+                }
+                if (ch == '\n')
+                {
+                    return "\\n";
+                }
+                if (ch == '\r')
+                {
+                    return "\\r";
+                }
+                if (ch == '\t')
+                {
+                    return "\\t";
+                }
+                return std::string(1, ch);
+            }
+
+            void SkipWhitespace()
+            {
+                while (position_ < input_.size() &&
+                       std::isspace(static_cast<unsigned char>(input_[position_])) != 0)
+                {
+                    ++position_;
+                }
+            }
+
+            [[nodiscard]] bool ConsumeLiteral(const std::string_view literal)
+            {
+                if (input_.substr(position_, literal.size()) != literal)
+                {
+                    return false;
+                }
+                position_ += literal.size();
+                return true;
+            }
+
+            [[nodiscard]] char Peek() const
+            {
+                if (position_ >= input_.size())
+                {
+                    return '\0';
+                }
+                return input_[position_];
+            }
+
+            [[nodiscard]] char Read()
+            {
+                if (position_ >= input_.size())
+                {
+                    throw std::runtime_error("unexpected end of json input");
+                }
+                return input_[position_++];
+            }
+
+            [[nodiscard]] JsonValue ParseValue()
+            {
+                SkipWhitespace();
+                switch (Peek())
+                {
+                case '{':
+                    return ParseObject();
+                case '[':
+                    return ParseArray();
+                case '"':
+                {
+                    JsonValue value;
+                    value.storage = ParseString();
+                    return value;
+                }
+                case 't':
+                case 'f':
+                {
+                    JsonValue value;
+                    value.storage = ParseBool();
+                    return value;
+                }
+                case 'n':
+                {
+                    ParseNull();
+                    JsonValue value;
+                    value.storage = nullptr;
+                    return value;
+                }
+                default:
+                    if (std::isdigit(static_cast<unsigned char>(Peek())) != 0)
+                    {
+                        JsonValue value;
+                        value.storage = ParseUnsigned();
+                        return value;
+                    }
+                    throw std::runtime_error("unsupported json value");
+                }
+            }
+
+            [[nodiscard]] JsonValue ParseObject()
+            {
+                static_cast<void>(Read()); // {
+                JsonValue::Object object;
+                SkipWhitespace();
+                if (Peek() == '}')
+                {
+                    static_cast<void>(Read());
+                    JsonValue value;
+                    value.storage = std::move(object);
+                    return value;
+                }
+
+                while (true)
+                {
+                    SkipWhitespace();
+                    if (Peek() != '"')
+                    {
+                        throw std::runtime_error("json object key must be string");
+                    }
+                    const std::string key = ParseString();
+                    SkipWhitespace();
+                    if (Read() != ':')
+                    {
+                        throw std::runtime_error("json object is missing ':'");
+                    }
+                    object.emplace(key, ParseValue());
+                    SkipWhitespace();
+                    const char separator = Read();
+                    if (separator == '}')
+                    {
+                        break;
+                    }
+                    if (separator != ',')
+                    {
+                        throw std::runtime_error(
+                            "json object expects ',' or '}', got '" +
+                            DescribeChar(separator) + "' at offset " +
+                            std::to_string(position_));
+                    }
+                }
+
+                JsonValue value;
+                value.storage = std::move(object);
+                return value;
+            }
+
+            [[nodiscard]] JsonValue ParseArray()
+            {
+                static_cast<void>(Read()); // [
+                JsonValue::Array array;
+                SkipWhitespace();
+                if (Peek() == ']')
+                {
+                    static_cast<void>(Read());
+                    JsonValue value;
+                    value.storage = std::move(array);
+                    return value;
+                }
+
+                while (true)
+                {
+                    array.push_back(ParseValue());
+                    SkipWhitespace();
+                    const char separator = Read();
+                    if (separator == ']')
+                    {
+                        break;
+                    }
+                    if (separator != ',')
+                    {
+                        throw std::runtime_error(
+                            "json array expects ',' or ']', got '" +
+                            DescribeChar(separator) + "' at offset " +
+                            std::to_string(position_));
+                    }
+                }
+
+                JsonValue value;
+                value.storage = std::move(array);
+                return value;
+            }
+
+            [[nodiscard]] std::string ParseString()
+            {
+                if (Read() != '"')
+                {
+                    throw std::runtime_error("json string must begin with '\"'");
+                }
+
+                std::string value;
+                while (true)
+                {
+                    const char ch = Read();
+                    if (ch == '"')
+                    {
+                        break;
+                    }
+                    if (ch == '\\')
+                    {
+                        const char escaped = Read();
+                        switch (escaped)
+                        {
+                        case '"':
+                        case '\\':
+                        case '/':
+                            value.push_back(escaped);
+                            break;
+                        case 'b':
+                            value.push_back('\b');
+                            break;
+                        case 'f':
+                            value.push_back('\f');
+                            break;
+                        case 'n':
+                            value.push_back('\n');
+                            break;
+                        case 'r':
+                            value.push_back('\r');
+                            break;
+                        case 't':
+                            value.push_back('\t');
+                            break;
+                        default:
+                            throw std::runtime_error("unsupported json escape");
+                        }
+                        continue;
+                    }
+                    value.push_back(ch);
+                }
+
+                return value;
+            }
+
+            [[nodiscard]] std::uint64_t ParseUnsigned()
+            {
+                const std::size_t begin = position_;
+                while (position_ < input_.size() &&
+                       std::isdigit(static_cast<unsigned char>(input_[position_])) != 0)
+                {
+                    ++position_;
+                }
+                return std::stoull(std::string(input_.substr(begin, position_ - begin)));
+            }
+
+            [[nodiscard]] bool ParseBool()
+            {
+                if (ConsumeLiteral("true"))
+                {
+                    return true;
+                }
+                if (ConsumeLiteral("false"))
+                {
+                    return false;
+                }
+                throw std::runtime_error("invalid json boolean");
+            }
+
+            void ParseNull()
+            {
+                if (!ConsumeLiteral("null"))
+                {
+                    throw std::runtime_error("invalid json null");
+                }
+            }
+
+            std::string_view input_;
+            std::size_t position_{0};
+        };
+
+        [[nodiscard]] const JsonValue::Object &ExpectObject(const JsonValue &value,
+                                                            const std::string_view context)
+        {
+            const auto *object = std::get_if<JsonValue::Object>(&value.storage);
+            if (object == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " must be object");
+            }
+            return *object;
+        }
+
+        [[nodiscard]] const JsonValue::Array &ExpectArray(const JsonValue &value,
+                                                          const std::string_view context)
+        {
+            const auto *array = std::get_if<JsonValue::Array>(&value.storage);
+            if (array == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " must be array");
+            }
+            return *array;
+        }
+
+        [[nodiscard]] std::string ExpectString(const JsonValue &value,
+                                               const std::string_view context)
+        {
+            const auto *string_value = std::get_if<std::string>(&value.storage);
+            if (string_value == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " must be string");
+            }
+            return *string_value;
+        }
+
+        [[nodiscard]] std::uint64_t ExpectUnsigned(const JsonValue &value,
+                                                   const std::string_view context)
+        {
+            const auto *unsigned_value = std::get_if<std::uint64_t>(&value.storage);
+            if (unsigned_value == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " must be unsigned integer");
+            }
+            return *unsigned_value;
+        }
+
+        [[nodiscard]] const JsonValue *FindObjectField(const JsonValue::Object &object,
+                                                       const std::string_view key)
+        {
+            const auto it = object.find(std::string(key));
+            if (it == object.end())
+            {
+                return nullptr;
+            }
+            return &it->second;
+        }
+
+        [[nodiscard]] const JsonValue &RequireObjectField(const JsonValue::Object &object,
+                                                          const std::string_view key,
+                                                          const std::string_view context)
+        {
+            const JsonValue *value = FindObjectField(object, key);
+            if (value == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " is missing field '" +
+                                         std::string(key) + "'");
+            }
+            return *value;
+        }
+
+        [[nodiscard]] std::optional<std::string> OptionalStringField(
+            const JsonValue::Object &object,
+            const std::string_view key)
+        {
+            const JsonValue *value = FindObjectField(object, key);
+            if (value == nullptr)
+            {
+                return std::nullopt;
+            }
+            if (std::holds_alternative<std::nullptr_t>(value->storage))
+            {
+                return std::nullopt;
+            }
+            return ExpectString(*value, key);
+        }
+
+        [[nodiscard]] ClusterChecksumAlgorithm ParseChecksumAlgorithm(
+            const std::string &value)
+        {
+            if (value == "sha256")
+            {
+                return ClusterChecksumAlgorithm::kSha256;
+            }
+            return ClusterChecksumAlgorithm::kUnknown;
+        }
+
+        [[nodiscard]] MetadataNodeInitialRole ParseMetadataInitialRole(
+            const std::string &value)
+        {
+            if (value == "voter")
+            {
+                return MetadataNodeInitialRole::kVoter;
+            }
+            if (value == "learner")
+            {
+                return MetadataNodeInitialRole::kLearner;
+            }
+            return MetadataNodeInitialRole::kUnknown;
+        }
+
+        [[nodiscard]] ClusterConfig ParseClusterConfigFromJsonValue(
+            const JsonValue &root_value)
+        {
+            const JsonValue::Object &root = ExpectObject(root_value, "cluster_config");
+            ClusterConfig config;
+            config.cluster_id = ExpectString(
+                RequireObjectField(root, "cluster_id", "cluster_config"),
+                "cluster_id");
+            config.base_dir = std::filesystem::path(ExpectString(
+                RequireObjectField(root, "base_dir", "cluster_config"),
+                "base_dir"));
+
+            const JsonValue::Array &view_nodes = ExpectArray(
+                RequireObjectField(root, "view_nodes", "cluster_config"),
+                "view_nodes");
+            config.view_nodes.reserve(view_nodes.size());
+            for (const JsonValue &node_value : view_nodes)
+            {
+                const JsonValue::Object &node = ExpectObject(node_value, "view_node");
+                config.view_nodes.push_back(ViewNodeConfig{
+                    .node_id = OptionalStringField(node, "node_id"),
+                    .endpoint = ExpectString(
+                        RequireObjectField(node, "endpoint", "view_node"),
+                        "view_node.endpoint"),
+                    .data_dir = std::filesystem::path(ExpectString(
+                        RequireObjectField(node, "data_dir", "view_node"),
+                        "view_node.data_dir")),
+                });
+            }
+
+            const JsonValue::Array &metadata_nodes = ExpectArray(
+                RequireObjectField(root, "metadata_nodes", "cluster_config"),
+                "metadata_nodes");
+            config.metadata_nodes.reserve(metadata_nodes.size());
+            for (const JsonValue &node_value : metadata_nodes)
+            {
+                const JsonValue::Object &node = ExpectObject(node_value, "metadata_node");
+                config.metadata_nodes.push_back(MetadataNodeConfig{
+                    .node_id = ExpectString(
+                        RequireObjectField(node, "node_id", "metadata_node"),
+                        "metadata_node.node_id"),
+                    .raft_id = static_cast<std::int32_t>(ExpectUnsigned(
+                        RequireObjectField(node, "raft_id", "metadata_node"),
+                        "metadata_node.raft_id")),
+                    .endpoint = ExpectString(
+                        RequireObjectField(node, "endpoint", "metadata_node"),
+                        "metadata_node.endpoint"),
+                    .data_dir = std::filesystem::path(ExpectString(
+                        RequireObjectField(node, "data_dir", "metadata_node"),
+                        "metadata_node.data_dir")),
+                    .snapshot_dir = std::filesystem::path(ExpectString(
+                        RequireObjectField(node, "snapshot_dir", "metadata_node"),
+                        "metadata_node.snapshot_dir")),
+                    .initial_role = ParseMetadataInitialRole(ExpectString(
+                        RequireObjectField(node, "initial_role", "metadata_node"),
+                        "metadata_node.initial_role")),
+                });
+            }
+
+            const JsonValue::Array &storage_nodes = ExpectArray(
+                RequireObjectField(root, "storage_nodes", "cluster_config"),
+                "storage_nodes");
+            config.storage_nodes.reserve(storage_nodes.size());
+            for (const JsonValue &node_value : storage_nodes)
+            {
+                const JsonValue::Object &node = ExpectObject(node_value, "storage_node");
+                const JsonValue::Object &failure_domain = ExpectObject(
+                    RequireObjectField(node, "failure_domain", "storage_node"),
+                    "storage_node.failure_domain");
+                config.storage_nodes.push_back(StorageNodeConfig{
+                    .node_id = OptionalStringField(node, "node_id"),
+                    .endpoint = ExpectString(
+                        RequireObjectField(node, "endpoint", "storage_node"),
+                        "storage_node.endpoint"),
+                    .data_dir = std::filesystem::path(ExpectString(
+                        RequireObjectField(node, "data_dir", "storage_node"),
+                        "storage_node.data_dir")),
+                    .capacity_bytes = ExpectUnsigned(
+                        RequireObjectField(node, "capacity_bytes", "storage_node"),
+                        "storage_node.capacity_bytes"),
+                    .failure_domain = FailureDomainConfig{
+                        .zone = ExpectString(
+                            RequireObjectField(failure_domain, "zone",
+                                               "storage_node.failure_domain"),
+                            "storage_node.failure_domain.zone"),
+                        .rack = ExpectString(
+                            RequireObjectField(failure_domain, "rack",
+                                               "storage_node.failure_domain"),
+                            "storage_node.failure_domain.rack"),
+                    },
+                });
+            }
+
+            const JsonValue::Object &membership = ExpectObject(
+                RequireObjectField(root, "initial_raft_membership", "cluster_config"),
+                "initial_raft_membership");
+            config.initial_raft_membership.membership_epoch = ExpectUnsigned(
+                RequireObjectField(membership, "membership_epoch",
+                                   "initial_raft_membership"),
+                "initial_raft_membership.membership_epoch");
+
+            for (const JsonValue &value : ExpectArray(
+                     RequireObjectField(membership, "voter_raft_ids",
+                                        "initial_raft_membership"),
+                     "initial_raft_membership.voter_raft_ids"))
+            {
+                config.initial_raft_membership.voter_raft_ids.push_back(
+                    static_cast<std::int32_t>(ExpectUnsigned(
+                        value,
+                        "initial_raft_membership.voter_raft_ids[]")));
+            }
+            for (const JsonValue &value : ExpectArray(
+                     RequireObjectField(membership, "learner_raft_ids",
+                                        "initial_raft_membership"),
+                     "initial_raft_membership.learner_raft_ids"))
+            {
+                config.initial_raft_membership.learner_raft_ids.push_back(
+                    static_cast<std::int32_t>(ExpectUnsigned(
+                        value,
+                        "initial_raft_membership.learner_raft_ids[]")));
+            }
+
+            const JsonValue::Object &chunk_policy = ExpectObject(
+                RequireObjectField(root, "chunk_policy", "cluster_config"),
+                "chunk_policy");
+            config.chunk_policy = ChunkPolicyConfig{
+                .chunk_size_bytes = ExpectUnsigned(
+                    RequireObjectField(chunk_policy, "chunk_size_bytes", "chunk_policy"),
+                    "chunk_policy.chunk_size_bytes"),
+                .replica_count = static_cast<std::uint32_t>(ExpectUnsigned(
+                    RequireObjectField(chunk_policy, "replica_count", "chunk_policy"),
+                    "chunk_policy.replica_count")),
+                .minimum_successful_writes =
+                    static_cast<std::uint32_t>(ExpectUnsigned(
+                        RequireObjectField(chunk_policy,
+                                           "minimum_successful_writes",
+                                           "chunk_policy"),
+                        "chunk_policy.minimum_successful_writes")),
+                .checksum_algorithm = ParseChecksumAlgorithm(ExpectString(
+                    RequireObjectField(chunk_policy, "checksum_algorithm",
+                                       "chunk_policy"),
+                    "chunk_policy.checksum_algorithm")),
+            };
+
+            const JsonValue::Object &timeouts = ExpectObject(
+                RequireObjectField(root, "timeouts", "cluster_config"),
+                "timeouts");
+            config.timeouts = ClusterTimeoutConfig{
+                .discovery_rpc_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "discovery_rpc_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.discovery_rpc_timeout_ms")),
+                .metadata_rpc_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "metadata_rpc_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.metadata_rpc_timeout_ms")),
+                .storage_rpc_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "storage_rpc_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.storage_rpc_timeout_ms")),
+                .heartbeat_interval = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "heartbeat_interval_ms",
+                                       "timeouts"),
+                    "timeouts.heartbeat_interval_ms")),
+                .registration_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "registration_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.registration_timeout_ms")),
+                .commit_deadline = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "commit_deadline_ms",
+                                       "timeouts"),
+                    "timeouts.commit_deadline_ms")),
+                .liveness_stale_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "liveness_stale_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.liveness_stale_timeout_ms")),
+                .liveness_dead_timeout = std::chrono::milliseconds(ExpectUnsigned(
+                    RequireObjectField(timeouts, "liveness_dead_timeout_ms",
+                                       "timeouts"),
+                    "timeouts.liveness_dead_timeout_ms")),
+            };
+            return config;
         }
     } // namespace
 
@@ -1704,6 +2298,51 @@ namespace clusterdemo
         const InitialRaftQuorumComputationResult result =
             ComputeInitialRaftQuorum(membership);
         return result.ok() ? result.summary->commit_quorum : 0U;
+    }
+
+    ClusterConfigLoadResult LoadClusterConfigFromJsonFile(
+        const std::filesystem::path &path)
+    {
+        ClusterConfigLoadResult result;
+        if (path.empty())
+        {
+            result.status = ClusterConfigStatusCode::kInvalidArgument;
+            result.error_detail = "config path must not be empty";
+            return result;
+        }
+
+        std::ifstream input(path, std::ios::binary);
+        if (!input.is_open())
+        {
+            result.status = ClusterConfigStatusCode::kInvalidArgument;
+            result.error_detail = "failed to open cluster config file: " +
+                                  path.generic_string();
+            return result;
+        }
+
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        try
+        {
+            const std::string json_text = buffer.str();
+            JsonParser parser(json_text);
+            ClusterConfig config = ParseClusterConfigFromJsonValue(parser.Parse());
+            result.validation = ValidateClusterConfig(config);
+            result.status = DeriveGenerationStatus(result.validation);
+            result.config = std::move(config);
+            if (!result.validation.ok())
+            {
+                result.error_detail = BuildValidationErrorDetail(result.validation);
+            }
+            return result;
+        }
+        catch (const std::exception &ex)
+        {
+            result.status = ClusterConfigStatusCode::kInvalidArgument;
+            result.error_detail = "failed to parse cluster config json: " +
+                                  std::string(ex.what());
+            return result;
+        }
     }
 
     std::string SerializeClusterConfigToJson(const ClusterConfig &config)

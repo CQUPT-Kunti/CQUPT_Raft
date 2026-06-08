@@ -282,6 +282,21 @@ namespace clusterdemo
         }
     };
 
+    struct ClusterConfigLoadResult
+    {
+        ClusterConfigStatusCode status{ClusterConfigStatusCode::kOk};
+        std::string error_detail;
+        std::optional<ClusterConfig> config;
+        ClusterConfigValidationResult validation;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == ClusterConfigStatusCode::kOk &&
+                   validation.ok() &&
+                   config.has_value();
+        }
+    };
+
     [[nodiscard]] ClusterConfigValidationResult ValidateClusterConfig(
         const ClusterConfig &config);
 
@@ -317,6 +332,11 @@ namespace clusterdemo
 
     [[nodiscard]] std::size_t ComputeInitialRaftQuorumSize(
         const InitialRaftMembershipConfig &membership);
+
+    // 读取文本配置文件并恢复 ClusterConfig。该接口只负责配置加载与校验，
+    // 不承载 app startup、registry 业务逻辑或运行时 authority。
+    [[nodiscard]] ClusterConfigLoadResult LoadClusterConfigFromJsonFile(
+        const std::filesystem::path &path);
 
     // 生成器输出的文本配置只描述 cluster/config 边界，不承载 app startup
     // 或运行时 discovery / quorum authority。

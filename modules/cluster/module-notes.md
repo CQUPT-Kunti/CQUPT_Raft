@@ -128,6 +128,7 @@
 - 配置生成器：
   - 后续可扩展为生成本地开发、测试、基准和多节点部署配置，但必须保持结果可重复、可校验、可追踪。
   - 当前公共接口已补充：
+    - `LoadClusterConfigFromJsonFile(...)`：从统一配置文件恢复 `ClusterConfig` 并执行基础校验，供 role-specific app startup 复用；它不承载 app 生命周期和业务 authority。
     - `AllocateClusterEndpoints(...)`：按统一 generation request 为 View / Metadata / Storage 生成稳定 endpoint 分配结果，并对端口冲突、非法 endpoint 给出诊断。
     - `ResolveClusterNodeConfig(...)`：从完整 `ClusterConfig` 中按 `node_type + node_id` 精确解析单节点启动配置；解析失败必须显式报错，禁止 fallback 到默认节点。
     - `ComputeInitialRaftQuorum(...)`：只基于 initial voter membership 计算 election / commit quorum，并对空 voter、重复 voter、voter/learner 重叠等配置错误返回诊断；该 helper 不是运行时 membership authority。
