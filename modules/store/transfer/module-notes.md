@@ -36,12 +36,19 @@
 - 必须处理 `NOT_LEADER`、leader hint、超时、重试边界和幂等诊断。
 - 不在本地判断 PENDING 是否可见；普通下载只接受 MetadataNode 返回的 COMMITTED manifest。
 
+当前 `metadata_transfer_client.h` 只定义 adapter 接口、请求/结果类型、timeout / wait-for-ready 选项和 transport / metadata 诊断边界；不实现 RPC 调用逻辑。后续 `metadata_transfer_client.cpp` 负责把这些逻辑接口映射到 `MetadataService`，但仍不得在 adapter 层保存 object manifest 权威副本、判断对象最终可见性或实现 upload/download 编排。
+
 ### `StorageTransferClient`
 
 - transfer 模块访问 StorageNode 的 data-plane adapter。
 - 负责 `WriteChunk`、`ReadChunk` 和必要的 chunk endpoint 解析。
 - 必须通过 StorageNode contract 交互，不直接修改 StorageNode 本地 chunk 文件、索引或 publish 状态。
 - checksum mismatch、durability failure、IO failure 必须显式返回失败。
+- T033 头文件边界：
+  - `StorageTransferTarget`：封装 transfer 已解析出的 `node_id` + `endpoint`
+  - `StorageTransferWriteRequest/Result`：表达单节点 chunk 写入、幂等重试 request_id、durable / already_exists / retryable 诊断
+  - `StorageTransferReadRequest/Result`：表达单节点 chunk 读取、expected checksum、校验结果和 bounded payload 返回
+  - `StorageTransferClient`：只负责单次 `WriteChunk` / `ReadChunk` adapter，不负责 manifest 选择、对象可见性、commit 或整文件编排
 
 ### chunk reader
 
@@ -55,6 +62,24 @@
 - 上传时用于向 WritePlan / WriteChunk / CommitObject 提供可验证事实。
 - 下载时用于逐 chunk 校验和最终对象 checksum 校验。
 - 校验失败必须终止对应传输并报告，不得静默修正或继续提交成功。
+
+### `object_transfer.h` 接口边界
+
+`modules/store/transfer/object_transfer.h` 只定义 transfer 编排层的接口边界，不实现真实上传下载。当前头文件应表达：
+
+- `ObjectTransfer` 作为 `storage_client` 侧 upload/download 编排入口
+- `TransferSession` / `UploadTransferSession` / `DownloadTransferSession` 的生命周期快照边界
+- `TransferChunkReader` 的 bounded chunk 读取接口，明确单次只返回单个 chunk buffer
+- `TransferChecksumState` 的增量 checksum 边界，禁止依赖整文件常驻内存
+- `TransferWritePlan`、`TransferCommittedChunk`、`TransferCommittedManifest` 这些 metadata facts 边界
+- 与 `MetadataTransferClient`、`StorageTransferClient`、`ViewNodeClient` 的依赖注入边界
+
+它不负责：
+
+- 实现 StorageNode `WriteChunk` / `ReadChunk`
+- 实现 MetadataNode `CreateWritePlan` / `CommitObject`
+- 实现 ViewNode discovery 重试循环
+- 让 payload、chunk bytes 或完整文件进入 Raft metadata/control-plane
 
 ## 上传流程边界
 

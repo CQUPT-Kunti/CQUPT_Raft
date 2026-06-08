@@ -76,17 +76,17 @@
 
 ### Tests for User Story 1
 
-- [ ] T026 [P] [US1] Add E2E upload/download happy-path test scaffold in `tests/integrated_object_storage_e2e_test.cpp`
-- [ ] T027 [P] [US1] Add manifest visibility test for PENDING hidden and COMMITTED visible states in `tests/integrated_object_storage_e2e_test.cpp`
-- [ ] T028 [P] [US1] Add checksum mismatch download failure test in `tests/integrated_object_storage_e2e_test.cpp`
+- [X] T026 [P] [US1] Add E2E upload/download happy-path test scaffold in `tests/integrated_object_storage_e2e_test.cpp`
+- [X] T027 [P] [US1] Add manifest visibility test for PENDING hidden and COMMITTED visible states in `tests/integrated_object_storage_e2e_test.cpp`
+- [X] T028 [P] [US1] Add checksum mismatch download failure test in `tests/integrated_object_storage_e2e_test.cpp`
 
 ### Implementation for User Story 1
 
-- [ ] T029 [P] [US1] Define transfer session, chunk reader, and checksum state interfaces in `modules/store/transfer/object_transfer.h`
+- [X] T029 [P] [US1] Define transfer session, chunk reader, and checksum state interfaces in `modules/store/transfer/object_transfer.h`
 - [ ] T030 [US1] Implement bounded file chunking and upload transfer session in `modules/store/transfer/object_transfer.cpp`
-- [ ] T031 [P] [US1] Define metadata upload/download adapter interface in `modules/store/transfer/metadata_transfer_client.h`
+- [X] T031 [P] [US1] Define metadata upload/download adapter interface in `modules/store/transfer/metadata_transfer_client.h`
 - [ ] T032 [US1] Implement metadata transfer adapter over MetadataService in `modules/store/transfer/metadata_transfer_client.cpp`
-- [ ] T033 [P] [US1] Define StorageNode chunk read/write adapter interface in `modules/store/transfer/storage_transfer_client.h`
+- [X] T033 [P] [US1] Define StorageNode chunk read/write adapter interface in `modules/store/transfer/storage_transfer_client.h`
 - [ ] T034 [US1] Implement StorageNode chunk read/write adapter in `modules/store/transfer/storage_transfer_client.cpp`
 - [ ] T035 [US1] Integrate ViewNode discovery into transfer orchestration in `modules/store/transfer/object_transfer.cpp`
 - [ ] T036 [US1] Add manifest-driven download reconstruction and final SHA-256 verification in `modules/store/transfer/object_transfer.cpp`
