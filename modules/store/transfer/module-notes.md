@@ -176,6 +176,13 @@ upload 失败时，transfer 可以产生清理候选或失败摘要，但不能�
 - `storage_client` 是用户入口，负责参数解析、配置加载、调用 transfer 编排并输出诊断。
 - 复杂 upload / download 编排应在 transfer 模块内完成，避免 app 变成业务逻辑中心。
 
+## T037 CLI 边界
+
+- `storage_client upload/download` 只负责解析 CLI 参数、读取最小 client config、装配 ViewNode/transfer adapter 并输出结果。
+- app 层可以基于 transfer result 决定退出码和成功/失败展示，但不能重新实现 discovery、Metadata RPC、StorageNode chunk IO 或对象可见性判断。
+- upload 只有在 transfer 明确返回 `committed=true` 时才能被 CLI 声明为成功；不得把仅创建了 write plan 或仅完成部分 chunk 准备的结果误报为上传成功。
+- download 只有在 transfer 明确返回最终 checksum verified 后才能输出 integrity `PASS`。
+
 ## 传输侧错误边界
 
 - `NOT_LEADER`：应基于 leader hint 或发现结果重新选择 MetadataNode；重试策略必须保留上限和诊断。

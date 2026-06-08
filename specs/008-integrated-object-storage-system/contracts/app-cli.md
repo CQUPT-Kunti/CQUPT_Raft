@@ -36,6 +36,8 @@ storage_client upload --config <path> --bucket <bucket> --object <key> --file <s
 - Write chunks to StorageNode.
 - Commit object.
 - Print object_id, version, size, checksum, chunk count, and request_id.
+- Optional overrides may include `--object-id`, `--request-id`, `--chunk-size`, `--replicas`, `--min-writes`, and `--concurrency`.
+- If `--object-id` is omitted, the CLI may derive a stable safe object_id from bucket/object key instead of requiring users to invent one manually.
 
 ### download
 
@@ -50,6 +52,7 @@ storage_client download --config <path> --bucket <bucket> --object <key> --out <
 - Read chunks from StorageNode.
 - Verify chunk checksums and final object checksum.
 - Print PASS-style integrity result or clear failure reason.
+- Optional overrides may include `--object-id`, `--version`, `--request-id`, and `--concurrency`.
 
 ### status
 
