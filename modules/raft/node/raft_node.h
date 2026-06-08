@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -93,6 +94,27 @@ namespace raftdemo
     std::vector<PeerReplicationStatus> peers;
   };
 
+  enum class CommittedMembershipRole
+  {
+    kUnknown,
+    kVoter,
+    kLearner,
+    kNonMember,
+  };
+
+  struct CommittedMembershipQuorumSummary
+  {
+    // 仅用于诊断：必须基于已提交 membership 计算，不能按 live 节点或 ViewNode 观测降 quorum。
+    std::uint64_t committed_log_index{0};
+    std::uint64_t committed_term{0};
+    std::vector<int> voter_ids;
+    std::vector<int> learner_ids;
+    std::size_t voter_count{0};
+    std::size_t learner_count{0};
+    std::size_t quorum_size{0};
+    CommittedMembershipRole local_role{CommittedMembershipRole::kUnknown};
+  };
+
   class RaftNode : public std::enable_shared_from_this<RaftNode>
   {
   public:
@@ -122,6 +144,8 @@ namespace raftdemo
     const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
     NodeStatusSnapshot GetStatusSnapshot() const;
     NodeMetricsSnapshot GetMetricsSnapshot() const;
+    // 只读诊断接口：返回当前已提交 membership / quorum 摘要，不提供任何可变入口。
+    CommittedMembershipQuorumSummary GetCommittedMembershipQuorumSummary() const;
     bool IsRunning() const;
 
   private:

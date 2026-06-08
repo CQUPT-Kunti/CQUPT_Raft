@@ -132,16 +132,16 @@
 
 ### Tests for User Story 5
 
-- [ ] T050 [P] [US5] Add 3-voter quorum insufficiency object commit test in `tests/integrated_object_storage_quorum_test.cpp`
-- [ ] T051 [P] [US5] Add 5-voter quorum calculation and commit availability test in `tests/integrated_object_storage_quorum_test.cpp`
-- [ ] T052 [P] [US5] Add ViewNode-registered Raft node not counted as voter test in `tests/integrated_object_storage_quorum_test.cpp`
+- [X] T050 [P] [US5] Add 3-voter quorum insufficiency object commit test in `tests/integrated_object_storage_quorum_test.cpp`
+- [X] T051 [P] [US5] Add 5-voter quorum calculation and commit availability test in `tests/integrated_object_storage_quorum_test.cpp`
+- [X] T052 [P] [US5] Add ViewNode-registered Raft node not counted as voter test in `tests/integrated_object_storage_quorum_test.cpp`
 
 ### Implementation for User Story 5
 
-- [ ] T053 [US5] Expose read-only committed membership/quorum summary for diagnostics in `modules/raft/node/raft_node.h`
-- [ ] T054 [US5] Implement quorum summary without changing election or commit behavior in `modules/raft/node/raft_node.cpp`
+- [X] T053 [US5] Expose read-only committed membership/quorum summary for diagnostics in `modules/raft/node/raft_node.h`
+- [X] T054 [US5] Implement quorum summary without changing election or commit behavior in `modules/raft/node/raft_node.cpp`
 - [ ] T055 [US5] Map quorum and leader diagnostics into MetadataService responses where needed in `modules/raft/service/metadata_service_impl.cpp`
-- [ ] T056 [US5] Add ViewNode Raft observation status mapping without membership authority in `modules/view/view_registry.cpp`
+- [X] T056 [US5] Add ViewNode Raft observation status mapping without membership authority in `modules/view/view_registry.cpp`
 - [ ] T057 [US5] Wire `integrated_object_storage_quorum` test target in `tests/CMakeLists.txt`
 
 **Checkpoint**: User Story 5 proves no availability shortcut can shrink Raft quorum.

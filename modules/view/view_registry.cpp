@@ -420,11 +420,55 @@ namespace viewdemo
             return ViewNodeLivenessState::kDead;
         }
 
+        MetadataMembershipObservedState MapObservedMembershipState(
+            const MetadataNodeObservation &observation,
+            const ViewNodeLivenessState liveness,
+            const ViewRegistryHealthReport &health)
+        {
+            if (liveness == ViewNodeLivenessState::kDead ||
+                health.health == ViewNodeHealth::kUnavailable)
+            {
+                return MetadataMembershipObservedState::kDown;
+            }
+
+            if (observation.membership_state !=
+                MetadataMembershipObservedState::kUnknown)
+            {
+                return observation.membership_state;
+            }
+
+            if (observation.raft_role == MetadataRaftObservedRole::kLearner)
+            {
+                return MetadataMembershipObservedState::kLearner;
+            }
+
+            return MetadataMembershipObservedState::kRegistered;
+        }
+
+        std::optional<MetadataNodeObservation> NormalizeMetadataObservation(
+            const ViewNodeType node_type,
+            const ViewNodeLivenessState liveness,
+            const ViewRegistryHealthReport &health,
+            std::optional<MetadataNodeObservation> observation)
+        {
+            if (node_type != ViewNodeType::kMetadata)
+            {
+                return std::nullopt;
+            }
+
+            MetadataNodeObservation normalized =
+                observation.value_or(MetadataNodeObservation{});
+            // ViewNode 只补 discovery / observation status，不推导 Raft authority。
+            normalized.membership_state =
+                MapObservedMembershipState(normalized, liveness, health);
+            return normalized;
+        }
+
         ViewNodeSnapshot MakeSnapshot(const Record &record,
                                       const std::uint64_t now_unix_ms,
                                       const ViewRegistryConfig &config)
         {
-            return ViewNodeSnapshot{
+            ViewNodeSnapshot snapshot{
                 .cluster_id = record.registration.cluster_id,
                 .node_id = record.registration.node_id,
                 .node_type = record.registration.node_type,
@@ -444,6 +488,13 @@ namespace viewdemo
                 .capacity = record.registration.capacity,
                 .load = record.registration.load,
                 .metadata = record.registration.metadata};
+
+            snapshot.metadata = NormalizeMetadataObservation(
+                snapshot.node_type,
+                snapshot.liveness,
+                snapshot.health,
+                std::move(snapshot.metadata));
+            return snapshot;
         }
 
         SequenceDecision EvaluateSequenceDecision(

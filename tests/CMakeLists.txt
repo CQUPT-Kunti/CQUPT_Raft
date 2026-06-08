@@ -903,6 +903,11 @@ endif()
 add_raft_gtest(test_integrated_object_storage_quorum
   integrated_object_storage_quorum_test.cpp
   "${RAFT_008_LABELS_QUORUM}")
+if(TARGET test_integrated_object_storage_quorum AND NOT TARGET integrated_object_storage_quorum)
+  add_custom_target(integrated_object_storage_quorum
+    DEPENDS test_integrated_object_storage_quorum
+  )
+endif()
 add_raft_gtest(test_integrated_object_storage_recovery
   integrated_object_storage_recovery_test.cpp
   "${RAFT_008_LABELS_RECOVERY}")

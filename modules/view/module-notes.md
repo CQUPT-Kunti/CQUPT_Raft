@@ -75,6 +75,14 @@ ViewNode 的定位是 discovery-only / observation-only：它可以展示观测�
 
 Discovery snapshot 只返回候选端点和观测事实。MetadataNode 的 leader hint 只按观测 term / 时间选择最新提示；StorageNode 的 capacity、health、load 只用于发现过滤和诊断，不代表对象可见性。后续测试应覆盖重复注册、endpoint 冲突、stale heartbeat、liveness 过滤、leader hint 选择和 storage writable 过滤。
 
+对于 MetadataNode 的 Raft 观测状态，registry 会在快照输出阶段做保守归一化：
+
+- MetadataNode 已注册但未携带明确 membership 状态时，默认展示为 `REGISTERED`，表示“已被 ViewNode 观测到”，不是已提交 membership。
+- 观测 role 为 `LEARNER` 且 membership 状态未知时，可展示为 `LEARNER`。
+- 节点被判定为 `DEAD` 或 heartbeat/health 已观测为 `UNAVAILABLE` 时，快照中的 membership 观测状态映射为 `DOWN`。
+
+以上映射只服务于 discovery、status 和 diagnostics；它不会把 ViewNode 注册结果解释为 voter authority，也不会修改 Raft quorum、election 或 committed membership。
+
 ## Non-Authority Boundary
 
 ViewNode 不保存 object manifest 的一致性权威副本，不决定对象是否 `COMMITTED` 可见，不参与 `CommitObject`，不直接读写 StorageNode chunk 数据。
