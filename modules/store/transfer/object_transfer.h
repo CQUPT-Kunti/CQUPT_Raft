@@ -97,6 +97,16 @@ namespace storedemo
         std::vector<StorageNodeId> replica_nodes;
     };
 
+    // upload 本地准备出的 chunk facts。
+    // 这里只记录 chunk index/offset/size/checksum，不伪造 chunk_id、replica 或 COMMITTED 状态。
+    struct TransferPreparedChunk
+    {
+        std::uint32_t chunk_index{0};
+        std::uint64_t offset{0};
+        std::uint64_t size{0};
+        ChunkChecksum checksum;
+    };
+
     // MetadataNode CreateWritePlan 返回的 metadata facts 边界。
     struct TransferWritePlan
     {
@@ -205,6 +215,7 @@ namespace storedemo
         ObjectTransferStatusCode status{ObjectTransferStatusCode::kOk};
         std::string error_detail;
         TransferSessionSnapshot session;
+        std::vector<TransferPreparedChunk> prepared_chunks;
         std::optional<TransferWritePlan> write_plan;
         std::vector<TransferCommittedChunk> committed_chunks;
         std::optional<TransferCommittedManifest> committed_manifest;
@@ -274,6 +285,10 @@ namespace storedemo
         virtual void Close() = 0;
     };
 
+    // 返回默认的 bounded 文件 chunk reader。
+    // 它只负责本地文件分块读取，不负责 metadata authority 或 StorageNode RPC。
+    [[nodiscard]] std::unique_ptr<TransferChunkReader> CreateFileTransferChunkReader();
+
     struct TransferChecksumUpdateRequest
     {
         std::uint32_t chunk_index{0};
@@ -330,6 +345,10 @@ namespace storedemo
         virtual TransferChecksumSnapshot Snapshot() const = 0;
         virtual void Reset() = 0;
     };
+
+    // 返回默认的增量对象 checksum state。
+    // 它只维护 chunk/object checksum facts，不缓存完整对象 payload。
+    [[nodiscard]] std::unique_ptr<TransferChecksumState> CreateTransferChecksumState();
 
     // TransferSession 只表示单次客户端 upload/download 的生命周期快照。
     // 它不是 Raft 持久状态，也不是 StorageNode 本地状态。

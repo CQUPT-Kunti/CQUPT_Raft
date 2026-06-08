@@ -37,6 +37,13 @@
 - 不在本地判断 PENDING 是否可见；普通下载只接受 MetadataNode 返回的 COMMITTED manifest。
 
 当前 `metadata_transfer_client.h` 只定义 adapter 接口、请求/结果类型、timeout / wait-for-ready 选项和 transport / metadata 诊断边界；不实现 RPC 调用逻辑。后续 `metadata_transfer_client.cpp` 负责把这些逻辑接口映射到 `MetadataService`，但仍不得在 adapter 层保存 object manifest 权威副本、判断对象最终可见性或实现 upload/download 编排。
+T032 当前实现采用“现有 MetadataService 边界内的最小映射”：
+
+- `CreateWritePlan` 通过现有 `CreateObject` RPC 创建 pending metadata 记录，并返回 transfer 可消费的对象 identity / checksum facts。
+- 当前 `metadata.proto` 还没有显式返回 chunk layout / placement，因此 `TransferWritePlan.chunks` 暂不由 adapter 伪造。
+- `CommitObject` 通过现有 `CommitObject` RPC 提交 chunk manifest facts，不提交 payload。
+- `GetObjectManifest` 通过现有 `HeadObject` RPC 读取 COMMITTED `ObjectRecord` 并转换为 transfer manifest facts。
+- 由于当前 `HeadObject` 只暴露 COMMITTED 对象，adapter 不能从现有 service 中区分“对象真实不存在”和“PENDING 但对普通读不可见”的全部细粒度状态。
 
 ### `StorageTransferClient`
 
@@ -49,6 +56,11 @@
   - `StorageTransferWriteRequest/Result`：表达单节点 chunk 写入、幂等重试 request_id、durable / already_exists / retryable 诊断
   - `StorageTransferReadRequest/Result`：表达单节点 chunk 读取、expected checksum、校验结果和 bounded payload 返回
   - `StorageTransferClient`：只负责单次 `WriteChunk` / `ReadChunk` adapter，不负责 manifest 选择、对象可见性、commit 或整文件编排
+- T034 实现边界：
+  - `storage_transfer_client.cpp` 当前复用 `StorageNodeClient` 发起单节点 `WriteChunk` / `ReadChunk`
+  - 可以做 endpoint -> gRPC channel 的轻量缓存，但不缓存对象可见性或 manifest authority
+  - 只转换 data-plane request/response、retryable 状态、durable/already_exists/verified 等事实
+  - 不把 StorageNode 本地 live chunk 状态解释成对象 `COMMITTED` 可见
 
 ### chunk reader
 
@@ -70,7 +82,10 @@
 - `ObjectTransfer` 作为 `storage_client` 侧 upload/download 编排入口
 - `TransferSession` / `UploadTransferSession` / `DownloadTransferSession` 的生命周期快照边界
 - `TransferChunkReader` 的 bounded chunk 读取接口，明确单次只返回单个 chunk buffer
+- 默认 `CreateFileTransferChunkReader()` factory，用于本地 bounded 文件分块读取
 - `TransferChecksumState` 的增量 checksum 边界，禁止依赖整文件常驻内存
+- 默认 `CreateTransferChecksumState()` factory，用于维护对象级增量 checksum
+- `TransferPreparedChunk`，表达 upload 本地读取后得到的 chunk index/offset/size/checksum facts
 - `TransferWritePlan`、`TransferCommittedChunk`、`TransferCommittedManifest` 这些 metadata facts 边界
 - 与 `MetadataTransferClient`、`StorageTransferClient`、`ViewNodeClient` 的依赖注入边界
 

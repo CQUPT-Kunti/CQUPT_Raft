@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+
+#include <grpcpp/grpcpp.h>
 
 #include "store/chunk/chunk_store.h"
 #include "store/runtime/storage_executor.h"
@@ -71,6 +74,14 @@ namespace storedemo
         bool verified{false};
     };
 
+    struct StorageTransferClientConfig
+    {
+        // 复用 StorageNodeClient 的写入重试上限，但不在这里引入 upload/download 编排。
+        std::uint32_t max_write_retries{0};
+        // 为空时默认使用 insecure channel credentials。
+        std::shared_ptr<grpc::ChannelCredentials> channel_credentials;
+    };
+
     class StorageTransferClient
     {
     public:
@@ -84,4 +95,10 @@ namespace storedemo
         virtual StorageTransferReadResult ReadChunk(
             const StorageTransferReadRequest &request) = 0;
     };
+
+    // 返回一个基于 StorageNode gRPC data-plane 的 transfer adapter。
+    // 它只负责单 chunk 的 read/write RPC 映射，不负责对象可见性、manifest、
+    // ViewNode discovery 或 upload/download 编排。
+    std::shared_ptr<StorageTransferClient> CreateGrpcStorageTransferClient(
+        StorageTransferClientConfig config = {});
 }
