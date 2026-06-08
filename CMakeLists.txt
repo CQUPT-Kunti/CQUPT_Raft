@@ -395,6 +395,15 @@ raft_add_optional_app_target(storage_client
   apps/storage_client.cpp
 )
 
+if(TARGET storage_client)
+  target_link_libraries(storage_client
+    PRIVATE
+      view_proto
+      metadata_proto
+      storage_node_proto
+  )
+endif()
+
 raft_add_optional_app_target(storage_bench
   apps/storage_bench.cpp
 )

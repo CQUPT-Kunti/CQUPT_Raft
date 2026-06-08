@@ -895,6 +895,11 @@ add_raft_gtest(test_raft_replicator_behavior test_raft_replicator_behavior.cpp
 add_raft_gtest(test_integrated_object_storage_e2e
   integrated_object_storage_e2e_test.cpp
   "${RAFT_008_LABELS_E2E}")
+if(TARGET test_integrated_object_storage_e2e AND NOT TARGET integrated_object_storage_e2e)
+  add_custom_target(integrated_object_storage_e2e
+    DEPENDS test_integrated_object_storage_e2e
+  )
+endif()
 add_raft_gtest(test_integrated_object_storage_quorum
   integrated_object_storage_quorum_test.cpp
   "${RAFT_008_LABELS_QUORUM}")
