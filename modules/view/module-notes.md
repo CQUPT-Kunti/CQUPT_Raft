@@ -58,6 +58,8 @@ ViewNode 的定位是 discovery-only / observation-only：它可以展示观测�
 `modules/view/view_service_impl.cpp` 负责把 `proto/view.proto` 请求映射到 `ViewNodeRegistry`，并把 registry 结果映射回 gRPC response。它应：
 
 - 保持 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 的同步 unary adapter 实现
+- 对 StorageNode 首次注册补 node_id allocation / confirmation service path，但不把
+  ViewNode 变成 metadata authority 或 membership authority
 - 返回可诊断的 summary、snapshot、warning 和 leader hint 观测信息
 - 支持注入 `now_unix_ms`，避免 discovery / cluster view 实现偷偷依赖不可控全局时间
 - 把 registry 异常收敛为明确的 gRPC internal failure，而不是静默吞掉

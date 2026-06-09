@@ -109,6 +109,175 @@ namespace clusterdemo
             return oss.str();
         }
 
+        std::string QuoteDiagnosticValue(const std::string_view value)
+        {
+            return "'" + std::string(value) + "'";
+        }
+
+        std::string QuoteDiagnosticOptionalRaftId(
+            const std::optional<std::int32_t> raft_id)
+        {
+            if (!raft_id.has_value())
+            {
+                return "<none>";
+            }
+            return "'" + std::to_string(*raft_id) + "'";
+        }
+
+        std::string BuildIdentitySummary(const NodeIdentity &identity)
+        {
+            std::ostringstream oss;
+            oss << "cluster_id=" << QuoteDiagnosticValue(identity.cluster_id)
+                << ", node_id=" << QuoteDiagnosticValue(identity.node_id)
+                << ", node_type=" << QuoteDiagnosticValue(ToString(identity.node_type))
+                << ", raft_id=" << QuoteDiagnosticOptionalRaftId(identity.raft_id)
+                << ", source=" << QuoteDiagnosticValue(ToString(identity.source));
+            return oss.str();
+        }
+
+        NodeIdentityValidationResult ValidateNodeIdentityMatchesDetailed(
+            const NodeIdentity &identity,
+            const ExpectedNodeIdentity &expected,
+            const std::filesystem::path &identity_path = {},
+            const std::string_view subject = "existing identity")
+        {
+            NodeIdentityValidationResult result;
+            const auto make_message = [&](const std::string &detail)
+            {
+                std::ostringstream oss;
+                oss << subject << " " << detail;
+                if (!identity_path.empty())
+                {
+                    oss << " at " << PathToDiagnosticString(identity_path);
+                }
+                return oss.str();
+            };
+
+            if (expected.cluster_id.has_value() &&
+                identity.cluster_id != *expected.cluster_id)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kClusterIdMismatch,
+                         "cluster_id",
+                         make_message("cluster_id mismatch: expected=" +
+                                      QuoteDiagnosticValue(*expected.cluster_id) +
+                                      ", actual=" +
+                                      QuoteDiagnosticValue(identity.cluster_id) +
+                                      "; refusing to reuse data_dir for a different cluster"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.node_id.has_value() &&
+                identity.node_id != *expected.node_id)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kNodeIdMismatch,
+                         "node_id",
+                         make_message("node_id mismatch: expected=" +
+                                      QuoteDiagnosticValue(*expected.node_id) +
+                                      ", actual=" +
+                                      QuoteDiagnosticValue(identity.node_id) +
+                                      "; refusing to start with another node's durable identity"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.node_type != ClusterNodeType::kUnknown &&
+                identity.node_type != expected.node_type)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kNodeTypeMismatch,
+                         "node_type",
+                         make_message("node_type mismatch: expected=" +
+                                      QuoteDiagnosticValue(
+                                          ToString(expected.node_type)) +
+                                      ", actual=" +
+                                      QuoteDiagnosticValue(
+                                          ToString(identity.node_type)) +
+                                      "; refusing to reuse identity across node roles"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.raft_id.has_value() &&
+                identity.raft_id != expected.raft_id)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kRaftIdMismatch,
+                         "raft_id",
+                         make_message("raft_id mismatch: expected=" +
+                                      QuoteDiagnosticOptionalRaftId(
+                                          expected.raft_id) +
+                                      ", actual=" +
+                                      QuoteDiagnosticOptionalRaftId(
+                                          identity.raft_id) +
+                                      "; refusing to reuse a different Raft identity"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.source.has_value() &&
+                identity.source != *expected.source)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kSourceMismatch,
+                         "source",
+                         make_message("source mismatch: expected=" +
+                                      QuoteDiagnosticValue(
+                                          ToString(*expected.source)) +
+                                      ", actual=" +
+                                      QuoteDiagnosticValue(
+                                          ToString(identity.source)) +
+                                      "; refusing to silently reinterpret durable identity provenance"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.require_raft_id_for_metadata &&
+                identity.node_type == ClusterNodeType::kMetadata &&
+                (!identity.raft_id.has_value() || *identity.raft_id <= 0))
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kMissingRaftId,
+                         "raft_id",
+                         make_message("metadata identity must provide positive raft_id; actual=" +
+                                      QuoteDiagnosticOptionalRaftId(identity.raft_id)),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            if (expected.forbid_raft_id_for_non_metadata &&
+                identity.node_type != ClusterNodeType::kMetadata &&
+                identity.raft_id.has_value())
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kUnexpectedRaftId,
+                         "raft_id",
+                         make_message("non-metadata identity must not provide raft_id; actual=" +
+                                      QuoteDiagnosticOptionalRaftId(identity.raft_id) +
+                                      "; refusing to treat non-Raft nodes as MetadataNode members"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
+            return result;
+        }
+
         bool ParseInt64(std::string_view text, std::int64_t *out)
         {
             if (out == nullptr)
@@ -1014,95 +1183,7 @@ namespace clusterdemo
         const NodeIdentity &identity,
         const ExpectedNodeIdentity &expected)
     {
-        NodeIdentityValidationResult result;
-
-        if (expected.cluster_id.has_value() &&
-            identity.cluster_id != *expected.cluster_id)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kClusterIdMismatch,
-                     "cluster_id",
-                     "existing identity cluster_id does not match expected cluster_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.node_id.has_value() &&
-            identity.node_id != *expected.node_id)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kNodeIdMismatch,
-                     "node_id",
-                     "existing identity node_id does not match expected node_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.node_type != ClusterNodeType::kUnknown &&
-            identity.node_type != expected.node_type)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kNodeTypeMismatch,
-                     "node_type",
-                     "existing identity node_type does not match expected node_type",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.raft_id.has_value() &&
-            identity.raft_id != expected.raft_id)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kRaftIdMismatch,
-                     "raft_id",
-                     "existing identity raft_id does not match expected raft_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.source.has_value() &&
-            identity.source != *expected.source)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kSourceMismatch,
-                     "source",
-                     "existing identity source does not match expected source",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.require_raft_id_for_metadata &&
-            identity.node_type == ClusterNodeType::kMetadata &&
-            (!identity.raft_id.has_value() || *identity.raft_id <= 0))
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kMissingRaftId,
-                     "raft_id",
-                     "metadata identity must provide positive raft_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (expected.forbid_raft_id_for_non_metadata &&
-            identity.node_type != ClusterNodeType::kMetadata &&
-            identity.raft_id.has_value())
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kUnexpectedRaftId,
-                     "raft_id",
-                     "non-metadata identity must not provide raft_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        return result;
+        return ValidateNodeIdentityMatchesDetailed(identity, expected);
     }
 
     NodeIdentityLoadResult LoadNodeIdentity(const NodeIdentityLoadOptions &options)
@@ -1229,8 +1310,13 @@ namespace clusterdemo
             return result;
         }
 
-        auto match_validation =
-            ValidateNodeIdentityMatches(parsed->identity, options.expected);
+        // load 阶段要把 durable identity 的路径和 expected/actual 差异一起返回，
+        // 避免调用方只看到 conflict 却无法定位是哪份 node.identity 被错误复用。
+        auto match_validation = ValidateNodeIdentityMatchesDetailed(
+            parsed->identity,
+            options.expected,
+            result.identity_path,
+            "existing node.identity");
         if (!match_validation.ok())
         {
             result.validation = std::move(match_validation);
@@ -1296,10 +1382,30 @@ namespace clusterdemo
             if (options.store_mode == NodeIdentityStoreMode::kCreateNewOnly)
             {
                 result.status = NodeIdentityStatusCode::kConflict;
+                const ExpectedNodeIdentity requested_identity{
+                    .cluster_id = identity.cluster_id,
+                    .node_id = identity.node_id,
+                    .node_type = identity.node_type,
+                    .raft_id = identity.raft_id,
+                    .source = identity.source,
+                    .require_raft_id_for_metadata = true,
+                    .forbid_raft_id_for_non_metadata = true};
+                // create-only 冲突不能只报“已存在”，还要返回请求身份和现存身份
+                // 的具体差异，避免调用方误把错误 data_dir 当成可安全复用。
+                auto mismatch_validation = ValidateNodeIdentityMatchesDetailed(
+                    *loaded.identity,
+                    requested_identity,
+                    result.identity_path,
+                    "existing node.identity");
+                result.validation = std::move(mismatch_validation);
                 AddIssue(&result.validation,
                          NodeIdentityIssueCode::kExistingIdentityConflict,
                          "node.identity",
-                         "refusing to overwrite existing node.identity in create-only mode",
+                         "refusing to overwrite existing node.identity in create-only mode; "
+                         "requested identity=" +
+                             BuildIdentitySummary(identity) +
+                             ", existing identity=" +
+                             BuildIdentitySummary(*loaded.identity),
                          loaded.identity->node_type,
                          loaded.identity->node_id,
                          loaded.identity->raft_id,
@@ -1308,8 +1414,11 @@ namespace clusterdemo
                 return result;
             }
 
-            auto expected_validation =
-                ValidateNodeIdentityMatches(*loaded.identity, options.expected_existing);
+            auto expected_validation = ValidateNodeIdentityMatchesDetailed(
+                *loaded.identity,
+                options.expected_existing,
+                result.identity_path,
+                "existing node.identity");
             if (!expected_validation.ok())
             {
                 result.status = NodeIdentityStatusCode::kConflict;
@@ -1321,11 +1430,30 @@ namespace clusterdemo
             if (!NodeIdentityEquals(*loaded.identity, identity))
             {
                 result.status = NodeIdentityStatusCode::kConflict;
+                const ExpectedNodeIdentity requested_identity{
+                    .cluster_id = identity.cluster_id,
+                    .node_id = identity.node_id,
+                    .node_type = identity.node_type,
+                    .raft_id = identity.raft_id,
+                    .source = identity.source,
+                    .require_raft_id_for_metadata = true,
+                    .forbid_raft_id_for_non_metadata = true};
+                // replace-only 只允许重写同一身份文件；如果请求身份不同，必须显式
+                // 返回 expected/actual 诊断，不能静默把其他节点身份覆盖进去。
+                auto mismatch_validation = ValidateNodeIdentityMatchesDetailed(
+                    *loaded.identity,
+                    requested_identity,
+                    result.identity_path,
+                    "existing node.identity");
+                result.validation = std::move(mismatch_validation);
                 AddIssue(&result.validation,
                          NodeIdentityIssueCode::kExistingIdentityConflict,
                          "node.identity",
                          "replace mode only permits rewriting the same identity; "
-                         "existing file differs from requested identity",
+                         "requested identity=" +
+                             BuildIdentitySummary(identity) +
+                             ", existing identity=" +
+                             BuildIdentitySummary(*loaded.identity),
                          loaded.identity->node_type,
                          loaded.identity->node_id,
                          loaded.identity->raft_id,

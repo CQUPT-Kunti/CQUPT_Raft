@@ -5,11 +5,27 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace viewdemo
 {
     namespace
     {
+        struct StorageNodeIdResolution
+        {
+            ViewRegistryStatusCode status{ViewRegistryStatusCode::kOk};
+            NodeRegistration registration;
+            std::vector<ViewRegistryDiagnostic> diagnostics;
+            bool conflict{false};
+            bool confirmed_existing{false};
+            bool generated_new{false};
+
+            [[nodiscard]] bool ok() const
+            {
+                return status == ViewRegistryStatusCode::kOk;
+            }
+        };
+
         std::uint64_t SystemNowUnixMs()
         {
             const auto now = std::chrono::system_clock::now();
@@ -28,6 +44,62 @@ namespace viewdemo
 
             const auto now_unix_ms = config.now_unix_ms();
             return now_unix_ms == 0 ? SystemNowUnixMs() : now_unix_ms;
+        }
+
+        std::uint64_t Fnv1a64(const std::string_view text)
+        {
+            constexpr std::uint64_t kOffsetBasis = 14695981039346656037ull;
+            constexpr std::uint64_t kPrime = 1099511628211ull;
+
+            std::uint64_t hash = kOffsetBasis;
+            for (const unsigned char ch : text)
+            {
+                hash ^= static_cast<std::uint64_t>(ch);
+                hash *= kPrime;
+            }
+            return hash;
+        }
+
+        std::string ToLowerHex(const std::uint64_t value)
+        {
+            constexpr char kDigits[] = "0123456789abcdef";
+            std::string text(16, '0');
+            for (std::size_t i = 0; i < text.size(); ++i)
+            {
+                const auto shift =
+                    static_cast<unsigned>((text.size() - 1 - i) * 4);
+                text[i] = kDigits[(value >> shift) & 0x0fU];
+            }
+            return text;
+        }
+
+        std::string AllocateStorageNodeId(const std::string_view cluster_id,
+                                          const std::string_view fingerprint)
+        {
+            std::string seed;
+            seed.reserve(cluster_id.size() + fingerprint.size() + 1);
+            seed.append(cluster_id);
+            seed.push_back('\n');
+            seed.append(fingerprint);
+            return "store-" + ToLowerHex(Fnv1a64(seed));
+        }
+
+        ViewRegistryDiagnostic MakeServiceDiagnostic(
+            const ViewRegistryIssueCode code,
+            std::string message,
+            const RequestId &request_id,
+            const ClusterId &cluster_id,
+            const NodeId &node_id,
+            const Endpoint &endpoint)
+        {
+            return ViewRegistryDiagnostic{
+                .code = code,
+                .message = std::move(message),
+                .request_id = request_id,
+                .cluster_id = cluster_id,
+                .node_id = node_id,
+                .endpoint = endpoint,
+                .sequence = 0};
         }
 
         ViewNodeType FromProtoNodeType(const ::view::ViewNodeType node_type)
@@ -373,6 +445,147 @@ namespace viewdemo
             return result;
         }
 
+        std::vector<ViewNodeSnapshot> FindStorageNodesByFingerprint(
+            const ViewNodeRegistry &registry,
+            const ClusterId &cluster_id,
+            const std::string_view data_dir_fingerprint,
+            const std::uint64_t now_unix_ms)
+        {
+            if (cluster_id.empty() || data_dir_fingerprint.empty())
+            {
+                return {};
+            }
+
+            const auto cluster_view = registry.GetClusterView(
+                GetClusterViewRequest{.request_id = {},
+                                      .cluster_id = cluster_id,
+                                      .include_dead_nodes = true,
+                                      .include_warnings = false},
+                now_unix_ms);
+            if (!cluster_view.ok())
+            {
+                return {};
+            }
+
+            std::vector<ViewNodeSnapshot> matches;
+            for (const auto &snapshot : cluster_view.snapshot.storage_nodes)
+            {
+                if (snapshot.data_dir_fingerprint == data_dir_fingerprint)
+                {
+                    matches.push_back(snapshot);
+                }
+            }
+            return matches;
+        }
+
+        StorageNodeIdResolution ResolveStorageNodeIdForRegistration(
+            const RegisterNodeRequest &request,
+            const ViewNodeRegistry &registry,
+            const std::uint64_t now_unix_ms)
+        {
+            StorageNodeIdResolution resolution;
+            resolution.registration = request.registration;
+
+            if (resolution.registration.node_type != ViewNodeType::kStorage)
+            {
+                return resolution;
+            }
+
+            const auto &cluster_id = resolution.registration.cluster_id;
+            const auto &fingerprint =
+                resolution.registration.data_dir_fingerprint;
+            const auto &endpoint = resolution.registration.endpoint;
+
+            const auto fingerprint_matches = FindStorageNodesByFingerprint(
+                registry,
+                cluster_id,
+                fingerprint,
+                now_unix_ms);
+            if (fingerprint_matches.size() > 1)
+            {
+                resolution.status = ViewRegistryStatusCode::kConflict;
+                resolution.conflict = true;
+                resolution.diagnostics.push_back(
+                    MakeServiceDiagnostic(
+                        ViewRegistryIssueCode::kDataDirFingerprintConflict,
+                        "data_dir_fingerprint is already associated with multiple storage node_ids",
+                        request.request_id,
+                        cluster_id,
+                        resolution.registration.node_id,
+                        endpoint));
+                return resolution;
+            }
+
+            if (!fingerprint_matches.empty())
+            {
+                const auto &matched = fingerprint_matches.front();
+                if (!resolution.registration.node_id.empty() &&
+                    resolution.registration.node_id != matched.node_id)
+                {
+                    resolution.status = ViewRegistryStatusCode::kConflict;
+                    resolution.conflict = true;
+                    resolution.diagnostics.push_back(
+                        MakeServiceDiagnostic(
+                            ViewRegistryIssueCode::kDataDirFingerprintConflict,
+                            "data_dir_fingerprint is already registered to a different node_id",
+                            request.request_id,
+                            cluster_id,
+                            resolution.registration.node_id,
+                            endpoint));
+                    return resolution;
+                }
+
+                resolution.registration.node_id = matched.node_id;
+                resolution.confirmed_existing = true;
+                return resolution;
+            }
+
+            if (!resolution.registration.node_id.empty())
+            {
+                return resolution;
+            }
+
+            if (resolution.registration.data_dir_fingerprint.empty())
+            {
+                resolution.status = ViewRegistryStatusCode::kInvalidArgument;
+                resolution.diagnostics.push_back(
+                    MakeServiceDiagnostic(
+                        ViewRegistryIssueCode::kMissingNodeId,
+                        "storage first registration with empty node_id requires non-empty data_dir_fingerprint",
+                        request.request_id,
+                        cluster_id,
+                        resolution.registration.node_id,
+                        endpoint));
+                return resolution;
+            }
+
+            // ViewNode 这里只分配稳定的 discovery identity，不授予任何 metadata authority。
+            const auto allocated_node_id =
+                AllocateStorageNodeId(cluster_id, fingerprint);
+            const auto existing =
+                registry.LookupNode(cluster_id, allocated_node_id, now_unix_ms);
+            if (existing.summary.status == ViewRegistryStatusCode::kOk &&
+                existing.snapshot.has_value() &&
+                existing.snapshot->data_dir_fingerprint != fingerprint)
+            {
+                resolution.status = ViewRegistryStatusCode::kConflict;
+                resolution.conflict = true;
+                resolution.diagnostics.push_back(
+                    MakeServiceDiagnostic(
+                        ViewRegistryIssueCode::kNodeIdConflict,
+                        "allocated node_id is already registered to a different storage identity",
+                        request.request_id,
+                        cluster_id,
+                        allocated_node_id,
+                        endpoint));
+                return resolution;
+            }
+
+            resolution.registration.node_id = allocated_node_id;
+            resolution.generated_new = true;
+            return resolution;
+        }
+
         void FillProtoSummary(const ViewRegistryResponseSummary &summary,
                               ::view::ViewNodeResponseSummary *proto_summary)
         {
@@ -557,6 +770,29 @@ namespace viewdemo
                 std::string(rpc_name) +
                     " failed inside view service adapter");
         }
+
+        void FillServiceRegisterFailure(
+            const RegisterNodeRequest &request,
+            const StorageNodeIdResolution &resolution,
+            ::view::RegisterNodeResponse *response)
+        {
+            FillProtoSummary(
+                ViewRegistryResponseSummary{
+                    .status = resolution.status,
+                    .message = resolution.diagnostics.empty()
+                                   ? "storage node registration failed before registry apply"
+                                   : resolution.diagnostics.front().message,
+                    .request_id = request.request_id,
+                    .cluster_id = request.registration.cluster_id,
+                    .node_id = resolution.registration.node_id,
+                    .retry_after_ms = 0},
+                response->mutable_summary());
+            response->set_created(false);
+            response->set_idempotent(false);
+            response->set_conflict(resolution.conflict);
+            response->clear_snapshot();
+            AppendWarnings(resolution.diagnostics, response);
+        }
     } // namespace
 
     ViewNodeServiceImpl::ViewNodeServiceImpl(
@@ -588,12 +824,36 @@ namespace viewdemo
 
         try
         {
-            // service adapter 只做 proto -> registry 的观测事实映射。
-            const auto result = registry_->RegisterNode(RegisterNodeRequest{
+            const RegisterNodeRequest register_request{
                 .request_id = request->request_id(),
-                .registration = FromProtoRegistration(request->registration())});
+                .registration = FromProtoRegistration(request->registration())};
+            // service adapter 只补 first registration 的 node_id 分配/确认边界；
+            // ViewNode 仍然只是 discovery / observation 组件，不决定对象可见性。
+            const auto resolution = ResolveStorageNodeIdForRegistration(
+                register_request,
+                *registry_,
+                ResolveNowUnixMs(config_));
+            if (!resolution.ok())
+            {
+                FillServiceRegisterFailure(register_request, resolution, response);
+                return ::grpc::Status::OK;
+            }
+
+            const auto result = registry_->RegisterNode(
+                RegisterNodeRequest{.request_id = register_request.request_id,
+                                    .registration = resolution.registration});
 
             FillProtoSummary(result.summary, response->mutable_summary());
+            if (resolution.generated_new)
+            {
+                response->mutable_summary()->set_message(
+                    "storage node_id allocated by view service and registration applied");
+            }
+            else if (resolution.confirmed_existing)
+            {
+                response->mutable_summary()->set_message(
+                    "storage node_id confirmed from existing view registration");
+            }
             response->set_created(result.created);
             response->set_idempotent(result.idempotent);
             response->set_conflict(result.conflict);
@@ -605,6 +865,7 @@ namespace viewdemo
             {
                 response->clear_snapshot();
             }
+            AppendWarnings(resolution.diagnostics, response);
             AppendWarnings(result.diagnostics, response);
             return ::grpc::Status::OK;
         }

@@ -149,6 +149,66 @@ namespace clusterdemo
             EXPECT_EQ(load.identity->source, identity.source);
         }
 
+        TEST_F(NodeIdentityTest,
+               T067StorageNodeFirstStartCreatesStableIdentityAndReloadsIt)
+        {
+            const auto data_dir = MakeDataDir("t067-first-start");
+            const auto identity = MakeStorageIdentity("store-node-t067");
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = identity.cluster_id,
+                            .node_id = identity.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = identity,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
+            EXPECT_TRUE(first_start.created_new);
+            EXPECT_FALSE(first_start.loaded_existing);
+            EXPECT_EQ(first_start.identity->node_id, identity.node_id);
+            EXPECT_EQ(first_start.identity->node_type, ClusterNodeType::kStorage);
+            EXPECT_FALSE(first_start.identity->raft_id.has_value());
+            EXPECT_FALSE(first_start.diagnostic.empty());
+            EXPECT_TRUE(std::filesystem::exists(first_start.identity_path));
+
+            const auto reload = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = identity.cluster_id,
+                        .node_id = identity.node_id,
+                        .node_type = ClusterNodeType::kStorage,
+                        .raft_id = std::nullopt,
+                        .source = identity.source,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            ASSERT_TRUE(reload.ok()) << reload.diagnostic;
+            ASSERT_TRUE(reload.identity.has_value());
+            EXPECT_EQ(reload.identity->node_id, identity.node_id);
+            EXPECT_EQ(reload.identity->cluster_id, identity.cluster_id);
+            EXPECT_EQ(reload.identity->node_type, ClusterNodeType::kStorage);
+            EXPECT_EQ(reload.identity->source, NodeIdentitySource::kViewNodeAllocator);
+            EXPECT_FALSE(reload.identity->raft_id.has_value());
+            EXPECT_FALSE(reload.diagnostic.empty());
+        }
+
         TEST_F(NodeIdentityTest, LoadOrCreateReusesExistingIdentityOnRestart)
         {
             const auto data_dir = MakeDataDir("restartable");
@@ -207,6 +267,88 @@ namespace clusterdemo
             EXPECT_EQ(restart.identity->raft_id, identity.raft_id);
         }
 
+        TEST_F(NodeIdentityTest,
+               T068RestartReusesExistingStorageNodeIdWithoutSilentOverwrite)
+        {
+            const auto data_dir = MakeDataDir("t068-restart");
+            const auto original = MakeStorageIdentity("store-node-t068");
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = original.cluster_id,
+                            .node_id = original.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = original.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = original,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
+            const auto first_identity = *first_start.identity;
+
+            const auto restart = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = original.cluster_id,
+                            .node_id = original.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = original.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = MakeStorageIdentity("store-node-should-not-replace"),
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(restart.ok()) << restart.diagnostic;
+            ASSERT_TRUE(restart.identity.has_value());
+            EXPECT_TRUE(restart.loaded_existing);
+            EXPECT_FALSE(restart.created_new);
+            EXPECT_EQ(restart.identity->node_id, first_identity.node_id);
+            EXPECT_EQ(restart.identity->cluster_id, first_identity.cluster_id);
+            EXPECT_EQ(restart.identity->node_type, first_identity.node_type);
+            EXPECT_EQ(restart.identity->created_at_unix_ms,
+                      first_identity.created_at_unix_ms);
+            EXPECT_EQ(restart.identity->source, first_identity.source);
+
+            const auto verify = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = original.cluster_id,
+                        .node_id = original.node_id,
+                        .node_type = ClusterNodeType::kStorage,
+                        .raft_id = std::nullopt,
+                        .source = original.source,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            ASSERT_TRUE(verify.ok()) << verify.diagnostic;
+            ASSERT_TRUE(verify.identity.has_value());
+            EXPECT_EQ(verify.identity->node_id, "store-node-t068");
+            EXPECT_NE(verify.identity->node_id, "store-node-should-not-replace");
+        }
+
         TEST_F(NodeIdentityTest, LoadReportsConflictWhenExpectedNodeIdMismatches)
         {
             const auto data_dir = MakeDataDir("mismatch");
@@ -239,6 +381,85 @@ namespace clusterdemo
             EXPECT_TRUE(ValidationContains(load.validation,
                                            NodeIdentityIssueCode::kNodeIdMismatch));
             EXPECT_FALSE(load.diagnostic.empty());
+        }
+
+        TEST_F(NodeIdentityTest,
+               T069StorageNodeIdentityMismatchFailsAndKeepsExistingIdentity)
+        {
+            const auto data_dir = MakeDataDir("t069-mismatch");
+            const auto original = MakeStorageIdentity("store-node-t069");
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = original.cluster_id,
+                            .node_id = original.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = original.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = original,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+
+            const auto mismatch = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = "cluster-beta",
+                            .node_id = "store-node-t069-other",
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = original.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = MakeStorageIdentity("store-node-should-not-appear"),
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            EXPECT_EQ(mismatch.status, NodeIdentityStatusCode::kConflict);
+            EXPECT_FALSE(mismatch.ok());
+            EXPECT_FALSE(mismatch.loaded_existing);
+            EXPECT_FALSE(mismatch.created_new);
+            EXPECT_TRUE(ValidationContains(mismatch.validation,
+                                           NodeIdentityIssueCode::kClusterIdMismatch));
+            EXPECT_TRUE(ValidationContains(mismatch.validation,
+                                           NodeIdentityIssueCode::kNodeIdMismatch));
+            EXPECT_NE(mismatch.diagnostic.find("expected"), std::string::npos);
+
+            const auto verify = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = original.cluster_id,
+                        .node_id = original.node_id,
+                        .node_type = ClusterNodeType::kStorage,
+                        .raft_id = std::nullopt,
+                        .source = original.source,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            ASSERT_TRUE(verify.ok()) << verify.diagnostic;
+            ASSERT_TRUE(verify.identity.has_value());
+            EXPECT_EQ(verify.identity->node_id, original.node_id);
+            EXPECT_EQ(verify.identity->cluster_id, original.cluster_id);
         }
 
         TEST_F(NodeIdentityTest, LoadRejectsCorruptIdentityFile)

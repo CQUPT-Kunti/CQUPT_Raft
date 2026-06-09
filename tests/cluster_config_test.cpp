@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <sstream>
 #include <string>
@@ -88,6 +89,20 @@ namespace clusterdemo
             return false;
         }
 
+        const ClusterConfigValidationIssue *FindIssue(
+            const ClusterConfigValidationResult &validation,
+            const ClusterConfigIssueCode code)
+        {
+            for (const ClusterConfigValidationIssue &issue : validation.issues)
+            {
+                if (issue.code == code)
+                {
+                    return &issue;
+                }
+            }
+            return nullptr;
+        }
+
         std::string BuildEndpointAllocationSignature(
             const ClusterEndpointAllocationResult &allocation)
         {
@@ -114,6 +129,48 @@ namespace clusterdemo
                 }
             }
             return count;
+        }
+
+        std::filesystem::path MakeTempConfigPath(const std::size_t voter_count)
+        {
+            const auto now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            return std::filesystem::temp_directory_path() /
+                   "cqupt_raft_cluster_config_test" /
+                   ("t070-" + std::to_string(voter_count) + "-" +
+                    std::to_string(now_ns) + ".json");
+        }
+
+        void WriteConfigJson(const std::filesystem::path &path,
+                             const std::string &content)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            ASSERT_FALSE(ec) << ec.message();
+
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            ASSERT_TRUE(output.is_open()) << path.string();
+            output << content;
+            output.close();
+            ASSERT_TRUE(output.good()) << path.string();
+        }
+
+        std::vector<std::string> MakeFixedMetadataNodeIds(const std::size_t count)
+        {
+            static constexpr std::array<const char *, 7> kMetadataNodeIds{
+                "meta-zulu",
+                "meta-alpha",
+                "meta-gamma",
+                "meta-beta",
+                "meta-theta",
+                "meta-delta",
+                "meta-omega",
+            };
+
+            return std::vector<std::string>(kMetadataNodeIds.begin(),
+                                            kMetadataNodeIds.begin() + count);
         }
 
         std::string BuildConfigSignature(const ClusterConfig &config)
@@ -297,6 +354,93 @@ namespace clusterdemo
             EXPECT_EQ(first.config.initial_raft_membership.membership_epoch, 4242U);
         }
 
+        TEST(cluster_config_generation_test,
+             T070MetadataRaftIdsStayStableDistinctAndMatchInitialMembership)
+        {
+            for (const std::size_t voter_count : std::array<std::size_t, 4>{1, 3, 5, 7})
+            {
+                SCOPED_TRACE("voter_count=" + std::to_string(voter_count));
+                ClusterConfigGenerationRequest request =
+                    MakeGenerationRequest(voter_count);
+                request.fixed_metadata_node_ids =
+                    MakeFixedMetadataNodeIds(voter_count);
+
+                const ClusterConfigGenerationResult first =
+                    GenerateDeterministicClusterConfig(request);
+                const ClusterConfigGenerationResult second =
+                    GenerateDeterministicClusterConfig(request);
+
+                ASSERT_TRUE(first.ok()) << first.error_detail;
+                ASSERT_TRUE(second.ok()) << second.error_detail;
+                ASSERT_EQ(first.config.metadata_nodes.size(), voter_count);
+                ASSERT_EQ(second.config.metadata_nodes.size(), voter_count);
+
+                std::vector<std::int32_t> first_raft_ids;
+                std::vector<std::int32_t> second_raft_ids;
+                first_raft_ids.reserve(voter_count);
+                second_raft_ids.reserve(voter_count);
+
+                std::set<std::int32_t> unique_raft_ids;
+                for (std::size_t index = 0; index < voter_count; ++index)
+                {
+                    const auto &first_node = first.config.metadata_nodes[index];
+                    const auto &second_node = second.config.metadata_nodes[index];
+                    EXPECT_EQ(first_node.node_id,
+                              request.fixed_metadata_node_ids[index]);
+                    EXPECT_FALSE(first_node.node_id.empty());
+                    EXPECT_GT(first_node.raft_id, 0);
+                    EXPECT_EQ(first_node.raft_id,
+                              static_cast<std::int32_t>(index + 1));
+                    EXPECT_EQ(first_node.raft_id, second_node.raft_id);
+                    EXPECT_EQ(first_node.node_id, second_node.node_id);
+                    EXPECT_NE(first_node.node_id, std::to_string(first_node.raft_id));
+                    EXPECT_EQ(first_node.initial_role,
+                              MetadataNodeInitialRole::kVoter);
+
+                    first_raft_ids.push_back(first_node.raft_id);
+                    second_raft_ids.push_back(second_node.raft_id);
+                    unique_raft_ids.insert(first_node.raft_id);
+
+                    const auto resolved = ResolveClusterNodeConfig(
+                        first.config,
+                        ClusterNodeType::kMetadata,
+                        first_node.node_id);
+                    ASSERT_TRUE(resolved.ok()) << resolved.error_detail;
+                    ASSERT_TRUE(resolved.resolved.has_value());
+                    EXPECT_EQ(resolved.resolved->node_id, first_node.node_id);
+                    ASSERT_TRUE(resolved.resolved->raft_id.has_value());
+                    EXPECT_EQ(*resolved.resolved->raft_id, first_node.raft_id);
+                }
+
+                EXPECT_EQ(unique_raft_ids.size(), voter_count);
+                EXPECT_EQ(first.config.initial_raft_membership.voter_raft_ids,
+                          first_raft_ids);
+                EXPECT_EQ(second.config.initial_raft_membership.voter_raft_ids,
+                          second_raft_ids);
+
+                const std::filesystem::path json_path =
+                    MakeTempConfigPath(voter_count);
+                WriteConfigJson(json_path,
+                                SerializeClusterConfigToJson(first.config));
+                const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+                ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+                ASSERT_TRUE(loaded.config.has_value());
+                EXPECT_EQ(loaded.config->initial_raft_membership.voter_raft_ids,
+                          first_raft_ids);
+                ASSERT_EQ(loaded.config->metadata_nodes.size(), voter_count);
+                for (std::size_t index = 0; index < voter_count; ++index)
+                {
+                    EXPECT_EQ(loaded.config->metadata_nodes[index].node_id,
+                              first.config.metadata_nodes[index].node_id);
+                    EXPECT_EQ(loaded.config->metadata_nodes[index].raft_id,
+                              first.config.metadata_nodes[index].raft_id);
+                }
+
+                std::error_code remove_ec;
+                std::filesystem::remove(json_path, remove_ec);
+            }
+        }
+
         TEST(cluster_config_validation_test,
              rejects_zero_storage_capacity_in_generated_config)
         {
@@ -312,6 +456,29 @@ namespace clusterdemo
             EXPECT_FALSE(generated.validation.ok());
             EXPECT_TRUE(ContainsIssue(generated.validation,
                                       ClusterConfigIssueCode::kInvalidCapacity));
+        }
+
+        TEST(cluster_config_validation_test,
+             T070RejectsDuplicateFixedMetadataRaftIdsWithClearDiagnostics)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.fixed_metadata_node_ids = MakeFixedMetadataNodeIds(3);
+            request.fixed_metadata_raft_ids = {17, 17, 19};
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+
+            EXPECT_FALSE(generated.ok());
+            EXPECT_EQ(generated.status, ClusterConfigStatusCode::kConflict);
+            EXPECT_FALSE(generated.validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssue(generated.validation,
+                          ClusterConfigIssueCode::kDuplicateRaftId);
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->field_path, "metadata_nodes[1].raft_id");
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
+            EXPECT_EQ(issue->node_id, request.fixed_metadata_node_ids[1]);
         }
 
         TEST(cluster_config_endpoint_allocation_test,
