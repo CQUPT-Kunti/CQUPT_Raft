@@ -162,8 +162,8 @@
 
 ### Implementation for User Story 3
 
-- [ ] T061 [US3] Add node registration client loop for MetadataNode startup in `apps/metadata_node_app.cpp`
-- [ ] T062 [US3] Add node registration and heartbeat loop for StorageNode startup in `apps/storage_node_app.cpp`
+- [X] T061 [US3] Add node registration client loop for MetadataNode startup in `apps/metadata_node_app.cpp`
+- [X] T062 [US3] Add node registration and heartbeat loop for StorageNode startup in `apps/storage_node_app.cpp`
 - [X] T063 [US3] Add ViewNode-backed StorageNode snapshot adapter for placement in `modules/store/placement/placement_manager.h`
 - [X] T064 [US3] Implement ViewNode-backed StorageNode snapshot adapter in `modules/store/placement/placement_manager.cpp`
 - [X] T065 [US3] Add `storage_client status` command using ViewNode cluster view in `apps/storage_client.cpp`

@@ -388,11 +388,13 @@ raft_add_optional_app_target(view_node_app
 
 raft_add_optional_app_target(metadata_node_app
   apps/metadata_node_app.cpp
+  view_proto
   metadata_proto
 )
 
 raft_add_optional_app_target(storage_node_app
   apps/storage_node_app.cpp
+  view_proto
   storage_node_proto
 )
 

@@ -2,6 +2,9 @@
 #include "cluster/node_identity.h"
 #include "raft/common/config.h"
 #include "raft/node/raft_node.h"
+#include "view/view_client.h"
+
+#include <grpcpp/grpcpp.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,6 +58,15 @@ namespace
         clusterdemo::NodeIdentitySource identity_source{
             clusterdemo::NodeIdentitySource::kConfigGenerator};
         clusterdemo::InitialRaftQuorumSummary initial_quorum;
+    };
+
+    struct ViewRegistrationTarget
+    {
+        std::string endpoint;
+        std::shared_ptr<viewdemo::ViewNodeClient> client;
+        bool registered{false};
+        std::uint64_t next_sequence{1};
+        std::string last_error_key;
     };
 
     class IdentityStartupError final : public std::runtime_error
@@ -122,6 +135,12 @@ namespace
         {
             return false;
         }
+    }
+
+    [[nodiscard]] std::string NormalizePathKey(
+        const std::filesystem::path &path)
+    {
+        return path.lexically_normal().generic_string();
     }
 
     void PrintUsage(std::ostream &out)
@@ -427,6 +446,407 @@ namespace
         return snapshot_config;
     }
 
+    [[nodiscard]] viewdemo::ViewNodeClientConfig BuildViewNodeClientConfig(
+        const clusterdemo::ClusterTimeoutConfig &timeouts)
+    {
+        viewdemo::ViewNodeClientConfig config;
+        if (timeouts.registration_timeout > std::chrono::milliseconds::zero())
+        {
+            config.register_timeout = timeouts.registration_timeout;
+            config.heartbeat_timeout = timeouts.registration_timeout;
+        }
+        if (timeouts.discovery_rpc_timeout > std::chrono::milliseconds::zero())
+        {
+            config.cluster_view_timeout = timeouts.discovery_rpc_timeout;
+            config.discovery_timeout = timeouts.discovery_rpc_timeout;
+        }
+        config.wait_for_ready = false;
+        return config;
+    }
+
+    [[nodiscard]] std::string MakeViewRequestId(const std::string_view action,
+                                                const MetadataNodeStartupConfig &startup,
+                                                const std::uint64_t nonce)
+    {
+        return "metadata-node-" + std::string(action) + "-" + startup.node_id +
+               "-" + std::to_string(nonce);
+    }
+
+    [[nodiscard]] std::optional<std::string> FindMetadataNodeIdByRaftId(
+        const clusterdemo::ClusterConfig &config,
+        const std::int32_t raft_id)
+    {
+        for (const auto &node : config.metadata_nodes)
+        {
+            if (node.raft_id == raft_id)
+            {
+                return node.node_id;
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] viewdemo::MetadataMembershipObservedState
+    MapObservedMembershipState(
+        const raftdemo::CommittedMembershipRole local_role,
+        const clusterdemo::MetadataNodeInitialRole initial_role)
+    {
+        switch (local_role)
+        {
+        case raftdemo::CommittedMembershipRole::kVoter:
+            return viewdemo::MetadataMembershipObservedState::kVoter;
+        case raftdemo::CommittedMembershipRole::kLearner:
+            return viewdemo::MetadataMembershipObservedState::kLearner;
+        case raftdemo::CommittedMembershipRole::kNonMember:
+            return viewdemo::MetadataMembershipObservedState::kRegistered;
+        case raftdemo::CommittedMembershipRole::kUnknown:
+        default:
+            break;
+        }
+
+        if (initial_role == clusterdemo::MetadataNodeInitialRole::kVoter)
+        {
+            return viewdemo::MetadataMembershipObservedState::kVoter;
+        }
+        if (initial_role == clusterdemo::MetadataNodeInitialRole::kLearner)
+        {
+            return viewdemo::MetadataMembershipObservedState::kLearner;
+        }
+        return viewdemo::MetadataMembershipObservedState::kRegistered;
+    }
+
+    [[nodiscard]] viewdemo::MetadataRaftObservedRole MapObservedRaftRole(
+        const raftdemo::NodeStatusSnapshot &status,
+        const raftdemo::CommittedMembershipRole local_role)
+    {
+        if (local_role == raftdemo::CommittedMembershipRole::kLearner)
+        {
+            return viewdemo::MetadataRaftObservedRole::kLearner;
+        }
+        if (status.role == "Leader")
+        {
+            return viewdemo::MetadataRaftObservedRole::kLeader;
+        }
+        if (status.role == "Candidate")
+        {
+            return viewdemo::MetadataRaftObservedRole::kCandidate;
+        }
+        if (status.role == "Follower")
+        {
+            return viewdemo::MetadataRaftObservedRole::kFollower;
+        }
+        return viewdemo::MetadataRaftObservedRole::kUnknown;
+    }
+
+    [[nodiscard]] std::optional<viewdemo::MetadataLeaderHint> BuildLeaderHint(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup,
+        const raftdemo::NodeStatusSnapshot &status,
+        const std::uint64_t now_unix_ms)
+    {
+        int leader_id = status.leader_id;
+        std::string leader_endpoint = status.leader_address;
+        if (leader_id < 0 && status.role == "Leader")
+        {
+            leader_id = startup.raft_id;
+        }
+        if (leader_endpoint.empty() && leader_id == startup.raft_id)
+        {
+            leader_endpoint = startup.listen_endpoint;
+        }
+        if (leader_id < 0 || leader_endpoint.empty())
+        {
+            return std::nullopt;
+        }
+
+        viewdemo::MetadataLeaderHint hint;
+        hint.raft_id = leader_id;
+        hint.endpoint = leader_endpoint;
+        hint.observed_term = status.term;
+        hint.observed_at_unix_ms = now_unix_ms;
+
+        const auto leader_node_id = FindMetadataNodeIdByRaftId(config, leader_id);
+        if (leader_node_id.has_value())
+        {
+            hint.node_id = *leader_node_id;
+        }
+        else if (leader_id == startup.raft_id)
+        {
+            hint.node_id = startup.node_id;
+        }
+        return hint;
+    }
+
+    [[nodiscard]] viewdemo::MetadataNodeObservation BuildMetadataObservation(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup,
+        const raftdemo::NodeStatusSnapshot &status,
+        const raftdemo::CommittedMembershipQuorumSummary &quorum_summary,
+        const std::uint64_t now_unix_ms)
+    {
+        viewdemo::MetadataNodeObservation observation;
+        observation.raft_id = startup.raft_id;
+        observation.raft_role =
+            MapObservedRaftRole(status, quorum_summary.local_role);
+        observation.membership_state =
+            MapObservedMembershipState(quorum_summary.local_role,
+                                       startup.initial_role);
+        observation.leader_hint =
+            BuildLeaderHint(config, startup, status, now_unix_ms);
+        observation.observed_term = status.term;
+        observation.commit_index = status.commit_index;
+        observation.membership_epoch =
+            config.initial_raft_membership.membership_epoch;
+        return observation;
+    }
+
+    [[nodiscard]] viewdemo::NodeRegistration BuildMetadataRegistration(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup,
+        const raftdemo::NodeStatusSnapshot &status,
+        const raftdemo::CommittedMembershipQuorumSummary &quorum_summary,
+        const std::uint64_t now_unix_ms)
+    {
+        viewdemo::NodeRegistration registration;
+        registration.cluster_id = startup.cluster_id;
+        registration.node_id = startup.node_id;
+        registration.node_type = viewdemo::ViewNodeType::kMetadata;
+        registration.endpoint = startup.listen_endpoint;
+        registration.control_plane_endpoint = startup.listen_endpoint;
+        registration.data_plane_endpoint.clear();
+        registration.data_dir_fingerprint = NormalizePathKey(startup.data_dir);
+        registration.observed_at_unix_ms = now_unix_ms;
+        registration.health.health = viewdemo::ViewNodeHealth::kHealthy;
+        registration.health.disk_pressure = viewdemo::ViewNodeDiskPressure::kLow;
+        registration.health.io_error_count = 0;
+        registration.load.active_reads = 0;
+        registration.load.active_writes = 0;
+        registration.load.queued_ops = 0;
+        registration.load.write_admission_overloaded = false;
+        registration.load.read_admission_overloaded = false;
+        registration.metadata = BuildMetadataObservation(config,
+                                                         startup,
+                                                         status,
+                                                         quorum_summary,
+                                                         now_unix_ms);
+        return registration;
+    }
+
+    [[nodiscard]] std::vector<ViewRegistrationTarget> BuildViewTargets(
+        const clusterdemo::ClusterConfig &config)
+    {
+        std::vector<ViewRegistrationTarget> targets;
+        targets.reserve(config.view_nodes.size());
+
+        const auto client_config = BuildViewNodeClientConfig(config.timeouts);
+        for (const auto &view_node : config.view_nodes)
+        {
+            auto channel = grpc::CreateChannel(
+                view_node.endpoint,
+                grpc::InsecureChannelCredentials());
+            targets.push_back(ViewRegistrationTarget{
+                .endpoint = view_node.endpoint,
+                .client = std::make_shared<viewdemo::ViewNodeClient>(
+                    std::move(channel),
+                    view_node.endpoint,
+                    client_config),
+            });
+        }
+        return targets;
+    }
+
+    [[nodiscard]] std::string DescribeViewDiagnostics(
+        const std::vector<viewdemo::ViewRegistryDiagnostic> &diagnostics)
+    {
+        if (diagnostics.empty())
+        {
+            return {};
+        }
+
+        std::ostringstream oss;
+        for (std::size_t index = 0; index < diagnostics.size(); ++index)
+        {
+            if (index > 0)
+            {
+                oss << "; ";
+            }
+            oss << viewdemo::ToString(diagnostics[index].code) << ":"
+                << diagnostics[index].message;
+        }
+        return oss.str();
+    }
+
+    void ReportViewTargetFailure(
+        ViewRegistrationTarget *target,
+        const std::string_view stage,
+        const std::string &detail)
+    {
+        if (target == nullptr)
+        {
+            return;
+        }
+
+        const std::string error_key =
+            std::string(stage) + "|" + detail;
+        if (target->last_error_key == error_key)
+        {
+            return;
+        }
+        target->last_error_key = error_key;
+        std::cerr << "metadata_node_app view warning: endpoint="
+                  << target->endpoint
+                  << " stage=" << stage
+                  << " message=" << detail << '\n';
+    }
+
+    void ClearViewTargetFailure(
+        ViewRegistrationTarget *target,
+        const std::string_view stage)
+    {
+        if (target == nullptr || target->last_error_key.empty())
+        {
+            return;
+        }
+
+        std::cout << "metadata_node_app view recovered"
+                  << " endpoint=" << target->endpoint
+                  << " stage=" << stage << '\n';
+        target->last_error_key.clear();
+    }
+
+    bool EnsureRegisteredWithViewNode(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup,
+        const std::shared_ptr<raftdemo::RaftNode> &node,
+        ViewRegistrationTarget *target)
+    {
+        if (node == nullptr || target == nullptr)
+        {
+            return false;
+        }
+
+        const std::uint64_t now_unix_ms = NowUnixMs();
+        const auto status = node->GetStatusSnapshot();
+        const auto quorum_summary = node->GetCommittedMembershipQuorumSummary();
+        const auto registration = BuildMetadataRegistration(config,
+                                                            startup,
+                                                            status,
+                                                            quorum_summary,
+                                                            now_unix_ms);
+        const auto result = target->client->RegisterNode(
+            viewdemo::RegisterNodeRequest{
+                .request_id = MakeViewRequestId("register", startup, now_unix_ms),
+                .registration = registration,
+            });
+
+        if (!result.transport_ok())
+        {
+            ReportViewTargetFailure(
+                target,
+                "register",
+                "transport status=" +
+                    std::to_string(static_cast<int>(result.rpc.grpc_status_code)) +
+                    " message=" + result.rpc.grpc_error_message);
+            return false;
+        }
+        if (!result.result.ok())
+        {
+            std::string detail =
+                "status=" + std::string(viewdemo::ToString(result.result.summary.status)) +
+                " message=" + result.result.summary.message;
+            const std::string diagnostics =
+                DescribeViewDiagnostics(result.result.diagnostics);
+            if (!diagnostics.empty())
+            {
+                detail += " diagnostics=" + diagnostics;
+            }
+            ReportViewTargetFailure(target, "register", detail);
+            return false;
+        }
+
+        target->registered = true;
+        target->next_sequence = std::max<std::uint64_t>(target->next_sequence, 1);
+        ClearViewTargetFailure(target, "register");
+        return true;
+    }
+
+    void SendHeartbeatToViewNode(const clusterdemo::ClusterConfig &config,
+                                 const MetadataNodeStartupConfig &startup,
+                                 const std::shared_ptr<raftdemo::RaftNode> &node,
+                                 ViewRegistrationTarget *target)
+    {
+        if (node == nullptr || target == nullptr)
+        {
+            return;
+        }
+
+        const std::uint64_t now_unix_ms = NowUnixMs();
+        const auto status = node->GetStatusSnapshot();
+        const auto quorum_summary = node->GetCommittedMembershipQuorumSummary();
+        const auto observation = BuildMetadataRegistration(config,
+                                                           startup,
+                                                           status,
+                                                           quorum_summary,
+                                                           now_unix_ms);
+        const std::uint64_t sequence = target->next_sequence;
+        const auto result = target->client->HeartbeatNode(
+            viewdemo::HeartbeatNodeRequest{
+                .request_id = MakeViewRequestId("heartbeat", startup, sequence),
+                .cluster_id = startup.cluster_id,
+                .node_id = startup.node_id,
+                .node_type = viewdemo::ViewNodeType::kMetadata,
+                .sequence = sequence,
+                .observation = observation,
+            });
+
+        if (!result.transport_ok())
+        {
+            ReportViewTargetFailure(
+                target,
+                "heartbeat",
+                "transport status=" +
+                    std::to_string(static_cast<int>(result.rpc.grpc_status_code)) +
+                    " message=" + result.rpc.grpc_error_message);
+            return;
+        }
+        if (!result.result.ok())
+        {
+            std::string detail =
+                "status=" + std::string(viewdemo::ToString(result.result.summary.status)) +
+                " message=" + result.result.summary.message;
+            const std::string diagnostics =
+                DescribeViewDiagnostics(result.result.diagnostics);
+            if (!diagnostics.empty())
+            {
+                detail += " diagnostics=" + diagnostics;
+            }
+            ReportViewTargetFailure(target, "heartbeat", detail);
+            if (result.result.summary.status == viewdemo::ViewRegistryStatusCode::kNotFound ||
+                result.result.summary.status == viewdemo::ViewRegistryStatusCode::kConflict)
+            {
+                target->registered = false;
+                target->next_sequence = 1;
+            }
+            return;
+        }
+
+        ClearViewTargetFailure(target, "heartbeat");
+        target->registered = true;
+        if (result.result.applied || result.result.idempotent ||
+            result.result.stale_ignored)
+        {
+            const std::uint64_t accepted_sequence =
+                result.result.accepted_sequence == 0
+                    ? sequence
+                    : result.result.accepted_sequence;
+            target->next_sequence = accepted_sequence + 1;
+        }
+        else
+        {
+            target->next_sequence = sequence + 1;
+        }
+    }
+
     [[nodiscard]] int Run(const ParsedArgs &args)
     {
         const auto loaded_config =
@@ -471,6 +891,8 @@ namespace
             BuildRaftNodeConfig(*loaded_config.config, startup);
         const raftdemo::snapshotConfig snapshot_config =
             BuildSnapshotConfig(startup);
+        std::vector<ViewRegistrationTarget> view_targets =
+            BuildViewTargets(*loaded_config.config);
 
         std::shared_ptr<raftdemo::RaftNode> node;
         try
@@ -482,6 +904,16 @@ namespace
         {
             std::cerr << "metadata_node_app startup error: " << ex.what() << '\n';
             return static_cast<int>(ExitCode::kStartupError);
+        }
+
+        // ViewNode registration / heartbeat 只上报 discovery / observation facts。
+        // 即使 ViewNode 不可用，也不能反向改变 metadata authority、membership 或 quorum。
+        for (auto &target : view_targets)
+        {
+            (void)EnsureRegisteredWithViewNode(*loaded_config.config,
+                                              startup,
+                                              node,
+                                              &target);
         }
 
         std::cout << "metadata_node_app OK"
@@ -506,11 +938,52 @@ namespace
             node->Wait();
         });
 
+        const auto heartbeat_interval =
+            loaded_config.config->timeouts.heartbeat_interval;
+        std::thread view_registration_thread([&loaded_config, &startup, &node, &view_targets, heartbeat_interval]() {
+            while (!g_stop_requested.load())
+            {
+                for (auto &target : view_targets)
+                {
+                    if (!target.registered)
+                    {
+                        const bool registered =
+                            EnsureRegisteredWithViewNode(*loaded_config.config,
+                                                         startup,
+                                                         node,
+                                                         &target);
+                        if (!registered)
+                        {
+                            continue;
+                        }
+                    }
+
+                    SendHeartbeatToViewNode(*loaded_config.config,
+                                            startup,
+                                            node,
+                                            &target);
+                }
+
+                if (heartbeat_interval > std::chrono::milliseconds::zero())
+                {
+                    std::this_thread::sleep_for(heartbeat_interval);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+        });
+
         while (!g_stop_requested.load())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
+        if (view_registration_thread.joinable())
+        {
+            view_registration_thread.join();
+        }
         node->Stop();
         wait_thread.join();
         return static_cast<int>(ExitCode::kOk);

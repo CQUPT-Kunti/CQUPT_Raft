@@ -3,6 +3,7 @@
 #include "store/chunk/local_disk_chunk_store.h"
 #include "store/node/storage_node_registry.h"
 #include "store/node/storage_node_service.h"
+#include "view/view_client.h"
 
 #include <grpcpp/grpcpp.h>
 
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -51,9 +53,12 @@ namespace
         std::filesystem::path data_dir;
         std::uint64_t capacity_bytes{0};
         clusterdemo::FailureDomainConfig failure_domain;
+        std::vector<std::string> view_endpoints;
         clusterdemo::NodeIdentitySource identity_source{
             clusterdemo::NodeIdentitySource::kConfigGenerator};
         storedemo::StorageNodeRegistryConfig registry_config;
+        viewdemo::ViewNodeClientConfig view_client_config;
+        std::chrono::milliseconds heartbeat_interval{1000};
         int grpc_message_limit_bytes{4 * 1024 * 1024};
         std::size_t selected_storage_index{0};
     };
@@ -185,6 +190,26 @@ namespace
                 timeouts.liveness_dead_timeout.count());
         }
         config.enforce_unique_endpoints = true;
+        return config;
+    }
+
+    [[nodiscard]] viewdemo::ViewNodeClientConfig BuildViewClientConfig(
+        const clusterdemo::ClusterTimeoutConfig &timeouts)
+    {
+        viewdemo::ViewNodeClientConfig config;
+        if (timeouts.registration_timeout > std::chrono::milliseconds::zero())
+        {
+            config.register_timeout = timeouts.registration_timeout;
+            config.heartbeat_timeout = timeouts.registration_timeout;
+        }
+        else if (timeouts.discovery_rpc_timeout >
+                 std::chrono::milliseconds::zero())
+        {
+            config.register_timeout = timeouts.discovery_rpc_timeout;
+            config.heartbeat_timeout = timeouts.discovery_rpc_timeout;
+        }
+
+        config.wait_for_ready = true;
         return config;
     }
 
@@ -359,8 +384,29 @@ namespace
         StorageNodeStartupConfig startup;
         startup.cluster_id = config.cluster_id;
         startup.registry_config = BuildRegistryConfig(config.timeouts);
+        startup.view_client_config = BuildViewClientConfig(config.timeouts);
         startup.grpc_message_limit_bytes =
             ComputeGrpcMessageLimitBytes(config.chunk_policy.chunk_size_bytes);
+        if (config.timeouts.heartbeat_interval >
+            std::chrono::milliseconds::zero())
+        {
+            startup.heartbeat_interval = config.timeouts.heartbeat_interval;
+        }
+        startup.view_endpoints.reserve(config.view_nodes.size());
+        for (const auto &node : config.view_nodes)
+        {
+            if (!IsValidEndpoint(node.endpoint))
+            {
+                throw std::runtime_error("view node endpoint is invalid: " +
+                                         node.endpoint);
+            }
+            startup.view_endpoints.push_back(node.endpoint);
+        }
+        if (startup.view_endpoints.empty())
+        {
+            throw std::runtime_error(
+                "storage_node_app requires at least one ViewNode endpoint in cluster config");
+        }
 
         if (args.node_id.has_value())
         {
@@ -577,6 +623,246 @@ namespace
         return facts;
     }
 
+    [[nodiscard]] viewdemo::ViewNodeHealth ToViewNodeHealth(
+        const storedemo::StorageNodeHealth health)
+    {
+        switch (health)
+        {
+        case storedemo::StorageNodeHealth::kHealthy:
+            return viewdemo::ViewNodeHealth::kHealthy;
+        case storedemo::StorageNodeHealth::kDegraded:
+            return viewdemo::ViewNodeHealth::kDegraded;
+        case storedemo::StorageNodeHealth::kReadOnly:
+            return viewdemo::ViewNodeHealth::kReadOnly;
+        case storedemo::StorageNodeHealth::kDraining:
+            return viewdemo::ViewNodeHealth::kDraining;
+        case storedemo::StorageNodeHealth::kUnavailable:
+            return viewdemo::ViewNodeHealth::kUnavailable;
+        }
+
+        return viewdemo::ViewNodeHealth::kUnknown;
+    }
+
+    [[nodiscard]] viewdemo::ViewNodeDiskPressure ToViewNodeDiskPressure(
+        const storedemo::StorageNodeDiskPressure pressure)
+    {
+        switch (pressure)
+        {
+        case storedemo::StorageNodeDiskPressure::kLow:
+            return viewdemo::ViewNodeDiskPressure::kLow;
+        case storedemo::StorageNodeDiskPressure::kMedium:
+            return viewdemo::ViewNodeDiskPressure::kMedium;
+        case storedemo::StorageNodeDiskPressure::kHigh:
+            return viewdemo::ViewNodeDiskPressure::kHigh;
+        case storedemo::StorageNodeDiskPressure::kFull:
+            return viewdemo::ViewNodeDiskPressure::kFull;
+        }
+
+        return viewdemo::ViewNodeDiskPressure::kUnknown;
+    }
+
+    [[nodiscard]] std::string MakeRegisterRequestId(
+        const StorageNodeStartupConfig &startup)
+    {
+        return "storage-node-register-" + startup.node_id + "-" +
+               std::to_string(NowUnixMs());
+    }
+
+    [[nodiscard]] std::string MakeHeartbeatRequestId(
+        const StorageNodeStartupConfig &startup,
+        const std::uint64_t sequence)
+    {
+        return "storage-node-heartbeat-" + startup.node_id + "-" +
+               std::to_string(sequence);
+    }
+
+    void LogViewDiagnostics(const char *prefix,
+                            const std::vector<viewdemo::ViewRegistryDiagnostic> &diagnostics)
+    {
+        for (const auto &diagnostic : diagnostics)
+        {
+            std::cerr << prefix << " diagnostic="
+                      << viewdemo::DescribeViewRegistryDiagnostic(diagnostic)
+                      << '\n';
+        }
+    }
+
+    [[nodiscard]] viewdemo::NodeRegistration BuildViewNodeObservation(
+        const StorageNodeStartupConfig &startup,
+        const storedemo::StorageNodeRegistryFacts &facts)
+    {
+        viewdemo::NodeRegistration registration;
+        registration.cluster_id = startup.cluster_id;
+        registration.node_id = startup.node_id;
+        registration.node_type = viewdemo::ViewNodeType::kStorage;
+        registration.endpoint = startup.listen_endpoint;
+        registration.control_plane_endpoint = startup.listen_endpoint;
+        registration.data_plane_endpoint = startup.listen_endpoint;
+        registration.data_dir_fingerprint =
+            startup.data_dir.lexically_normal().generic_string();
+        registration.observed_at_unix_ms = NowUnixMs();
+        registration.failure_domain.zone = facts.failure_domain.zone;
+        registration.failure_domain.rack = facts.failure_domain.rack;
+        registration.health.health = ToViewNodeHealth(facts.health.health);
+        registration.health.disk_pressure =
+            ToViewNodeDiskPressure(facts.health.disk_pressure);
+        registration.health.io_error_count = facts.health.io_error_count;
+        registration.capacity.total_capacity_bytes =
+            facts.capacity.total_capacity_bytes;
+        registration.capacity.used_capacity_bytes =
+            facts.capacity.used_capacity_bytes;
+        registration.capacity.available_capacity_bytes =
+            facts.capacity.available_capacity_bytes;
+        registration.capacity.chunk_count = facts.capacity.chunk_count;
+        registration.load.active_reads = facts.load.load.active_reads;
+        registration.load.active_writes = facts.load.load.active_writes;
+        registration.load.queued_ops = facts.load.load.queued_ops;
+        registration.load.write_admission_overloaded =
+            facts.load.write_admission_overloaded;
+        registration.load.read_admission_overloaded =
+            facts.load.read_admission_overloaded;
+        return registration;
+    }
+
+    [[nodiscard]] storedemo::StorageNodeRegistryFacts ReadCurrentRegistryFacts(
+        const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
+        const StorageNodeStartupConfig &startup)
+    {
+        if (registry != nullptr)
+        {
+            const auto lookup = registry->LookupNode(startup.node_id, NowUnixMs());
+            if (lookup.ok())
+            {
+                return lookup.snapshot.facts;
+            }
+        }
+
+        return BuildRegistryFacts(startup);
+    }
+
+    [[nodiscard]] viewdemo::ViewNodeClient MakeViewNodeClient(
+        const std::string &endpoint,
+        const viewdemo::ViewNodeClientConfig &config)
+    {
+        auto channel = grpc::CreateChannel(endpoint,
+                                           grpc::InsecureChannelCredentials());
+        return viewdemo::ViewNodeClient(std::move(channel), endpoint, config);
+    }
+
+    [[nodiscard]] bool SleepWithStop(
+        const std::chrono::milliseconds duration)
+    {
+        constexpr auto kPollInterval = std::chrono::milliseconds(100);
+        auto remaining = duration;
+        while (!g_stop_requested.load() &&
+               remaining > std::chrono::milliseconds::zero())
+        {
+            const auto step = remaining < kPollInterval ? remaining : kPollInterval;
+            std::this_thread::sleep_for(step);
+            remaining -= step;
+        }
+        return !g_stop_requested.load();
+    }
+
+    [[nodiscard]] bool RegisterWithAnyViewNode(
+        const StorageNodeStartupConfig &startup,
+        const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
+        std::size_t *active_view_index)
+    {
+        if (active_view_index == nullptr)
+        {
+            throw std::runtime_error("active_view_index must not be null");
+        }
+
+        const storedemo::StorageNodeRegistryFacts facts =
+            ReadCurrentRegistryFacts(registry, startup);
+        const auto observation = BuildViewNodeObservation(startup, facts);
+        const std::size_t endpoint_count = startup.view_endpoints.size();
+        const std::size_t preferred_index =
+            endpoint_count == 0 ? 0 : (*active_view_index % endpoint_count);
+        std::string last_error =
+            "no ViewNode registration attempt was executed";
+
+        for (std::size_t offset = 0; offset < endpoint_count; ++offset)
+        {
+            const std::size_t index = (preferred_index + offset) % endpoint_count;
+            const std::string &target_endpoint = startup.view_endpoints[index];
+            auto client =
+                MakeViewNodeClient(target_endpoint, startup.view_client_config);
+            const auto call = client.RegisterNode(
+                viewdemo::RegisterNodeRequest{
+                    .request_id = MakeRegisterRequestId(startup),
+                    .registration = observation,
+                });
+            if (call.ok())
+            {
+                *active_view_index = index;
+                return true;
+            }
+
+            last_error = "target_endpoint=" + target_endpoint +
+                         " status=" + viewdemo::ToString(call.result.summary.status) +
+                         " message=" + call.result.summary.message;
+            if (!call.transport_ok())
+            {
+                last_error += " grpc_status=" +
+                              std::to_string(static_cast<int>(
+                                  call.rpc.grpc_status_code));
+            }
+            std::cerr << "storage_node_app view registration failed "
+                      << last_error << '\n';
+            LogViewDiagnostics("storage_node_app view registration failed",
+                               call.result.diagnostics);
+        }
+
+        std::cerr << "storage_node_app startup error: failed to register with any ViewNode "
+                  << "node_id=" << startup.node_id << " " << last_error << '\n';
+        return false;
+    }
+
+    [[nodiscard]] bool SendHeartbeatToViewNode(
+        const StorageNodeStartupConfig &startup,
+        const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
+        const std::uint64_t sequence,
+        const std::size_t active_view_index)
+    {
+        const storedemo::StorageNodeRegistryFacts facts =
+            ReadCurrentRegistryFacts(registry, startup);
+        const auto observation = BuildViewNodeObservation(startup, facts);
+        const std::string &target_endpoint =
+            startup.view_endpoints.at(active_view_index);
+        auto client =
+            MakeViewNodeClient(target_endpoint, startup.view_client_config);
+        const auto call = client.HeartbeatNode(
+            viewdemo::HeartbeatNodeRequest{
+                .request_id = MakeHeartbeatRequestId(startup, sequence),
+                .cluster_id = startup.cluster_id,
+                .node_id = startup.node_id,
+                .node_type = viewdemo::ViewNodeType::kStorage,
+                .sequence = sequence,
+                .observation = observation,
+            });
+        if (call.ok())
+        {
+            return true;
+        }
+
+        std::cerr << "storage_node_app view heartbeat failed"
+                  << " target_endpoint=" << target_endpoint
+                  << " sequence=" << sequence
+                  << " status=" << viewdemo::ToString(call.result.summary.status)
+                  << " message=" << call.result.summary.message;
+        if (!call.transport_ok())
+        {
+            std::cerr << " grpc_status="
+                      << static_cast<int>(call.rpc.grpc_status_code);
+        }
+        std::cerr << '\n';
+        LogViewDiagnostics("storage_node_app view heartbeat failed",
+                           call.result.diagnostics);
+        return false;
+    }
+
     [[nodiscard]] int Run(const ParsedArgs &args)
     {
         const auto loaded_config =
@@ -668,6 +954,15 @@ namespace
             return static_cast<int>(ExitCode::kStartupError);
         }
 
+        std::size_t active_view_index = 0;
+        // 注册和 heartbeat 只上报 StorageNode 的 data-plane 观测事实；
+        // 不授予 ViewNode 对 object visibility、placement 或 metadata authority。
+        if (!RegisterWithAnyViewNode(startup, registry, &active_view_index))
+        {
+            server->Shutdown();
+            return static_cast<int>(ExitCode::kStartupError);
+        }
+
         std::cout << "storage_node_app OK"
                   << " cluster_id=" << startup.cluster_id
                   << " node_id=" << identity_state.identity.node_id
@@ -686,12 +981,41 @@ namespace
                   << (identity_state.created_new ? "true" : "false")
                   << " chunk_root="
                   << init_result.paths.data_root.generic_string()
+                  << " view_endpoint="
+                  << startup.view_endpoints[active_view_index]
                   << '\n';
 
         std::signal(SIGINT, HandleSignal);
 #ifdef SIGTERM
         std::signal(SIGTERM, HandleSignal);
 #endif
+
+        std::thread heartbeat_thread([&startup, &registry, &active_view_index]() {
+            std::uint64_t next_sequence = 1;
+            while (!g_stop_requested.load())
+            {
+                if (!SleepWithStop(startup.heartbeat_interval))
+                {
+                    break;
+                }
+
+                // app 只负责生命周期和观测上报；这里不接管 placement、
+                // chunk 业务语义或 COMMITTED 可见性判定。
+                if (SendHeartbeatToViewNode(startup,
+                                            registry,
+                                            next_sequence,
+                                            active_view_index))
+                {
+                    ++next_sequence;
+                    continue;
+                }
+
+                if (RegisterWithAnyViewNode(startup, registry, &active_view_index))
+                {
+                    ++next_sequence;
+                }
+            }
+        });
 
         std::thread wait_thread([&server]() {
             server->Wait();
@@ -702,6 +1026,7 @@ namespace
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
+        heartbeat_thread.join();
         server->Shutdown();
         wait_thread.join();
         return static_cast<int>(ExitCode::kOk);
