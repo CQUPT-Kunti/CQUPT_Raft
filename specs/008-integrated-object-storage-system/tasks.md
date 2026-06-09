@@ -189,8 +189,8 @@
 ### Implementation for User Story 4
 
 - [ ] T071 [US4] Integrate identity load/create into `apps/storage_node_app.cpp`
-- [ ] T072 [US4] Integrate identity load/create into `apps/view_node_app.cpp`
-- [ ] T073 [US4] Integrate config-generated node_id and raft_id validation into `apps/metadata_node_app.cpp`
+- [X] T072 [US4] Integrate identity load/create into `apps/view_node_app.cpp`
+- [X] T073 [US4] Integrate config-generated node_id and raft_id validation into `apps/metadata_node_app.cpp`
 - [X] T074 [US4] Add ViewNode node_id allocation path for StorageNode first registration in `modules/view/view_service_impl.cpp`
 - [X] T075 [US4] Add durable identity conflict diagnostics in `modules/cluster/node_identity.cpp`
 

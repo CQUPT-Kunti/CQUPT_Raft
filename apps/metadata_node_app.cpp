@@ -149,8 +149,10 @@ namespace
                "[--data_dir <path>] [--listen <host:port>]\n"
             << "  --config   Unified cluster config json path\n"
             << "  --node_id  Controlled override to select the MetadataNode entry\n"
-            << "  --data_dir Safe local testing override for node.identity and Raft data\n"
-            << "  --listen   Safe local testing override for startup endpoint\n";
+            << "  --data_dir MetadataNode validates this path against the config-generated"
+               " durable identity and rejects drift\n"
+            << "  --listen   MetadataNode validates this endpoint against the config-generated"
+               " raft identity and rejects drift\n";
     }
 
     [[nodiscard]] ParsedArgs ParseArgs(int argc, char **argv)
@@ -261,6 +263,76 @@ namespace
         }
     }
 
+    void ValidateLocalOverrideSafety(
+        const ParsedArgs &args,
+        const clusterdemo::ResolvedClusterNodeConfig &resolved,
+        const MetadataNodeStartupConfig &startup)
+    {
+        if (startup.node_id.empty())
+        {
+            throw std::runtime_error("metadata node node_id must not be empty");
+        }
+        if (startup.raft_id <= 0)
+        {
+            throw std::runtime_error("metadata node raft_id must be > 0");
+        }
+        if (startup.data_dir.empty())
+        {
+            throw std::runtime_error("metadata node data_dir must not be empty");
+        }
+        if (startup.snapshot_dir.empty())
+        {
+            throw std::runtime_error("metadata node snapshot_dir must not be empty");
+        }
+        if (!IsValidEndpoint(startup.listen_endpoint))
+        {
+            throw std::runtime_error("metadata node endpoint is invalid: " +
+                                     startup.listen_endpoint);
+        }
+
+        if (args.node_id.has_value() && *args.node_id != startup.node_id)
+        {
+            throw std::runtime_error(
+                "--node_id resolved to an unexpected MetadataNode identity: requested=" +
+                *args.node_id + " actual=" + startup.node_id);
+        }
+
+        const std::string configured_data_dir =
+            NormalizePathKey(resolved.data_dir);
+        const std::string startup_data_dir =
+            NormalizePathKey(startup.data_dir);
+        if (args.data_dir_override.has_value() &&
+            startup_data_dir != configured_data_dir)
+        {
+            throw std::runtime_error(
+                "--data_dir override is rejected for MetadataNode: config-generated "
+                "data_dir=" +
+                resolved.data_dir.generic_string() +
+                " override=" +
+                args.data_dir_override->generic_string() +
+                "; refusing to move durable node_id/raft_id state to another directory");
+        }
+
+        if (args.listen_override.has_value() &&
+            startup.listen_endpoint != resolved.endpoint)
+        {
+            throw std::runtime_error(
+                "--listen override is rejected for MetadataNode: config-generated "
+                "endpoint=" +
+                resolved.endpoint + " override=" + *args.listen_override +
+                "; refusing to start raft_id=" +
+                std::to_string(startup.raft_id) +
+                " on a different runtime endpoint");
+        }
+
+        if (startup.initial_role != clusterdemo::MetadataNodeInitialRole::kVoter &&
+            startup.initial_role != clusterdemo::MetadataNodeInitialRole::kLearner)
+        {
+            throw std::runtime_error(
+                "metadata node initial_role must be voter or learner");
+        }
+    }
+
     [[nodiscard]] MetadataNodeStartupConfig ResolveStartupConfig(
         const clusterdemo::ClusterConfig &config,
         const ParsedArgs &args)
@@ -293,32 +365,45 @@ namespace
                 "failed to resolve metadata node from cluster config: " +
                 resolved.error_detail);
         }
+        if (!resolved.resolved.has_value())
+        {
+            throw std::runtime_error(
+                "failed to resolve metadata node from cluster config: empty result");
+        }
 
-        if (!resolved.resolved->raft_id.has_value() || *resolved.resolved->raft_id <= 0)
+        const auto &resolved_node = *resolved.resolved;
+
+        if (!resolved_node.raft_id.has_value() || *resolved_node.raft_id <= 0)
         {
             throw std::runtime_error(
-                "metadata node config must provide a positive raft_id");
+                "metadata node config must provide a positive raft_id"
+                " node_id=" +
+                resolved_node.node_id);
         }
-        if (!resolved.resolved->snapshot_dir.has_value() ||
-            resolved.resolved->snapshot_dir->empty())
+        if (!resolved_node.snapshot_dir.has_value() ||
+            resolved_node.snapshot_dir->empty())
         {
             throw std::runtime_error(
-                "metadata node config must provide snapshot_dir");
+                "metadata node config must provide snapshot_dir"
+                " node_id=" +
+                resolved_node.node_id);
         }
-        if (!resolved.resolved->metadata_initial_role.has_value() ||
-            *resolved.resolved->metadata_initial_role ==
+        if (!resolved_node.metadata_initial_role.has_value() ||
+            *resolved_node.metadata_initial_role ==
                 clusterdemo::MetadataNodeInitialRole::kUnknown)
         {
             throw std::runtime_error(
-                "metadata node config must provide initial_role as voter or learner");
+                "metadata node config must provide initial_role as voter or learner"
+                " node_id=" +
+                resolved_node.node_id);
         }
 
-        startup.node_id = resolved.resolved->node_id;
-        startup.raft_id = *resolved.resolved->raft_id;
-        startup.listen_endpoint = resolved.resolved->endpoint;
-        startup.data_dir = resolved.resolved->data_dir;
-        startup.snapshot_dir = *resolved.resolved->snapshot_dir;
-        startup.initial_role = *resolved.resolved->metadata_initial_role;
+        startup.node_id = resolved_node.node_id;
+        startup.raft_id = *resolved_node.raft_id;
+        startup.listen_endpoint = resolved_node.endpoint;
+        startup.data_dir = resolved_node.data_dir;
+        startup.snapshot_dir = *resolved_node.snapshot_dir;
+        startup.initial_role = *resolved_node.metadata_initial_role;
 
         if (args.data_dir_override.has_value())
         {
@@ -329,6 +414,7 @@ namespace
             startup.listen_endpoint = *args.listen_override;
         }
 
+        ValidateLocalOverrideSafety(args, resolved_node, startup);
         ValidateLocalMembershipBoundary(config, &startup);
         return startup;
     }
@@ -358,6 +444,8 @@ namespace
     [[nodiscard]] clusterdemo::NodeIdentity EnsureNodeIdentity(
         const MetadataNodeStartupConfig &startup)
     {
+        // MetadataNode 的 durable identity 必须来自配置生成的 node_id/raft_id，
+        // 不能被 ViewNode 分配身份或本地 override 重新解释来源。
         const clusterdemo::NodeIdentity identity_to_create{
             .cluster_id = startup.cluster_id,
             .node_id = startup.node_id,
@@ -607,6 +695,8 @@ namespace
         const raftdemo::CommittedMembershipQuorumSummary &quorum_summary,
         const std::uint64_t now_unix_ms)
     {
+        // ViewNode registration 只上报由 cluster config 确认过的 metadata identity，
+        // 不能分配、覆盖或漂移 MetadataNode 的 raft_id。
         viewdemo::NodeRegistration registration;
         registration.cluster_id = startup.cluster_id;
         registration.node_id = startup.node_id;

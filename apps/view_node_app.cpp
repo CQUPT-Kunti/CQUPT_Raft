@@ -53,6 +53,15 @@ namespace
         viewdemo::ViewRegistryConfig registry_config;
     };
 
+    struct IdentityStartupState
+    {
+        clusterdemo::NodeIdentity identity;
+        std::filesystem::path identity_path;
+        bool loaded_existing{false};
+        bool created_new{false};
+        bool durable{false};
+    };
+
     class IdentityStartupError final : public std::runtime_error
     {
     public:
@@ -339,7 +348,7 @@ namespace
         }
     }
 
-    [[nodiscard]] clusterdemo::NodeIdentity EnsureNodeIdentity(
+    [[nodiscard]] IdentityStartupState EnsureNodeIdentity(
         const ViewNodeStartupConfig &startup)
     {
         const clusterdemo::NodeIdentity identity_to_create{
@@ -362,6 +371,8 @@ namespace
             .forbid_raft_id_for_non_metadata = true,
         };
 
+        // ViewNode startup 只负责受控地 load/create durable identity。
+        // 已有 identity 不匹配时必须失败，不能在 app 层静默覆盖。
         const auto load_or_create = clusterdemo::LoadOrCreateNodeIdentity(
             clusterdemo::NodeIdentityLoadOrCreateRequest{
                 .load_options = clusterdemo::NodeIdentityLoadOptions{
@@ -382,9 +393,17 @@ namespace
         {
             throw IdentityStartupError(
                 load_or_create.status,
-                "node.identity startup check failed: " + load_or_create.diagnostic);
+                "node.identity startup check failed for data_dir=" +
+                    startup.data_dir.lexically_normal().generic_string() +
+                    ": " + load_or_create.diagnostic);
         }
-        return *load_or_create.identity;
+        return IdentityStartupState{
+            .identity = *load_or_create.identity,
+            .identity_path = load_or_create.identity_path,
+            .loaded_existing = load_or_create.loaded_existing,
+            .created_new = load_or_create.created_new,
+            .durable = load_or_create.durable,
+        };
     }
 
     [[nodiscard]] int Run(const ParsedArgs &args)
@@ -416,10 +435,10 @@ namespace
             return static_cast<int>(ExitCode::kConfigError);
         }
 
-        clusterdemo::NodeIdentity identity;
+        IdentityStartupState identity_state;
         try
         {
-            identity = EnsureNodeIdentity(startup);
+            identity_state = EnsureNodeIdentity(startup);
         }
         catch (const IdentityStartupError &ex)
         {
@@ -469,10 +488,17 @@ namespace
 
         std::cout << "view_node_app OK"
                   << " cluster_id=" << startup.cluster_id
-                  << " node_id=" << identity.node_id
+                  << " node_id=" << identity_state.identity.node_id
                   << " endpoint=" << startup.listen_endpoint
                   << " data_dir=" << startup.data_dir.generic_string()
-                  << " identity_source=" << clusterdemo::ToString(identity.source)
+                  << " identity_path=" <<
+            identity_state.identity_path.lexically_normal().generic_string()
+                  << " identity_source=" <<
+            clusterdemo::ToString(identity_state.identity.source)
+                  << " identity_state=" <<
+            (identity_state.created_new ? "created" : "loaded")
+                  << " identity_durable=" <<
+            (identity_state.durable ? "true" : "false")
                   << '\n';
 
         std::signal(SIGINT, HandleSignal);
