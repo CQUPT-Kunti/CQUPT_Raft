@@ -216,7 +216,7 @@
 - [X] T080 [US6] Add orphan/staging cleanup integration hook in `modules/store/maintenance/garbage_collector.cpp`
 - [X] T081 [US6] Add cleanup candidate emission from failed upload sessions in `modules/store/transfer/object_transfer.cpp`
 - [X] T082 [US6] Add retry/backoff policy for transient StorageNode failures in `modules/store/transfer/storage_transfer_client.cpp`
-- [ ] T083 [US6] Add bounded concurrency controls for upload/download sessions in `modules/store/transfer/object_transfer.cpp`
+- [X] T083 [US6] Add bounded concurrency controls for upload/download sessions in `modules/store/transfer/object_transfer.cpp`
 - [ ] T084 [US6] Wire recovery and concurrency test targets in `tests/CMakeLists.txt`
 - [ ] T085 [US6] Record Linux-specific failure validation and Windows fallback notes in `specs/008-integrated-object-storage-system/risk-register.md`
 

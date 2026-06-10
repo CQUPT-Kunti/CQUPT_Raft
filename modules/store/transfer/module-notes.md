@@ -169,6 +169,10 @@ upload 失败时，transfer 可以产生清理候选或失败摘要，但不能�
 - upload / download 的内存上界必须由 chunk size、并发 chunk 数、RPC buffer 和文件 IO buffer 共同约束。
 - 不允许为了计算 checksum、重试、CommitObject 或最终校验而把完整文件常驻内存。
 - 对象级 checksum 应使用增量状态维护。
+- T083 当前先把每个 upload/download session 的有效并发显式收紧为单个 chunk in-flight：
+  - 更大的 `concurrency` 请求会被记录为诊断并 clamp 到当前实现真实支持的上界。
+  - 单 session 的 in-flight chunk、buffer slot 和 task slot 都保持有界，避免在 object transfer 层演化成无界队列或整文件内存路径。
+  - 后续如果扩展到多 chunk 并行，仍必须在这个显式预算边界内推进，而不能绕开 cleanup/checksum/metadata authority 诊断。
 - 并发 chunk transfer 后续可扩展，但必须有明确的并发上限、背压或限流策略。
 - 大文件路径必须和小文件路径保持同一 payload boundary，不允许为小文件开特殊的 Raft inline payload 路径。
 

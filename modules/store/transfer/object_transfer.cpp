@@ -245,6 +245,104 @@ namespace storedemo
             return facts;
         }
 
+        constexpr std::uint32_t kMaxPerSessionInFlightChunks = 1;
+        constexpr std::uint32_t kMaxPerSessionBufferedChunks = 1;
+        constexpr std::uint32_t kMaxPerSessionTaskSlots = 1;
+
+        struct SessionConcurrencyBudget
+        {
+            std::uint32_t requested_concurrency{0};
+            std::uint32_t effective_concurrency{0};
+            std::uint32_t max_inflight_chunks{0};
+            std::uint32_t max_buffered_chunks{0};
+            std::uint32_t max_task_slots{0};
+            std::uint64_t max_inflight_payload_bytes{0};
+            bool clamped{false};
+        };
+
+        [[nodiscard]] std::uint64_t SaturatingMultiply(const std::uint64_t lhs,
+                                                       const std::uint32_t rhs)
+        {
+            if (lhs == 0 || rhs == 0)
+            {
+                return 0;
+            }
+            if (lhs > std::numeric_limits<std::uint64_t>::max() / rhs)
+            {
+                return std::numeric_limits<std::uint64_t>::max();
+            }
+            return lhs * rhs;
+        }
+
+        // T083 当前先把每个 transfer session 的 payload/任务并发显式限制为
+        // “单 chunk in-flight”。这样即使 CLI 传入更大的并发参数，也不会在
+        // object_transfer 层放大成无界 buffer、无界任务队列或整文件常驻内存路径。
+        [[nodiscard]] SessionConcurrencyBudget ResolveSessionConcurrencyBudget(
+            const std::uint32_t requested_concurrency,
+            const std::uint64_t bounded_chunk_bytes)
+        {
+            SessionConcurrencyBudget budget;
+            budget.requested_concurrency = requested_concurrency;
+            budget.effective_concurrency =
+                requested_concurrency == 0 ? 0 : kMaxPerSessionInFlightChunks;
+            budget.max_inflight_chunks = budget.effective_concurrency;
+            budget.max_buffered_chunks =
+                budget.effective_concurrency == 0 ? 0 : kMaxPerSessionBufferedChunks;
+            budget.max_task_slots =
+                budget.effective_concurrency == 0 ? 0 : kMaxPerSessionTaskSlots;
+            budget.max_inflight_payload_bytes = SaturatingMultiply(
+                bounded_chunk_bytes,
+                budget.max_buffered_chunks);
+            budget.clamped = requested_concurrency > budget.effective_concurrency;
+            return budget;
+        }
+
+        [[nodiscard]] std::uint64_t MaxManifestChunkSize(
+            const std::vector<TransferCommittedChunk> &chunks)
+        {
+            std::uint64_t max_chunk_size = 0;
+            for (const auto &chunk : chunks)
+            {
+                max_chunk_size = std::max(max_chunk_size, chunk.size);
+            }
+            return max_chunk_size;
+        }
+
+        [[nodiscard]] std::string DescribeConcurrencyBudget(
+            const ObjectTransferDirection direction,
+            const SessionConcurrencyBudget &budget)
+        {
+            const char *direction_name =
+                direction == ObjectTransferDirection::kUpload ? "upload" : "download";
+            std::string message =
+                std::string(direction_name) +
+                " session bounded concurrency policy: requested_concurrency=" +
+                std::to_string(budget.requested_concurrency) +
+                ", effective_concurrency=" +
+                std::to_string(budget.effective_concurrency) +
+                ", max_inflight_chunks=" +
+                std::to_string(budget.max_inflight_chunks) +
+                ", max_task_slots=" +
+                std::to_string(budget.max_task_slots) +
+                ", max_buffered_chunks=" +
+                std::to_string(budget.max_buffered_chunks) +
+                ", max_inflight_payload_bytes=" +
+                std::to_string(budget.max_inflight_payload_bytes);
+            if (budget.clamped)
+            {
+                message +=
+                    "; requested concurrency was clamped to keep object transfer on "
+                    "a single bounded chunk-in-flight path and preserve cleanup/"
+                    "checksum diagnostics";
+            }
+            else
+            {
+                message +=
+                    "; object transfer stays on a single bounded chunk-in-flight path";
+            }
+            return message;
+        }
+
         [[nodiscard]] ObjectTransferDiagnostic MakeDiagnostic(
             const ObjectTransferStatusCode status,
             const std::string &message,
@@ -1231,10 +1329,14 @@ namespace storedemo
                 std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
                   request_(std::move(request)),
+                  session_budget_(ResolveSessionConcurrencyBudget(
+                      request_.concurrency,
+                      request_.chunk_size)),
                   metadata_client_(std::move(metadata_client)),
                   storage_client_(std::move(storage_client)),
                   view_client_(std::move(view_client))
             {
+                mutable_snapshot().concurrency = session_budget_.effective_concurrency;
             }
 
             [[nodiscard]] ObjectTransferDirection direction() const override
@@ -1270,6 +1372,9 @@ namespace storedemo
                     Fail(&result, validation_status, result.error_detail);
                     return result;
                 }
+
+                AppendConcurrencyDiagnostic(&result.diagnostics);
+                result.session = Snapshot();
 
                 SetStage(ObjectTransferStage::kPreparing);
                 result.session = Snapshot();
@@ -1950,6 +2055,23 @@ namespace storedemo
                 return ObjectTransferStatusCode::kOk;
             }
 
+            void AppendConcurrencyDiagnostic(
+                std::vector<ObjectTransferDiagnostic> *diagnostics) const
+            {
+                if (diagnostics == nullptr)
+                {
+                    return;
+                }
+
+                auto diagnostic = MakeDiagnostic(
+                    ObjectTransferStatusCode::kOk,
+                    DescribeConcurrencyBudget(
+                        ObjectTransferDirection::kUpload,
+                        session_budget_),
+                    request_.request_id);
+                diagnostics->push_back(std::move(diagnostic));
+            }
+
             [[nodiscard]] std::optional<std::string> ValidateExpectedObjectChecksum(
                 const TransferObjectChecksumFacts &actual,
                 const TransferObjectChecksumFacts &expected) const
@@ -2193,6 +2315,7 @@ namespace storedemo
             }
 
             UploadObjectRequest request_;
+            SessionConcurrencyBudget session_budget_{};
             std::shared_ptr<MetadataTransferClient> metadata_client_;
             std::shared_ptr<StorageTransferClient> storage_client_;
             std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
@@ -2210,10 +2333,13 @@ namespace storedemo
                 std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
                   request_(std::move(request)),
+                  session_budget_(
+                      ResolveSessionConcurrencyBudget(request_.concurrency, 0)),
                   metadata_client_(std::move(metadata_client)),
                   storage_client_(std::move(storage_client)),
                   view_client_(std::move(view_client))
             {
+                mutable_snapshot().concurrency = session_budget_.effective_concurrency;
             }
 
             [[nodiscard]] ObjectTransferDirection direction() const override
@@ -2334,6 +2460,13 @@ namespace storedemo
                          "COMMITTED manifest layout is invalid: " + *layout_error);
                     return result;
                 }
+
+                session_budget_ = ResolveSessionConcurrencyBudget(
+                    request_.concurrency,
+                    MaxManifestChunkSize(ordered_chunks));
+                mutable_snapshot().concurrency = session_budget_.effective_concurrency;
+                AppendConcurrencyDiagnostic(&result.diagnostics);
+                result.session = Snapshot();
 
                 std::string storage_discovery_error;
                 const auto storage_targets = DiscoverStorageTargets(
@@ -2690,6 +2823,23 @@ namespace storedemo
                 return ObjectTransferStatusCode::kOk;
             }
 
+            void AppendConcurrencyDiagnostic(
+                std::vector<ObjectTransferDiagnostic> *diagnostics) const
+            {
+                if (diagnostics == nullptr)
+                {
+                    return;
+                }
+
+                auto diagnostic = MakeDiagnostic(
+                    ObjectTransferStatusCode::kOk,
+                    DescribeConcurrencyBudget(
+                        ObjectTransferDirection::kDownload,
+                        session_budget_),
+                    request_.request_id);
+                diagnostics->push_back(std::move(diagnostic));
+            }
+
             void Fail(DownloadObjectResult *result,
                       const ObjectTransferStatusCode status,
                       std::string message,
@@ -2733,6 +2883,7 @@ namespace storedemo
             }
 
             DownloadObjectRequest request_;
+            SessionConcurrencyBudget session_budget_{};
             std::shared_ptr<MetadataTransferClient> metadata_client_;
             std::shared_ptr<StorageTransferClient> storage_client_;
             std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
