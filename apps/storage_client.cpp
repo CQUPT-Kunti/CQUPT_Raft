@@ -506,6 +506,34 @@ namespace
         return oss.str();
     }
 
+    void PrintCommandFailure(std::string_view command,
+                             std::string_view request_id,
+                             std::string_view status,
+                             std::string_view message)
+    {
+        std::cerr << command << " FAILED";
+        if (!request_id.empty())
+        {
+            std::cerr << " request_id=" << request_id;
+        }
+        std::cerr << " status=" << status;
+        if (!message.empty())
+        {
+            std::cerr << " message=" << message;
+        }
+        std::cerr << '\n';
+    }
+
+    void PrintCommandSuccess(std::string_view command,
+                             std::string_view request_id)
+    {
+        std::cout << command << " OK";
+        if (!request_id.empty())
+        {
+            std::cout << " request_id=" << request_id;
+        }
+    }
+
     [[nodiscard]] std::string DeriveObjectId(const std::string_view bucket,
                                              const std::string_view object_key)
     {
@@ -1008,11 +1036,17 @@ namespace
     }
 
     void PrintClusterConfigIssues(
+        const std::string_view request_id,
         const clusterdemo::ClusterConfigValidationResult &validation)
     {
         for (const auto &issue : validation.issues)
         {
-            std::cerr << "diagnostic status="
+            std::cerr << "diagnostic";
+            if (!request_id.empty())
+            {
+                std::cerr << " request_id=" << request_id;
+            }
+            std::cerr << " status="
                       << clusterdemo::ToString(
                              clusterdemo::ClusterConfigStatusCode::kInvalidArgument)
                       << " issue="
@@ -1151,14 +1185,19 @@ namespace
     [[nodiscard]] int RunGenerateConfig(const ParsedArgs &args)
     {
         const auto request = MakeGenerationRequest(args);
+        const std::string request_id =
+            args.request_id.empty()
+                ? GenerateRequestId("generate-config", request.cluster_id)
+                : args.request_id;
         const auto result =
             clusterdemo::GenerateDeterministicClusterConfig(request);
         if (!result.ok())
         {
-            std::cerr << "generate-config FAILED"
-                      << " status=" << clusterdemo::ToString(result.status)
-                      << " message=" << result.error_detail << '\n';
-            PrintClusterConfigIssues(result.validation);
+            PrintCommandFailure("generate-config",
+                                request_id,
+                                clusterdemo::ToString(result.status),
+                                result.error_detail);
+            PrintClusterConfigIssues(request_id, result.validation);
             return ExitCodeForClusterConfigStatus(result.status);
         }
 
@@ -1170,14 +1209,15 @@ namespace
         }
         catch (const std::exception &ex)
         {
-            std::cerr << "generate-config FAILED"
-                      << " status=file_write_error"
-                      << " message=" << ex.what() << '\n';
+            PrintCommandFailure("generate-config",
+                                request_id,
+                                "FILE_WRITE_ERROR",
+                                ex.what());
             return static_cast<int>(CliExitCode::kConfigError);
         }
 
-        std::cout << "generate-config OK"
-                  << " cluster_id=" << result.config.cluster_id
+        PrintCommandSuccess("generate-config", request_id);
+        std::cout << " cluster_id=" << result.config.cluster_id
                   << " output=" << args.output_path.string()
                   << " view_nodes=" << result.config.view_nodes.size()
                   << " metadata_nodes=" << result.config.metadata_nodes.size()
@@ -1583,6 +1623,7 @@ namespace
             std::cerr << "status FAILED"
                       << " request_id=" << request_id
                       << " target_endpoint=" << config.view_endpoint
+                      << " status=GRPC_TRANSPORT_ERROR"
                       << " grpc_code="
                       << static_cast<int>(result.rpc.grpc_status_code)
                       << " retryable="
@@ -1673,9 +1714,12 @@ namespace
 
 int main(int argc, char **argv)
 {
+    ParsedArgs args;
+    bool parsed_args = false;
     try
     {
-        const ParsedArgs args = ParseArgs(argc, argv);
+        args = ParseArgs(argc, argv);
+        parsed_args = true;
         if (args.command == "generate-config")
         {
             return RunGenerateConfig(args);
@@ -1701,12 +1745,18 @@ int main(int argc, char **argv)
     }
     catch (const ClientConfigError &ex)
     {
-        std::cerr << "storage_client config error: " << ex.what() << '\n';
+        PrintCommandFailure(parsed_args ? args.command : "storage_client",
+                            parsed_args ? args.request_id : "",
+                            "CONFIG_ERROR",
+                            ex.what());
         return static_cast<int>(CliExitCode::kConfigError);
     }
     catch (const std::exception &ex)
     {
-        std::cerr << "storage_client error: " << ex.what() << '\n';
+        PrintCommandFailure(parsed_args ? args.command : "storage_client",
+                            parsed_args ? args.request_id : "",
+                            "INTERNAL_ERROR",
+                            ex.what());
         return static_cast<int>(CliExitCode::kInternalError);
     }
 }

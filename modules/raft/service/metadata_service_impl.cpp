@@ -183,6 +183,32 @@ namespace raftdemo
       return -1;
     }
 
+    std::string BuildContextDiagnosticMessage(
+        const std::string &base_message,
+        const NodeStatusSnapshot &status,
+        const std::optional<int> fallback_leader_id)
+    {
+      std::ostringstream oss;
+      oss << base_message;
+      const auto append_field = [&](const std::string &key, const auto &value)
+      {
+        if (base_message.find(key + "=") != std::string::npos)
+        {
+          return;
+        }
+        if (oss.tellp() > 0)
+        {
+          oss << "; ";
+        }
+        oss << key << "=" << value;
+      };
+      append_field("local_node_id", status.node_id);
+      append_field("local_node_address", status.address);
+      append_field("leader_hint_id", ResolveLeaderHintId(status, fallback_leader_id));
+      append_field("leader_hint_address", status.leader_address);
+      return oss.str();
+    }
+
     std::string BuildDiagnosticMessage(
         const std::string &base_message,
         const NodeStatusSnapshot &status,
@@ -191,9 +217,7 @@ namespace raftdemo
         const bool emphasize_quorum_boundary)
     {
       std::ostringstream oss;
-      oss << base_message
-          << "; leader_hint_id=" << ResolveLeaderHintId(status, fallback_leader_id)
-          << "; leader_hint_address=" << status.leader_address
+      oss << BuildContextDiagnosticMessage(base_message, status, fallback_leader_id)
           << "; committed_voter_count=" << quorum_summary.voter_count
           << "; committed_quorum_size=" << quorum_summary.quorum_size
           << "; local_committed_membership_role="
@@ -229,6 +253,21 @@ namespace raftdemo
       }
       leader_hint->set_leader_id(ResolveLeaderHintId(status, fallback_leader_id));
       leader_hint->set_leader_address(status.leader_address);
+    }
+
+    void DecorateSummaryWithContext(
+        const NodeStatusSnapshot &status,
+        const std::optional<int> fallback_leader_id,
+        raft::MetadataResponseSummary *summary)
+    {
+      if (summary == nullptr)
+      {
+        return;
+      }
+      // proto 当前没有 node_id 字段；这里统一把本地服务节点身份补进诊断 message。
+      summary->set_message(
+          BuildContextDiagnosticMessage(summary->message(), status, fallback_leader_id));
+      FillLeaderHint(status, fallback_leader_id, summary->mutable_leader_hint());
     }
 
     void DecorateSummaryWithDiagnostics(
@@ -377,6 +416,11 @@ namespace raftdemo
                   result.log_index,
                   result.term,
                   out);
+      DecorateSummaryWithContext(status,
+                                 result.leader_id >= 0
+                                     ? std::optional<int>(result.leader_id)
+                                     : std::nullopt,
+                                 out);
       if (ShouldAttachWriteDiagnostics(result))
       {
         DecorateSummaryWithDiagnostics(status,
@@ -411,6 +455,11 @@ namespace raftdemo
                   std::nullopt,
                   status.term,
                   response->mutable_summary());
+      DecorateSummaryWithContext(status,
+                                 status.leader_id >= 0
+                                     ? std::optional<int>(status.leader_id)
+                                     : std::nullopt,
+                                 response->mutable_summary());
       if constexpr (std::is_same_v<Response, raft::HeadObjectResponse>)
       {
         response->set_found(false);
@@ -740,6 +789,11 @@ namespace raftdemo
                   std::nullopt,
                   status.term,
                   response->mutable_summary());
+      DecorateSummaryWithContext(status,
+                                 status.leader_id >= 0
+                                     ? std::optional<int>(status.leader_id)
+                                     : std::nullopt,
+                                 response->mutable_summary());
       reactor->Finish(grpc::Status::OK);
       return reactor;
     }
@@ -1145,6 +1199,11 @@ namespace raftdemo
                 head.result.summary.log_index,
                 head.result.summary.term,
                 response->mutable_summary());
+    DecorateSummaryWithContext(status,
+                               status.leader_id >= 0
+                                   ? std::optional<int>(status.leader_id)
+                                   : std::nullopt,
+                               response->mutable_summary());
     response->set_found(head.record.has_value());
     if (head.record.has_value())
     {
@@ -1222,6 +1281,11 @@ namespace raftdemo
                 list.result.summary.log_index,
                 list.result.summary.term,
                 response->mutable_summary());
+    DecorateSummaryWithContext(status,
+                               status.leader_id >= 0
+                                   ? std::optional<int>(status.leader_id)
+                                   : std::nullopt,
+                               response->mutable_summary());
     response->clear_objects();
     for (const auto &record : list.records)
     {

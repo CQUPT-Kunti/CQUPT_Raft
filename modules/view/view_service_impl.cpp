@@ -721,7 +721,11 @@ namespace viewdemo
         }
 
         template <typename Response>
-        void SetInternalSummary(Response *response, std::string_view message)
+        void SetInternalSummary(Response *response,
+                                std::string_view message,
+                                std::string_view request_id = {},
+                                std::string_view cluster_id = {},
+                                std::string_view node_id = {})
         {
             if (response == nullptr)
             {
@@ -731,11 +735,33 @@ namespace viewdemo
             auto *summary = response->mutable_summary();
             summary->set_code(::view::VIEW_NODE_STATUS_CODE_INTERNAL_ERROR);
             summary->set_message(std::string(message));
+            summary->set_request_id(std::string(request_id));
+            summary->set_cluster_id(std::string(cluster_id));
+            summary->set_node_id(std::string(node_id));
+        }
+
+        std::string AppendServiceNote(std::string base_message,
+                                      const std::string_view note)
+        {
+            if (note.empty())
+            {
+                return base_message;
+            }
+            if (base_message.empty())
+            {
+                return std::string(note);
+            }
+            base_message.append("; service_note=");
+            base_message.append(note);
+            return base_message;
         }
 
         template <typename Response>
         ::grpc::Status ValidateRpcState(Response *response,
-                                        const ViewNodeRegistry *registry)
+                                        const ViewNodeRegistry *registry,
+                                        std::string_view request_id = {},
+                                        std::string_view cluster_id = {},
+                                        std::string_view node_id = {})
         {
             if (response == nullptr)
             {
@@ -745,7 +771,11 @@ namespace viewdemo
             }
             if (registry == nullptr)
             {
-                SetInternalSummary(response, "view registry is not configured");
+                SetInternalSummary(response,
+                                   "view registry is not configured",
+                                   request_id,
+                                   cluster_id,
+                                   node_id);
                 return ::grpc::Status(
                     ::grpc::StatusCode::FAILED_PRECONDITION,
                     "view registry is not configured");
@@ -816,7 +846,11 @@ namespace viewdemo
                                   "request must not be null");
         }
 
-        const auto state = ValidateRpcState(response, registry_.get());
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->registration().cluster_id(),
+                                            request->registration().node_id());
         if (!state.ok())
         {
             return state;
@@ -846,13 +880,15 @@ namespace viewdemo
             FillProtoSummary(result.summary, response->mutable_summary());
             if (resolution.generated_new)
             {
-                response->mutable_summary()->set_message(
-                    "storage node_id allocated by view service and registration applied");
+                response->mutable_summary()->set_message(AppendServiceNote(
+                    response->mutable_summary()->message(),
+                    "storage node_id allocated by view service and registration applied"));
             }
             else if (resolution.confirmed_existing)
             {
-                response->mutable_summary()->set_message(
-                    "storage node_id confirmed from existing view registration");
+                response->mutable_summary()->set_message(AppendServiceNote(
+                    response->mutable_summary()->message(),
+                    "storage node_id confirmed from existing view registration"));
             }
             response->set_created(result.created);
             response->set_idempotent(result.idempotent);
@@ -871,12 +907,20 @@ namespace viewdemo
         }
         catch (const std::exception &ex)
         {
-            SetInternalSummary(response, ex.what());
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->registration().cluster_id(),
+                               request->registration().node_id());
             return MakeInternalStatus("RegisterNode", ex);
         }
         catch (...)
         {
-            SetInternalSummary(response, "unknown internal error");
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->registration().cluster_id(),
+                               request->registration().node_id());
             return MakeUnknownInternalStatus("RegisterNode");
         }
     }
@@ -894,7 +938,11 @@ namespace viewdemo
                                   "request must not be null");
         }
 
-        const auto state = ValidateRpcState(response, registry_.get());
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id(),
+                                            request->node_id());
         if (!state.ok())
         {
             return state;
@@ -927,12 +975,20 @@ namespace viewdemo
         }
         catch (const std::exception &ex)
         {
-            SetInternalSummary(response, ex.what());
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id(),
+                               request->node_id());
             return MakeInternalStatus("HeartbeatNode", ex);
         }
         catch (...)
         {
-            SetInternalSummary(response, "unknown internal error");
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id(),
+                               request->node_id());
             return MakeUnknownInternalStatus("HeartbeatNode");
         }
     }
@@ -950,7 +1006,10 @@ namespace viewdemo
                                   "request must not be null");
         }
 
-        const auto state = ValidateRpcState(response, registry_.get());
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
         if (!state.ok())
         {
             return state;
@@ -988,12 +1047,18 @@ namespace viewdemo
         }
         catch (const std::exception &ex)
         {
-            SetInternalSummary(response, ex.what());
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
             return MakeInternalStatus("DiscoverMetadata", ex);
         }
         catch (...)
         {
-            SetInternalSummary(response, "unknown internal error");
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
             return MakeUnknownInternalStatus("DiscoverMetadata");
         }
     }
@@ -1011,7 +1076,10 @@ namespace viewdemo
                                   "request must not be null");
         }
 
-        const auto state = ValidateRpcState(response, registry_.get());
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
         if (!state.ok())
         {
             return state;
@@ -1043,12 +1111,18 @@ namespace viewdemo
         }
         catch (const std::exception &ex)
         {
-            SetInternalSummary(response, ex.what());
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
             return MakeInternalStatus("DiscoverStorage", ex);
         }
         catch (...)
         {
-            SetInternalSummary(response, "unknown internal error");
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
             return MakeUnknownInternalStatus("DiscoverStorage");
         }
     }
@@ -1066,7 +1140,10 @@ namespace viewdemo
                                   "request must not be null");
         }
 
-        const auto state = ValidateRpcState(response, registry_.get());
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
         if (!state.ok())
         {
             return state;
@@ -1112,12 +1189,18 @@ namespace viewdemo
         }
         catch (const std::exception &ex)
         {
-            SetInternalSummary(response, ex.what());
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
             return MakeInternalStatus("GetClusterView", ex);
         }
         catch (...)
         {
-            SetInternalSummary(response, "unknown internal error");
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
             return MakeUnknownInternalStatus("GetClusterView");
         }
     }

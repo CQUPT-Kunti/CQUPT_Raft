@@ -231,7 +231,7 @@
 - [X] T086 [P] Add or update module notes for `modules/cluster/module-notes.md`, `modules/view/module-notes.md`, and `modules/store/transfer/module-notes.md`
 - [X] T087 [P] Add validation matrix for acceptance scenarios in `specs/008-integrated-object-storage-system/validation-matrix.md`
 - [X] T088 [P] Add Windows startup and path smoke notes to `specs/008-integrated-object-storage-system/quickstart.md`
-- [ ] T089 Add request_id/node_id/leader-hint diagnostic consistency checks across `apps/storage_client.cpp`, `modules/view/view_service_impl.cpp`, and `modules/raft/service/metadata_service_impl.cpp`
+- [X] T089 Add request_id/node_id/leader-hint diagnostic consistency checks across `apps/storage_client.cpp`, `modules/view/view_service_impl.cpp`, and `modules/raft/service/metadata_service_impl.cpp`
 - [ ] T090 Run `cmake --preset debug-ninja-low-parallel` and save only failure summaries to `specs/008-integrated-object-storage-system/task-reports/` if needed
 - [ ] T091 Run `cmake --build --preset debug-ninja-low-parallel` and save only failure summaries to `specs/008-integrated-object-storage-system/task-reports/` if needed
 - [ ] T092 Run `CTEST_PARALLEL_LEVEL=1 ./test.sh --group all` and report according to Test Log Output Rules
