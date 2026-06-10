@@ -4,6 +4,15 @@
 
 `modules/store/upload` 承载最小 upload coordinator / helper。
 
+### 008 阶段边界补充
+
+- 本模块负责 upload 协调、WritePlan 执行衔接、chunk 写入结果收集、checksum 边界表达，以及 commit 前后的 data-plane 协作事实汇总。
+- 本模块服务于 Raft metadata control-plane 与 StorageNode data-plane 的接线，但不是对象元数据权威。
+- 本模块可以消费上层给出的 WritePlan、placement 结果、chunk 写入回执和 cleanup candidate，不直接拥有 object manifest 的一致性真相。
+- 本模块不得修改 Raft quorum、leader election、membership change，也不得把任何节点注册结果解释为 Raft voter membership。
+- 本模块不得把完整 payload、chunk bytes 或整对象内容写入 metadata、Raft log、Raft snapshot 或 metadata snapshot。
+- 008 后续演进里，本模块应优先支持 bounded / streaming checksum 与分块文件处理，避免为了对象级 checksum 把整文件一次性放入内存。
+
 当前只负责：
 
 - `CreateObject -> Placement -> WriteChunk -> CommitObject` 的协调顺序
@@ -20,8 +29,21 @@
 - heartbeat / registry
 - Raft 提案逻辑
 - 真实 metadata gRPC client 或真实 StorageNode registry
+- 对象是否可见的最终判定
+- object manifest 的权威持久化
+- ViewNode、cluster config、node.identity 的所有权逻辑
 
 ## 主要结构
+
+### `UploadObjectChecksumFacts`
+
+- 描述对象级 metadata facts：
+  - `size`
+  - `checksum`
+  - `etag`
+- 这些 facts 应由上层 streaming / bounded checksum 路径产出。
+- 真实 payload 不得为了计算对象级 checksum 或 etag 在 coordinator 内拼成整对象。
+- `size` / `checksum` / `etag` 可以进入 WritePlan / CommitObject 这类 metadata/control-plane 请求；chunk bytes 和完整文件内容不能进入 metadata / Raft。
 
 ### `UploadChunkInput`
 
@@ -32,6 +54,8 @@
   - `payload`
   - `expected_size`
   - `expected_checksum`
+- `payload` 只能表示单个 bounded chunk 的 data-plane buffer，不能承载完整对象常驻内存。
+- `expected_checksum` 可由调用方按 chunk streaming / bounded 路径预先填充；如果后续实现需要现算，也只能对当前 chunk 计算，不能拼接整对象。
 
 ### `UploadCommittedChunk`
 
@@ -75,12 +99,14 @@
   - `object_id`
   - `version`
   - `etag`
+  - `object_checksum`
   - `chunks`
   - `replica_policy`
   - `candidates`
   - `excluded_nodes`
   - `context`
   - `client_time_unix_ms`
+- `etag` 保留为现有 metadata 字段兼容入口；008 新路径应优先使用 `object_checksum` 中由 streaming / bounded 路径产出的对象级 facts。
 
 ### `UploadCoordinatorResult`
 
@@ -227,22 +253,24 @@
   - 优先使用调用方传入的 `expected_size`
   - 否则退回 `payload.size()`
 
-### `ComputeObjectEtag(const UploadCoordinatorRequest&, std::string*, std::string*)`
+### `ResolveObjectChecksumFacts(const UploadCoordinatorRequest&, UploadObjectChecksumFacts*, std::string*)`
 
 - 作用：
-  - 决定 `CreateObject` / `CommitObject` 里使用的对象级 `etag`
+  - 生成 `CreateObject` / `CommitObject` 里使用的对象级 `size` / `checksum` / `etag`
+- T024 bounded 实现：
+  - 按 chunk 顺序增量更新对象级 SHA-256，不拼接整对象 payload
+  - 如果 `request.object_checksum.checksum` 已给出，则把增量计算结果与其比对
+  - 如果 `request.object_checksum.size` 已给出，则校验其与所有 chunk payload 大小之和一致
+  - `etag` 选择顺序：
+    - `request.object_checksum.etag`
+    - `request.etag`
+    - 增量计算得到的对象级 checksum 字符串
 - 当前逻辑：
-  - 如果请求已经带了 `etag`，直接使用
-  - 否则把所有 chunk payload 按输入顺序拼接后，调用 `ComputeChunkChecksum(...)` 生成一个对象级摘要字符串
+  - 对每个 chunk 的 `payload` 做 bounded 更新
+  - 最终只产出对象级 metadata facts，不保留整对象 buffer
 - 边界：
-  - 这里只生成 metadata 里的 `etag`，不会把 payload 写进 metadata 或 Raft
-
-### `ComputeObjectSize(const UploadCoordinatorRequest&)`
-
-- 作用：
-  - 统计对象总大小
-- 当前逻辑：
-  - 累加所有 `chunk.payload.size()`
+  - 这里只生成 metadata facts，不会把 payload 写进 metadata 或 Raft
+  - checksum mismatch 返回可诊断失败，避免带错 metadata facts 进入后续 `CommitObject`
 
 ### `IsDurableWriteSuccess(const WriteChunkResponse&)`
 
@@ -327,8 +355,8 @@
 
 ### 2. 计算对象级 metadata facts
 
-- 先通过 `ComputeObjectSize(...)` 统计对象总大小
-- 再通过 `ComputeObjectEtag(...)` 决定要写进 metadata 的 `etag`
+- 通过 `ResolveObjectChecksumFacts(...)` 按 chunk 顺序增量计算对象级 `size` / `checksum` / `etag`
+- 不拼接整对象 payload，只把最终对象级 metadata facts 带入 `CreateObject` / `CommitObject`
 
 ### 3. 先创建 pending object
 

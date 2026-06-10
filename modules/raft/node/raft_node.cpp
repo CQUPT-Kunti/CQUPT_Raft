@@ -142,6 +142,15 @@ namespace raftdemo
       return SnapshotAppliedBoundary{expected_index, expected_term};
     }
 
+    std::size_t ComputeCommittedVoterQuorumSize(const std::size_t voter_count)
+    {
+      if (voter_count == 0)
+      {
+        return 0;
+      }
+      return voter_count / 2 + 1;
+    }
+
   } // namespace
 
   RaftNode::RaftNode(NodeConfig config)
@@ -510,6 +519,39 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       });
     }
     return snapshot;
+  }
+
+  CommittedMembershipQuorumSummary RaftNode::GetCommittedMembershipQuorumSummary() const
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+
+    CommittedMembershipQuorumSummary summary;
+    summary.committed_log_index = commit_index_;
+    summary.committed_term = TermAtIndexLocked(commit_index_);
+
+    // 当前阶段 RaftNode 内部没有运行时 membership authority；诊断摘要必须只读取
+    // 已提交配置边界下当前节点已知的成员集，不能根据 live 节点或 ViewNode 观测降 quorum。
+    summary.voter_ids.reserve(config_.peers.size() + 1);
+    summary.voter_ids.push_back(config_.node_id);
+    for (const auto &peer : config_.peers)
+    {
+      summary.voter_ids.push_back(peer.node_id);
+    }
+    std::sort(summary.voter_ids.begin(), summary.voter_ids.end());
+    summary.voter_ids.erase(std::unique(summary.voter_ids.begin(), summary.voter_ids.end()),
+                            summary.voter_ids.end());
+
+    // 第一阶段暂未把 learner membership 下沉到 RaftNode 运行时，因此这里保持只读空集，
+    // 避免把 registered-only 或观测节点误计入 committed voter quorum。
+    summary.voter_count = summary.voter_ids.size();
+    summary.learner_count = summary.learner_ids.size();
+    summary.quorum_size = ComputeCommittedVoterQuorumSize(summary.voter_count);
+    summary.local_role = std::binary_search(summary.voter_ids.begin(),
+                                            summary.voter_ids.end(),
+                                            config_.node_id)
+                             ? CommittedMembershipRole::kVoter
+                             : CommittedMembershipRole::kNonMember;
+    return summary;
   }
 
   std::string RaftNode::Describe() const

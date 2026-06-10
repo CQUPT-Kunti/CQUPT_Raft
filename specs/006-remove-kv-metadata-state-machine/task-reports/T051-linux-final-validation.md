@@ -14,7 +14,10 @@
 
 ## Failed tests
 
-- 	165 - RaftSnapshotDiagnosisTest.RestartedSingleNodeReplaysAppliedTailAfterRejectingCorruptedNewestSnapshot (Failed)
+- 	 82 - MetadataFailoverTest.SameCommitRequestIdCanBeRetriedOnNewLeader (Failed)
+- 	 92 - MetadataConcurrencyStressTest.ConcurrentDuplicateRequestIdProposalsShareOneLogEntryAndOneApply (Subprocess aborted)
+- 	210 - IntegratedObjectStorageQuorumTest.ThreeVoterCommittedMembershipDoesNotShrinkQuorumWhenOnlyOneNodeRemainsLive (Failed)
+- 	276 - storage_upload_coordinator (Failed)
 
 ## Logs
 

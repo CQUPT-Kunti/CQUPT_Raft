@@ -26,6 +26,31 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+function(raft_collect_existing_sources out_var)
+  set(collected_sources)
+  foreach(source_file IN LISTS ARGN)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
+      list(APPEND collected_sources "${source_file}")
+    endif()
+  endforeach()
+  set(${out_var} "${collected_sources}" PARENT_SCOPE)
+endfunction()
+
+function(raft_add_optional_app_target target_name source_file)
+  set(optional_private_libs ${ARGN})
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}")
+    message(STATUS "Skip planned target ${target_name}: ${source_file} not found yet")
+    return()
+  endif()
+
+  add_executable(${target_name} ${source_file})
+  target_link_libraries(${target_name}
+    PRIVATE
+      raft_core
+      ${optional_private_libs}
+  )
+endfunction()
+
 if(MSVC)
   add_compile_options(/utf-8)
 endif()
@@ -82,15 +107,19 @@ message(STATUS "Using gRPC ${gRPC_VERSION}")
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(STORAGE_NODE_PROTO_RELATIVE proto/storage_node.proto)
 set(STORAGE_NODE_PROTO_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/${STORAGE_NODE_PROTO_RELATIVE})
+set(VIEW_PROTO_RELATIVE proto/view.proto)
+set(VIEW_PROTO_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/${VIEW_PROTO_RELATIVE})
 set(PROTO_FILES
   ${PROTO_DIR}/common.proto
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${VIEW_PROTO_SCHEMA}
   ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GRPC_PROTO_FILES
   ${PROTO_DIR}/raft.proto
   ${PROTO_DIR}/metadata.proto
+  ${VIEW_PROTO_SCHEMA}
   ${STORAGE_NODE_PROTO_SCHEMA}
 )
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -110,22 +139,26 @@ set(PROTO_SRCS
   ${GENERATED_DIR}/common.pb.cc
   ${GENERATED_DIR}/raft.pb.cc
   ${GENERATED_DIR}/metadata.pb.cc
+  ${GENERATED_DIR}/view.pb.cc
   ${GENERATED_DIR}/storage_node.pb.cc
 )
 set(PROTO_HDRS
   ${GENERATED_DIR}/common.pb.h
   ${GENERATED_DIR}/raft.pb.h
   ${GENERATED_DIR}/metadata.pb.h
+  ${GENERATED_DIR}/view.pb.h
   ${GENERATED_DIR}/storage_node.pb.h
 )
 set(GRPC_SRCS
   ${GENERATED_DIR}/raft.grpc.pb.cc
   ${GENERATED_DIR}/metadata.grpc.pb.cc
+  ${GENERATED_DIR}/view.grpc.pb.cc
   ${GENERATED_DIR}/storage_node.grpc.pb.cc
 )
 set(GRPC_HDRS
   ${GENERATED_DIR}/raft.grpc.pb.h
   ${GENERATED_DIR}/metadata.grpc.pb.h
+  ${GENERATED_DIR}/view.grpc.pb.h
   ${GENERATED_DIR}/storage_node.grpc.pb.h
 )
 
@@ -210,6 +243,24 @@ target_link_libraries(metadata_proto
     gRPC::grpc++
 )
 
+add_library(view_proto
+  ${GENERATED_DIR}/view.pb.cc
+  ${GENERATED_DIR}/view.pb.h
+  ${GENERATED_DIR}/view.grpc.pb.cc
+  ${GENERATED_DIR}/view.grpc.pb.h
+)
+
+target_include_directories(view_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(view_proto
+  PUBLIC
+    protobuf::libprotobuf
+    gRPC::grpc++
+)
+
 add_library(storage_node_proto
   ${GENERATED_DIR}/storage_node.pb.cc
   ${GENERATED_DIR}/storage_node.pb.h
@@ -232,6 +283,7 @@ if(WIN32)
   target_link_libraries(common_proto PUBLIC Ws2_32)
   target_link_libraries(raft_proto PUBLIC Ws2_32)
   target_link_libraries(metadata_proto PUBLIC Ws2_32)
+  target_link_libraries(view_proto PUBLIC Ws2_32)
   target_link_libraries(storage_node_proto PUBLIC Ws2_32)
 endif()
 
@@ -266,6 +318,33 @@ add_library(raft_core
   modules/raft/replication/replicator.cpp
 )
 
+# 008 规划模块占位：
+# 仅在未来源文件实际落地时，才把 cluster / view / store/transfer 接入 `raft_core`。
+# 这样当前不会因为规划路径尚未实现而导致 configure / build 失败。
+set(RAFT_008_PLANNED_CORE_SOURCES
+  modules/cluster/cluster_config.cpp
+  modules/cluster/node_identity.cpp
+  modules/view/view_registry.cpp
+  modules/view/view_service_impl.cpp
+  modules/view/view_client.cpp
+  modules/store/transfer/object_transfer.cpp
+  modules/store/transfer/metadata_transfer_client.cpp
+  modules/store/transfer/storage_transfer_client.cpp
+)
+
+raft_collect_existing_sources(RAFT_008_EXISTING_CORE_SOURCES
+  ${RAFT_008_PLANNED_CORE_SOURCES}
+)
+
+if(RAFT_008_EXISTING_CORE_SOURCES)
+  target_sources(raft_core
+    PRIVATE
+      ${RAFT_008_EXISTING_CORE_SOURCES}
+  )
+else()
+  message(STATUS "008 planned raft_core sources are not present yet; keep placeholder wiring only")
+endif()
+
 target_include_directories(raft_core
   PUBLIC
     ${PROJECT_INCLUDE_DIR}
@@ -298,6 +377,36 @@ add_executable(raft_metadata_client
 target_link_libraries(raft_metadata_client
   PRIVATE
     metadata_proto
+)
+
+# 008 规划 app target 占位：
+# 仅当对应入口文件存在时才创建 target，避免当前阶段因占位路径缺失而破坏构建。
+raft_add_optional_app_target(view_node_app
+  apps/view_node_app.cpp
+  view_proto
+)
+
+raft_add_optional_app_target(metadata_node_app
+  apps/metadata_node_app.cpp
+  view_proto
+  metadata_proto
+)
+
+raft_add_optional_app_target(storage_node_app
+  apps/storage_node_app.cpp
+  view_proto
+  storage_node_proto
+)
+
+raft_add_optional_app_target(storage_client
+  apps/storage_client.cpp
+  view_proto
+  metadata_proto
+  storage_node_proto
+)
+
+raft_add_optional_app_target(storage_bench
+  apps/storage_bench.cpp
 )
 
 enable_testing()

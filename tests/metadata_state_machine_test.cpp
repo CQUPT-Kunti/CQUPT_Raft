@@ -189,7 +189,7 @@ TEST(MetadataStateMachineTest, EmptyRequestIdReturnsExplicitErrorAndIsNotRecorde
     EXPECT_EQ(machine.LastAppliedIndex(), 0U);
 }
 
-TEST(MetadataStateMachineTest, CreateObjectApplyCreatesPendingRecordAndIndexEntry)
+TEST(MetadataStateMachineTest, CreateObjectApplyCreatesPendingRecordAndKeepsIndexHidden)
 {
     raftdemo::MetadataStateMachine machine;
     EXPECT_TRUE(ApplyMetadataCommand(
@@ -222,8 +222,7 @@ TEST(MetadataStateMachineTest, CreateObjectApplyCreatesPendingRecordAndIndexEntr
 
     const std::optional<std::string> indexed_id =
         machine.FindIndexedObjectId("bucket-d", "object/a");
-    ASSERT_TRUE(indexed_id.has_value());
-    EXPECT_EQ(*indexed_id, "obj-1");
+    EXPECT_FALSE(indexed_id.has_value());
 }
 
 TEST(MetadataStateMachineTest, CreateObjectApplyRejectsMissingOrDeletedBucketAndConflicts)

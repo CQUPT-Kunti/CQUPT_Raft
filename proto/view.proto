@@ -1,0 +1,268 @@
+syntax = "proto3";
+
+package view;
+
+// ViewNode 只负责 discovery / observation。
+// 注册到 ViewNode 不等于加入 Raft membership，也不改变 quorum、commit
+// 或 leader election 规则。ViewNode 不保存 object manifest 的权威副本，
+// 本契约也不承载真实 payload、chunk bytes 或完整文件内容。
+service ViewNodeService {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc HeartbeatNode(HeartbeatNodeRequest) returns (HeartbeatNodeResponse);
+  rpc DiscoverMetadata(DiscoverMetadataRequest) returns (DiscoverMetadataResponse);
+  rpc DiscoverStorage(DiscoverStorageRequest) returns (DiscoverStorageResponse);
+  rpc GetClusterView(GetClusterViewRequest) returns (GetClusterViewResponse);
+}
+
+enum ViewNodeStatusCode {
+  VIEW_NODE_STATUS_CODE_UNSPECIFIED = 0;
+  VIEW_NODE_STATUS_CODE_OK = 1;
+  VIEW_NODE_STATUS_CODE_IDEMPOTENT_REPLAY = 2;
+  VIEW_NODE_STATUS_CODE_INVALID_ARGUMENT = 3;
+  VIEW_NODE_STATUS_CODE_NOT_FOUND = 4;
+  VIEW_NODE_STATUS_CODE_CONFLICT = 5;
+  VIEW_NODE_STATUS_CODE_STALE_IGNORED = 6;
+  VIEW_NODE_STATUS_CODE_INTERNAL_ERROR = 7;
+  VIEW_NODE_STATUS_CODE_TIMEOUT = 8;
+  VIEW_NODE_STATUS_CODE_OVERLOADED = 9;
+  VIEW_NODE_STATUS_CODE_SERVICE_UNAVAILABLE = 10;
+  VIEW_NODE_STATUS_CODE_UNSUPPORTED = 11;
+}
+
+enum ViewNodeType {
+  VIEW_NODE_TYPE_UNSPECIFIED = 0;
+  VIEW_NODE_TYPE_VIEW = 1;
+  VIEW_NODE_TYPE_METADATA = 2;
+  VIEW_NODE_TYPE_STORAGE = 3;
+}
+
+enum ViewNodeLivenessState {
+  VIEW_NODE_LIVENESS_STATE_UNSPECIFIED = 0;
+  VIEW_NODE_LIVENESS_STATE_LIVE = 1;
+  VIEW_NODE_LIVENESS_STATE_STALE = 2;
+  VIEW_NODE_LIVENESS_STATE_SUSPECT = 3;
+  VIEW_NODE_LIVENESS_STATE_DEAD = 4;
+}
+
+enum ViewNodeHealth {
+  VIEW_NODE_HEALTH_UNSPECIFIED = 0;
+  VIEW_NODE_HEALTH_HEALTHY = 1;
+  VIEW_NODE_HEALTH_DEGRADED = 2;
+  VIEW_NODE_HEALTH_READ_ONLY = 3;
+  VIEW_NODE_HEALTH_DRAINING = 4;
+  VIEW_NODE_HEALTH_UNAVAILABLE = 5;
+}
+
+enum ViewNodeDiskPressure {
+  VIEW_NODE_DISK_PRESSURE_UNSPECIFIED = 0;
+  VIEW_NODE_DISK_PRESSURE_LOW = 1;
+  VIEW_NODE_DISK_PRESSURE_MEDIUM = 2;
+  VIEW_NODE_DISK_PRESSURE_HIGH = 3;
+  VIEW_NODE_DISK_PRESSURE_FULL = 4;
+}
+
+// 仅表示 ViewNode 观测到的 MetadataNode membership 状态，不是权威 membership。
+enum MetadataMembershipObservedState {
+  METADATA_MEMBERSHIP_OBSERVED_STATE_UNSPECIFIED = 0;
+  METADATA_MEMBERSHIP_OBSERVED_STATE_REGISTERED = 1;
+  METADATA_MEMBERSHIP_OBSERVED_STATE_JOINING = 2;
+  METADATA_MEMBERSHIP_OBSERVED_STATE_LEARNER = 3;
+  METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER = 4;
+  METADATA_MEMBERSHIP_OBSERVED_STATE_DOWN = 5;
+}
+
+enum MetadataRaftObservedRole {
+  METADATA_RAFT_OBSERVED_ROLE_UNSPECIFIED = 0;
+  METADATA_RAFT_OBSERVED_ROLE_FOLLOWER = 1;
+  METADATA_RAFT_OBSERVED_ROLE_CANDIDATE = 2;
+  METADATA_RAFT_OBSERVED_ROLE_LEADER = 3;
+  METADATA_RAFT_OBSERVED_ROLE_LEARNER = 4;
+  METADATA_RAFT_OBSERVED_ROLE_OBSERVER = 5;
+}
+
+message ViewNodeResponseSummary {
+  ViewNodeStatusCode code = 1;
+  string message = 2;
+  string request_id = 3;
+  string cluster_id = 4;
+  string node_id = 5;
+  uint64 retry_after_ms = 6;
+}
+
+message ViewNodeFailureDomain {
+  string zone = 1;
+  string rack = 2;
+}
+
+message ViewNodeCapacityReport {
+  uint64 total_capacity_bytes = 1;
+  uint64 used_capacity_bytes = 2;
+  uint64 available_capacity_bytes = 3;
+  uint64 chunk_count = 4;
+}
+
+message ViewNodeHealthReport {
+  ViewNodeHealth health = 1;
+  ViewNodeDiskPressure disk_pressure = 2;
+  uint64 io_error_count = 3;
+}
+
+message ViewNodeLoadReport {
+  uint32 active_reads = 1;
+  uint32 active_writes = 2;
+  uint32 queued_ops = 3;
+  bool write_admission_overloaded = 4;
+  bool read_admission_overloaded = 5;
+}
+
+// leader hint 只是观测信息；Client 后续仍必须处理 MetadataNode NOT_LEADER。
+message MetadataLeaderHint {
+  string node_id = 1;
+  int32 raft_id = 2;
+  string endpoint = 3;
+  uint64 observed_term = 4;
+  uint64 observed_at_unix_ms = 5;
+}
+
+message MetadataNodeObservation {
+  int32 raft_id = 1;
+  MetadataRaftObservedRole raft_role = 2;
+  MetadataMembershipObservedState membership_state = 3;
+  MetadataLeaderHint leader_hint = 4;
+  uint64 observed_term = 5;
+  uint64 commit_index = 6;
+  uint64 membership_epoch = 7;
+}
+
+// RegisterNode / HeartbeatNode 里的 metadata 字段只表达观测事实。
+// ViewNode 不得据此直接把节点提升为 voter，也不得修改已提交 membership。
+message ViewNodeRegistration {
+  string cluster_id = 1;
+  string node_id = 2;
+  ViewNodeType node_type = 3;
+  string endpoint = 4;
+  string control_plane_endpoint = 5;
+  string data_plane_endpoint = 6;
+  string data_dir_fingerprint = 7;
+  uint64 observed_at_unix_ms = 8;
+  ViewNodeFailureDomain failure_domain = 9;
+  ViewNodeHealthReport health = 10;
+  ViewNodeCapacityReport capacity = 11;
+  ViewNodeLoadReport load = 12;
+  MetadataNodeObservation metadata = 20;
+}
+
+message ViewNodeSnapshot {
+  string cluster_id = 1;
+  string node_id = 2;
+  ViewNodeType node_type = 3;
+  string endpoint = 4;
+  string control_plane_endpoint = 5;
+  string data_plane_endpoint = 6;
+  string data_dir_fingerprint = 7;
+  uint64 registered_at_unix_ms = 8;
+  uint64 last_seen_unix_ms = 9;
+  uint64 last_sequence = 10;
+  ViewNodeLivenessState liveness = 11;
+  ViewNodeFailureDomain failure_domain = 12;
+  ViewNodeHealthReport health = 13;
+  ViewNodeCapacityReport capacity = 14;
+  ViewNodeLoadReport load = 15;
+  MetadataNodeObservation metadata = 20;
+}
+
+message ClusterViewWarning {
+  string code = 1;
+  string message = 2;
+  string node_id = 3;
+  string endpoint = 4;
+}
+
+message RegisterNodeRequest {
+  string request_id = 1;
+  ViewNodeRegistration registration = 2;
+}
+
+message RegisterNodeResponse {
+  ViewNodeResponseSummary summary = 1;
+  bool created = 2;
+  bool idempotent = 3;
+  bool conflict = 4;
+  ViewNodeSnapshot snapshot = 5;
+  repeated ClusterViewWarning warnings = 6;
+}
+
+message HeartbeatNodeRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  ViewNodeType node_type = 4;
+  uint64 sequence = 5;
+  ViewNodeRegistration observation = 6;
+}
+
+message HeartbeatNodeResponse {
+  ViewNodeResponseSummary summary = 1;
+  uint64 accepted_sequence = 2;
+  bool applied = 3;
+  bool idempotent = 4;
+  bool stale_ignored = 5;
+  ViewNodeSnapshot snapshot = 6;
+}
+
+message DiscoverMetadataRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  bool prefer_leader = 3;
+  bool live_only = 4;
+  uint32 limit = 5;
+}
+
+// 返回的 MetadataNode 列表和 leader_hint 都是 discovery candidates / observed facts。
+// Client 必须继续遵守 MetadataService 的 NOT_LEADER 重定向语义。
+message DiscoverMetadataResponse {
+  ViewNodeResponseSummary summary = 1;
+  repeated ViewNodeSnapshot metadata_nodes = 2;
+  MetadataLeaderHint leader_hint = 3;
+  uint64 observed_at_unix_ms = 4;
+  uint64 membership_epoch = 5;
+  repeated ClusterViewWarning warnings = 6;
+}
+
+message DiscoverStorageRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  bool live_only = 3;
+  uint64 minimum_available_capacity_bytes = 4;
+  string zone = 5;
+  string rack = 6;
+  uint32 limit = 7;
+  bool require_writable = 8;
+}
+
+// 返回的是观测到的 StorageNode facts，不代表对象可见性。
+// 对象可见性只能来自 MetadataNode 的 COMMITTED manifest。
+message DiscoverStorageResponse {
+  ViewNodeResponseSummary summary = 1;
+  repeated ViewNodeSnapshot storage_nodes = 2;
+  uint64 observed_at_unix_ms = 3;
+  repeated ClusterViewWarning warnings = 4;
+}
+
+message GetClusterViewRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  bool include_dead_nodes = 3;
+  bool include_warnings = 4;
+}
+
+// ClusterView 用于 status、诊断和测试观测，不是对象 manifest 或 Raft membership 的权威来源。
+message GetClusterViewResponse {
+  ViewNodeResponseSummary summary = 1;
+  repeated ViewNodeSnapshot view_nodes = 2;
+  repeated ViewNodeSnapshot metadata_nodes = 3;
+  repeated ViewNodeSnapshot storage_nodes = 4;
+  MetadataLeaderHint leader_hint = 5;
+  uint64 observed_at_unix_ms = 6;
+  repeated ClusterViewWarning warnings = 7;
+}

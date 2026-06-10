@@ -2083,7 +2083,15 @@ namespace raftdemo
         std::string_view object_key) const
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
-        const auto it = object_index_.find(MakeObjectIdentity(bucket, object_key));
+        const std::string object_identity = MakeObjectIdentity(bucket, object_key);
+        const auto object_it = objects_.find(object_identity);
+        // 诊断索引查询只对 committed 记录开放，避免把 pending 内部状态误报成可见对象。
+        if (object_it == objects_.end() || !object_it->second.IsCommitted())
+        {
+            return std::nullopt;
+        }
+
+        const auto it = object_index_.find(object_identity);
         if (it == object_index_.end() || it->second.empty())
         {
             return std::nullopt;

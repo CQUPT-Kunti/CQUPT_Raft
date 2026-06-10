@@ -1,0 +1,80 @@
+{
+  "cluster_id": "t044-cluster",
+  "base_dir": "tmp/test-artifacts/t044-cluster-root",
+  "view_nodes": [
+    {
+      "node_id": "view-1",
+      "endpoint": "127.0.0.1:18001",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/view/view-1"
+    }
+  ],
+  "metadata_nodes": [
+    {
+      "node_id": "meta-1",
+      "raft_id": 1,
+      "endpoint": "127.0.0.1:18101",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-1/data",
+      "snapshot_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-1/snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-2",
+      "raft_id": 2,
+      "endpoint": "127.0.0.1:18102",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-2/data",
+      "snapshot_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-2/snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-3",
+      "raft_id": 3,
+      "endpoint": "127.0.0.1:18103",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-3/data",
+      "snapshot_dir": "tmp/test-artifacts/t044-cluster-root/metadata/meta-3/snapshots",
+      "initial_role": "voter"
+    }
+  ],
+  "storage_nodes": [
+    {
+      "node_id": "store-1",
+      "endpoint": "127.0.0.1:18201",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/storage/store-1",
+      "capacity_bytes": 68719476736,
+      "failure_domain": {
+        "zone": "",
+        "rack": ""
+      }
+    },
+    {
+      "node_id": "store-2",
+      "endpoint": "127.0.0.1:18202",
+      "data_dir": "tmp/test-artifacts/t044-cluster-root/storage/store-2",
+      "capacity_bytes": 68719476736,
+      "failure_domain": {
+        "zone": "",
+        "rack": ""
+      }
+    }
+  ],
+  "initial_raft_membership": {
+    "membership_epoch": 1,
+    "voter_raft_ids": [1, 2, 3],
+    "learner_raft_ids": []
+  },
+  "chunk_policy": {
+    "chunk_size_bytes": 4194304,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "checksum_algorithm": "sha256"
+  },
+  "timeouts": {
+    "discovery_rpc_timeout_ms": 3000,
+    "metadata_rpc_timeout_ms": 3000,
+    "storage_rpc_timeout_ms": 3000,
+    "heartbeat_interval_ms": 1000,
+    "registration_timeout_ms": 3000,
+    "commit_deadline_ms": 5000,
+    "liveness_stale_timeout_ms": 5000,
+    "liveness_dead_timeout_ms": 15000
+  }
+}

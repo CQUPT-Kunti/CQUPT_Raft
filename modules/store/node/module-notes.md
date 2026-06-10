@@ -4,6 +4,16 @@
 
 `modules/store/node` 承载 StorageNode data-plane 的 RPC 适配层，以及供后续 heartbeat / placement / read-side 消费的 in-memory `StorageNodeRegistry`。
 
+### 008 阶段边界补充
+
+- 本模块负责 StorageNode data-plane 节点能力，包括 chunk 写入、读取、删除、checksum、durable publish、restart recovery 后的本地可服务状态，以及本地 health/capacity/load 事实对外上报。
+- 本模块可以向 ViewNode 注册并发送 heartbeat，也可以为 placement / read-side 暴露本地节点事实，但这些事实不等于对象提交事实。
+- 本模块不决定对象是否可见；对象可见性来自 Raft MetadataNode 已 COMMITTED 的 manifest。
+- 本模块不保存 object manifest 的一致性权威副本，不替代 MetadataNode 做对象状态机。
+- 本模块不参与 Raft quorum、leader election、membership change，也不得把节点注册、心跳或健康状态解释为 voter 资格。
+- 本模块必须保持 data-plane / control-plane 边界清晰：data-plane 返回 chunk 事实和本地 durability 事实，control-plane 决定 manifest、版本与可见性。
+- 008 后续扩展里，本模块可以继续演进 ViewNode 注册、restart recovery 和跨平台 durability 表达，但不能借此把 metadata 权威或共识逻辑下沉进来。
+
 当前只负责：
 
 - `StorageNodeRegistry` 的 in-memory register / heartbeat / partial report merge / lookup / list / snapshot

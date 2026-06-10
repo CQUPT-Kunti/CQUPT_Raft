@@ -211,6 +211,42 @@ namespace storedemo
         [[nodiscard]] StorageNodeStatusCode status_code() const;
     };
 
+    struct GarbageCollectorCleanupHookDiagnostic
+    {
+        CleanupCandidateSource source{CleanupCandidateSource::kDeletedObject};
+        CleanupObjectState object_state{CleanupObjectState::kUnspecified};
+        GarbageCollectionReason reason{GarbageCollectionReason::kUnspecified};
+        ChunkId chunk_id;
+        std::string object_id;
+        std::uint64_t version{0};
+        std::uint32_t chunk_index{0};
+        std::string task_id;
+        std::string metadata_boundary;
+        GarbageCollectorSubmitCode submit_code{GarbageCollectorSubmitCode::kAccepted};
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        std::size_t queue_depth{0};
+        bool accepted{false};
+        bool already_exists{false};
+    };
+
+    struct GarbageCollectorCleanupHookResult
+    {
+        StorageNodeStatusCode status{StorageNodeStatusCode::kOk};
+        std::string error_detail;
+        std::size_t submitted_count{0};
+        std::size_t already_exists_count{0};
+        std::size_t rejected_count{0};
+        std::size_t final_queue_depth{0};
+        bool partial_acceptance{false};
+        std::vector<GarbageCollectorCleanupHookDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == StorageNodeStatusCode::kOk;
+        }
+    };
+
     struct GarbageCollectorDrainResult
     {
         bool drained{false};
@@ -260,6 +296,10 @@ namespace storedemo
         GarbageCollector &operator=(const GarbageCollector &) = delete;
 
         GarbageCollectorSubmitResult SubmitTask(GarbageCollectorTask task);
+        // cleanup hook 只负责把上游已生成的 cleanup candidates 接入 GC task
+        // 模型；是否允许删除仍必须经过 metadata-driven safety checker。
+        GarbageCollectorCleanupHookResult SubmitCleanupCandidates(
+            const std::vector<CleanupCandidate> &candidates);
         GarbageCollectorDrainResult Drain();
         GarbageCollectorStopResult Stop(GarbageCollectorStopRequest request = {});
 

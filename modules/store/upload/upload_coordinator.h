@@ -12,12 +12,23 @@
 
 namespace storedemo
 {
+    struct UploadObjectChecksumFacts
+    {
+        std::uint64_t size{0};
+        ChunkChecksum checksum;
+        std::string etag;
+    };
+
     struct UploadChunkInput
     {
         std::uint32_t chunk_index{0};
         std::uint64_t offset{0};
+        // payload 只能是单个 bounded chunk 的 data-plane buffer，
+        // 不能作为整对象常驻内存或 metadata/Raft payload 通道。
         std::string payload;
         std::optional<std::uint64_t> expected_size;
+        // 调用方可用 streaming / bounded checksum 路径预先填充；
+        // 缺省时 T024 实现只能按当前 chunk 现算，不能拼接整对象。
         ChunkChecksum expected_checksum;
     };
 
@@ -63,7 +74,12 @@ namespace storedemo
         std::string object_key;
         std::string object_id;
         std::uint64_t version{0};
+        // 兼容旧 metadata etag 字段；新调用方应优先使用
+        // object_checksum 中由 streaming / bounded 路径产出的对象级 facts。
         std::string etag;
+        // 对象级 size/checksum/etag facts 只属于 metadata/control-plane；
+        // 真实 payload 不得为计算这些 facts 而在 coordinator 内拼成整对象。
+        UploadObjectChecksumFacts object_checksum;
         std::vector<UploadChunkInput> chunks;
         ReplicaPolicy replica_policy;
         std::vector<StorageNodePlacementCandidate> candidates;

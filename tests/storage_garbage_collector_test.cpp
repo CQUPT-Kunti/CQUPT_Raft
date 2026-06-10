@@ -986,6 +986,108 @@ namespace storedemo
         }
 
         TEST_F(StorageGarbageCollectorTest,
+               SubmitCleanupCandidatesAcceptsFailedUploadCandidateAndPreservesBoundary)
+        {
+            std::atomic<int> handler_runs{0};
+            std::string observed_metadata_boundary;
+            std::string observed_chunk_id;
+
+            GarbageCollector collector(
+                [&](const GarbageCollectorTask &task)
+                {
+                    handler_runs.fetch_add(1, std::memory_order_relaxed);
+                    observed_metadata_boundary = task.metadata_boundary;
+                    observed_chunk_id = task.chunk_id;
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                SingleWorkerConfig());
+
+            FailedUploadCleanupRequest request;
+            request.bucket = "bucket-t080";
+            request.object_key = "objects/failed-upload";
+            request.object_id = "obj-t080-failed";
+            request.version = 8;
+            request.object_state = CleanupObjectState::kPending;
+            request.created_at_unix_ms = 1713008000;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t080-failed", 8, 0, 0, 256)};
+
+            const auto candidates = BuildFailedUploadCleanupCandidates(request);
+            ASSERT_EQ(candidates.size(), 1U);
+
+            const auto hook_result = collector.SubmitCleanupCandidates(candidates);
+            ASSERT_TRUE(hook_result.ok()) << hook_result.error_detail;
+            EXPECT_EQ(hook_result.submitted_count, 1U);
+            EXPECT_EQ(hook_result.already_exists_count, 0U);
+            EXPECT_EQ(hook_result.rejected_count, 0U);
+            ASSERT_EQ(hook_result.diagnostics.size(), 1U);
+            EXPECT_TRUE(hook_result.diagnostics.front().accepted);
+            EXPECT_FALSE(hook_result.diagnostics.front().already_exists);
+            EXPECT_EQ(hook_result.diagnostics.front().reason,
+                      GarbageCollectionReason::kFailedUploadCleanup);
+            EXPECT_EQ(hook_result.diagnostics.front().status,
+                      StorageNodeStatusCode::kOk);
+            EXPECT_NE(hook_result.diagnostics.front().metadata_boundary.find(
+                          "metadata-fact:failed-upload"),
+                      std::string::npos);
+
+            ASSERT_TRUE(collector.Drain().drained);
+            EXPECT_EQ(handler_runs.load(std::memory_order_relaxed), 1);
+            EXPECT_NE(observed_metadata_boundary.find("metadata-fact:failed-upload"),
+                      std::string::npos);
+            EXPECT_EQ(observed_chunk_id, candidates.front().identity.chunk_id);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
+               SubmitCleanupCandidatesReportsDuplicateCandidateAsDiagnosableIdempotentFact)
+        {
+            GarbageCollector collector(
+                [](const GarbageCollectorTask &)
+                {
+                    DeleteChunkResponse response;
+                    response.status = StorageNodeStatusCode::kOk;
+                    response.deleted = true;
+                    return response;
+                },
+                AllowDeleteByMetadataSafety,
+                SingleWorkerConfig());
+
+            FailedUploadCleanupRequest request;
+            request.bucket = "bucket-t080";
+            request.object_key = "objects/duplicate-failed-upload";
+            request.object_id = "obj-t080-duplicate";
+            request.version = 4;
+            request.object_state = CleanupObjectState::kPending;
+            request.created_at_unix_ms = 1713008100;
+            request.durable_chunks = {
+                MakeCleanupChunkFact("obj-t080-duplicate", 4, 0, 0, 128)};
+
+            const auto candidates = BuildFailedUploadCleanupCandidates(request);
+            ASSERT_EQ(candidates.size(), 1U);
+
+            const std::vector<CleanupCandidate> duplicate_candidates = {
+                candidates.front(),
+                candidates.front()};
+            const auto hook_result =
+                collector.SubmitCleanupCandidates(duplicate_candidates);
+            ASSERT_TRUE(hook_result.ok()) << hook_result.error_detail;
+            EXPECT_EQ(hook_result.submitted_count, 1U);
+            EXPECT_EQ(hook_result.already_exists_count, 1U);
+            EXPECT_EQ(hook_result.rejected_count, 0U);
+            ASSERT_EQ(hook_result.diagnostics.size(), 2U);
+            EXPECT_TRUE(hook_result.diagnostics.front().accepted);
+            EXPECT_TRUE(hook_result.diagnostics.back().already_exists);
+            EXPECT_EQ(hook_result.diagnostics.back().submit_code,
+                      GarbageCollectorSubmitCode::kAlreadyExists);
+            EXPECT_EQ(hook_result.diagnostics.back().status,
+                      StorageNodeStatusCode::kAlreadyExists);
+        }
+
+        TEST_F(StorageGarbageCollectorTest,
                AbortAndDeletedCleanupCandidatesRespectObjectStateBoundaries)
         {
             AbortCleanupRequest abort_request;

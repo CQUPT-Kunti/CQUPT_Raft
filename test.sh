@@ -17,11 +17,14 @@ show_usage() {
   cat <<'EOF'
 Usage:
   ./test.sh
+  ./test.sh --group all [--skip-configure] [--skip-build]
   ./test.sh --group no-kv [--skip-configure] [--skip-build]
   ./test.sh --group recovery [--skip-configure] [--skip-build]
   ./test.sh --help
 
 Groups:
+  all
+    统一全量入口；等价于默认不传 --group 的 configure/build/single-worker CTest 流程。
   no-kv
     轻量 no-KV 审计入口；只构建 no_kv_surface_audit target，并运行 NoKvSurfaceAudit。
   recovery
@@ -189,6 +192,8 @@ done
 
 case "${GROUP}" in
   "")
+    ;;
+  all)
     ;;
   no-kv)
     run_no_kv_group
