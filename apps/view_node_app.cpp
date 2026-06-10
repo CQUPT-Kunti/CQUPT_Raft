@@ -1,5 +1,6 @@
 #include "cluster/cluster_config.h"
 #include "cluster/node_identity.h"
+#include "view/view_service_impl.h"
 #include "view/view_registry.h"
 
 #include <grpcpp/grpcpp.h>
@@ -474,8 +475,12 @@ namespace
                                  &selected_port);
         std::unique_ptr<grpc::ServerCompletionQueue> completion_queue =
             builder.AddCompletionQueue();
+        viewdemo::ViewNodeServiceImpl service(registry);
+        // 入口层只负责把现有 ViewNode gRPC adapter 挂到 server，
+        // 不在 app 中扩展 discovery/authority 业务逻辑。
+        builder.RegisterService(&service);
 
-        // T045 只负责 thin startup：这里先建立 gRPC 生命周期边界与本地 registry，
+        // T045 只负责 thin startup：这里建立 gRPC 生命周期边界并注册已有 adapter，
         // 不把 ViewNode service 业务逻辑扩展进 app，也不在此改动 target wiring。
 
         std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
