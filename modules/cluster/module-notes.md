@@ -2,142 +2,160 @@
 
 ## 模块职责
 
-`modules/cluster/` 负责 008 阶段统一的 cluster / config / identity 公共基础边界。
+`modules/cluster/` 负责 008 阶段统一的 cluster config、单节点解析、初始 Raft quorum 诊断和本地 `node.identity` 持久身份边界。
 
-当前规划中，本模块负责：
+当前代码已经实现的职责主要有：
 
-- `ClusterConfig` 的结构表达、配置生成、配置加载、配置校验边界
-- 统一描述 ViewNode、MetadataNode、StorageNode 的数量、endpoint、`data_dir`、capacity、timeout、chunk policy
-- 初始 Raft membership 的配置生成边界，支持 1/3/5/7 个 MetadataNode voter 配置
-- `NodeIdentity` / `node.identity` 的持久身份边界，包括首次创建、重启复用、identity/config mismatch 检查
-- Linux / Windows 路径、flush、atomic publish、directory durability 等跨平台差异说明
+- `ClusterConfig` / `ClusterConfigGenerationRequest` / `ResolvedClusterNodeConfig` 等配置类型
+- 确定性配置生成、endpoint 分配、文本配置序列化与加载
+- 初始 MetadataNode voter / learner membership 校验与 quorum helper
+- `node.identity` 的 load / store / load-or-create
+- identity/config mismatch、raft_id mismatch、durability publish failure 等诊断
 
-本模块不直接承载运行中的业务编排；它提供的是拓扑、身份和 durability contract 的公共基础。
+本模块只负责“配置和本地身份”这层基础能力，不负责运行时业务 authority。
 
-## 核心概念
+## 当前关键结构和接口
 
-### `ClusterConfig`
+### `cluster_config.h`
 
-- 描述一次集群启动的目标拓扑和关键运行参数。
-- 应统一表达：
-  - `cluster_id`
-  - ViewNode / MetadataNode / StorageNode 列表
-  - endpoint
-  - `data_dir`
-  - `snapshot_dir`
-  - capacity
-  - timeout
-  - chunk policy
-  - 初始 Raft membership
-- 这里负责“配置正确性”和“配置可生成”，不负责运行时共识推进。
+当前对外边界主要包括：
 
-### `NodeIdentity`
+- `ValidateClusterConfig(...)`
+  - 校验 `cluster_id`、节点数量、`node_id`、`endpoint`、`data_dir`、`snapshot_dir`、capacity、chunk policy、timeout policy、raft_id 和初始 membership 一致性
+- `AllocateClusterEndpoints(...)`
+  - 仅根据 generation request 生成稳定 endpoint 分配结果
+  - 不启动节点，不做 discovery
+- `GenerateDeterministicClusterConfig(...)`
+  - 生成可重复、可诊断的完整 `ClusterConfig`
+  - MetadataNode 的 `node_id` 与 `raft_id` 在这里锁定，后续 app 只能校验，不能运行时重写
+- `ResolveClusterNodeConfig(...)`
+  - 按 `node_type + node_id` 精确解析单节点配置
+  - 不允许 fallback 到“第一个节点”或硬编码 demo 拓扑
+- `ComputeInitialRaftQuorum(...)` / `ComputeInitialRaftQuorumSize(...)`
+  - 只根据 initial voter membership 计算 election / commit quorum
+  - 这是配置校验和诊断 helper，不是运行时 membership authority
+- `LoadClusterConfigFromJsonFile(...)` / `SerializeClusterConfigToJson(...)`
+  - 负责文本配置文件读写边界
+  - 不承载 app 生命周期和业务逻辑
 
-- 描述节点本地持久身份。
-- 应至少能表达：
-  - `node_id`
-  - `node_type`
-  - 可选 `raft_id`
-  - `cluster_id`
-  - identity version
-  - 创建来源和时间
-- 关注点是：
-  - 首次创建
-  - 重启复用
-  - 与配置不一致时显式报错
-  - durable write contract
-- 当前 `node_identity.h` 只定义类型和接口边界：
-  - `NodeIdentity` 表达持久身份。
-  - `ExpectedNodeIdentity` 表达启动配置对本地身份的匹配期望。
-  - `NodeIdentityLoadOptions` / `NodeIdentityStoreOptions` 表达 load / store 的输入边界。
-  - `NodeIdentityLoadResult` / `NodeIdentityStoreResult` / `NodeIdentityLoadOrCreateResult` 表达结果、诊断和 durability 状态边界。
-  - `ValidateNodeIdentity` / `ValidateNodeIdentityMatches` / `LoadNodeIdentity` / `StoreNodeIdentity` / `LoadOrCreateNodeIdentity` 仅声明接口，不在头文件实现文件 IO。
-- `node.identity` 当前采用稳定的文本 `key=value` 格式，至少包含 `identity_version`、`cluster_id`、`node_id`、`node_type`、`raft_id`、`created_at_unix_ms`、`source` 字段；格式损坏、缺字段、重复字段或与期望配置冲突时必须返回明确诊断，不能静默覆盖。
-- MetadataNode 必须区分 `node_id` 与 `raft_id`；StorageNode / ViewNode 不应携带 `raft_id`。
-- `node.identity` 已存在且与期望冲突时必须显式失败，不得静默覆盖。
+### `node_identity.h`
 
-### `RaftMembership`
+当前对外边界主要包括：
 
-- 在本模块中只作为“初始配置生成边界”和“静态校验对象”出现。
-- 本模块可以生成或校验初始 voter / learner 配置。
-- 本模块不是运行时 membership authority。
-- 运行中 membership change 只能由 Raft 自己通过已提交日志生效。
+- `NodeIdentity`
+  - 持久身份最少包含：`cluster_id`、`node_id`、`node_type`、可选 `raft_id`、`identity_version`、`created_at_unix_ms`、`source`
+- `ExpectedNodeIdentity`
+  - 表达 app 启动时对本地身份的匹配期望
+  - 非空期望不匹配时必须显式失败，不能静默覆盖
+- `LoadNodeIdentity(...)`
+  - 只负责读取和校验 `node.identity`
+- `StoreNodeIdentity(...)`
+  - 只负责持久化写入与 durability publish
+- `LoadOrCreateNodeIdentity(...)`
+  - 先尝试读取既有 identity；不存在时再创建
+  - 已有 identity 与期望不一致时失败，不会偷偷重建
+- `ValidateNodeIdentity(...)` / `ValidateNodeIdentityMatches(...)`
+  - 做纯校验，不做文件 IO
 
-### endpoint
+## 当前实现流程
 
-- endpoint 用于统一描述节点监听地址和服务发现入口。
-- 本模块负责 endpoint 唯一性、格式合理性、角色归属的一致性校验。
-- 本模块不负责 endpoint 健康状态观测，也不负责发现结果分发。
-- 当前 `ClusterConfig` 只有单一 `endpoint` 字段，因此配置生成阶段不能静默分裂 `bind_host` / `advertise_host`。
-- 在未引入独立 listen/advertise 字段前，生成器应要求 `advertise_host` 为空或与 `bind_host` 一致，并对不一致输入返回明确错误。
+### 配置生成与解析
 
-### `data_dir`
+1. generation request 提供节点数量、固定 `node_id` / `raft_id`、port base、`base_dir`、chunk policy、timeout 等输入
+2. `AllocateClusterEndpoints(...)` 先生成稳定 endpoint 分配
+3. `GenerateDeterministicClusterConfig(...)` 组合：
+   - ViewNode 配置
+   - MetadataNode 配置
+   - StorageNode 配置
+   - initial Raft membership
+4. `ValidateClusterConfig(...)` 统一校验
+5. app 启动时通过 `LoadClusterConfigFromJsonFile(...)` + `ResolveClusterNodeConfig(...)` 恢复自己的单节点配置
 
-- `data_dir` 是本地 durable state 的根路径边界。
-- 本模块负责：
-  - 路径合法性校验
-  - 不同节点目录冲突检查
-  - identity 所属目录和角色匹配关系
-- 本模块不负责具体 chunk、Raft log、snapshot 的读写实现。
+### `node.identity` 读写与复用
 
-### capacity
+1. `ResolveNodeIdentityPath(data_dir)` 固定 identity 文件路径
+2. `LoadNodeIdentity(...)` 解析文本 `key=value` 文件并做结构校验
+3. `ValidateNodeIdentityMatches(...)` 校验本地 identity 与启动配置期望是否一致
+4. `StoreNodeIdentity(...)` 通过临时文件写入 + publish 完成身份持久化
+5. `LoadOrCreateNodeIdentity(...)` 在“读已有”和“首次创建”之间做明确分支
 
-- capacity 用于表达 StorageNode 的静态或初始配置能力。
-- 本模块只负责配置表达与基础校验。
-- 真正的运行时容量变化、健康状态和负载属于 ViewNode / StorageNode 观测事实，不由本模块决定。
+当前实现明确区分：
 
-### durability contract
+- MetadataNode：
+  - 必须区分 `node_id` 与 `raft_id`
+  - 缺 `raft_id`、重复 `raft_id` 或与 config 不匹配都会失败
+- StorageNode / ViewNode：
+  - 不应携带 `raft_id`
+  - 若本地 identity 带了 `raft_id`，会按 mismatch/validation failure 处理
 
-- 本模块负责说明 identity 和配置相关持久化文件的 durability contract。
-- 必须明确：
+## 跨平台 durability 边界
+
+当前 `node.identity` 的 durable publish contract 已经落在实现里：
+
+- Linux：
   - 临时文件写入
-  - flush
-  - atomic publish
-  - directory durability
-  - 平台差异
-- 不允许 required durability operation 出现 no-op success。
+  - 文件 flush / `fsync`
+  - 原子 publish
+  - `data_dir` 目录 `fsync`
+  - 只有全部完成后才能报告 durable success
+- Windows：
+  - 临时文件写入
+  - `FlushFileBuffers`
+  - `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 发布
+  - 由于独立目录 durability 还没有完全等价实现，`kRequired` 模式必须返回明确 `durability_error`
+  - 只允许 `kBestEffortForTests` 以 `durable=false` 返回受限成功
 
-## 禁止事项
+这里的核心约束是：required durability operation 不能 silent no-op success。
 
-- 不实现 Raft 共识、leader election、AppendEntries、InstallSnapshot。
-- 不直接修改已提交的 Raft membership。
-- 不决定对象是否 COMMITTED 可见。
-- 不保存 object manifest 的一致性权威副本。
-- 不处理真实 chunk payload 或文件内容。
-- 不替代 ViewNode 的服务发现、节点注册、心跳观测。
-- 不替代 StorageNode 的 chunk 落盘、publish、checksum、restart recovery 逻辑。
-- 不把配置生成器写成混合业务入口，不把 MetadataNode / ViewNode / StorageNode 的业务逻辑下沉到本模块。
+## 非职责边界
 
-## Linux / Windows 路径与 durability 注意点
+本模块不负责：
 
-- 路径处理应优先使用跨平台语义，不把 Linux 专有路径假设写死进共享配置逻辑。
-- Linux 上，如果 contract 声明要求 durable publish，应明确 file flush 和 directory durability 的要求。
-- Linux 当前实现边界是：临时文件写入 -> 文件 `fsync` -> 原子 publish -> `data_dir` 目录 `fsync`，只有全部完成后才可报告 durable success。
-- Windows 当前实现边界是：临时文件写入 -> `FlushFileBuffers` -> `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 发布；由于独立目录 durability 还没有等价实现，`required` 模式必须返回明确 `durability_error`，只允许 `best_effort_for_tests` 以 `durable=false` 成功返回，禁止静默伪装成 durable success。
-- identity 文件写入必须有“写入中”和“已发布”边界，避免崩溃后把半写状态当成有效身份。
-- `data_dir`、identity 文件名和路径拼接规则必须保持可诊断，避免平台差异导致身份漂移。
+- Raft leader election、log replication、commit、snapshot、runtime membership change
+- ViewNode 注册、心跳、leader hint、cluster view
+- StorageNode chunk 写入、publish、checksum、restart recovery
+- 对象 `PENDING/COMMITTED/DELETED` 可见性
+- 真实 payload、chunk bytes 或整文件内容
 
-## 后续扩展点
+尤其要注意：
 
-- 运行时动态 membership 接口边界：
-  - 本模块只保留配置和参数表达边界，不直接实现运行时 AddRaftNode / RemoveRaftNode / PromoteLearner。
-- 配置热加载：
-  - 可预留接口边界，但热加载不应绕过现有 identity / durability / ownership 校验。
-- 多 ViewNode 配置：
-  - 本模块可以描述多个 ViewNode endpoint 和角色配置，但不赋予其一致性权威。
-- 配置生成器：
-  - 后续可扩展为生成本地开发、测试、基准和多节点部署配置，但必须保持结果可重复、可校验、可追踪。
-  - 当前公共接口已补充：
-    - `LoadClusterConfigFromJsonFile(...)`：从统一配置文件恢复 `ClusterConfig` 并执行基础校验，供 role-specific app startup 复用；它不承载 app 生命周期和业务 authority。
-    - `AllocateClusterEndpoints(...)`：按统一 generation request 为 View / Metadata / Storage 生成稳定 endpoint 分配结果，并对端口冲突、非法 endpoint 给出诊断。
-    - `ResolveClusterNodeConfig(...)`：从完整 `ClusterConfig` 中按 `node_type + node_id` 精确解析单节点启动配置；解析失败必须显式报错，禁止 fallback 到默认节点。
-    - `ComputeInitialRaftQuorum(...)`：只基于 initial voter membership 计算 election / commit quorum，并对空 voter、重复 voter、voter/learner 重叠等配置错误返回诊断；该 helper 不是运行时 membership authority。
+- `ComputeInitialRaftQuorum(...)` 不是运行时 quorum authority
+- `ClusterConfig` 不是动态 membership change API
+- `node.identity` 不会因为 ViewNode 注册结果或 CLI override 被静默改写
 
-## 模块边界总结
+## 容易误用的点
 
-- 本模块表达“系统应该如何被配置和识别”。
-- Raft 模块决定“哪些 metadata 被一致性提交”。
-- ViewNode 模块决定“节点如何被发现和观测”。
-- StorageNode 模块决定“chunk 如何被真实保存和恢复”。
+- 把 `node_id` 和 `raft_id` 混为一谈：
+  - MetadataNode 必须同时维护二者的语义边界
+- 把 config generator 生成的 membership 当成运行时可修改状态：
+  - 当前模块只生成和校验初始配置
+- 用“默认节点”替代显式 `ResolveClusterNodeConfig(...)`：
+  - 当前实现明确禁止这种 fallback
+- 把 Windows best-effort 路径误写成 durable success：
+  - 这会直接破坏 identity/restart contract
 
-`modules/cluster/` 不能跨过这些边界变成新的业务中心。
+## 与其他模块的交互
+
+- `apps/metadata_node_app.cpp`
+  - 使用 cluster 模块解析 config，并校验 config-generated `node_id` / `raft_id`
+- `apps/storage_node_app.cpp` / `apps/view_node_app.cpp`
+  - 使用 `LoadOrCreateNodeIdentity(...)` 加载或创建稳定身份
+- `modules/view/`
+  - 只能消费这里生成/校验过的稳定身份事实，不能反向改写本地 identity
+- `modules/raft/node`
+  - 只读取 config-generated Raft 身份和初始 membership，不由 cluster 模块驱动运行时变更
+
+## 当前状态和后续边界
+
+- 已实现：
+  - 确定性配置生成
+  - 单节点配置解析
+  - 初始 quorum helper
+  - durable identity load/store/load-or-create
+  - identity conflict diagnostics
+- 未实现：
+  - 运行时动态 membership change
+  - config 热加载
+  - 跨节点分布式 identity 协调
+
+后续如果扩展这些能力，仍必须保持“cluster 只负责配置和本地身份，不负责运行时 authority”这条硬边界。

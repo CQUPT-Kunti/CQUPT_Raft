@@ -89,9 +89,9 @@ set(RAFT_008_LABELS_E2E
 set(RAFT_008_LABELS_QUORUM
   "integrated-object-storage;integrated-object-storage-quorum;platform-neutral")
 set(RAFT_008_LABELS_RECOVERY
-  "integrated-object-storage;integrated-object-storage-recovery;storage-transfer;durability-boundary;linux-primary-diagnosis")
+  "integrated-object-storage;integrated-object-storage-recovery;storage-transfer;storage-node;storage-node-recovery;durability-boundary;linux-primary-diagnosis")
 set(RAFT_008_LABELS_CONCURRENCY
-  "integrated-object-storage;integrated-object-storage-concurrency;storage-transfer;platform-neutral;linux-primary-diagnosis")
+  "integrated-object-storage;integrated-object-storage-concurrency;storage-transfer;storage-node;storage-node-concurrency;platform-neutral;linux-primary-diagnosis")
 set(RAFT_008_LABELS_VIEW_NODE
   "integrated-object-storage;view-node;platform-neutral")
 set(RAFT_008_LABELS_NODE_IDENTITY
@@ -908,12 +908,68 @@ if(TARGET test_integrated_object_storage_quorum AND NOT TARGET integrated_object
     DEPENDS test_integrated_object_storage_quorum
   )
 endif()
-add_raft_gtest(test_integrated_object_storage_recovery
-  integrated_object_storage_recovery_test.cpp
-  "${RAFT_008_LABELS_RECOVERY}")
-add_raft_gtest(test_integrated_object_storage_concurrency
-  integrated_object_storage_concurrency_test.cpp
-  "${RAFT_008_LABELS_CONCURRENCY}")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/integrated_object_storage_recovery_test.cpp")
+  add_executable(test_integrated_object_storage_recovery
+    integrated_object_storage_recovery_test.cpp
+  )
+
+  target_link_libraries(test_integrated_object_storage_recovery
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_integrated_object_storage_recovery
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  gtest_discover_tests(test_integrated_object_storage_recovery
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    TEST_PREFIX "integrated_object_storage_recovery."
+    PROPERTIES
+      LABELS "${RAFT_008_LABELS_RECOVERY}"
+  )
+else()
+  message(STATUS "Skip test_integrated_object_storage_recovery: integrated_object_storage_recovery_test.cpp not found")
+endif()
+if(TARGET test_integrated_object_storage_recovery AND NOT TARGET integrated_object_storage_recovery)
+  add_custom_target(integrated_object_storage_recovery
+    DEPENDS test_integrated_object_storage_recovery
+  )
+endif()
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/integrated_object_storage_concurrency_test.cpp")
+  add_executable(test_integrated_object_storage_concurrency
+    integrated_object_storage_concurrency_test.cpp
+  )
+
+  target_link_libraries(test_integrated_object_storage_concurrency
+    PRIVATE
+      raft_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_integrated_object_storage_concurrency
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  gtest_discover_tests(test_integrated_object_storage_concurrency
+    DISCOVERY_TIMEOUT 60
+    DISCOVERY_MODE PRE_TEST
+    TEST_PREFIX "integrated_object_storage_concurrency."
+    PROPERTIES
+      LABELS "${RAFT_008_LABELS_CONCURRENCY}"
+  )
+else()
+  message(STATUS "Skip test_integrated_object_storage_concurrency: integrated_object_storage_concurrency_test.cpp not found")
+endif()
+if(TARGET test_integrated_object_storage_concurrency AND NOT TARGET integrated_object_storage_concurrency)
+  add_custom_target(integrated_object_storage_concurrency
+    DEPENDS test_integrated_object_storage_concurrency
+  )
+endif()
 add_raft_gtest(test_view_node_discovery
   view_node_discovery_test.cpp
   "${RAFT_008_LABELS_VIEW_NODE}")

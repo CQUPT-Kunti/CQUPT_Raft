@@ -217,8 +217,8 @@
 - [X] T081 [US6] Add cleanup candidate emission from failed upload sessions in `modules/store/transfer/object_transfer.cpp`
 - [X] T082 [US6] Add retry/backoff policy for transient StorageNode failures in `modules/store/transfer/storage_transfer_client.cpp`
 - [X] T083 [US6] Add bounded concurrency controls for upload/download sessions in `modules/store/transfer/object_transfer.cpp`
-- [ ] T084 [US6] Wire recovery and concurrency test targets in `tests/CMakeLists.txt`
-- [ ] T085 [US6] Record Linux-specific failure validation and Windows fallback notes in `specs/008-integrated-object-storage-system/risk-register.md`
+- [X] T084 [US6] Wire recovery and concurrency test targets in `tests/CMakeLists.txt`
+- [X] T085 [US6] Record Linux-specific failure validation and Windows fallback notes in `specs/008-integrated-object-storage-system/risk-register.md`
 
 **Checkpoint**: User Story 6 validates failure and concurrency behavior beyond happy path.
 
@@ -228,9 +228,9 @@
 
 **Purpose**: 收口文档、诊断、跨平台和验收矩阵。
 
-- [ ] T086 [P] Add or update module notes for `modules/cluster/module-notes.md`, `modules/view/module-notes.md`, and `modules/store/transfer/module-notes.md`
-- [ ] T087 [P] Add validation matrix for acceptance scenarios in `specs/008-integrated-object-storage-system/validation-matrix.md`
-- [ ] T088 [P] Add Windows startup and path smoke notes to `specs/008-integrated-object-storage-system/quickstart.md`
+- [X] T086 [P] Add or update module notes for `modules/cluster/module-notes.md`, `modules/view/module-notes.md`, and `modules/store/transfer/module-notes.md`
+- [X] T087 [P] Add validation matrix for acceptance scenarios in `specs/008-integrated-object-storage-system/validation-matrix.md`
+- [X] T088 [P] Add Windows startup and path smoke notes to `specs/008-integrated-object-storage-system/quickstart.md`
 - [ ] T089 Add request_id/node_id/leader-hint diagnostic consistency checks across `apps/storage_client.cpp`, `modules/view/view_service_impl.cpp`, and `modules/raft/service/metadata_service_impl.cpp`
 - [ ] T090 Run `cmake --preset debug-ninja-low-parallel` and save only failure summaries to `specs/008-integrated-object-storage-system/task-reports/` if needed
 - [ ] T091 Run `cmake --build --preset debug-ninja-low-parallel` and save only failure summaries to `specs/008-integrated-object-storage-system/task-reports/` if needed

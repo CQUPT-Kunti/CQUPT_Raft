@@ -2,111 +2,214 @@
 
 ## 模块职责
 
-`modules/view/` 规划承载 008 阶段的 ViewNode 注册、心跳、服务发现和状态观测逻辑。它帮助 Client 发现 MetadataNode / StorageNode，帮助运维视角查看节点健康、容量、负载、leader hint 和冲突诊断。
+`modules/view/` 负责 008 阶段的 ViewNode registry、gRPC service adapter、client adapter 和 discovery/observation 边界。
 
-ViewNode 的定位是 discovery-only / observation-only：它可以展示观测到的事实和候选端点，但不成为对象元数据、Raft membership 或 chunk 数据的权威。
+当前代码已经实现的能力主要有：
 
-## 核心概念
+- 内存型 `ViewNodeRegistry`
+- `RegisterNode` / `HeartbeatNode` / `DiscoverMetadata` / `DiscoverStorage` / `GetClusterView`
+- liveness 推导、Metadata leader hint 观测、storage writable 过滤
+- ViewNode gRPC service adapter
+- ViewNode gRPC client adapter
+- StorageNode 首次注册时基于 `data_dir_fingerprint` 的 `node_id` 分配/确认路径
 
-- `NodeRegistration`：记录 node_id、node_type、endpoint、data/control plane endpoint、capacity、health、load、failure_domain、last heartbeat 和冲突诊断字段。注册相同 node_id 且兼容 endpoint 时应幂等；同 endpoint 不同 node_id 或同 node_id 不兼容注册必须可诊断。
-- `Heartbeat`：节点周期性上报 sequence、observed_at、health、load、capacity 和可选 leader hint。低 sequence 或旧观测不得覆盖较新事实。
-- `Liveness`：ViewNode 根据 heartbeat 新鲜度推导 `LIVE`、`STALE`、`SUSPECT`、`DEAD` 等观测状态。状态转换是服务发现输入，不是 Raft quorum 或对象可见性的依据。
-- `DiscoverMetadata`：返回可用 MetadataNode endpoint、leader hint、观测到的 membership 状态和 freshness。Client 仍必须处理 `NOT_LEADER`、quorum failure 和 MetadataNode 返回的权威结果。
-- `DiscoverStorage`：返回 StorageNode endpoint、容量、负载和健康事实，供后续 placement / client 解析 endpoint 使用。placement 权威仍在 metadata control-plane 的策略和已提交 metadata 中。
-- `GetClusterView`：返回 ViewNode、MetadataNode、StorageNode 的观测快照，包括 liveness、capacity、leader hint、冲突和 stale 警告。
-- `leader hint`：MetadataNode leader 的非权威观测提示，用于减少 Client 重试成本；过期或错误时不得影响 Raft election 和 commit 安全。
+它的定位始终是 discovery-only / observation-only，不是 Raft 或对象状态的权威节点。
 
-## `view_registry.h` 接口边界
+## 当前关键结构和接口
 
-`modules/view/view_registry.h` 只定义 `viewdemo::ViewNodeRegistry` 的类型和接口边界，不包含注册、心跳排序、liveness transition 或 discovery snapshot 的实现。核心类型包括节点类型、liveness、健康状态、MetadataNode 观测角色、membership 观测状态、注册请求、heartbeat 请求、节点快照、diagnostic、metadata/storage discovery 结果和 cluster view 快照。
+### `view_registry.h`
 
-`ViewNodeRegistry` 对外暴露 `RegisterNode`、`HeartbeatNode`、`LookupNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView`、`size` 和 `config`。查询接口显式接收 `now_unix_ms`，方便后续 T016 使用确定性时间源实现和测试 liveness 计算。该头文件不包含 proto/gRPC 依赖；T018/T019 的 service adapter 负责 proto 字段与 registry 类型之间的映射。
+当前 registry 暴露的核心类型和接口包括：
 
-## `view_service_impl.h` 接口边界
+- 观测类型：
+  - `NodeRegistration`
+  - `ViewNodeSnapshot`
+  - `MetadataLeaderHint`
+  - `MetadataNodeObservation`
+  - `ViewRegistryDiagnostic`
+- 请求/结果类型：
+  - `RegisterNodeRequest/Result`
+  - `HeartbeatNodeRequest/Result`
+  - `DiscoverMetadataRequest/Result`
+  - `DiscoverStorageRequest/Result`
+  - `GetClusterViewRequest/Result`
+- 运行配置：
+  - `ViewRegistryConfig`
+  - 包括 `stale_timeout`、`suspect_timeout`、`dead_timeout`、endpoint 唯一性和 dead node 保留策略
+- 对外接口：
+  - `RegisterNode(...)`
+  - `HeartbeatNode(...)`
+  - `LookupNode(...)`
+  - `DiscoverMetadata(...)`
+  - `DiscoverStorage(...)`
+  - `GetClusterView(...)`
 
-`modules/view/view_service_impl.h` 只定义 `view::ViewNodeService::Service` 到 `viewdemo::ViewNodeRegistry` 的 gRPC adapter 声明，不实现 RPC 逻辑。它应：
+### `view_service_impl.h`
 
-- 通过依赖注入持有 `ViewNodeRegistry`
-- 为 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 预留同步 unary RPC 处理边界
-- 允许注入确定性时间源，便于后续 T019 和测试控制 `now_unix_ms`
+`ViewNodeServiceImpl` 是 proto/view 与 `ViewNodeRegistry` 之间的 unary gRPC adapter：
 
-它不负责：
+- 只负责字段映射、时间注入和错误收敛
+- 不承载 app 生命周期
+- 不修改 membership、不决定对象可见性、不操作 payload
 
-- 修改 Raft membership 或缩小 quorum
-- 决定对象 `COMMITTED` 可见性
-- 读写 StorageNode chunk payload
-- 承载 `view_node_app` 启动和进程生命周期编排
+### `view_client.h`
 
-## `view_client.h` / `view_client.cpp` 边界
+`ViewNodeClient` 是调用方复用的 RPC client adapter：
 
-`modules/view/view_client.h` / `modules/view/view_client.cpp` 负责把调用方的 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 请求映射到 `ViewNodeService` unary RPC，并把 proto response 转回本地 `viewdemo` 结果类型。当前实现支持：
+- 统一 timeout / `wait_for_ready` 配置
+- 返回 transport 诊断和 registry 语义结果
+- 供 `metadata_node_app`、`storage_node_app`、`storage_client` 和 transfer 编排复用
 
-- 按 RPC 类型应用默认 timeout，并允许单次调用覆盖 timeout / `wait_for_ready`
-- 返回 transport 诊断（gRPC status code、message、details、effective timeout、retryable）
-- 把 summary / snapshot / warning 转为本地结果与 diagnostics
+## 当前实现流程
 
-它不负责：
+### registry
 
-- 对 leader hint 做强一致解释
-- 决定对象 `COMMITTED` 可见性
-- 修改 Raft membership 或 quorum
-- 操作 StorageNode payload
-- 实现 upload/download 编排或 app 注册/心跳循环
+`view_registry.cpp` 当前是内存 registry，实现重点包括：
 
-## `view_service_impl.cpp` 实现边界
+1. 注册请求校验：
+   - `cluster_id`
+   - `node_id`
+   - `node_type`
+   - endpoint
+2. endpoint / `node_id` / `data_dir_fingerprint` 冲突诊断
+3. heartbeat sequence 去旧
+4. 根据 `last_seen_unix_ms` 和 registry timeout 推导：
+   - `LIVE`
+   - `STALE`
+   - `SUSPECT`
+   - `DEAD`
+5. 生成 discovery snapshot 和 cluster view
 
-`modules/view/view_service_impl.cpp` 负责把 `proto/view.proto` 请求映射到 `ViewNodeRegistry`，并把 registry 结果映射回 gRPC response。它应：
+Metadata 观测状态在快照阶段会做保守归一化：
 
-- 保持 `RegisterNode`、`HeartbeatNode`、`DiscoverMetadata`、`DiscoverStorage`、`GetClusterView` 的同步 unary adapter 实现
-- 对 StorageNode 首次注册补 node_id allocation / confirmation service path，但不把
-  ViewNode 变成 metadata authority 或 membership authority
-- 返回可诊断的 summary、snapshot、warning 和 leader hint 观测信息
-- 支持注入 `now_unix_ms`，避免 discovery / cluster view 实现偷偷依赖不可控全局时间
-- 把 registry 异常收敛为明确的 gRPC internal failure，而不是静默吞掉
+- 已注册但 membership 未明确时，只展示为 `REGISTERED`
+- `LEARNER` 只表示观测上的 learner，不等于 committed membership
+- `DEAD` / `UNAVAILABLE` 会映射成 `DOWN`
 
-它不负责：
+这些都只是观测显示，不授予任何 Raft authority。
 
-- 把注册结果解释为已提交 Raft membership
-- 把 leader hint 当成强一致 leader authority
-- 把 StorageNode discovery 结果解释为对象可见性
-- 保存 object manifest 或 chunk payload
+### service adapter
 
-## `view_registry.cpp` 实现边界
+`view_service_impl.cpp` 负责：
 
-`modules/view/view_registry.cpp` 实现内存 registry，不做持久化、RPC 适配或 app 启动逻辑。当前实现负责注册幂等检查、同 cluster endpoint 冲突诊断、heartbeat sequence 去旧、观测事实刷新、按 `stale_timeout` / `suspect_timeout` / `dead_timeout` 计算 `LIVE` / `STALE` / `SUSPECT` / `DEAD`，以及生成 MetadataNode、StorageNode 和 ClusterView 快照。
+- proto 枚举和本地枚举之间的转换
+- gRPC request/response 与 registry 类型之间的映射
+- `now_unix_ms` 注入
+- 异常收敛成明确的 gRPC internal failure
 
-Discovery snapshot 只返回候选端点和观测事实。MetadataNode 的 leader hint 只按观测 term / 时间选择最新提示；StorageNode 的 capacity、health、load 只用于发现过滤和诊断，不代表对象可见性。后续测试应覆盖重复注册、endpoint 冲突、stale heartbeat、liveness 过滤、leader hint 选择和 storage writable 过滤。
+其中 StorageNode first registration 的 `node_id` 路径已经接入：
 
-对于 MetadataNode 的 Raft 观测状态，registry 会在快照输出阶段做保守归一化：
+- 当 StorageNode 注册请求 `node_id` 为空时，service 会要求非空 `data_dir_fingerprint`
+- 使用 `cluster_id + '\n' + data_dir_fingerprint` 做 FNV-1a 64 计算
+- 生成稳定 `store-<hex>` 形式的 `node_id`
+- 如果该 fingerprint 已绑定既有 storage registration，则走 confirm-existing
+- 如果同 fingerprint 或已分配 `node_id` 指向不兼容记录，则返回冲突
 
-- MetadataNode 已注册但未携带明确 membership 状态时，默认展示为 `REGISTERED`，表示“已被 ViewNode 观测到”，不是已提交 membership。
-- 观测 role 为 `LEARNER` 且 membership 状态未知时，可展示为 `LEARNER`。
-- 节点被判定为 `DEAD` 或 heartbeat/health 已观测为 `UNAVAILABLE` 时，快照中的 membership 观测状态映射为 `DOWN`。
+这条路径只解决“ViewNode 侧 StorageNode 首次注册 identity allocation/confirmation”，不意味着：
 
-以上映射只服务于 discovery、status 和 diagnostics；它不会把 ViewNode 注册结果解释为 voter authority，也不会修改 Raft quorum、election 或 committed membership。
+- 修改 Raft membership
+- 给 MetadataNode 分配 `raft_id`
+- 改写本地 `node.identity`
 
-## Non-Authority Boundary
+### client adapter
 
-ViewNode 不保存 object manifest 的一致性权威副本，不决定对象是否 `COMMITTED` 可见，不参与 `CommitObject`，不直接读写 StorageNode chunk 数据。
+`view_client.cpp` 当前负责：
 
-ViewNode 不修改 Raft membership，不降低 Raft quorum，不参与 Raft leader election，也不把新注册 MetadataNode 直接提升为 voter。MetadataNode 的 `REGISTERED`、`JOINING`、`LEARNER`、`VOTER`、`DOWN` 只是在 ViewNode 中展示的观测状态；Raft voter 身份和 quorum 只能来自 Raft 已提交 membership。
+- 统一构造 unary RPC context
+- 设置 deadline / `wait_for_ready`
+- 解析 proto summary / warning / snapshot / leader hint
+- 把 proto warning code 映射到本地 `ViewRegistryIssueCode`
+- 输出 transport 诊断：
+  - gRPC status code
+  - error message/details
+  - effective timeout
+  - retryable
 
-## 与其他组件的关系
+client adapter 只做 transport + proto 映射，不做强一致推理。
 
-- MetadataNode：向 ViewNode 注册 endpoint、raft_id、观测角色、membership 观测状态和 leader hint。对象 manifest、WritePlan、CommitObject、PENDING/COMMITTED 可见性仍由 Raft metadata control-plane 决定。
-- StorageNode：向 ViewNode 注册 node_id、endpoint、capacity、health、load 和 failure domain，并持续 heartbeat。真实 chunk 写入、读取、publish durability 和清理由 StorageNode data-plane 负责。
-- Client：通过 ViewNode 获取 MetadataNode / StorageNode 候选地址和集群状态，但上传下载必须以 MetadataNode 的 WritePlan / COMMITTED manifest 和 StorageNode chunk RPC 结果为准。
-- ViewNode：多个 ViewNode 之间在第一阶段不提供共识；单个 ViewNode 的 registry 是发现和观测缓存，不是强一致元数据副本。
+## 关键边界
 
-## 后续扩展点
+### discovery / observation only
 
-- 多 ViewNode 启动和 Client failover。
-- ViewNode 自身高可用或 registry 复制，但必须先定义一致性和故障语义。
-- 注册租约、租约续期和明确的过期策略。
-- registry 状态持久化及 Linux/Windows durability contract。
-- 认证授权、租户隔离和管理审计。
-- 更细粒度的容量、负载、failure domain、draining/maintenance 状态和诊断指标。
+ViewNode 可以：
 
-## 测试与诊断要求
+- 返回 MetadataNode 候选 endpoint
+- 返回 leader hint
+- 返回 StorageNode endpoint / 容量 / health / load 快照
+- 返回 cluster view
 
-后续实现应覆盖注册幂等、身份冲突、heartbeat sequence 去旧、liveness 超时转换、发现快照 freshness、leader hint 过期、StorageNode dead 排除和 MetadataNode 注册不改变 quorum 等场景。诊断输出应保留 request_id、node_id、endpoint、sequence、状态和冲突原因，便于高并发与故障恢复场景定位。
+ViewNode 不可以：
+
+- 保存 object manifest 权威副本
+- 决定对象是否 `COMMITTED` 可见
+- 参与 `CommitObject`
+- 修改 Raft membership
+- 缩小 quorum
+- 参与 leader election
+- 直接读写 StorageNode chunk payload
+
+### MetadataNode registration 与 voter membership 的边界
+
+MetadataNode 在 ViewNode 中可以带：
+
+- `raft_id`
+- `raft_role`
+- `membership_state`
+- `leader_hint`
+- `term`
+- `commit_index`
+- `membership_epoch`
+
+但这些都只是“被上报或被观测到的事实”。即使 `membership_state` 显示为 `VOTER`，其权威来源也只能是 Metadata/Raft 自己的已提交状态，不是 ViewNode。
+
+### StorageNode first registration / node_id allocation 边界
+
+这条路径只允许用于 StorageNode：
+
+- 依赖 `data_dir_fingerprint` 做稳定 node_id 分配或确认
+- 解决首次注册 node_id 缺失的问题
+
+误用风险主要有两类：
+
+- 把它当成 MetadataNode / ViewNode 的通用 identity authority
+- 把“已在 ViewNode 注册成功”误解释成“已持久化本地 identity”
+
+当前实现都没有这么做，后续维护也不能越界。
+
+## 与其他模块的交互
+
+- `apps/metadata_node_app.cpp`
+  - 启动后用 `ViewNodeClient` 注册自己并上报 leader/quorum 观测信息
+- `apps/storage_node_app.cpp`
+  - 启动后用 `ViewNodeClient` 注册自己并做 heartbeat
+- `modules/store/placement`
+  - 只消费 ViewNode 暴露的 StorageNode snapshot 作为 placement 候选输入
+- `modules/store/transfer`
+  - 只把 `DiscoverMetadata` / `DiscoverStorage` 结果当成 endpoint 候选，不当成对象可见性 authority
+
+## 容易误用的点
+
+- 把 leader hint 当成强一致 leader 事实
+  - 当前实现明确要求调用方继续处理 `NOT_LEADER`
+- 把 registry 的 membership 观测状态当成 committed voter 集合
+  - 这会直接破坏 quorum 边界
+- 把 `DiscoverStorage` 的 live/healthy 结果当成对象可见性依据
+  - transfer 和 client 都不能这么做
+- 把 StorageNode first registration allocation 当成通用 node identity 服务
+  - 当前只支持 StorageNode 的 first registration path
+
+## 当前状态和后续边界
+
+- 已实现：
+  - registry
+  - service/client adapter
+  - liveness 计算
+  - leader hint 观测
+  - StorageNode first registration / confirmation path
+- 未实现：
+  - ViewNode 自身高可用或复制
+  - registry 持久化
+  - 多 ViewNode 共识
+  - 认证授权和租户隔离
+
+后续扩展这些能力时，仍必须保持“ViewNode 只负责 discovery/observation，不负责 metadata authority、membership authority 和 payload path”这条硬边界。
