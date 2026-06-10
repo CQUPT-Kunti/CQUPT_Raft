@@ -65,6 +65,12 @@ T032 当前实现采用“现有 MetadataService 边界内的最小映射”：
   - 可以做 endpoint -> gRPC channel 的轻量缓存，但不缓存对象可见性或 manifest authority
   - 只转换 data-plane request/response、retryable 状态、durable/already_exists/verified 等事实
   - 不把 StorageNode 本地 live chunk 状态解释成对象 `COMMITTED` 可见
+- T082 在此基础上补充了 transfer adapter 自身的 transient retry/backoff 边界：
+  - 只对 `Timeout`、`IoError`、`Overloaded`、`NodeUnavailable` 这类 `IsRetriableStatus(...)` 可判定的临时失败做有限重试
+  - `ChecksumMismatch`、`Corrupted`、`InvalidArgument`、`DiskFull`、`NotFound` 等非临时失败不会被 adapter 盲目重试
+  - retry 会复用同一 `request_id` / chunk identity，并把 transfer 总 deadline 折算成每次尝试的剩余超时，避免累计超时失控
+  - backoff 由 `initial_backoff_ms` 和 `max_backoff_ms` 约束；即使服务端给出 `retry_after_ms`，也只在本地有界窗口内遵守
+  - 重试耗尽或 deadline 到期时返回带 `request_id`、`chunk_id`、`node_id`、`endpoint`、`attempt` 的清晰诊断，不把数据损坏伪装成可恢复重试
 
 ### chunk reader
 

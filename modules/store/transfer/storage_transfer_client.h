@@ -76,8 +76,16 @@ namespace storedemo
 
     struct StorageTransferClientConfig
     {
-        // 复用 StorageNodeClient 的写入重试上限，但不在这里引入 upload/download 编排。
+        // 透传给 StorageNodeClient 的单次 WriteChunk RPC 内部重试上限。
         std::uint32_t max_write_retries{0};
+        // transfer adapter 对可重试临时失败额外允许的写入重试次数。
+        std::uint32_t max_transient_write_retries{1};
+        // transfer adapter 对可重试临时失败额外允许的读取重试次数。
+        std::uint32_t max_transient_read_retries{1};
+        // 有界退避起始值；为 0 时表示发生 retry 时不主动 sleep。
+        std::uint32_t initial_backoff_ms{10};
+        // 有界退避上限，避免因单个 chunk 传输放大阻塞。
+        std::uint32_t max_backoff_ms{50};
         // 为空时默认使用 insecure channel credentials。
         std::shared_ptr<grpc::ChannelCredentials> channel_credentials;
     };

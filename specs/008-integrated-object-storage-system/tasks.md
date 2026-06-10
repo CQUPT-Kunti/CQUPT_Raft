@@ -188,7 +188,7 @@
 
 ### Implementation for User Story 4
 
-- [ ] T071 [US4] Integrate identity load/create into `apps/storage_node_app.cpp`
+- [X] T071 [US4] Integrate identity load/create into `apps/storage_node_app.cpp`
 - [X] T072 [US4] Integrate identity load/create into `apps/view_node_app.cpp`
 - [X] T073 [US4] Integrate config-generated node_id and raft_id validation into `apps/metadata_node_app.cpp`
 - [X] T074 [US4] Add ViewNode node_id allocation path for StorageNode first registration in `modules/view/view_service_impl.cpp`
@@ -213,9 +213,9 @@
 
 ### Implementation for User Story 6
 
-- [ ] T080 [US6] Add orphan/staging cleanup integration hook in `modules/store/maintenance/garbage_collector.cpp`
+- [X] T080 [US6] Add orphan/staging cleanup integration hook in `modules/store/maintenance/garbage_collector.cpp`
 - [ ] T081 [US6] Add cleanup candidate emission from failed upload sessions in `modules/store/transfer/object_transfer.cpp`
-- [ ] T082 [US6] Add retry/backoff policy for transient StorageNode failures in `modules/store/transfer/storage_transfer_client.cpp`
+- [X] T082 [US6] Add retry/backoff policy for transient StorageNode failures in `modules/store/transfer/storage_transfer_client.cpp`
 - [ ] T083 [US6] Add bounded concurrency controls for upload/download sessions in `modules/store/transfer/object_transfer.cpp`
 - [ ] T084 [US6] Wire recovery and concurrency test targets in `tests/CMakeLists.txt`
 - [ ] T085 [US6] Record Linux-specific failure validation and Windows fallback notes in `specs/008-integrated-object-storage-system/risk-register.md`

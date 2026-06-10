@@ -204,6 +204,16 @@
 - 输出：携带 `task_id/chunk_id/object_id/version/chunk_index/reason/metadata_boundary` 的 `GarbageCollectorTask`
 - 边界：只做字段映射，不做提交、持久化或 safety decision
 
+### `GarbageCollector::SubmitCleanupCandidates(const std::vector<CleanupCandidate>&)`
+
+- 责任：把 orphan / pending-timeout / failed-upload / abort / deleted cleanup candidates 统一接入 GC task 提交入口。
+- 输入：已经带有 `reason/object identity/chunk identity/metadata_boundary` 的 `CleanupCandidate` 列表。
+- 输出：逐 candidate 的提交诊断，以及整体提交统计。
+- 边界：
+  - 这里只做 `candidate -> task -> SubmitTask(...)` 的集成收口，不直接删除 chunk。
+  - 是否允许删除已 COMMITTED live chunk，仍由 metadata-driven safety checker 决定。
+  - `AlreadyExists` 只表示 cleanup 请求已可诊断地幂等收敛，不代表 metadata authority 已发生变化。
+
 ### `ValidateRecoveredTask(GarbageCollectorTask*, std::string*)`
 
 - 责任：校验从持久化 snapshot 读回的 task 是否具备恢复所需的最小字段

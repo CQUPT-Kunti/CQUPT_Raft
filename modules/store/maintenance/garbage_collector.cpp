@@ -504,6 +504,30 @@ namespace storedemo
                 .error_detail = std::move(delete_response.error_detail),
                 .retry_after_ms = delete_response.retry_after_ms};
         }
+
+        GarbageCollectorCleanupHookDiagnostic MakeCleanupHookDiagnostic(
+            const CleanupCandidate &candidate,
+            const GarbageCollectorTask &task,
+            const GarbageCollectorSubmitResult &submit_result)
+        {
+            return GarbageCollectorCleanupHookDiagnostic{
+                .source = candidate.source,
+                .object_state = candidate.object_state,
+                .reason = candidate.reason,
+                .chunk_id = candidate.identity.chunk_id,
+                .object_id = candidate.identity.object_id,
+                .version = candidate.identity.version,
+                .chunk_index = candidate.identity.chunk_index,
+                .task_id = task.task_id,
+                .metadata_boundary = candidate.metadata_boundary,
+                .submit_code = submit_result.code,
+                .status = submit_result.status_code(),
+                .error_detail = submit_result.error_detail,
+                .queue_depth = submit_result.queue_depth,
+                .accepted = submit_result.code == GarbageCollectorSubmitCode::kAccepted,
+                .already_exists =
+                    submit_result.code == GarbageCollectorSubmitCode::kAlreadyExists};
+        }
     }
 
     struct GarbageCollector::Impl
@@ -1230,6 +1254,57 @@ namespace storedemo
             ++impl_->submitted_tasks;
         }
         impl_->cv.notify_all();
+        return result;
+    }
+
+    GarbageCollectorCleanupHookResult GarbageCollector::SubmitCleanupCandidates(
+        const std::vector<CleanupCandidate> &candidates)
+    {
+        GarbageCollectorCleanupHookResult result;
+        if (candidates.empty())
+        {
+            result.status = StorageNodeStatusCode::kInvalidArgument;
+            result.error_detail = "cleanup candidates must not be empty";
+            return result;
+        }
+
+        result.diagnostics.reserve(candidates.size());
+        for (const auto &candidate : candidates)
+        {
+            const auto task = CleanupCandidateToGarbageCollectorTask(candidate);
+            const auto submit_result = SubmitTask(task);
+            result.final_queue_depth = submit_result.queue_depth;
+            result.diagnostics.push_back(
+                MakeCleanupHookDiagnostic(candidate, task, submit_result));
+
+            if (submit_result.code == GarbageCollectorSubmitCode::kAccepted)
+            {
+                ++result.submitted_count;
+                continue;
+            }
+
+            if (submit_result.code == GarbageCollectorSubmitCode::kAlreadyExists)
+            {
+                ++result.already_exists_count;
+                continue;
+            }
+
+            ++result.rejected_count;
+            if (result.status == StorageNodeStatusCode::kOk)
+            {
+                result.status = submit_result.status_code();
+                result.error_detail = submit_result.error_detail;
+            }
+        }
+
+        result.partial_acceptance =
+            result.rejected_count != 0 &&
+            (result.submitted_count != 0 || result.already_exists_count != 0);
+        if (result.rejected_count == 0)
+        {
+            result.status = StorageNodeStatusCode::kOk;
+            result.error_detail.clear();
+        }
         return result;
     }
 

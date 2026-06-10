@@ -2,7 +2,10 @@
 
 #include "store/node/storage_node_client.h"
 
+#include <algorithm>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -134,6 +137,202 @@ namespace storedemo
             result.verified = response.verified;
             return result;
         }
+
+        using TransferClock = std::chrono::steady_clock;
+
+        [[nodiscard]] bool HasDeadline(const StorageTaskContext &context)
+        {
+            return context.timeout_ms != 0;
+        }
+
+        [[nodiscard]] TransferClock::time_point ResolveAbsoluteDeadline(
+            const StorageTaskContext &context)
+        {
+            return HasDeadline(context)
+                       ? TransferClock::now() +
+                             std::chrono::milliseconds(context.timeout_ms)
+                       : TransferClock::time_point::max();
+        }
+
+        [[nodiscard]] bool HasDeadlineExpired(
+            const StorageTaskContext &context,
+            const TransferClock::time_point absolute_deadline)
+        {
+            return HasDeadline(context) && TransferClock::now() >= absolute_deadline;
+        }
+
+        [[nodiscard]] std::uint64_t RemainingTimeoutMs(
+            const StorageTaskContext &context,
+            const TransferClock::time_point absolute_deadline)
+        {
+            if (!HasDeadline(context))
+            {
+                return 0;
+            }
+
+            const auto now = TransferClock::now();
+            if (now >= absolute_deadline)
+            {
+                return 1;
+            }
+
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    absolute_deadline - now)
+                    .count();
+            return static_cast<std::uint64_t>(std::max<std::int64_t>(1, remaining));
+        }
+
+        [[nodiscard]] StorageTaskContext MakeAttemptContext(
+            const StorageTaskContext &base_context,
+            const TransferClock::time_point absolute_deadline)
+        {
+            StorageTaskContext context = base_context;
+            if (HasDeadline(base_context))
+            {
+                context.timeout_ms =
+                    RemainingTimeoutMs(base_context, absolute_deadline);
+            }
+            return context;
+        }
+
+        [[nodiscard]] std::uint64_t ComputeBackoffMs(
+            const StorageTransferClientConfig &config,
+            const std::uint64_t retry_after_ms,
+            const std::uint32_t failure_index)
+        {
+            const std::uint64_t cap = config.max_backoff_ms;
+            const std::uint64_t base = config.initial_backoff_ms;
+            if (cap == 0)
+            {
+                return 0;
+            }
+
+            std::uint64_t delay = base;
+            if (delay != 0)
+            {
+                const std::uint32_t shift = std::min<std::uint32_t>(failure_index, 10);
+                for (std::uint32_t i = 0; i < shift && delay < cap; ++i)
+                {
+                    delay = std::min<std::uint64_t>(cap, delay * 2);
+                }
+            }
+            if (retry_after_ms != 0)
+            {
+                delay = std::max(delay,
+                                 std::min<std::uint64_t>(cap, retry_after_ms));
+            }
+            return std::min(delay, cap);
+        }
+
+        template <typename Result>
+        void AnnotateAttemptFailure(Result *result,
+                                    const std::string_view operation,
+                                    const std::string &request_id,
+                                    const StorageTransferTarget &target,
+                                    const ChunkId &chunk_id,
+                                    const std::uint32_t attempts_used,
+                                    const std::uint32_t max_retries)
+        {
+            if (result == nullptr)
+            {
+                return;
+            }
+
+            std::string detail = operation == "WriteChunk"
+                                     ? "WriteChunk transient failure"
+                                     : "ReadChunk transient failure";
+            detail += " after ";
+            detail += std::to_string(attempts_used);
+            detail += " attempt(s)";
+            detail += " (max_retries=";
+            detail += std::to_string(max_retries);
+            detail += ", request_id=";
+            detail += request_id;
+            detail += ", chunk_id=";
+            detail += chunk_id;
+            detail += ", node_id=";
+            detail += target.node_id.empty() ? "<unknown>" : target.node_id;
+            detail += ", endpoint=";
+            detail += target.endpoint.empty() ? "<unknown>" : target.endpoint;
+            detail += ", status=";
+            detail += ToString(result->status);
+            detail += ")";
+            if (!result->error_detail.empty())
+            {
+                detail += ": ";
+                detail += result->error_detail;
+            }
+            result->error_detail = std::move(detail);
+        }
+
+        template <typename Result>
+        Result MakeDeadlineExceededResult(const Result &last_result,
+                                          const std::string_view operation,
+                                          const std::string &request_id,
+                                          const StorageTransferTarget &target,
+                                          const ChunkId &chunk_id,
+                                          const std::uint32_t attempts_used)
+        {
+            Result result = last_result;
+            result.status = StorageNodeStatusCode::kTimeout;
+            result.retryable = true;
+            result.target = target;
+            result.error_detail =
+                std::string(operation == "WriteChunk"
+                                ? "WriteChunk retry deadline expired"
+                                : "ReadChunk retry deadline expired") +
+                " before attempt " + std::to_string(attempts_used + 1) +
+                " (request_id=" + request_id + ", chunk_id=" + chunk_id +
+                ", node_id=" +
+                (target.node_id.empty() ? std::string("<unknown>") : target.node_id) +
+                ", endpoint=" +
+                (target.endpoint.empty() ? std::string("<unknown>") : target.endpoint) +
+                ")";
+            return result;
+        }
+
+        [[nodiscard]] bool SleepForRetryBackoff(
+            const std::uint64_t backoff_ms,
+            const StorageTaskContext &context,
+            const TransferClock::time_point absolute_deadline)
+        {
+            if (backoff_ms == 0)
+            {
+                return true;
+            }
+
+            std::uint64_t bounded_backoff_ms = backoff_ms;
+            if (HasDeadline(context))
+            {
+                const auto now = TransferClock::now();
+                if (now >= absolute_deadline)
+                {
+                    return false;
+                }
+
+                const auto remaining_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        absolute_deadline - now)
+                        .count();
+                if (remaining_ms <= 0)
+                {
+                    return false;
+                }
+                bounded_backoff_ms = std::min<std::uint64_t>(
+                    bounded_backoff_ms,
+                    static_cast<std::uint64_t>(remaining_ms));
+            }
+
+            if (bounded_backoff_ms == 0)
+            {
+                return true;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(bounded_backoff_ms));
+            return true;
+        }
     } // namespace
 
     class GrpcStorageTransferClient final : public StorageTransferClient
@@ -184,14 +383,63 @@ namespace storedemo
             node_request.expected_checksum = request.expected_checksum;
             node_request.payload = request.payload;
 
-            StorageNodeClientWriteChunkOptions options;
-            options.context = request.context;
-            options.durability = StorageNodeWriteDurability::kPublish;
+            const auto absolute_deadline = ResolveAbsoluteDeadline(request.context);
+            const std::uint32_t max_retries = config_.max_transient_write_retries;
+            StorageTransferWriteResult last_result;
+            last_result.target = request.target;
 
-            const WriteChunkResponse response =
-                MakeNodeClient(request.target.endpoint)
-                    .WriteChunk(node_request, options);
-            return TranslateWriteResult(request, response);
+            for (std::uint32_t attempt_index = 0;; ++attempt_index)
+            {
+                if (HasDeadlineExpired(request.context, absolute_deadline))
+                {
+                    return MakeDeadlineExceededResult(last_result,
+                                                     "WriteChunk",
+                                                     request.request_id,
+                                                     request.target,
+                                                     node_request.identity.chunk_id,
+                                                     attempt_index);
+                }
+
+                StorageNodeClientWriteChunkOptions options;
+                options.context =
+                    MakeAttemptContext(request.context, absolute_deadline);
+                options.durability = StorageNodeWriteDurability::kPublish;
+
+                const WriteChunkResponse response =
+                    MakeNodeClient(request.target.endpoint)
+                        .WriteChunk(node_request, options);
+                last_result = TranslateWriteResult(request, response);
+                if (!last_result.retryable || attempt_index >= max_retries)
+                {
+                    if (last_result.retryable)
+                    {
+                        AnnotateAttemptFailure(&last_result,
+                                               "WriteChunk",
+                                               request.request_id,
+                                               last_result.target,
+                                               node_request.identity.chunk_id,
+                                               attempt_index + 1,
+                                               max_retries);
+                    }
+                    return last_result;
+                }
+
+                const auto backoff_ms =
+                    ComputeBackoffMs(config_,
+                                     last_result.retry_after_ms,
+                                     attempt_index);
+                if (!SleepForRetryBackoff(backoff_ms,
+                                          request.context,
+                                          absolute_deadline))
+                {
+                    return MakeDeadlineExceededResult(last_result,
+                                                     "WriteChunk",
+                                                     request.request_id,
+                                                     last_result.target,
+                                                     node_request.identity.chunk_id,
+                                                     attempt_index + 1);
+                }
+            }
         }
 
         StorageTransferReadResult ReadChunk(
@@ -227,13 +475,62 @@ namespace storedemo
             node_request.expected_checksum = request.expected_checksum;
             node_request.verify_checksum = request.verify_checksum;
 
-            StorageNodeClientReadChunkOptions options;
-            options.context = request.context;
+            const auto absolute_deadline = ResolveAbsoluteDeadline(request.context);
+            const std::uint32_t max_retries = config_.max_transient_read_retries;
+            StorageTransferReadResult last_result;
+            last_result.target = request.target;
 
-            const ReadChunkResponse response =
-                MakeNodeClient(request.target.endpoint)
-                    .ReadChunk(node_request, options);
-            return TranslateReadResult(request, response);
+            for (std::uint32_t attempt_index = 0;; ++attempt_index)
+            {
+                if (HasDeadlineExpired(request.context, absolute_deadline))
+                {
+                    return MakeDeadlineExceededResult(last_result,
+                                                     "ReadChunk",
+                                                     request.request_id,
+                                                     request.target,
+                                                     normalized_identity.chunk_id,
+                                                     attempt_index);
+                }
+
+                StorageNodeClientReadChunkOptions options;
+                options.context =
+                    MakeAttemptContext(request.context, absolute_deadline);
+
+                const ReadChunkResponse response =
+                    MakeNodeClient(request.target.endpoint)
+                        .ReadChunk(node_request, options);
+                last_result = TranslateReadResult(request, response);
+                if (!last_result.retryable || attempt_index >= max_retries)
+                {
+                    if (last_result.retryable)
+                    {
+                        AnnotateAttemptFailure(&last_result,
+                                               "ReadChunk",
+                                               request.request_id,
+                                               last_result.target,
+                                               normalized_identity.chunk_id,
+                                               attempt_index + 1,
+                                               max_retries);
+                    }
+                    return last_result;
+                }
+
+                const auto backoff_ms =
+                    ComputeBackoffMs(config_,
+                                     last_result.retry_after_ms,
+                                     attempt_index);
+                if (!SleepForRetryBackoff(backoff_ms,
+                                          request.context,
+                                          absolute_deadline))
+                {
+                    return MakeDeadlineExceededResult(last_result,
+                                                     "ReadChunk",
+                                                     request.request_id,
+                                                     last_result.target,
+                                                     normalized_identity.chunk_id,
+                                                     attempt_index + 1);
+                }
+            }
         }
 
     private:
