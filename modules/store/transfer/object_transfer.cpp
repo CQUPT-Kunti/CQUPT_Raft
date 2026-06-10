@@ -770,6 +770,133 @@ namespace storedemo
             return std::nullopt;
         }
 
+        [[nodiscard]] std::vector<StorageTransferTarget> SortedStorageTargets(
+            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets)
+        {
+            std::vector<StorageTransferTarget> targets;
+            targets.reserve(storage_targets.size());
+            for (const auto &[node_id, target] : storage_targets)
+            {
+                (void)node_id;
+                if (target.node_id.empty() || target.endpoint.empty())
+                {
+                    continue;
+                }
+                targets.push_back(target);
+            }
+
+            std::sort(targets.begin(),
+                      targets.end(),
+                      [](const StorageTransferTarget &lhs,
+                         const StorageTransferTarget &rhs)
+                      {
+                          if (lhs.node_id != rhs.node_id)
+                          {
+                              return lhs.node_id < rhs.node_id;
+                          }
+                          return lhs.endpoint < rhs.endpoint;
+                      });
+            return targets;
+        }
+
+        [[nodiscard]] TransferCommittedChunk BuildDurableChunkFacts(
+            const ChunkIdentity &identity,
+            const std::uint64_t expected_size,
+            const ChunkChecksum &expected_checksum,
+            const StorageTransferWriteResult &first_durable_result,
+            std::vector<StorageNodeId> durable_replicas)
+        {
+            TransferCommittedChunk committed_chunk;
+            committed_chunk.identity = identity;
+            committed_chunk.size = first_durable_result.metadata.size == 0
+                                       ? expected_size
+                                       : first_durable_result.metadata.size;
+            committed_chunk.checksum =
+                first_durable_result.metadata.checksum.IsSet()
+                    ? first_durable_result.metadata.checksum
+                    : expected_checksum;
+            committed_chunk.replica_nodes = std::move(durable_replicas);
+            return committed_chunk;
+        }
+
+        [[nodiscard]] std::vector<CleanupCandidate>
+        BuildFailedUploadCleanupCandidatesFromChunks(
+            const std::string &bucket,
+            const std::string &object_key,
+            const std::string &object_id,
+            const std::uint64_t version,
+            const std::uint64_t created_at_unix_ms,
+            const std::vector<TransferCommittedChunk> &durable_chunks)
+        {
+            std::vector<CleanupChunkFact> cleanup_chunk_facts;
+            cleanup_chunk_facts.reserve(durable_chunks.size());
+            for (const auto &chunk : durable_chunks)
+            {
+                CleanupChunkFact fact;
+                fact.identity = chunk.identity;
+                fact.identity.offset = chunk.identity.offset;
+                fact.size = chunk.size;
+                fact.checksum = chunk.checksum;
+                fact.replica_nodes = chunk.replica_nodes;
+                cleanup_chunk_facts.push_back(std::move(fact));
+            }
+
+            FailedUploadCleanupRequest cleanup_request;
+            cleanup_request.bucket = bucket;
+            cleanup_request.object_key = object_key;
+            cleanup_request.object_id = object_id;
+            cleanup_request.version = version;
+            cleanup_request.object_state = CleanupObjectState::kPending;
+            cleanup_request.created_at_unix_ms = created_at_unix_ms;
+            cleanup_request.durable_chunks = std::move(cleanup_chunk_facts);
+            return BuildFailedUploadCleanupCandidates(cleanup_request);
+        }
+
+        void AppendStorageWriteDiagnostic(const std::string &request_id,
+                                         const StorageTransferWriteResult &write_result,
+                                         const ChunkIdentity &identity,
+                                         const std::uint32_t chunk_index,
+                                         const std::uint64_t offset,
+                                         std::vector<ObjectTransferDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            ObjectTransferDiagnostic diagnostic;
+            diagnostic.status = MapStorageStatus(write_result.status);
+            diagnostic.message =
+                write_result.ok()
+                    ? "StorageNode WriteChunk recorded durable chunk facts; object visibility still depends on CommitObject"
+                    : "StorageNode WriteChunk failed: " + write_result.error_detail;
+            diagnostic.request_id = request_id;
+            diagnostic.node_id = write_result.target.node_id;
+            diagnostic.endpoint = write_result.target.endpoint;
+            diagnostic.chunk_id = identity.chunk_id;
+            diagnostic.chunk_index = chunk_index;
+            diagnostic.offset = offset;
+            diagnostic.retryable = write_result.retryable;
+            diagnostics->push_back(std::move(diagnostic));
+        }
+
+        [[nodiscard]] TransferCommittedManifest BuildFallbackCommittedManifest(
+            const TransferWritePlan &write_plan,
+            const TransferObjectChecksumFacts &object_checksum,
+            const std::vector<TransferCommittedChunk> &committed_chunks,
+            const std::uint64_t committed_at_unix_ms)
+        {
+            TransferCommittedManifest manifest;
+            manifest.bucket = write_plan.bucket;
+            manifest.object_key = write_plan.object_key;
+            manifest.object_id = write_plan.object_id;
+            manifest.version = write_plan.version;
+            manifest.object_checksum = object_checksum;
+            manifest.chunks = committed_chunks;
+            manifest.committed_at_unix_ms = committed_at_unix_ms;
+            return manifest;
+        }
+
         class FileTransferChunkReader final : public TransferChunkReader
         {
         public:
@@ -1135,6 +1262,7 @@ namespace storedemo
             {
                 UploadObjectResult result;
                 result.session = Snapshot();
+                current_write_plan_.reset();
 
                 const auto validation_status = ValidateRequest(&result.error_detail);
                 if (validation_status != ObjectTransferStatusCode::kOk)
@@ -1341,6 +1469,32 @@ namespace storedemo
                     return result;
                 }
                 result.write_plan = create_plan_call.result.write_plan;
+                current_write_plan_ = result.write_plan;
+
+                const std::string resolved_object_id =
+                    !result.write_plan->object_id.empty()
+                        ? result.write_plan->object_id
+                        : (!create_plan_call.result.summary.object_id.empty()
+                               ? create_plan_call.result.summary.object_id
+                               : request_.object_id);
+                if (resolved_object_id.empty())
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kMetadataRejected,
+                         "Metadata CreateWritePlan did not return a usable object_id");
+                    return result;
+                }
+                if (result.write_plan->version == 0)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kMetadataRejected,
+                         "Metadata CreateWritePlan did not return a usable version");
+                    return result;
+                }
+                result.write_plan->object_id = resolved_object_id;
+                mutable_snapshot().object_id = resolved_object_id;
+                mutable_snapshot().version = result.write_plan->version;
+                result.session = Snapshot();
 
                 std::string storage_discovery_error;
                 const auto storage_targets = DiscoverStorageTargets(
@@ -1360,8 +1514,357 @@ namespace storedemo
                          std::move(storage_discovery_error));
                     return result;
                 }
+                if (storage_client_ == nullptr)
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kInternalError,
+                         "StorageTransferClient is required for upload chunk writes");
+                    return result;
+                }
 
-                (void)storage_client_;
+                std::vector<TransferCommittedChunk> durable_chunks;
+                durable_chunks.reserve(result.prepared_chunks.size());
+                bool uncertain_cleanup_possible = false;
+
+                if (!result.prepared_chunks.empty())
+                {
+                    SetStage(ObjectTransferStage::kUploadingChunks);
+                    result.session = Snapshot();
+
+                    open_error.clear();
+                    const auto reopen_status = reader.Open(
+                        {.source_path = request_.source_path,
+                         .chunk_size = request_.chunk_size,
+                         .start_offset = 0},
+                        &open_error);
+                    if (reopen_status != ObjectTransferStatusCode::kOk)
+                    {
+                        Fail(&result, reopen_status, std::move(open_error));
+                        return result;
+                    }
+
+                    std::size_t prepared_index = 0;
+                    while (true)
+                    {
+                        TransferChunkReadResult chunk = reader.ReadNextChunk();
+                        if (!chunk.ok())
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 chunk.status,
+                                 chunk.error_detail,
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+
+                        if (chunk.payload.empty())
+                        {
+                            if (chunk.last_chunk || chunk.eof)
+                            {
+                                if (prepared_index == result.prepared_chunks.size())
+                                {
+                                    break;
+                                }
+
+                                reader.Close();
+                                BuildCleanupCandidates(&result,
+                                                       durable_chunks,
+                                                       uncertain_cleanup_possible);
+                                Fail(&result,
+                                     ObjectTransferStatusCode::kConflict,
+                                     "upload second pass observed fewer chunks than prepared checksum facts",
+                                     static_cast<std::uint32_t>(prepared_index),
+                                     prepared_index < result.prepared_chunks.size()
+                                         ? result.prepared_chunks[prepared_index].offset
+                                         : 0);
+                                return result;
+                            }
+                        }
+
+                        if (prepared_index >= result.prepared_chunks.size())
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 ObjectTransferStatusCode::kConflict,
+                                 "upload second pass observed more chunks than prepared checksum facts",
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+
+                        const auto &prepared_chunk = result.prepared_chunks[prepared_index];
+                        if (chunk.chunk_index != prepared_chunk.chunk_index ||
+                            chunk.offset != prepared_chunk.offset)
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 ObjectTransferStatusCode::kConflict,
+                                 "upload second pass chunk order does not match prepared checksum facts",
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+                        if (static_cast<std::uint64_t>(chunk.payload.size()) !=
+                            prepared_chunk.size)
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 ObjectTransferStatusCode::kConflict,
+                                 "upload second pass chunk size does not match prepared checksum facts",
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+
+                        ChunkChecksum verified_checksum;
+                        std::string verify_error;
+                        const auto verify_status = VerifyChunkChecksum(
+                            chunk.payload,
+                            prepared_chunk.checksum,
+                            &verified_checksum,
+                            &verify_error);
+                        if (verify_status != StorageNodeStatusCode::kOk)
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 verify_status ==
+                                         StorageNodeStatusCode::kChecksumMismatch
+                                     ? ObjectTransferStatusCode::kChecksumMismatch
+                                     : ObjectTransferStatusCode::kInternalError,
+                                 "upload second pass chunk checksum verification failed: " +
+                                     verify_error,
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+
+                        std::string identity_error;
+                        const ChunkIdentity identity = BuildChunkIdentity(
+                            prepared_chunk,
+                            resolved_object_id,
+                            result.write_plan->version,
+                            &identity_error);
+                        if (identity.chunk_id.empty())
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 ObjectTransferStatusCode::kInternalError,
+                                 "failed to build upload chunk identity: " +
+                                     identity_error,
+                                 chunk.chunk_index,
+                                 chunk.offset);
+                            return result;
+                        }
+
+                        std::string resolve_targets_error;
+                        const auto desired_replica_count =
+                            ResolveDesiredReplicaCount(prepared_chunk.chunk_index);
+                        const auto minimum_successful_writes =
+                            ResolveMinimumSuccessfulWrites(prepared_chunk.chunk_index);
+                        const auto chunk_targets = ResolveChunkTargets(
+                            prepared_chunk,
+                            storage_targets,
+                            desired_replica_count,
+                            &resolve_targets_error);
+                        if (chunk_targets.empty())
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 ObjectTransferStatusCode::kDiscoveryUnavailable,
+                                 std::move(resolve_targets_error),
+                                 chunk.chunk_index,
+                                 chunk.offset,
+                                 identity.chunk_id);
+                            return result;
+                        }
+
+                        std::vector<StorageNodeId> durable_replicas;
+                        durable_replicas.reserve(chunk_targets.size());
+                        StorageTransferWriteResult first_durable_result;
+                        bool have_durable_result = false;
+                        ObjectTransferStatusCode last_failure_status =
+                            ObjectTransferStatusCode::kStorageRejected;
+                        std::string last_failure_message =
+                            "StorageNode WriteChunk did not reach minimum_successful_writes";
+                        StorageTransferTarget last_failure_target;
+                        bool last_failure_retryable = false;
+
+                        for (const auto &target : chunk_targets)
+                        {
+                            const auto write_result = storage_client_->WriteChunk(
+                                {.request_id = request_.request_id + "/chunk-" +
+                                                 std::to_string(prepared_chunk.chunk_index) +
+                                                 "/node-" + target.node_id,
+                                 .target = target,
+                                 .identity = identity,
+                                 .offset = prepared_chunk.offset,
+                                 .expected_size = prepared_chunk.size,
+                                 .expected_checksum = prepared_chunk.checksum,
+                                 .payload = chunk.payload});
+                            AppendStorageWriteDiagnostic(request_.request_id,
+                                                         write_result,
+                                                         identity,
+                                                         prepared_chunk.chunk_index,
+                                                         prepared_chunk.offset,
+                                                         &result.diagnostics);
+
+                            if (write_result.ok())
+                            {
+                                if (!have_durable_result)
+                                {
+                                    first_durable_result = write_result;
+                                    have_durable_result = true;
+                                }
+                                durable_replicas.push_back(
+                                    write_result.target.node_id.empty()
+                                        ? target.node_id
+                                        : write_result.target.node_id);
+                                continue;
+                            }
+
+                            last_failure_status = MapStorageStatus(write_result.status);
+                            last_failure_message =
+                                "StorageNode WriteChunk failed: " +
+                                write_result.error_detail;
+                            last_failure_target = write_result.target.endpoint.empty()
+                                                      ? target
+                                                      : write_result.target;
+                            last_failure_retryable = write_result.retryable;
+                            uncertain_cleanup_possible =
+                                uncertain_cleanup_possible || write_result.retryable;
+                        }
+
+                        if (durable_replicas.size() < minimum_successful_writes)
+                        {
+                            reader.Close();
+                            if (have_durable_result)
+                            {
+                                durable_chunks.push_back(BuildDurableChunkFacts(
+                                    identity,
+                                    prepared_chunk.size,
+                                    prepared_chunk.checksum,
+                                    first_durable_result,
+                                    durable_replicas));
+                            }
+                            BuildCleanupCandidates(
+                                &result,
+                                durable_chunks,
+                                uncertain_cleanup_possible,
+                                last_failure_retryable
+                                    ? "upload failure left uncertain chunk placement facts; cleanup_candidate_possible stays true even if candidate list is partial"
+                                    : std::string());
+                            Fail(&result,
+                                 last_failure_status,
+                                 "chunk " + identity.chunk_id +
+                                     " did not reach minimum_successful_writes=" +
+                                     std::to_string(minimum_successful_writes) +
+                                     "; " + last_failure_message,
+                                 prepared_chunk.chunk_index,
+                                 prepared_chunk.offset,
+                                 identity.chunk_id,
+                                 last_failure_target.node_id,
+                                 last_failure_target.endpoint,
+                                 last_failure_retryable);
+                            return result;
+                        }
+
+                        auto durable_chunk = BuildDurableChunkFacts(
+                            identity,
+                            prepared_chunk.size,
+                            prepared_chunk.checksum,
+                            first_durable_result,
+                            durable_replicas);
+                        result.committed_chunks.push_back(durable_chunk);
+                        durable_chunks.push_back(std::move(durable_chunk));
+                        ++prepared_index;
+
+                        if (chunk.last_chunk ||
+                            (chunk.eof &&
+                             prepared_index == result.prepared_chunks.size()))
+                        {
+                            break;
+                        }
+                    }
+                    reader.Close();
+                }
+
+                SetStage(ObjectTransferStage::kCommittingObject);
+                mutable_snapshot().metadata_commit_attempted = true;
+                result.commit_attempted = true;
+                result.session = Snapshot();
+
+                const auto commit_call = discovered_metadata_client->CommitObject(
+                    {.request_id = request_.request_id,
+                     .bucket = request_.bucket,
+                     .object_key = request_.object_key,
+                     .object_id = result.write_plan->object_id,
+                     .version = result.write_plan->version,
+                     .object_checksum = finalize_result.object_checksum,
+                     .committed_chunks = result.committed_chunks,
+                     .client_time_unix_ms = request_.client_time_unix_ms});
+                AppendMetadataDiagnostics(commit_call.result.diagnostics,
+                                          &result.diagnostics);
+                if (!commit_call.transport_ok() || !commit_call.result.ok() ||
+                    !commit_call.result.committed)
+                {
+                    BuildCleanupCandidates(
+                        &result,
+                        durable_chunks,
+                        !durable_chunks.empty(),
+                        durable_chunks.empty()
+                            ? std::string()
+                            : "CommitObject failed after chunk writes; durable chunks remain cleanup candidates until metadata authority confirms otherwise");
+                    Fail(&result,
+                         !commit_call.transport_ok()
+                             ? ObjectTransferStatusCode::kMetadataRejected
+                             : MapMetadataStatus(commit_call.result.summary.status),
+                         !commit_call.transport_ok()
+                             ? "Metadata CommitObject RPC failed: " +
+                                   commit_call.rpc.grpc_error_message
+                             : "Metadata CommitObject failed: " +
+                                   commit_call.result.summary.message);
+                    return result;
+                }
+
+                result.committed = true;
+                mutable_snapshot().committed_visible = true;
+                if (commit_call.result.committed_manifest.has_value())
+                {
+                    result.committed_manifest =
+                        commit_call.result.committed_manifest;
+                }
+                else
+                {
+                    result.committed_manifest = BuildFallbackCommittedManifest(
+                        *result.write_plan,
+                        finalize_result.object_checksum,
+                        result.committed_chunks,
+                        request_.client_time_unix_ms);
+                }
+                result.cleanup_candidates.clear();
+                result.cleanup_candidate_possible = false;
 
                 MarkCompleted();
                 result.status = ObjectTransferStatusCode::kOk;
@@ -1369,7 +1872,7 @@ namespace storedemo
                 result.diagnostics.push_back(
                     MakeDiagnostic(
                         ObjectTransferStatusCode::kOk,
-                        "ViewNode discovery resolved metadata/storage candidates and MetadataNode accepted CreateWritePlan; chunk write and CommitObject remain later stages",
+                        "upload session completed bounded chunk writes and CommitObject; COMMITTED visibility still comes only from MetadataNode authority",
                         request_.request_id));
                 return result;
             }
@@ -1470,11 +1973,189 @@ namespace storedemo
                 return std::nullopt;
             }
 
+            void BuildCleanupCandidates(
+                UploadObjectResult *result,
+                const std::vector<TransferCommittedChunk> &durable_chunks,
+                const bool uncertain_cleanup_possible,
+                const std::string &uncertain_reason = std::string()) const
+            {
+                if (result == nullptr)
+                {
+                    return;
+                }
+
+                if (!durable_chunks.empty())
+                {
+                    const auto object_id =
+                        !snapshot_ref().object_id.empty()
+                            ? snapshot_ref().object_id
+                            : (result->write_plan.has_value()
+                                       ? result->write_plan->object_id
+                                       : request_.object_id);
+                    const auto version =
+                        snapshot_ref().version != 0
+                            ? snapshot_ref().version
+                            : (result->write_plan.has_value()
+                                   ? result->write_plan->version
+                                   : 0);
+                    const auto created_at_unix_ms =
+                        result->write_plan.has_value()
+                            ? result->write_plan->created_at_unix_ms
+                            : request_.client_time_unix_ms;
+                    result->cleanup_candidates =
+                        BuildFailedUploadCleanupCandidatesFromChunks(
+                            request_.bucket,
+                            request_.object_key,
+                            object_id,
+                            version,
+                            created_at_unix_ms,
+                            durable_chunks);
+                }
+
+                result->cleanup_candidate_possible =
+                    uncertain_cleanup_possible || !result->cleanup_candidates.empty();
+                if (uncertain_cleanup_possible && !uncertain_reason.empty())
+                {
+                    auto diagnostic = MakeDiagnostic(
+                        ObjectTransferStatusCode::kStorageRejected,
+                        uncertain_reason,
+                        request_.request_id);
+                    result->diagnostics.push_back(std::move(diagnostic));
+                }
+            }
+
+            [[nodiscard]] std::vector<StorageTransferTarget> ResolveChunkTargets(
+                const TransferPreparedChunk &chunk,
+                const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets,
+                const std::uint32_t desired_replica_count,
+                std::string *error_detail) const
+            {
+                std::vector<StorageTransferTarget> targets;
+                if (result_write_plan_has_chunk_targets(chunk))
+                {
+                    const auto *chunk_plan = FindChunkPlan(chunk.chunk_index);
+                    if (chunk_plan != nullptr)
+                    {
+                        for (const auto &node_id : chunk_plan->candidate_nodes)
+                        {
+                            const auto it = storage_targets.find(node_id);
+                            if (it == storage_targets.end() ||
+                                it->second.endpoint.empty())
+                            {
+                                continue;
+                            }
+                            const auto duplicate =
+                                std::find_if(targets.begin(),
+                                             targets.end(),
+                                             [&](const StorageTransferTarget &target)
+                                             {
+                                                 return target.node_id == it->second.node_id;
+                                             });
+                            if (duplicate == targets.end())
+                            {
+                                targets.push_back(it->second);
+                            }
+                        }
+                    }
+                }
+
+                if (targets.empty())
+                {
+                    targets = SortedStorageTargets(storage_targets);
+                }
+
+                if (targets.size() > desired_replica_count)
+                {
+                    targets.resize(desired_replica_count);
+                }
+                if (targets.size() < desired_replica_count)
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "ViewNode returned fewer writable StorageNode targets than desired_replica_count");
+                    return {};
+                }
+                return targets;
+            }
+
+            [[nodiscard]] const TransferChunkPlan *FindChunkPlan(
+                const std::uint32_t chunk_index) const
+            {
+                if (!current_write_plan_.has_value())
+                {
+                    return nullptr;
+                }
+                for (const auto &chunk_plan : current_write_plan_->chunks)
+                {
+                    if (chunk_plan.identity.chunk_index == chunk_index)
+                    {
+                        return &chunk_plan;
+                    }
+                }
+                return nullptr;
+            }
+
+            [[nodiscard]] bool result_write_plan_has_chunk_targets(
+                const TransferPreparedChunk &chunk) const
+            {
+                const auto *chunk_plan = FindChunkPlan(chunk.chunk_index);
+                return chunk_plan != nullptr && !chunk_plan->candidate_nodes.empty();
+            }
+
+            [[nodiscard]] std::uint32_t ResolveMinimumSuccessfulWrites(
+                const std::uint32_t chunk_index) const
+            {
+                const auto *chunk_plan = FindChunkPlan(chunk_index);
+                if (chunk_plan != nullptr && chunk_plan->minimum_successful_writes != 0)
+                {
+                    return chunk_plan->minimum_successful_writes;
+                }
+                return request_.minimum_successful_writes;
+            }
+
+            [[nodiscard]] std::uint32_t ResolveDesiredReplicaCount(
+                const std::uint32_t chunk_index) const
+            {
+                const auto *chunk_plan = FindChunkPlan(chunk_index);
+                if (chunk_plan != nullptr && chunk_plan->required_replica_count != 0)
+                {
+                    return chunk_plan->required_replica_count;
+                }
+                return request_.desired_replica_count;
+            }
+
+            [[nodiscard]] ChunkIdentity BuildChunkIdentity(
+                const TransferPreparedChunk &chunk,
+                const std::string &object_id,
+                const std::uint64_t version,
+                std::string *error_detail) const
+            {
+                ChunkIdentity identity;
+                identity.object_id = object_id;
+                identity.version = version;
+                identity.chunk_index = chunk.chunk_index;
+                identity.offset = chunk.offset;
+                const auto status = MakeChunkId(identity.object_id,
+                                                identity.version,
+                                                identity.chunk_index,
+                                                &identity.chunk_id,
+                                                error_detail);
+                if (status != StorageNodeStatusCode::kOk)
+                {
+                    return {};
+                }
+                return identity;
+            }
+
             void Fail(UploadObjectResult *result,
                       const ObjectTransferStatusCode status,
                       std::string message,
                       const std::uint32_t chunk_index = 0,
-                      const std::uint64_t offset = 0)
+                      const std::uint64_t offset = 0,
+                      const ChunkId &chunk_id = ChunkId(),
+                      const std::string &node_id = std::string(),
+                      const std::string &endpoint = std::string(),
+                      const std::optional<bool> retryable_override = std::nullopt)
             {
                 if (result == nullptr)
                 {
@@ -1484,31 +2165,38 @@ namespace storedemo
                 TransferFailureSummary failure;
                 failure.status = status;
                 failure.error_detail = message;
+                failure.node_id = node_id;
+                failure.endpoint = endpoint;
+                failure.chunk_id = chunk_id;
                 failure.chunk_index = chunk_index;
                 failure.offset = offset;
-                failure.retryable = status == ObjectTransferStatusCode::kIoError ||
-                                    status == ObjectTransferStatusCode::kTimeout ||
-                                    status == ObjectTransferStatusCode::kDiscoveryUnavailable ||
-                                    status == ObjectTransferStatusCode::kMetadataNotLeader;
+                failure.retryable = retryable_override.value_or(
+                    status == ObjectTransferStatusCode::kIoError ||
+                    status == ObjectTransferStatusCode::kTimeout ||
+                    status == ObjectTransferStatusCode::kDiscoveryUnavailable ||
+                    status == ObjectTransferStatusCode::kMetadataNotLeader);
                 SetFailure(failure);
 
                 result->status = status;
                 result->error_detail = std::move(message);
                 result->session = Snapshot();
-                result->diagnostics.push_back(
-                    MakeDiagnostic(result->status,
-                                   result->error_detail,
-                                   request_.request_id,
-                                   chunk_index,
-                                   offset,
-                                   ChunkId(),
-                                   failure.retryable));
+                auto diagnostic = MakeDiagnostic(result->status,
+                                                 result->error_detail,
+                                                 request_.request_id,
+                                                 chunk_index,
+                                                 offset,
+                                                 chunk_id,
+                                                 failure.retryable);
+                diagnostic.node_id = node_id;
+                diagnostic.endpoint = endpoint;
+                result->diagnostics.push_back(std::move(diagnostic));
             }
 
             UploadObjectRequest request_;
             std::shared_ptr<MetadataTransferClient> metadata_client_;
             std::shared_ptr<StorageTransferClient> storage_client_;
             std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
+            std::optional<TransferWritePlan> current_write_plan_;
         };
 
         class BasicDownloadTransferSession final : public DownloadTransferSession,

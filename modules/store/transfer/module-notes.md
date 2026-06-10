@@ -119,6 +119,17 @@ T032 当前实现采用“现有 MetadataService 边界内的最小映射”：
 
 upload 失败时，transfer 可以产生清理候选或失败摘要，但不能自行把对象标记为 COMMITTED，也不能直接删除 StorageNode 本地状态绕过 StorageNode contract。
 
+## T081 failed upload cleanup candidate 边界
+
+- upload 失败路径会把“已确认 durable、但尚未被 MetadataNode 成功 COMMIT 的 chunk facts”转换成 `CleanupCandidate`。
+- candidate 来源只代表 failed upload / pending cleanup 事实，不代表对象已经提交，也不代表允许直接删除 live chunk。
+- 当前 `object_transfer.cpp` 在 bounded checksum 首遍扫描后，会重新按 bounded chunk 方式读取源文件并执行 `WriteChunk`，避免为了 cleanup candidate 或 commit 把整对象常驻内存。
+- 若 chunk 写入部分成功、`minimum_successful_writes` 未满足、`CommitObject` 失败，或第二遍上传过程中发生校验/IO 冲突，transfer 会保留：
+  - `committed_chunks`：已 durable 且原本准备提交的 chunk facts
+  - `cleanup_candidates`：交给 T080 cleanup hook / 后续维护流程的 failed-upload cleanup 候选
+  - `cleanup_candidate_possible`：包括 retryable/uncertain write 在内的保守风险标记
+- 如果出现 retryable / transport 级不确定写入，transfer 不会把失败伪装成成功；即使 candidate 列表只能部分确认，也会把不确定风险保留在 `cleanup_candidate_possible` 和诊断里。
+
 ## 下载流程边界
 
 1. `storage_client` 创建 download `TransferSession`，设置目标 bucket、object key、输出路径和 request_id。

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "store/common/store_types.h"
+#include "store/maintenance/garbage_collector.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -229,11 +230,17 @@ namespace storedemo
         TransferSessionSnapshot session;
         std::vector<TransferPreparedChunk> prepared_chunks;
         std::optional<TransferWritePlan> write_plan;
+        // 这里记录“已经 durable 且原本准备提交给 metadata”的 chunk facts；
+        // 即使 CommitObject 失败，也可作为 cleanup candidate 的来源。
         std::vector<TransferCommittedChunk> committed_chunks;
         std::optional<TransferCommittedManifest> committed_manifest;
+        // cleanup candidate 只表示“可能需要后续清理的未提交 durable/orphan chunk”；
+        // 不能被解释成对象已 COMMITTED，也不能直接替代 metadata authority。
+        std::vector<CleanupCandidate> cleanup_candidates;
         std::vector<ObjectTransferDiagnostic> diagnostics;
         bool commit_attempted{false};
         bool committed{false};
+        // 用于表达“存在需要后续 cleanup/GC 关注的风险”，包括 uncertain write。
         bool cleanup_candidate_possible{false};
 
         [[nodiscard]] bool ok() const
