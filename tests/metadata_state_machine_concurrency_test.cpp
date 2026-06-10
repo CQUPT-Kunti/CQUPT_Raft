@@ -82,8 +82,8 @@ TEST(MetadataStateMachineConcurrencyTest, ConcurrentDuplicateRequestIdApplyStays
     EXPECT_EQ(machine.LastAppliedIndex(), 401U);
     EXPECT_EQ(machine.ObjectCount(), 1U);
     EXPECT_EQ(machine.RequestCount(), 2U);
-    EXPECT_EQ(machine.FindIndexedObjectId("bucket-concurrent-idem", "object/a"),
-              std::optional<std::string>("obj-concurrent-idem"));
+    EXPECT_FALSE(
+        machine.FindIndexedObjectId("bucket-concurrent-idem", "object/a").has_value());
 }
 
 TEST(MetadataStateMachineConcurrencyTest, ConcurrentHeadAndListReadsRemainConsistent)

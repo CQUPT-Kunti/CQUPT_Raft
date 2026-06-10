@@ -261,7 +261,7 @@ namespace storedemo
                 if (error_detail != nullptr)
                 {
                     *error_detail =
-                        "object checksum size must match object_checksum.size";
+                        "object_checksum.size must match summed chunk payload size";
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
