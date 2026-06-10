@@ -206,10 +206,10 @@
 
 ### Tests for User Story 6
 
-- [ ] T076 [P] [US6] Add StorageNode restart after committed upload test in `tests/integrated_object_storage_recovery_test.cpp`
-- [ ] T077 [P] [US6] Add uncommitted chunk cleanup test in `tests/integrated_object_storage_recovery_test.cpp`
-- [ ] T078 [P] [US6] Add concurrent upload/download stress test with 100 operations in `tests/integrated_object_storage_concurrency_test.cpp`
-- [ ] T079 [P] [US6] Add no healthy StorageNode capacity failure test in `tests/integrated_object_storage_recovery_test.cpp`
+- [X] T076 [P] [US6] Add StorageNode restart after committed upload test in `tests/integrated_object_storage_recovery_test.cpp`
+- [X] T077 [P] [US6] Add uncommitted chunk cleanup test in `tests/integrated_object_storage_recovery_test.cpp`
+- [X] T078 [P] [US6] Add concurrent upload/download stress test with 100 operations in `tests/integrated_object_storage_concurrency_test.cpp`
+- [X] T079 [P] [US6] Add no healthy StorageNode capacity failure test in `tests/integrated_object_storage_recovery_test.cpp`
 
 ### Implementation for User Story 6
 
