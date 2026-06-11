@@ -73,10 +73,10 @@
 
 **Independent Test**: 更高 incarnation 优先；同 incarnation 更高 sequence 优先；`observed_time` 不单独作为覆盖依据。
 
-- [ ] T026 [P] [US1] Add higher incarnation wins test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T027 [P] [US1] Add same-incarnation higher sequence wins test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T028 [P] [US1] Add observed_time-only stale override rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T029 [P] [US5] Add identity restart old-incarnation rejection test in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
+- [X] T026 [P] [US1] Add higher incarnation wins test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [X] T027 [P] [US1] Add same-incarnation higher sequence wins test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [X] T028 [P] [US1] Add observed_time-only stale override rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [X] T029 [P] [US5] Add identity restart old-incarnation rejection test in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
 - [ ] T030 [US1] Add incarnation-aware observed state fields to `modules/view/view_registry.h` and implementation in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T031 [US1] Implement deterministic merge ordering in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T032 [US1] Add conflict diagnostics for duplicate node_id, endpoint, and data_dir fingerprint in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)

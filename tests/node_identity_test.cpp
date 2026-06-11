@@ -15,6 +15,44 @@ namespace clusterdemo
 {
     namespace
     {
+        struct ParsedProcessIncarnationId
+        {
+            std::string durable_node_id;
+            std::string boot_token;
+        };
+
+        [[nodiscard]] std::optional<ParsedProcessIncarnationId>
+        ParseProcessIncarnationId(const std::string &incarnation_id)
+        {
+            const std::string marker = ":boot:";
+            const auto marker_pos = incarnation_id.find(marker);
+            if (marker_pos == std::string::npos || marker_pos == 0)
+            {
+                return std::nullopt;
+            }
+
+            const auto boot_token = incarnation_id.substr(
+                marker_pos + marker.size());
+            if (boot_token.empty())
+            {
+                return std::nullopt;
+            }
+
+            return ParsedProcessIncarnationId{
+                .durable_node_id = incarnation_id.substr(0, marker_pos),
+                .boot_token = boot_token};
+        }
+
+        [[nodiscard]] bool IsCurrentIncarnation(
+            const ProcessIncarnation &candidate,
+            const ProcessIncarnation &current)
+        {
+            return candidate.cluster_id == current.cluster_id &&
+                   candidate.node_id == current.node_id &&
+                   candidate.node_type == current.node_type &&
+                   candidate.incarnation_id == current.incarnation_id;
+        }
+
         class NodeIdentityTest : public ::testing::Test
         {
         protected:
@@ -555,6 +593,94 @@ namespace clusterdemo
             EXPECT_EQ(restart.identity->node_id, first_start.identity->node_id);
             EXPECT_NE(restart_incarnation.incarnation_id,
                       first_incarnation.incarnation_id);
+        }
+
+        TEST_F(NodeIdentityTest, RestartReusesNodeIdButRejectsOldIncarnation)
+        {
+            const auto data_dir = MakeDataDir("t029-view-old-incarnation");
+            const auto identity = MakeViewIdentity("view-node-t029");
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = identity.cluster_id,
+                            .node_id = identity.node_id,
+                            .node_type = ClusterNodeType::kView,
+                            .raft_id = std::nullopt,
+                            .source = identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = identity,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
+            const auto first_incarnation =
+                CreateIncarnationOrAssert(*first_start.identity);
+            const auto first_incarnation_id =
+                ParseProcessIncarnationId(first_incarnation.incarnation_id);
+            ASSERT_TRUE(first_incarnation_id.has_value());
+            EXPECT_EQ(first_incarnation_id->durable_node_id,
+                      first_start.identity->node_id);
+
+            const auto restart = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = identity.cluster_id,
+                            .node_id = identity.node_id,
+                            .node_type = ClusterNodeType::kView,
+                            .raft_id = std::nullopt,
+                            .source = identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create =
+                        MakeViewIdentity("view-node-should-not-replace-t029"),
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(restart.ok()) << restart.diagnostic;
+            ASSERT_TRUE(restart.identity.has_value());
+            const auto current_incarnation =
+                CreateIncarnationOrAssert(*restart.identity);
+            const auto current_incarnation_id =
+                ParseProcessIncarnationId(current_incarnation.incarnation_id);
+            ASSERT_TRUE(current_incarnation_id.has_value());
+
+            EXPECT_EQ(restart.identity->node_id, first_start.identity->node_id);
+            EXPECT_EQ(current_incarnation.node_id, first_incarnation.node_id);
+            EXPECT_EQ(current_incarnation.cluster_id,
+                      first_incarnation.cluster_id);
+            EXPECT_EQ(current_incarnation.node_type,
+                      first_incarnation.node_type);
+            EXPECT_NE(current_incarnation.incarnation_id,
+                      first_incarnation.incarnation_id);
+            EXPECT_EQ(current_incarnation_id->durable_node_id,
+                      first_incarnation_id->durable_node_id);
+            EXPECT_NE(current_incarnation_id->boot_token,
+                      first_incarnation_id->boot_token);
+            EXPECT_TRUE(IsCurrentIncarnation(current_incarnation,
+                                             current_incarnation));
+            EXPECT_FALSE(IsCurrentIncarnation(first_incarnation,
+                                              current_incarnation));
+            EXPECT_EQ(first_incarnation.startup_sequence_base,
+                      kProcessIncarnationInitialSequence);
+            EXPECT_EQ(current_incarnation.startup_sequence_base,
+                      kProcessIncarnationInitialSequence);
         }
 
         TEST_F(NodeIdentityTest,
