@@ -79,6 +79,7 @@
 | Scenario | Test Or Script Entry | Pass Criteria |
 |----------|----------------------|---------------|
 | Static local RPC baseline preservation | `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/rpc_demo.sh status`, `examples/object-storage-local-3meta-6store/rpc_demo.sh roundtrip`, `examples/object-storage-local-3meta-6store/tingzhi.sh` | 1 ViewNode + 3 MetadataNode + 6 StorageNode static real RPC roundtrip remains valid; later 009 scenarios must extend from this baseline and must not regress it |
+| Local RPC ViewNode self-liveness regression | `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/rpc_demo.sh status-self-liveness`, `examples/object-storage-local-3meta-6store/tingzhi.sh` | `storage_client status` 输出必须包含本地 ViewNode 自身记录及 `liveness`；跨过 dead TTL 后健康运行中的 ViewNode 仍应保持 `LIVE`，在 T021 之前若出现 `STALE` / `SUSPECT` / `DEAD` 应直接暴露失败 |
 | Single ViewNode self refresh | `tests/view_node_discovery_test.cpp` | ViewNode remains `LIVE` for at least 2x dead TTL while self refresh is enabled |
 | Self refresh stopped | `tests/view_node_discovery_test.cpp` | State transitions to `STALE` / `SUSPECT` / `DEAD` by TTL |
 | Dual ViewNode sync | ViewNode discovery/peer sync test | State registered on one ViewNode appears on peer after sync |

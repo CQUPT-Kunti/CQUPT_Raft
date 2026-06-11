@@ -672,6 +672,142 @@ namespace
                   ViewRegistryIssueCode::kLivenessExcluded);
     }
 
+    TEST(ViewNodeDiscoveryTest, ViewNodeSelfRefreshKeepsSelfLiveBeyondDeadTtl)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        RunningViewNodeDiscoveryService service(config, 100);
+
+        auto self =
+            MakeRegistration(ViewNodeType::kView, "view-self-1", 9700, 100);
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(self, "integration-register-view-self-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(register_result.result.created);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "integration-cluster-view-self-initial";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = false;
+        cluster_request.include_warnings = true;
+
+        auto cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].node_id,
+                  "view-self-1");
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_seen_unix_ms,
+                  100U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence, 0U);
+
+        service.set_now_unix_ms(191);
+        cluster_request.request_id =
+            "integration-cluster-view-self-beyond-dead-ttl";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        // 健康运行中的 ViewNode 应靠自身 refresh 持续维持 LIVE，而不是依赖外部节点
+        // heartbeat。超过 dead TTL 后，cluster view 里仍应保留 self record，且要看到
+        // 实际状态更新，而不是单纯依赖更晚的查询时间。
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].node_id,
+                  "view-self-1");
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+        EXPECT_GT(cluster_result.result.snapshot.view_nodes[0].last_seen_unix_ms,
+                  100U);
+        EXPECT_GT(cluster_result.result.snapshot.view_nodes[0].last_sequence, 0U);
+        EXPECT_TRUE(cluster_result.result.snapshot.diagnostics.empty());
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         ViewNodeSelfRefreshDisabledAllowsTtlTransitions)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        RunningViewNodeDiscoveryService service(config, 100);
+
+        auto self =
+            MakeRegistration(ViewNodeType::kView, "view-self-disabled-1", 9705, 100);
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(self, "integration-register-view-self-disabled-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(register_result.result.created);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto expect_self_liveness =
+            [&](const std::uint64_t now_unix_ms,
+                const char *request_id,
+                const ViewNodeLivenessState expected_liveness) {
+                SCOPED_TRACE(request_id);
+                service.set_now_unix_ms(now_unix_ms);
+                cluster_request.request_id = request_id;
+                const auto cluster_result =
+                    service.client().GetClusterView(cluster_request);
+                ASSERT_TRUE(cluster_result.transport_ok());
+                ASSERT_EQ(cluster_result.result.summary.status,
+                          ViewRegistryStatusCode::kOk);
+                ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+                EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].node_id,
+                          "view-self-disabled-1");
+                EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
+                          expected_liveness);
+                EXPECT_EQ(
+                    cluster_result.result.snapshot.view_nodes[0].last_seen_unix_ms,
+                    100U);
+                EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence,
+                          0U);
+            };
+
+        // 不执行任何 self refresh / heartbeat；只用可控时钟推进，验证 TTL
+        // 状态机仍会正常降级。
+        expect_self_liveness(100,
+                             "integration-cluster-view-self-disabled-live",
+                             ViewNodeLivenessState::kLive);
+        expect_self_liveness(131,
+                             "integration-cluster-view-self-disabled-stale",
+                             ViewNodeLivenessState::kStale);
+        expect_self_liveness(161,
+                             "integration-cluster-view-self-disabled-suspect",
+                             ViewNodeLivenessState::kSuspect);
+        expect_self_liveness(191,
+                             "integration-cluster-view-self-disabled-dead",
+                             ViewNodeLivenessState::kDead);
+
+        cluster_request.request_id =
+            "integration-cluster-view-self-disabled-dead-filtered";
+        cluster_request.include_dead_nodes = false;
+        const auto filtered_dead_result =
+            service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(filtered_dead_result.transport_ok());
+        ASSERT_EQ(filtered_dead_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(filtered_dead_result.result.snapshot.view_nodes.empty());
+        ASSERT_EQ(filtered_dead_result.result.snapshot.diagnostics.size(), 1U);
+        EXPECT_EQ(filtered_dead_result.result.snapshot.diagnostics[0].code,
+                  ViewRegistryIssueCode::kLivenessExcluded);
+        EXPECT_EQ(filtered_dead_result.result.snapshot.diagnostics[0].node_id,
+                  "view-self-disabled-1");
+    }
+
     TEST(ViewNodeDiscoveryTest,
          IntegrationMetadataDiscoveryReturnsEndpointAndObservedState)
     {
