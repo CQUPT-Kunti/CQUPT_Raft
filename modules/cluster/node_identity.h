@@ -13,6 +13,7 @@ namespace clusterdemo
 {
     inline constexpr std::uint32_t kNodeIdentityCurrentVersion{2};
     inline constexpr std::string_view kNodeIdentityFileName{"node.identity"};
+    inline constexpr std::uint64_t kProcessIncarnationInitialSequence{1};
 
     enum class NodeIdentitySource : std::uint8_t
     {
@@ -211,6 +212,33 @@ namespace clusterdemo
         }
     };
 
+    // 单次进程启动实例身份。它绑定长期 node_id，但不写回 node.identity，
+    // 也不表达 Raft membership authority。
+    struct ProcessIncarnation
+    {
+        ClusterId cluster_id;
+        ClusterNodeId node_id;
+        ClusterNodeType node_type{ClusterNodeType::kUnknown};
+        std::string incarnation_id;
+        std::int64_t started_at_unix_ms{0};
+        std::uint64_t startup_sequence_base{
+            kProcessIncarnationInitialSequence};
+    };
+
+    struct ProcessIncarnationResult
+    {
+        NodeIdentityStatusCode status{NodeIdentityStatusCode::kOk};
+        std::optional<ProcessIncarnation> incarnation;
+        NodeIdentityValidationResult validation;
+        std::string diagnostic;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == NodeIdentityStatusCode::kOk &&
+                   incarnation.has_value() && validation.ok();
+        }
+    };
+
     [[nodiscard]] std::filesystem::path ResolveNodeIdentityPath(
         const std::filesystem::path &data_dir);
 
@@ -222,8 +250,9 @@ namespace clusterdemo
         const ExpectedNodeIdentity &expected);
 
     // 以下接口声明 009 阶段 durable identity 的 load/store/load-or-create 边界。
-    // T012 已实现解析、临时文件写入、flush、atomic publish、restart validation
-    // 和目录 durability；T013 负责 process incarnation / boot epoch 边界。
+    // 当前实现已覆盖解析、临时文件写入、flush、atomic publish、restart
+    // validation、目录 durability，以及基于 durable identity 的 process
+    // incarnation / boot epoch 生成边界。
     [[nodiscard]] NodeIdentityLoadResult LoadNodeIdentity(
         const NodeIdentityLoadOptions &options);
 
@@ -233,6 +262,11 @@ namespace clusterdemo
 
     [[nodiscard]] NodeIdentityLoadOrCreateResult LoadOrCreateNodeIdentity(
         const NodeIdentityLoadOrCreateRequest &request);
+
+    // T013 只生成单次进程启动实例身份，不修改长期 durable identity。
+    // 调用方必须先成功 load/create NodeIdentity，再据此生成 incarnation。
+    [[nodiscard]] ProcessIncarnationResult CreateProcessIncarnation(
+        const NodeIdentity &identity);
 
     [[nodiscard]] const char *ToString(NodeIdentitySource source);
     [[nodiscard]] const char *ToString(NodeIdentityMembershipState state);

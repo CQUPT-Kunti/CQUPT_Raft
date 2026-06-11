@@ -27,6 +27,7 @@
 输出：
 
 - 本地 durable `NodeIdentity`。
+- 基于已验证 `NodeIdentity` 生成的 process incarnation / boot epoch 边界。
 - 按 role 解析后的单节点配置。
 - 仅供配置校验和诊断使用的初始 quorum / membership 摘要。
 
@@ -36,6 +37,7 @@
 - `identity_file` 首次缺失在 first-start 场景下是正常输入；当前 `LoadOrCreateNodeIdentity` 已按“缺失则创建、存在则校验复用”工作。
 - 重启必须复用长期 `node_id`；`tests/node_identity_test.cpp` 已把“重启不静默换 node_id”作为现有边界。
 - 每次进程启动都必须生成新的 incarnation / boot epoch；这不是 `node.identity` 的长期字段，后续应在 app/heartbeat 路径生成，不能靠重写 durable `node_id` 表达。
+- invalid / corrupt / mismatch identity 不得生成 process incarnation；调用方必须先成功 load/create durable identity，再生成单次启动实例身份。
 - StorageNode / ViewNode 可以本地生成并持久化自己的 `node_id`。即使当前 `NodeIdentitySource` 里有 `kViewNodeAllocator` 命名，它也只是来源诊断，不能把 ViewNode 解释成全局 ID authority。
 - Metadata bootstrap voter 与 Metadata dynamic join candidate 必须分开。
 - Metadata bootstrap voter 可以从 bootstrap config 固定出 `node_id + raft_id + initial_role`。
@@ -47,6 +49,7 @@
 - 把“本地已有 `node.identity`”误写成“已经加入 Metadata/Raft voter 集合”。
 - 把 `cluster_config` 的初始 voter/learner 配置误写成后续 dynamic join / promote 的 authority。
 - 把 per-process incarnation / sequence 持久化成长期身份的一部分，导致重启后无法区分旧进程与新进程。
+- 把 process incarnation / boot epoch 当成 Raft membership authority、`membership_state` 或 committed membership 变更入口。
 - 把 old-format / 缺少新必填字段的 `node.identity` 当成可自动补齐或自动升级的输入。
 - 把 corrupt / old-format `node.identity` 当成 missing identity 并在启动时静默重建。
 

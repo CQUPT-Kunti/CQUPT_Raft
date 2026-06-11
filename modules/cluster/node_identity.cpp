@@ -1,6 +1,7 @@
 #include "cluster/node_identity.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -129,6 +130,30 @@ namespace clusterdemo
         bool IsSupportedIdentityVersion(const std::uint32_t identity_version)
         {
             return identity_version == kNodeIdentityCurrentVersion;
+        }
+
+        std::uint64_t NextIncarnationOrdinal()
+        {
+            static std::atomic<std::uint64_t> next_ordinal{1};
+            return next_ordinal.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        std::string BuildProcessIncarnationId(const NodeIdentity &identity,
+                                              const std::int64_t started_at_unix_ns)
+        {
+#ifdef _WIN32
+            const auto pid = static_cast<unsigned long>(_getpid());
+#else
+            const auto pid = static_cast<unsigned long>(::getpid());
+#endif
+            const auto ordinal = NextIncarnationOrdinal();
+
+            std::ostringstream oss;
+            oss << identity.node_id
+                << ":boot:" << started_at_unix_ns
+                << ":" << pid
+                << ":" << ordinal;
+            return oss.str();
         }
 
         NodeIdentityMembershipState InferDefaultMembershipState(
@@ -1123,6 +1148,17 @@ namespace clusterdemo
             return NodeIdentityStatusCode::kConflict;
         }
 
+        NodeIdentityStatusCode ProcessIncarnationStatusFromValidation(
+            const NodeIdentityValidationResult &validation)
+        {
+            if (HasIssueCode(validation,
+                             NodeIdentityIssueCode::kUnsupportedIdentityVersion))
+            {
+                return NodeIdentityStatusCode::kUnsupported;
+            }
+            return NodeIdentityStatusCode::kInvalidArgument;
+        }
+
         void CleanupStagingFile(const std::filesystem::path &staging_path)
         {
             std::error_code ignored;
@@ -1821,6 +1857,44 @@ namespace clusterdemo
         result.validation = stored.validation;
         result.durable = stored.durable;
         result.diagnostic = stored.diagnostic;
+        return result;
+    }
+
+    ProcessIncarnationResult CreateProcessIncarnation(const NodeIdentity &identity)
+    {
+        ProcessIncarnationResult result;
+
+        auto identity_validation = ValidateNodeIdentity(identity);
+        if (!identity_validation.ok())
+        {
+            result.validation = std::move(identity_validation);
+            result.status =
+                ProcessIncarnationStatusFromValidation(result.validation);
+            result.diagnostic = JoinIssues(result.validation);
+            return result;
+        }
+
+        const auto now = std::chrono::system_clock::now();
+        const auto started_at_unix_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch())
+                .count();
+        const auto started_at_unix_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch())
+                .count();
+
+        result.status = NodeIdentityStatusCode::kOk;
+        result.incarnation = ProcessIncarnation{
+            .cluster_id = identity.cluster_id,
+            .node_id = identity.node_id,
+            .node_type = identity.node_type,
+            .incarnation_id =
+                BuildProcessIncarnationId(identity, started_at_unix_ns),
+            .started_at_unix_ms = started_at_unix_ms,
+            .startup_sequence_base = kProcessIncarnationInitialSequence};
+        result.diagnostic =
+            "process incarnation created successfully from durable node identity";
         return result;
     }
 
