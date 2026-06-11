@@ -1026,6 +1026,15 @@ namespace viewdemo
         return result;
     }
 
+    HeartbeatNodeResult ViewNodeRegistry::RefreshSelfNode(
+        const HeartbeatNodeRequest &request)
+    {
+        // self refresh 只是 ViewNode 对自己 observed state 的周期性更新，
+        // 故意复用 heartbeat 的 sequence / observed_at / liveness 语义，
+        // 避免把 self record 变成绕过 TTL 的永久 LIVE 特权。
+        return HeartbeatNode(request);
+    }
+
     LookupNodeResult ViewNodeRegistry::LookupNode(
         const std::string_view cluster_id,
         const std::string_view node_id,

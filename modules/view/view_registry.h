@@ -403,6 +403,12 @@ namespace viewdemo
 
         HeartbeatNodeResult HeartbeatNode(const HeartbeatNodeRequest &request);
 
+        // self refresh 复用与普通 heartbeat 相同的 registry update 语义：
+        // 调用方必须提供当前 observed_at_unix_ms 和递增 sequence。
+        // 该入口只刷新本节点的 observed state，不绕过 TTL，也不授予
+        // 任何 membership authority。
+        HeartbeatNodeResult RefreshSelfNode(const HeartbeatNodeRequest &request);
+
         [[nodiscard]] LookupNodeResult LookupNode(
             std::string_view cluster_id,
             std::string_view node_id,

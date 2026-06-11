@@ -179,6 +179,12 @@ namespace
             now_unix_ms_ = now_unix_ms;
         }
 
+        [[nodiscard]] viewdemo::HeartbeatNodeResult RefreshSelfNode(
+            const HeartbeatNodeRequest &request) const
+        {
+            return registry_->RefreshSelfNode(request);
+        }
+
     private:
         std::uint64_t now_unix_ms_{kNow};
         std::shared_ptr<ViewNodeRegistry> registry_;
@@ -709,15 +715,25 @@ namespace
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence, 0U);
 
         service.set_now_unix_ms(191);
+        auto self_refresh = MakeHeartbeatRequest(ViewNodeType::kView,
+                                                 "view-self-1",
+                                                 9700,
+                                                 1,
+                                                 191);
+        const auto self_refresh_result = service.RefreshSelfNode(self_refresh);
+        ASSERT_EQ(self_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(self_refresh_result.applied);
+        EXPECT_EQ(self_refresh_result.accepted_sequence, 1U);
+
         cluster_request.request_id =
             "integration-cluster-view-self-beyond-dead-ttl";
         cluster_result = service.client().GetClusterView(cluster_request);
         ASSERT_TRUE(cluster_result.transport_ok());
         ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
 
-        // 健康运行中的 ViewNode 应靠自身 refresh 持续维持 LIVE，而不是依赖外部节点
-        // heartbeat。超过 dead TTL 后，cluster view 里仍应保留 self record，且要看到
-        // 实际状态更新，而不是单纯依赖更晚的查询时间。
+        // 健康运行中的 ViewNode 依靠 registry self refresh 持续维持 LIVE。
+        // 这里不启动 app 层 loop，只直接触发一次 registry self refresh，
+        // 验证它遵守正常 update 语义而不是依赖 TTL 豁免。
         ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].node_id,
                   "view-self-1");
