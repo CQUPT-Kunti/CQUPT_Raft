@@ -63,6 +63,11 @@ namespace
         bool durable{false};
     };
 
+    struct ProcessIncarnationStartupState
+    {
+        clusterdemo::ProcessIncarnation incarnation;
+    };
+
     class IdentityStartupError final : public std::runtime_error
     {
     public:
@@ -217,11 +222,12 @@ namespace
     }
 
     [[nodiscard]] std::optional<viewdemo::NodeRegistration> MakeSelfRegistration(
-        const ViewNodeStartupConfig &startup)
+        const ViewNodeStartupConfig &startup,
+        const clusterdemo::NodeIdentity &identity)
     {
         viewdemo::NodeRegistration registration;
-        registration.cluster_id = startup.cluster_id;
-        registration.node_id = startup.node_id;
+        registration.cluster_id = identity.cluster_id;
+        registration.node_id = identity.node_id;
         registration.node_type = viewdemo::ViewNodeType::kView;
         registration.endpoint = startup.listen_endpoint;
         registration.control_plane_endpoint = startup.listen_endpoint;
@@ -407,6 +413,26 @@ namespace
         };
     }
 
+    [[nodiscard]] ProcessIncarnationStartupState EnsureProcessIncarnation(
+        const clusterdemo::NodeIdentity &identity,
+        const std::filesystem::path &identity_path)
+    {
+        const auto incarnation_result =
+            clusterdemo::CreateProcessIncarnation(identity);
+        if (!incarnation_result.ok())
+        {
+            throw IdentityStartupError(
+                incarnation_result.status,
+                "process incarnation startup check failed for identity_path=" +
+                    identity_path.lexically_normal().generic_string() +
+                    ": " + incarnation_result.diagnostic);
+        }
+
+        return ProcessIncarnationStartupState{
+            .incarnation = *incarnation_result.incarnation,
+        };
+    }
+
     [[nodiscard]] int Run(const ParsedArgs &args)
     {
         const auto loaded_config =
@@ -447,15 +473,31 @@ namespace
             return static_cast<int>(MapIdentityExitCode(ex.status()));
         }
 
+        ProcessIncarnationStartupState process_state;
+        try
+        {
+            process_state = EnsureProcessIncarnation(
+                identity_state.identity,
+                identity_state.identity_path);
+        }
+        catch (const IdentityStartupError &ex)
+        {
+            std::cerr << ex.what() << '\n';
+            return static_cast<int>(MapIdentityExitCode(ex.status()));
+        }
+
         auto registry = std::make_shared<viewdemo::ViewNodeRegistry>(
             startup.registry_config);
 
-        if (const auto registration = MakeSelfRegistration(startup);
+        if (const auto registration = MakeSelfRegistration(
+                startup,
+                identity_state.identity);
             registration.has_value())
         {
             const auto result = registry->RegisterNode(
                 viewdemo::RegisterNodeRequest{
-                    .request_id = "view-node-startup-register-" + startup.node_id,
+                    .request_id =
+                        "view-node-startup-register-" + identity_state.identity.node_id,
                     .registration = *registration,
                 });
             if (!result.summary.ok())
@@ -492,8 +534,11 @@ namespace
         }
 
         std::cout << "view_node_app OK"
-                  << " cluster_id=" << startup.cluster_id
+                  << " cluster_id=" << identity_state.identity.cluster_id
+                  << " node_type=view"
                   << " node_id=" << identity_state.identity.node_id
+                  << " incarnation_id="
+                  << process_state.incarnation.incarnation_id
                   << " endpoint=" << startup.listen_endpoint
                   << " data_dir=" << startup.data_dir.generic_string()
                   << " identity_path=" <<

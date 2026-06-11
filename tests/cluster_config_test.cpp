@@ -481,6 +481,93 @@ namespace clusterdemo
             EXPECT_EQ(issue->node_id, request.fixed_metadata_node_ids[1]);
         }
 
+        TEST(cluster_config_validation_test,
+             allows_metadata_candidate_outside_initial_membership_and_roundtrips_json)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+            ASSERT_EQ(generated.config.metadata_nodes.size(), 4U);
+            ASSERT_EQ(generated.config.initial_raft_membership.learner_raft_ids.size(), 1U);
+
+            ClusterConfig candidate_config = generated.config;
+            candidate_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+            candidate_config.initial_raft_membership.learner_raft_ids.clear();
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(candidate_config);
+            EXPECT_TRUE(validation.ok());
+
+            const ClusterNodeResolutionResult resolved = ResolveClusterNodeConfig(
+                candidate_config,
+                ClusterNodeType::kMetadata,
+                "meta-candidate-d");
+            ASSERT_TRUE(resolved.ok()) << resolved.error_detail;
+            ASSERT_TRUE(resolved.resolved.has_value());
+            EXPECT_EQ(resolved.resolved->node_id, "meta-candidate-d");
+            EXPECT_EQ(resolved.resolved->metadata_initial_role,
+                      MetadataNodeInitialRole::kCandidate);
+            ASSERT_TRUE(resolved.resolved->raft_id.has_value());
+            EXPECT_GT(*resolved.resolved->raft_id, 0);
+
+            const std::filesystem::path json_path = MakeTempConfigPath(34);
+            WriteConfigJson(json_path,
+                            SerializeClusterConfigToJson(candidate_config));
+            const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+            ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+            ASSERT_TRUE(loaded.config.has_value());
+            ASSERT_EQ(loaded.config->metadata_nodes.size(), 4U);
+            EXPECT_EQ(loaded.config->metadata_nodes.back().initial_role,
+                      MetadataNodeInitialRole::kCandidate);
+            EXPECT_TRUE(loaded.config->initial_raft_membership.learner_raft_ids.empty());
+
+            std::error_code remove_ec;
+            std::filesystem::remove(json_path, remove_ec);
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_metadata_candidate_that_stays_in_initial_membership)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssue(validation,
+                          ClusterConfigIssueCode::kInvalidInitialMembership);
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->field_path, "metadata_nodes[3].initial_role");
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
+            EXPECT_EQ(issue->node_id, "meta-candidate-d");
+        }
+
         TEST(cluster_config_endpoint_allocation_test,
              allocates_stable_role_specific_endpoints_from_request)
         {

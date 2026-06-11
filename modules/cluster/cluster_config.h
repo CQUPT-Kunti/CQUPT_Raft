@@ -27,6 +27,7 @@ namespace clusterdemo
         kUnknown = 0,
         kVoter = 1,
         kLearner = 2,
+        kCandidate = 3,
     };
 
     enum class ClusterChecksumAlgorithm : std::uint8_t

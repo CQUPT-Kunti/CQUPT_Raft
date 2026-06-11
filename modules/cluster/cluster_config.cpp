@@ -1139,6 +1139,10 @@ namespace clusterdemo
             {
                 return MetadataNodeInitialRole::kLearner;
             }
+            if (value == "candidate")
+            {
+                return MetadataNodeInitialRole::kCandidate;
+            }
             return MetadataNodeInitialRole::kUnknown;
         }
 
@@ -1577,7 +1581,7 @@ namespace clusterdemo
                 AppendIssue(&result,
                             ClusterConfigIssueCode::kInvalidInitialMembership,
                             field_prefix + ".initial_role",
-                            "initial_role must be voter or learner",
+                            "initial_role must be voter, learner or candidate",
                             ClusterNodeType::kMetadata,
                             node.node_id,
                             node.endpoint);
@@ -1835,14 +1839,39 @@ namespace clusterdemo
                                 node.endpoint);
                 }
             }
+            else if (node.initial_role == MetadataNodeInitialRole::kCandidate)
+            {
+                if (node.raft_id > 0 &&
+                    (voter_ids.find(node.raft_id) != voter_ids.end() ||
+                     learner_ids.find(node.raft_id) != learner_ids.end()))
+                {
+                    AppendIssue(&result,
+                                ClusterConfigIssueCode::kInvalidInitialMembership,
+                                field_prefix + ".initial_role",
+                                "MetadataNode configured as candidate must not appear in initial committed membership",
+                                ClusterNodeType::kMetadata,
+                                node.node_id,
+                                node.endpoint);
+                }
+            }
         }
 
-        if (voter_ids.size() + learner_ids.size() != config.metadata_nodes.size())
+        std::size_t expected_initial_membership_nodes = 0;
+        for (const MetadataNodeConfig &node : config.metadata_nodes)
+        {
+            if (node.initial_role == MetadataNodeInitialRole::kVoter ||
+                node.initial_role == MetadataNodeInitialRole::kLearner)
+            {
+                ++expected_initial_membership_nodes;
+            }
+        }
+
+        if (voter_ids.size() + learner_ids.size() != expected_initial_membership_nodes)
         {
             AppendIssue(&result,
                         ClusterConfigIssueCode::kInvalidInitialMembership,
                         "initial_raft_membership",
-                        "every MetadataNode must appear exactly once in initial membership");
+                        "initial committed membership must cover every non-candidate MetadataNode exactly once");
         }
 
         return result;
@@ -2516,6 +2545,8 @@ namespace clusterdemo
             return "voter";
         case MetadataNodeInitialRole::kLearner:
             return "learner";
+        case MetadataNodeInitialRole::kCandidate:
+            return "candidate";
         case MetadataNodeInitialRole::kUnknown:
         default:
             return "unknown";

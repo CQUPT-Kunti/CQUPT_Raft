@@ -143,6 +143,41 @@ namespace
         return path.lexically_normal().generic_string();
     }
 
+    [[nodiscard]] bool IsDynamicJoinCandidateMode(
+        const MetadataNodeStartupConfig &startup)
+    {
+        return startup.initial_role ==
+               clusterdemo::MetadataNodeInitialRole::kCandidate;
+    }
+
+    [[nodiscard]] clusterdemo::NodeIdentityMembershipState
+    ResolveMetadataIdentityMembershipState(
+        const MetadataNodeStartupConfig &startup)
+    {
+        switch (startup.initial_role)
+        {
+        case clusterdemo::MetadataNodeInitialRole::kVoter:
+            return clusterdemo::NodeIdentityMembershipState::kVoter;
+        case clusterdemo::MetadataNodeInitialRole::kLearner:
+            return clusterdemo::NodeIdentityMembershipState::kLearner;
+        case clusterdemo::MetadataNodeInitialRole::kCandidate:
+            return clusterdemo::NodeIdentityMembershipState::kCandidate;
+        case clusterdemo::MetadataNodeInitialRole::kUnknown:
+        default:
+            return clusterdemo::NodeIdentityMembershipState::kUnknown;
+        }
+    }
+
+    [[nodiscard]] clusterdemo::NodeIdentitySource ResolveMetadataIdentitySource(
+        const MetadataNodeStartupConfig &startup)
+    {
+        if (IsDynamicJoinCandidateMode(startup))
+        {
+            return clusterdemo::NodeIdentitySource::kExplicitOverride;
+        }
+        return clusterdemo::NodeIdentitySource::kConfigGenerator;
+    }
+
     void PrintUsage(std::ostream &out)
     {
         out << "Usage: metadata_node_app --config <path> [--node_id <id>] "
@@ -236,17 +271,9 @@ namespace
                       startup->raft_id) !=
             config.initial_raft_membership.learner_raft_ids.end();
 
-        if (in_voter_set == in_learner_set)
-        {
-            throw std::runtime_error(
-                "metadata node raft_id must appear in exactly one initial membership role"
-                " node_id=" +
-                startup->node_id + " raft_id=" + std::to_string(startup->raft_id));
-        }
-
         // app startup 只做配置和身份边界校验，不修改真实 membership authority。
         if (startup->initial_role == clusterdemo::MetadataNodeInitialRole::kVoter &&
-            !in_voter_set)
+            (!in_voter_set || in_learner_set))
         {
             throw std::runtime_error(
                 "metadata node initial_role=voter but raft_id is not present in voter set"
@@ -254,10 +281,19 @@ namespace
                 startup->node_id + " raft_id=" + std::to_string(startup->raft_id));
         }
         if (startup->initial_role == clusterdemo::MetadataNodeInitialRole::kLearner &&
-            !in_learner_set)
+            (!in_learner_set || in_voter_set))
         {
             throw std::runtime_error(
                 "metadata node initial_role=learner but raft_id is not present in learner set"
+                " node_id=" +
+                startup->node_id + " raft_id=" + std::to_string(startup->raft_id));
+        }
+        if (startup->initial_role ==
+                clusterdemo::MetadataNodeInitialRole::kCandidate &&
+            (in_voter_set || in_learner_set))
+        {
+            throw std::runtime_error(
+                "metadata node initial_role=candidate must not appear in initial committed membership"
                 " node_id=" +
                 startup->node_id + " raft_id=" + std::to_string(startup->raft_id));
         }
@@ -326,10 +362,11 @@ namespace
         }
 
         if (startup.initial_role != clusterdemo::MetadataNodeInitialRole::kVoter &&
-            startup.initial_role != clusterdemo::MetadataNodeInitialRole::kLearner)
+            startup.initial_role != clusterdemo::MetadataNodeInitialRole::kLearner &&
+            startup.initial_role != clusterdemo::MetadataNodeInitialRole::kCandidate)
         {
             throw std::runtime_error(
-                "metadata node initial_role must be voter or learner");
+                "metadata node initial_role must be voter, learner or candidate");
         }
     }
 
@@ -393,7 +430,7 @@ namespace
                 clusterdemo::MetadataNodeInitialRole::kUnknown)
         {
             throw std::runtime_error(
-                "metadata node config must provide initial_role as voter or learner"
+                "metadata node config must provide initial_role as voter, learner or candidate"
                 " node_id=" +
                 resolved_node.node_id);
         }
@@ -404,6 +441,7 @@ namespace
         startup.data_dir = resolved_node.data_dir;
         startup.snapshot_dir = *resolved_node.snapshot_dir;
         startup.initial_role = *resolved_node.metadata_initial_role;
+        startup.identity_source = ResolveMetadataIdentitySource(startup);
 
         if (args.data_dir_override.has_value())
         {
@@ -444,13 +482,16 @@ namespace
     [[nodiscard]] clusterdemo::NodeIdentity EnsureNodeIdentity(
         const MetadataNodeStartupConfig &startup)
     {
-        // MetadataNode 的 durable identity 必须来自配置生成的 node_id/raft_id，
-        // 不能被 ViewNode 分配身份或本地 override 重新解释来源。
+        // bootstrap voter 与 dynamic join candidate 都通过统一 durable identity
+        // 流程进入，但本地 identity 不能越权表达 committed membership authority。
+        const auto membership_state =
+            ResolveMetadataIdentityMembershipState(startup);
         const clusterdemo::NodeIdentity identity_to_create{
             .cluster_id = startup.cluster_id,
             .node_id = startup.node_id,
             .node_type = clusterdemo::ClusterNodeType::kMetadata,
             .raft_id = startup.raft_id,
+            .membership_state = membership_state,
             .identity_version = clusterdemo::kNodeIdentityCurrentVersion,
             .created_at_unix_ms = static_cast<std::int64_t>(NowUnixMs()),
             .source = startup.identity_source,
@@ -461,6 +502,7 @@ namespace
             .node_id = startup.node_id,
             .node_type = clusterdemo::ClusterNodeType::kMetadata,
             .raft_id = startup.raft_id,
+            .membership_state = membership_state,
             .source = startup.identity_source,
             .require_raft_id_for_metadata = true,
             .forbid_raft_id_for_non_metadata = true,
@@ -489,6 +531,20 @@ namespace
                 "node.identity startup check failed: " + load_or_create.diagnostic);
         }
         return *load_or_create.identity;
+    }
+
+    [[nodiscard]] clusterdemo::ProcessIncarnation EnsureProcessIncarnation(
+        const clusterdemo::NodeIdentity &identity)
+    {
+        const auto incarnation = clusterdemo::CreateProcessIncarnation(identity);
+        if (!incarnation.ok())
+        {
+            throw IdentityStartupError(
+                incarnation.status,
+                "process incarnation startup check failed: " +
+                    incarnation.diagnostic);
+        }
+        return *incarnation.incarnation;
     }
 
     [[nodiscard]] raftdemo::NodeConfig BuildRaftNodeConfig(
@@ -982,6 +1038,37 @@ namespace
             return static_cast<int>(MapIdentityExitCode(ex.status()));
         }
 
+        clusterdemo::ProcessIncarnation incarnation;
+        try
+        {
+            incarnation = EnsureProcessIncarnation(identity);
+        }
+        catch (const IdentityStartupError &ex)
+        {
+            std::cerr << ex.what() << '\n';
+            return static_cast<int>(MapIdentityExitCode(ex.status()));
+        }
+
+        if (IsDynamicJoinCandidateMode(startup))
+        {
+            std::cout
+                << "metadata_node_app candidate mode prepared durable identity and process incarnation"
+                << " cluster_id=" << startup.cluster_id
+                << " node_id=" << identity.node_id
+                << " raft_id=" << startup.raft_id
+                << " endpoint=" << startup.listen_endpoint
+                << " data_dir=" << startup.data_dir.generic_string()
+                << " identity_membership_state="
+                << clusterdemo::ToString(identity.membership_state)
+                << " identity_source="
+                << clusterdemo::ToString(identity.source)
+                << " incarnation_id=" << incarnation.incarnation_id
+                << "; JoinMetadataCluster/AddLearner is not implemented in T016,"
+                << " refusing to start candidate as a Raft voter/learner without committed membership authority"
+                << '\n';
+            return static_cast<int>(ExitCode::kUnsupported);
+        }
+
         const raftdemo::NodeConfig node_config =
             BuildRaftNodeConfig(*loaded_config.config, startup);
         const raftdemo::snapshotConfig snapshot_config =
@@ -1021,7 +1108,10 @@ namespace
                   << " initial_role=" << clusterdemo::ToString(startup.initial_role)
                   << " initial_voters=" << startup.initial_quorum.voter_count
                   << " initial_commit_quorum=" << startup.initial_quorum.commit_quorum
+                  << " identity_membership_state="
+                  << clusterdemo::ToString(identity.membership_state)
                   << " identity_source=" << clusterdemo::ToString(identity.source)
+                  << " incarnation_id=" << incarnation.incarnation_id
                   << '\n';
 
         std::signal(SIGINT, HandleSignal);
