@@ -47,3 +47,9 @@ Mitigation: 009 is pre-deployment for the new identity schema. Support only the 
 Risk: Dynamic registration could pass one local demo while missing restart, duplicate, TTL, stale heartbeat, old incarnation, leader failover, and odd-voter tests.
 
 Mitigation: Keep validation matrix mandatory for phase closure. Every phase task should name its CTest/example entry and failure class.
+
+## R9: Identity Atomic Publish Durability Is Only Logically Validated On Linux
+
+Risk: `node.identity` atomic publish currently has Linux-targeted logic coverage for `fsync(fd) -> atomic publish -> fsync(data_dir)` and explicit Windows refusal for required directory durability, but the project has not run power-loss-grade validation or real Windows/macOS durability confirmation in 009.
+
+Mitigation: Keep Linux as the primary validated platform for now, record Windows/macOS as pending, and do not claim cross-platform durability PASS until dedicated platform validation runs. If required durability cannot be proven on a platform, the implementation must keep returning an explicit error rather than silently succeeding.
