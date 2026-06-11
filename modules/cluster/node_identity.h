@@ -221,8 +221,9 @@ namespace clusterdemo
         const NodeIdentity &identity,
         const ExpectedNodeIdentity &expected);
 
-    // 以下接口只声明 durable load/store 边界。T013 负责在 .cpp 中实现
-    // node.identity 的解析、临时文件写入、flush、atomic publish 和目录 durability。
+    // 以下接口声明 009 阶段 durable identity 的 load/store/load-or-create 边界。
+    // T012 已实现解析、临时文件写入、flush、atomic publish、restart validation
+    // 和目录 durability；T013 负责 process incarnation / boot epoch 边界。
     [[nodiscard]] NodeIdentityLoadResult LoadNodeIdentity(
         const NodeIdentityLoadOptions &options);
 

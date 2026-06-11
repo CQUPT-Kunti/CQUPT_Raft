@@ -300,6 +300,82 @@ namespace clusterdemo
             EXPECT_EQ(reload.identity->source, identity.source);
         }
 
+        TEST_F(
+            NodeIdentityTest,
+            T012FirstStartIgnoresResidualStagingFileAndCreatesFinalIdentity)
+        {
+            const auto data_dir = MakeDataDir("t012-ignore-staging-file");
+            const auto identity_path = ResolveNodeIdentityPath(data_dir);
+            const auto staging_path = data_dir / "node.identity.tmp.leftover";
+            ASSERT_FALSE(std::filesystem::exists(identity_path));
+
+            WriteTextFile(
+                staging_path,
+                "identity_version=2\n"
+                "cluster_id=cluster-alpha\n"
+                "node_id=stale-temp-node\n"
+                "node_type=storage\n"
+                "raft_id=\n"
+                "created_at_unix_ms=1710000009999\n"
+                "membership_state=non_raft\n"
+                "persistent_generation=1\n"
+                "source=explicit_override\n");
+
+            const auto requested = MakeStorageIdentity("store-node-t012");
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = requested.cluster_id,
+                            .node_id = requested.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = requested.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = requested,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
+            EXPECT_TRUE(first_start.created_new);
+            EXPECT_FALSE(first_start.loaded_existing);
+            EXPECT_TRUE(std::filesystem::exists(identity_path));
+            EXPECT_TRUE(std::filesystem::exists(staging_path));
+            EXPECT_EQ(first_start.identity->node_id, requested.node_id);
+            EXPECT_FALSE(first_start.identity->raft_id.has_value());
+
+            const auto reload = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = requested.cluster_id,
+                        .node_id = requested.node_id,
+                        .node_type = ClusterNodeType::kStorage,
+                        .raft_id = std::nullopt,
+                        .source = requested.source,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            ASSERT_TRUE(reload.ok()) << reload.diagnostic;
+            ASSERT_TRUE(reload.identity.has_value());
+            EXPECT_EQ(reload.identity->node_id, requested.node_id);
+            const auto final_content = ReadTextFile(identity_path);
+            EXPECT_NE(final_content.find("node_id=store-node-t012"),
+                      std::string::npos);
+            EXPECT_EQ(final_content.find("stale-temp-node"), std::string::npos);
+            EXPECT_NE(ReadTextFile(staging_path).find("stale-temp-node"),
+                      std::string::npos);
+        }
+
         TEST_F(NodeIdentityTest,
                T008MetadataBootstrapVoterIdentityUsesFixedNodeIdAndRaftIdAcrossCreateAndReload)
         {

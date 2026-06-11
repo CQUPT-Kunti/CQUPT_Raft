@@ -1346,7 +1346,7 @@ namespace clusterdemo
                 NodeIdentityStoreMode::kReplaceOnlyIfMatchesExpected;
             result.durable = false;
             result.diagnostic =
-                "best-effort node.identity publish completed on Windows; "
+                "best-effort atomic node.identity publish completed on Windows; "
                 "file flush and MoveFileExW succeeded, directory durability not claimed";
             return result;
 #else
@@ -1436,7 +1436,7 @@ namespace clusterdemo
                 options.store_mode ==
                 NodeIdentityStoreMode::kReplaceOnlyIfMatchesExpected;
             result.durable = true;
-            result.diagnostic = "node.identity durable publish completed";
+            result.diagnostic = "node.identity atomic durable publish completed";
             return result;
 #endif
         }
