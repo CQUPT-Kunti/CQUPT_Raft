@@ -35,10 +35,8 @@ namespace viewdemo
         struct Record
         {
             NodeRegistration registration;
-            std::string incarnation_id;
+            ViewNodeObservedState observed_state;
             std::uint64_t registered_at_unix_ms{0};
-            std::uint64_t last_seen_unix_ms{0};
-            std::uint64_t last_sequence{0};
         };
 
         using Records = std::map<RecordKey, Record>;
@@ -645,16 +643,18 @@ namespace viewdemo
                 .cluster_id = record.registration.cluster_id,
                 .node_id = record.registration.node_id,
                 .node_type = record.registration.node_type,
-                .incarnation_id = record.incarnation_id,
+                .incarnation_id = record.observed_state.incarnation_id,
                 .endpoint = record.registration.endpoint,
                 .control_plane_endpoint =
                     record.registration.control_plane_endpoint,
                 .data_plane_endpoint = record.registration.data_plane_endpoint,
                 .data_dir_fingerprint = record.registration.data_dir_fingerprint,
+                .observed_state = record.observed_state,
                 .registered_at_unix_ms = record.registered_at_unix_ms,
-                .last_seen_unix_ms = record.last_seen_unix_ms,
-                .last_sequence = record.last_sequence,
-                .liveness = DetermineLiveness(record.last_seen_unix_ms,
+                .last_seen_unix_ms = record.observed_state.observed_at_unix_ms,
+                .last_sequence = record.observed_state.sequence,
+                .liveness = DetermineLiveness(
+                    record.observed_state.observed_at_unix_ms,
                                               now_unix_ms,
                                               config),
                 .failure_domain = record.registration.failure_domain,
@@ -699,7 +699,7 @@ namespace viewdemo
             const std::uint64_t incoming_sequence,
             const std::uint64_t incoming_observed_at)
         {
-            switch (CompareIncarnationIds(record.incarnation_id,
+            switch (CompareIncarnationIds(record.observed_state.incarnation_id,
                                           incoming_incarnation_id))
             {
             case IncarnationDecision::kIncomingOlder:
@@ -712,8 +712,8 @@ namespace viewdemo
                 break;
             }
 
-            return EvaluateSequenceDecision(record.last_sequence,
-                                            record.last_seen_unix_ms,
+            return EvaluateSequenceDecision(record.observed_state.sequence,
+                                            record.observed_state.observed_at_unix_ms,
                                             incoming_sequence,
                                             incoming_observed_at);
         }
@@ -1042,8 +1042,8 @@ namespace viewdemo
         Record record;
         record.registration = request.registration;
         record.registered_at_unix_ms = request.registration.observed_at_unix_ms;
-        record.last_seen_unix_ms = request.registration.observed_at_unix_ms;
-        record.last_sequence = 0;
+        record.observed_state.observed_at_unix_ms =
+            request.registration.observed_at_unix_ms;
 
         const auto inserted = impl_->records.emplace(key, std::move(record));
         result.created = true;
@@ -1178,7 +1178,7 @@ namespace viewdemo
             return result;
         }
 
-        result.accepted_sequence = existing->second.last_sequence;
+        result.accepted_sequence = existing->second.observed_state.sequence;
         const auto decision = EvaluateSequenceDecisionWithIncarnation(
             existing->second,
             request.incarnation_id,
@@ -1225,10 +1225,12 @@ namespace viewdemo
         MergeRegistrationFacts(&existing->second, observation);
         if (!request.incarnation_id.empty())
         {
-            existing->second.incarnation_id = request.incarnation_id;
+            existing->second.observed_state.incarnation_id =
+                request.incarnation_id;
         }
-        existing->second.last_sequence = request.sequence;
-        existing->second.last_seen_unix_ms = observation.observed_at_unix_ms;
+        existing->second.observed_state.sequence = request.sequence;
+        existing->second.observed_state.observed_at_unix_ms =
+            observation.observed_at_unix_ms;
 
         result.applied = true;
         result.accepted_sequence = request.sequence;

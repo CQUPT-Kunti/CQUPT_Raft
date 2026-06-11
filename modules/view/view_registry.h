@@ -191,6 +191,13 @@ namespace viewdemo
         std::optional<MetadataNodeObservation> metadata;
     };
 
+    struct ViewNodeObservedState
+    {
+        std::string incarnation_id;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+    };
+
     struct ViewNodeSnapshot
     {
         ClusterId cluster_id;
@@ -201,6 +208,10 @@ namespace viewdemo
         Endpoint control_plane_endpoint;
         Endpoint data_plane_endpoint;
         std::string data_dir_fingerprint;
+        // 结构化 observed-state 事实，供后续 incarnation-aware merge 使用。
+        // 兼容字段 `incarnation_id` / `last_sequence` / `last_seen_unix_ms`
+        // 保持现有调用方不回归。
+        ViewNodeObservedState observed_state;
         std::uint64_t registered_at_unix_ms{0};
         std::uint64_t last_seen_unix_ms{0};
         std::uint64_t last_sequence{0};

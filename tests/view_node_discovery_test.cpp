@@ -260,6 +260,21 @@ namespace
         return nullptr;
     }
 
+    void ExpectObservedStateFacts(const viewdemo::ViewNodeSnapshot &snapshot,
+                                  const std::string &incarnation_id,
+                                  const std::uint64_t sequence,
+                                  const std::uint64_t observed_at_unix_ms)
+    {
+        EXPECT_EQ(snapshot.observed_state.incarnation_id, incarnation_id);
+        EXPECT_EQ(snapshot.observed_state.sequence, sequence);
+        EXPECT_EQ(snapshot.observed_state.observed_at_unix_ms,
+                  observed_at_unix_ms);
+        EXPECT_EQ(snapshot.incarnation_id, snapshot.observed_state.incarnation_id);
+        EXPECT_EQ(snapshot.last_sequence, snapshot.observed_state.sequence);
+        EXPECT_EQ(snapshot.last_seen_unix_ms,
+                  snapshot.observed_state.observed_at_unix_ms);
+    }
+
     TEST(ViewNodeDiscoveryTest, RegisterStoresNodeFactsAndLookupOrClusterViewSorted)
     {
         ViewNodeRegistry registry;
@@ -296,6 +311,7 @@ namespace
         EXPECT_EQ(lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
         EXPECT_EQ(lookup.snapshot->failure_domain.zone, "zone-b");
         EXPECT_EQ(lookup.snapshot->capacity.available_capacity_bytes, 6'144U);
+        ExpectObservedStateFacts(*lookup.snapshot, "", 0U, 102U);
 
         GetClusterViewRequest request;
         request.request_id = "cluster-view";
@@ -311,6 +327,9 @@ namespace
         EXPECT_EQ(cluster_view.snapshot.view_nodes[0].node_id, "view-1");
         EXPECT_EQ(cluster_view.snapshot.metadata_nodes[0].node_id, "meta-1");
         EXPECT_EQ(cluster_view.snapshot.storage_nodes[0].node_id, "store-1");
+        ExpectObservedStateFacts(cluster_view.snapshot.view_nodes[0], "", 0U, 100U);
+        ExpectObservedStateFacts(cluster_view.snapshot.metadata_nodes[0], "", 0U, 101U);
+        ExpectObservedStateFacts(cluster_view.snapshot.storage_nodes[0], "", 0U, 102U);
         EXPECT_FALSE(cluster_view.snapshot.leader_hint.has_value());
     }
 
@@ -455,6 +474,7 @@ namespace
         const auto lookup = registry.LookupNode(kClusterId, "meta-1", 181);
         ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, "", 7U, 160U);
         EXPECT_EQ(lookup.snapshot->last_sequence, 7U);
         EXPECT_EQ(lookup.snapshot->last_seen_unix_ms, 160U);
         EXPECT_EQ(lookup.snapshot->health.health, ViewNodeHealth::kDegraded);
@@ -835,6 +855,10 @@ namespace
         ASSERT_EQ(old_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(old_refresh_result.applied);
         ASSERT_TRUE(old_refresh_result.snapshot.has_value());
+        ExpectObservedStateFacts(*old_refresh_result.snapshot,
+                                 old_incarnation,
+                                 10U,
+                                 110U);
         EXPECT_EQ(old_refresh_result.snapshot->incarnation_id, old_incarnation);
         EXPECT_EQ(old_refresh_result.snapshot->last_sequence, 10U);
         EXPECT_EQ(old_refresh_result.snapshot->last_seen_unix_ms, 110U);
@@ -855,6 +879,10 @@ namespace
         ASSERT_EQ(new_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(new_refresh_result.applied);
         ASSERT_TRUE(new_refresh_result.snapshot.has_value());
+        ExpectObservedStateFacts(*new_refresh_result.snapshot,
+                                 new_incarnation,
+                                 1U,
+                                 111U);
         EXPECT_EQ(new_refresh_result.snapshot->incarnation_id, new_incarnation);
         EXPECT_EQ(new_refresh_result.snapshot->last_sequence, 1U);
         EXPECT_EQ(new_refresh_result.snapshot->last_seen_unix_ms, 111U);
@@ -909,6 +937,7 @@ namespace
                                                 114);
         ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, new_incarnation, 2U, 112U);
         EXPECT_EQ(lookup.snapshot->node_id, "view-self-payload-1");
         EXPECT_EQ(lookup.snapshot->endpoint, self.endpoint);
         EXPECT_EQ(lookup.snapshot->incarnation_id, new_incarnation);
@@ -962,6 +991,10 @@ namespace
         ASSERT_EQ(sequence_11_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(sequence_11_result.applied);
         ASSERT_TRUE(sequence_11_result.snapshot.has_value());
+        ExpectObservedStateFacts(*sequence_11_result.snapshot,
+                                 incarnation_id,
+                                 11U,
+                                 111U);
         EXPECT_EQ(sequence_11_result.snapshot->incarnation_id, incarnation_id);
         EXPECT_EQ(sequence_11_result.snapshot->last_sequence, 11U);
         EXPECT_EQ(sequence_11_result.snapshot->last_seen_unix_ms, 111U);
@@ -990,6 +1023,7 @@ namespace
                                                 250);
         ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, incarnation_id, 11U, 111U);
         EXPECT_EQ(lookup.snapshot->incarnation_id, incarnation_id);
         EXPECT_EQ(lookup.snapshot->last_sequence, 11U);
         EXPECT_EQ(lookup.snapshot->last_seen_unix_ms, 111U);
@@ -1050,6 +1084,10 @@ namespace
         ASSERT_EQ(new_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(new_refresh_result.applied);
         ASSERT_TRUE(new_refresh_result.snapshot.has_value());
+        ExpectObservedStateFacts(*new_refresh_result.snapshot,
+                                 new_incarnation,
+                                 1U,
+                                 111U);
         EXPECT_EQ(new_refresh_result.snapshot->incarnation_id, new_incarnation);
         EXPECT_EQ(new_refresh_result.snapshot->last_sequence, 1U);
         EXPECT_EQ(new_refresh_result.snapshot->last_seen_unix_ms, 111U);
@@ -1074,6 +1112,10 @@ namespace
                   ViewRegistryStatusCode::kStaleIgnored);
         ASSERT_TRUE(old_incarnation_late_result.stale_ignored);
         ASSERT_TRUE(old_incarnation_late_result.snapshot.has_value());
+        ExpectObservedStateFacts(*old_incarnation_late_result.snapshot,
+                                 new_incarnation,
+                                 1U,
+                                 111U);
         EXPECT_EQ(old_incarnation_late_result.snapshot->incarnation_id,
                   new_incarnation);
         EXPECT_EQ(old_incarnation_late_result.snapshot->last_sequence, 1U);
@@ -1087,6 +1129,7 @@ namespace
             registry.LookupNode(kClusterId, "view-incarnation-order-1", 121);
         ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, new_incarnation, 1U, 111U);
         EXPECT_EQ(lookup.snapshot->node_id, "view-incarnation-order-1");
         EXPECT_EQ(lookup.snapshot->endpoint, self.endpoint);
         EXPECT_EQ(lookup.snapshot->incarnation_id, new_incarnation);
@@ -1103,6 +1146,10 @@ namespace
         const auto cluster_view = registry.GetClusterView(cluster_request, 121);
         ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_EQ(cluster_view.snapshot.view_nodes.size(), 1U);
+        ExpectObservedStateFacts(cluster_view.snapshot.view_nodes[0],
+                                 new_incarnation,
+                                 1U,
+                                 111U);
         EXPECT_EQ(cluster_view.snapshot.view_nodes[0].node_id,
                   "view-incarnation-order-1");
         EXPECT_EQ(cluster_view.snapshot.view_nodes[0].incarnation_id,
@@ -1148,6 +1195,7 @@ namespace
         ASSERT_EQ(live_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(live_result.applied);
         ASSERT_TRUE(live_result.snapshot.has_value());
+        ExpectObservedStateFacts(*live_result.snapshot, incarnation_id, 11U, 210U);
         EXPECT_EQ(live_result.snapshot->last_sequence, 11U);
         EXPECT_EQ(live_result.snapshot->last_seen_unix_ms, 210U);
         EXPECT_EQ(live_result.snapshot->health.health,
@@ -1171,6 +1219,10 @@ namespace
         EXPECT_FALSE(stale_result.applied);
         EXPECT_EQ(stale_result.accepted_sequence, 11U);
         ASSERT_TRUE(stale_result.snapshot.has_value());
+        ExpectObservedStateFacts(*stale_result.snapshot,
+                                 incarnation_id,
+                                 11U,
+                                 210U);
         EXPECT_EQ(stale_result.snapshot->incarnation_id, incarnation_id);
         EXPECT_EQ(stale_result.snapshot->last_sequence, 11U);
         EXPECT_EQ(stale_result.snapshot->last_seen_unix_ms, 210U);
@@ -1185,6 +1237,7 @@ namespace
                                                 999);
         ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, incarnation_id, 11U, 210U);
         EXPECT_EQ(lookup.snapshot->incarnation_id, incarnation_id);
         EXPECT_EQ(lookup.snapshot->last_sequence, 11U);
         EXPECT_EQ(lookup.snapshot->last_seen_unix_ms, 210U);
