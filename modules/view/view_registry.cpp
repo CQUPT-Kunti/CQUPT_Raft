@@ -37,6 +37,7 @@ namespace viewdemo
             NodeRegistration registration;
             ViewNodeObservedState observed_state;
             std::uint64_t registered_at_unix_ms{0};
+            std::vector<ViewRegistryDiagnostic> sticky_diagnostics;
         };
 
         using Records = std::map<RecordKey, Record>;
@@ -346,6 +347,59 @@ namespace viewdemo
                                    request_id,
                                    cluster_id,
                                    node_id);
+        }
+
+        bool SameDiagnosticIdentity(const ViewRegistryDiagnostic &lhs,
+                                    const ViewRegistryDiagnostic &rhs)
+        {
+            return lhs.code == rhs.code &&
+                   lhs.message == rhs.message &&
+                   lhs.cluster_id == rhs.cluster_id &&
+                   lhs.node_id == rhs.node_id &&
+                   lhs.endpoint == rhs.endpoint &&
+                   lhs.sequence == rhs.sequence;
+        }
+
+        void RememberStickyDiagnostic(Record *record,
+                                      const ViewRegistryDiagnostic &diagnostic)
+        {
+            if (record == nullptr)
+            {
+                return;
+            }
+
+            constexpr std::size_t kMaxStickyDiagnostics = 8;
+            auto &diagnostics = record->sticky_diagnostics;
+            const auto duplicate = std::find_if(
+                diagnostics.begin(),
+                diagnostics.end(),
+                [&diagnostic](const ViewRegistryDiagnostic &existing)
+                { return SameDiagnosticIdentity(existing, diagnostic); });
+            if (duplicate != diagnostics.end())
+            {
+                *duplicate = diagnostic;
+                return;
+            }
+
+            if (diagnostics.size() >= kMaxStickyDiagnostics)
+            {
+                diagnostics.erase(diagnostics.begin());
+            }
+            diagnostics.push_back(diagnostic);
+        }
+
+        void AppendStickyDiagnostics(
+            const Record &record,
+            std::vector<ViewRegistryDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            diagnostics->insert(diagnostics->end(),
+                                record.sticky_diagnostics.begin(),
+                                record.sticky_diagnostics.end());
         }
 
         ViewRegistryStatusCode ValidateRegistration(
@@ -1008,6 +1062,20 @@ namespace viewdemo
                                    key.cluster_id,
                                    key.node_id,
                                    request.registration.endpoint));
+                const auto owner = impl_->records.find(*endpoint_owner);
+                if (owner != impl_->records.end())
+                {
+                    RememberStickyDiagnostic(
+                        &owner->second,
+                        MakeDiagnostic(
+                            ViewRegistryIssueCode::kEndpointConflict,
+                            "conflicting registration attempted to reuse endpoint from node_id=" +
+                                key.node_id,
+                            request.request_id,
+                            key.cluster_id,
+                            owner->second.registration.node_id,
+                            request.registration.endpoint));
+                }
                 return result;
             }
         }
@@ -1028,6 +1096,14 @@ namespace viewdemo
                            key.cluster_id,
                            key.node_id);
                 result.diagnostics.push_back(
+                    MakeDiagnostic(issue_code,
+                                   message,
+                                   request.request_id,
+                                   key.cluster_id,
+                                   key.node_id,
+                                   request.registration.endpoint));
+                RememberStickyDiagnostic(
+                    &existing->second,
                     MakeDiagnostic(issue_code,
                                    message,
                                    request.request_id,
@@ -1179,6 +1255,15 @@ namespace viewdemo
                                          request.cluster_id,
                                          request.node_id);
             result.diagnostics.push_back(
+                MakeDiagnostic(issue_code,
+                               message,
+                               request.request_id,
+                               request.cluster_id,
+                               request.node_id,
+                               observation.endpoint,
+                               request.sequence));
+            RememberStickyDiagnostic(
+                &existing->second,
                 MakeDiagnostic(issue_code,
                                message,
                                request.request_id,
@@ -1342,6 +1427,7 @@ namespace viewdemo
         result.snapshot = MakeSnapshot(existing->second,
                                        now_unix_ms,
                                        impl_->config);
+        AppendStickyDiagnostics(existing->second, &result.diagnostics);
         return result;
     }
 
@@ -1371,6 +1457,7 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.diagnostics);
             if (snapshot.node_type != ViewNodeType::kMetadata)
             {
                 continue;
@@ -1451,6 +1538,7 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.diagnostics);
             if (snapshot.node_type != ViewNodeType::kStorage)
             {
                 continue;
@@ -1547,6 +1635,7 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.snapshot.diagnostics);
             if (!request.include_dead_nodes &&
                 snapshot.liveness == ViewNodeLivenessState::kDead)
             {

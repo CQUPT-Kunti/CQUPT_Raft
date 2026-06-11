@@ -590,6 +590,7 @@ namespace viewdemo
             snapshot.cluster_id = proto.cluster_id();
             snapshot.node_id = proto.node_id();
             snapshot.node_type = FromProtoNodeType(proto.node_type());
+            snapshot.incarnation_id = proto.incarnation_id();
             snapshot.endpoint = proto.endpoint();
             snapshot.control_plane_endpoint = proto.control_plane_endpoint();
             snapshot.data_plane_endpoint = proto.data_plane_endpoint();
@@ -597,6 +598,10 @@ namespace viewdemo
             snapshot.registered_at_unix_ms = proto.registered_at_unix_ms();
             snapshot.last_seen_unix_ms = proto.last_seen_unix_ms();
             snapshot.last_sequence = proto.last_sequence();
+            snapshot.observed_state.incarnation_id = snapshot.incarnation_id;
+            snapshot.observed_state.sequence = snapshot.last_sequence;
+            snapshot.observed_state.observed_at_unix_ms =
+                snapshot.last_seen_unix_ms;
             snapshot.liveness = FromProtoLiveness(proto.liveness());
             snapshot.failure_domain.zone = proto.failure_domain().zone();
             snapshot.failure_domain.rack = proto.failure_domain().rack();
@@ -639,6 +644,7 @@ namespace viewdemo
             diagnostic.node_id =
                 warning.node_id().empty() ? node_id : warning.node_id();
             diagnostic.endpoint = warning.endpoint();
+            diagnostic.sequence = warning.sequence();
             return diagnostic;
         }
 
@@ -918,6 +924,7 @@ namespace viewdemo
         proto_request.set_node_id(request.node_id);
         proto_request.set_node_type(ToProtoNodeType(request.node_type));
         proto_request.set_sequence(request.sequence);
+        proto_request.set_incarnation_id(request.incarnation_id);
         FillProtoRegistration(request.observation,
                               proto_request.mutable_observation());
 

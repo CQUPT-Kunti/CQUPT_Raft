@@ -260,6 +260,20 @@ namespace
         return nullptr;
     }
 
+    [[nodiscard]] bool ContainsDiagnosticCode(
+        const std::vector<ViewRegistryDiagnostic> &diagnostics,
+        const ViewRegistryIssueCode code)
+    {
+        for (const auto &diagnostic : diagnostics)
+        {
+            if (diagnostic.code == code)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void ExpectObservedStateFacts(const viewdemo::ViewNodeSnapshot &snapshot,
                                   const std::string &incarnation_id,
                                   const std::uint64_t sequence,
@@ -383,6 +397,29 @@ namespace
         EXPECT_EQ(endpoint_result.diagnostics[0].code,
                   ViewRegistryIssueCode::kEndpointConflict);
 
+        const auto lookup = registry.LookupNode(kClusterId, "store-1", 200);
+        ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup.snapshot.has_value());
+        EXPECT_TRUE(ContainsDiagnosticCode(lookup.diagnostics,
+                                           ViewRegistryIssueCode::kDataDirFingerprintConflict));
+        EXPECT_TRUE(ContainsDiagnosticCode(lookup.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
+        EXPECT_EQ(lookup.snapshot->endpoint, original.endpoint);
+        EXPECT_EQ(lookup.snapshot->data_dir_fingerprint,
+                  original.data_dir_fingerprint);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-register-conflicts";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+        const auto cluster_view = registry.GetClusterView(cluster_request, 200);
+        ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_view.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kDataDirFingerprintConflict));
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_view.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
+
         EXPECT_EQ(registry.size(), 1U);
     }
 
@@ -484,6 +521,98 @@ namespace
         ASSERT_TRUE(lookup.snapshot->metadata->leader_hint.has_value());
         EXPECT_EQ(lookup.snapshot->metadata->leader_hint->node_id, "meta-1");
         EXPECT_EQ(lookup.snapshot->metadata->leader_hint->observed_term, 12U);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         HeartbeatConflictDiagnosticsDoNotOverrideExistingLiveState)
+    {
+        ViewNodeRegistry registry;
+
+        auto registration =
+            MakeRegistration(ViewNodeType::kStorage, "store-conflict-1", 9202, 100);
+        registration.capacity.total_capacity_bytes = 8'192;
+        registration.capacity.used_capacity_bytes = 2'048;
+        registration.capacity.available_capacity_bytes = 6'144;
+        RegisterNodeOrAssert(
+            &registry,
+            MakeRegisterRequest(registration, "register-store-conflict-1"));
+
+        auto applied = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                            "store-conflict-1",
+                                            9202,
+                                            7,
+                                            160);
+        applied.incarnation_id = "store-conflict-1:boot:160000000:12:1";
+        applied.observation.health.health = ViewNodeHealth::kHealthy;
+        applied.observation.health.disk_pressure = ViewNodeDiskPressure::kLow;
+        const auto applied_result = registry.HeartbeatNode(applied);
+        ASSERT_EQ(applied_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(applied_result.applied);
+
+        auto fingerprint_conflict = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                         "store-conflict-1",
+                                                         9202,
+                                                         8,
+                                                         170);
+        fingerprint_conflict.incarnation_id = applied.incarnation_id;
+        fingerprint_conflict.observation.data_dir_fingerprint =
+            "fingerprint-other";
+        fingerprint_conflict.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        const auto fingerprint_result = registry.HeartbeatNode(
+            fingerprint_conflict);
+        ASSERT_EQ(fingerprint_result.summary.status,
+                  ViewRegistryStatusCode::kConflict);
+        ASSERT_FALSE(fingerprint_result.applied);
+        ASSERT_FALSE(fingerprint_result.diagnostics.empty());
+        EXPECT_EQ(fingerprint_result.diagnostics[0].code,
+                  ViewRegistryIssueCode::kDataDirFingerprintConflict);
+
+        auto endpoint_conflict = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                      "store-conflict-1",
+                                                      9203,
+                                                      9,
+                                                      180);
+        endpoint_conflict.incarnation_id = applied.incarnation_id;
+        endpoint_conflict.observation.health.health =
+            ViewNodeHealth::kReadOnly;
+        const auto endpoint_result = registry.HeartbeatNode(endpoint_conflict);
+        ASSERT_EQ(endpoint_result.summary.status, ViewRegistryStatusCode::kConflict);
+        ASSERT_FALSE(endpoint_result.applied);
+        ASSERT_FALSE(endpoint_result.diagnostics.empty());
+        EXPECT_EQ(endpoint_result.diagnostics[0].code,
+                  ViewRegistryIssueCode::kEndpointConflict);
+
+        const auto lookup = registry.LookupNode(kClusterId,
+                                                "store-conflict-1",
+                                                200);
+        ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot,
+                                 applied.incarnation_id,
+                                 7U,
+                                 160U);
+        EXPECT_EQ(lookup.snapshot->endpoint, registration.endpoint);
+        EXPECT_EQ(lookup.snapshot->data_dir_fingerprint,
+                  registration.data_dir_fingerprint);
+        EXPECT_EQ(lookup.snapshot->health.health, ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot->health.disk_pressure, ViewNodeDiskPressure::kLow);
+        EXPECT_TRUE(ContainsDiagnosticCode(lookup.diagnostics,
+                                           ViewRegistryIssueCode::kDataDirFingerprintConflict));
+        EXPECT_TRUE(ContainsDiagnosticCode(lookup.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-heartbeat-conflicts";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+        const auto cluster_view = registry.GetClusterView(cluster_request, 200);
+        ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_view.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kDataDirFingerprintConflict));
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_view.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
     }
 
     TEST(ViewNodeDiscoveryTest, LivenessTransitionsAcrossLiveStaleSuspectAndDead)
@@ -1358,6 +1487,7 @@ namespace
         ASSERT_NE(initial_diagnostic, nullptr);
         EXPECT_NE(initial_diagnostic->message.find("sequence=0"),
                   std::string::npos);
+        EXPECT_EQ(initial_diagnostic->sequence, 0U);
         EXPECT_NE(initial_diagnostic->message.find("liveness=live"),
                   std::string::npos);
         EXPECT_NE(initial_diagnostic->message.find("incarnation=<none>"),
@@ -1379,6 +1509,10 @@ namespace
         cluster_result = service.client().GetClusterView(cluster_request);
         ASSERT_TRUE(cluster_result.transport_ok());
         ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        ExpectObservedStateFacts(cluster_result.result.snapshot.view_nodes[0],
+                                 incarnation_id,
+                                 5U,
+                                 125U);
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence, 5U);
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
                   ViewNodeLivenessState::kLive);
@@ -1388,6 +1522,7 @@ namespace
                 "view-self-diag-1",
                 "self_refresh_state source=self_refresh");
         ASSERT_NE(live_diagnostic, nullptr);
+        EXPECT_EQ(live_diagnostic->sequence, 5U);
         EXPECT_NE(live_diagnostic->message.find(
                       std::string("endpoint=") + self.endpoint),
                   std::string::npos);
@@ -1408,6 +1543,10 @@ namespace
         cluster_result = service.client().GetClusterView(cluster_request);
         ASSERT_TRUE(cluster_result.transport_ok());
         ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        ExpectObservedStateFacts(cluster_result.result.snapshot.view_nodes[0],
+                                 incarnation_id,
+                                 5U,
+                                 125U);
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
                   ViewNodeLivenessState::kStale);
         const auto *stale_diagnostic =
@@ -1416,6 +1555,7 @@ namespace
                 "view-self-diag-1",
                 "self_refresh_state source=self_refresh");
         ASSERT_NE(stale_diagnostic, nullptr);
+        EXPECT_EQ(stale_diagnostic->sequence, 5U);
         EXPECT_NE(stale_diagnostic->message.find("sequence=5"),
                   std::string::npos);
         EXPECT_NE(stale_diagnostic->message.find("liveness=stale"),
@@ -1597,6 +1737,10 @@ namespace
         EXPECT_EQ(discover_result.result.storage_nodes[0].node_id, "store-1");
         EXPECT_EQ(discover_result.result.storage_nodes[0].endpoint,
                   storage.endpoint);
+        ExpectObservedStateFacts(discover_result.result.storage_nodes[0],
+                                 "",
+                                 0U,
+                                 192U);
         EXPECT_EQ(discover_result.result.storage_nodes[0].failure_domain.zone,
                   "zone-c");
         EXPECT_EQ(discover_result.result.storage_nodes[0].failure_domain.rack,
@@ -1645,6 +1789,8 @@ namespace
         ASSERT_EQ(fresh_result.result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(fresh_result.result.applied);
         EXPECT_EQ(fresh_result.result.accepted_sequence, 7U);
+        ASSERT_TRUE(fresh_result.result.snapshot.has_value());
+        ExpectObservedStateFacts(*fresh_result.result.snapshot, "", 7U, 220U);
 
         auto stale_sequence = MakeHeartbeatRequest(ViewNodeType::kStorage,
                                                    "store-2",
@@ -1691,6 +1837,10 @@ namespace
         ASSERT_EQ(discover_result.result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_EQ(discover_result.result.storage_nodes.size(), 1U);
         EXPECT_EQ(discover_result.result.storage_nodes[0].node_id, "store-2");
+        ExpectObservedStateFacts(discover_result.result.storage_nodes[0],
+                                 "",
+                                 7U,
+                                 220U);
         EXPECT_EQ(discover_result.result.storage_nodes[0].health.health,
                   ViewNodeHealth::kDegraded);
         EXPECT_EQ(
@@ -1701,6 +1851,87 @@ namespace
         EXPECT_EQ(discover_result.result.storage_nodes[0].load.queued_ops, 15U);
         EXPECT_EQ(discover_result.result.storage_nodes[0].last_sequence, 7U);
         EXPECT_EQ(discover_result.result.storage_nodes[0].last_seen_unix_ms, 220U);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationHeartbeatAdapterPreservesIncarnationAwareObservedState)
+    {
+        RunningViewNodeDiscoveryService service;
+
+        auto view =
+            MakeRegistration(ViewNodeType::kView, "view-heartbeat-1", 9711, 180);
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(view, "integration-register-view-heartbeat-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(register_result.result.snapshot.has_value());
+        ExpectObservedStateFacts(*register_result.result.snapshot, "", 0U, 180U);
+
+        const std::string incarnation_id =
+            "view-heartbeat-1:boot:220000000:91:1";
+        auto fresh = MakeHeartbeatRequest(ViewNodeType::kView,
+                                          "view-heartbeat-1",
+                                          9711,
+                                          7,
+                                          220);
+        fresh.incarnation_id = incarnation_id;
+        fresh.observation.health.health = ViewNodeHealth::kDegraded;
+        fresh.observation.health.disk_pressure = ViewNodeDiskPressure::kMedium;
+
+        const auto fresh_result = service.client().HeartbeatNode(fresh);
+        ASSERT_TRUE(fresh_result.transport_ok());
+        ASSERT_EQ(fresh_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(fresh_result.result.applied);
+        ASSERT_TRUE(fresh_result.result.snapshot.has_value());
+        ExpectObservedStateFacts(*fresh_result.result.snapshot,
+                                 incarnation_id,
+                                 7U,
+                                 220U);
+        EXPECT_EQ(fresh_result.result.accepted_sequence, 7U);
+
+        auto stale = MakeHeartbeatRequest(ViewNodeType::kView,
+                                          "view-heartbeat-1",
+                                          9711,
+                                          6,
+                                          250);
+        stale.incarnation_id = incarnation_id;
+        stale.observation.health.health = ViewNodeHealth::kUnavailable;
+        stale.observation.health.disk_pressure = ViewNodeDiskPressure::kFull;
+
+        const auto stale_result = service.client().HeartbeatNode(stale);
+        ASSERT_TRUE(stale_result.transport_ok());
+        ASSERT_EQ(stale_result.result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_result.result.stale_ignored);
+        ASSERT_TRUE(stale_result.result.snapshot.has_value());
+        ExpectObservedStateFacts(*stale_result.result.snapshot,
+                                 incarnation_id,
+                                 7U,
+                                 220U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "integration-cluster-view-heartbeat-1";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        ExpectObservedStateFacts(cluster_result.result.snapshot.view_nodes[0],
+                                 incarnation_id,
+                                 7U,
+                                 220U);
+        const auto *diagnostic =
+            FindDiagnosticByNodeIdAndMessage(
+                cluster_result.result.snapshot.diagnostics,
+                "view-heartbeat-1",
+                "incarnation=view-heartbeat-1:boot:220000000:91:1");
+        ASSERT_NE(diagnostic, nullptr);
+        EXPECT_EQ(diagnostic->sequence, 7U);
     }
 
     TEST(ViewNodeDiscoveryTest,

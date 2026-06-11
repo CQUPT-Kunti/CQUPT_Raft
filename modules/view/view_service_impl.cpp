@@ -661,6 +661,7 @@ namespace viewdemo
                 snapshot.registered_at_unix_ms);
             proto_snapshot->set_last_seen_unix_ms(snapshot.last_seen_unix_ms);
             proto_snapshot->set_last_sequence(snapshot.last_sequence);
+            proto_snapshot->set_incarnation_id(snapshot.incarnation_id);
             proto_snapshot->set_liveness(ToProtoLiveness(snapshot.liveness));
             proto_snapshot->mutable_failure_domain()->set_zone(
                 snapshot.failure_domain.zone);
@@ -717,6 +718,7 @@ namespace viewdemo
                         : diagnostic.message);
                 warning->set_node_id(diagnostic.node_id);
                 warning->set_endpoint(diagnostic.endpoint);
+                warning->set_sequence(diagnostic.sequence);
             }
         }
 
@@ -776,6 +778,7 @@ namespace viewdemo
                     BuildViewSelfRefreshDiagnosticMessage(view_node));
                 warning->set_node_id(view_node.node_id);
                 warning->set_endpoint(view_node.endpoint);
+                warning->set_sequence(view_node.observed_state.sequence);
             }
         }
 
@@ -1014,6 +1017,7 @@ namespace viewdemo
                 .cluster_id = request->cluster_id(),
                 .node_id = request->node_id(),
                 .node_type = FromProtoNodeType(request->node_type()),
+                .incarnation_id = request->incarnation_id(),
                 .sequence = request->sequence(),
                 .observation = FromProtoRegistration(request->observation())});
 

@@ -103,6 +103,11 @@ Metadata 观测状态在快照阶段会做保守归一化：
   - `last_seen_unix_ms`
   - `health`
   - `liveness`
+- `HeartbeatNodeRequest` / `ViewNodeSnapshot` 的 adapter 映射会保留
+  incarnation-aware observed-state 事实：
+  - request 中的 `incarnation_id`
+  - snapshot 中的 `incarnation_id`
+  - 与之对应的 `last_sequence` / `last_seen_unix_ms`
 
 其中 StorageNode first registration 的 `node_id` 路径已经接入：
 
@@ -126,6 +131,8 @@ Metadata 观测状态在快照阶段会做保守归一化：
 - 设置 deadline / `wait_for_ready`
 - 解析 proto summary / warning / snapshot / leader hint
 - 把 proto warning code 映射到本地 `ViewRegistryIssueCode`
+- 把 proto snapshot 中的 `incarnation_id + last_sequence + last_seen_unix_ms`
+  重建回本地 `ViewNodeSnapshot::observed_state`
 - 输出 transport 诊断：
   - gRPC status code
   - error message/details

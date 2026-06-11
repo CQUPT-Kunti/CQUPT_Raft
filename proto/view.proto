@@ -168,6 +168,7 @@ message ViewNodeSnapshot {
   ViewNodeHealthReport health = 13;
   ViewNodeCapacityReport capacity = 14;
   ViewNodeLoadReport load = 15;
+  string incarnation_id = 16;
   MetadataNodeObservation metadata = 20;
 }
 
@@ -176,6 +177,7 @@ message ClusterViewWarning {
   string message = 2;
   string node_id = 3;
   string endpoint = 4;
+  uint64 sequence = 5;
 }
 
 message RegisterNodeRequest {
@@ -199,6 +201,7 @@ message HeartbeatNodeRequest {
   ViewNodeType node_type = 4;
   uint64 sequence = 5;
   ViewNodeRegistration observation = 6;
+  string incarnation_id = 7;
 }
 
 message HeartbeatNodeResponse {
