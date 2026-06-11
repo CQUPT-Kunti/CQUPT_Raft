@@ -16,6 +16,7 @@
 
 - `identity_file` 是节点自己的本地持久身份文件路径。
 - `identity_file` 首次不存在是正常情况，除非配置显式要求必须预置身份。
+- 009 只支持当前 `NodeIdentity` 新格式；不存在 legacy compatibility、自动升级或静默补字段。
 - 首次启动应创建 identity，原子写入后再启动 RPC 和注册流程。
 - 重启必须复用长期 `node_id`，并生成新的 process incarnation / boot epoch。
 - `node_id` 是长期逻辑身份；`incarnation / boot epoch` 是单次进程启动身份；`sequence` 只在同一 incarnation 内递增；`observed_time` 只服务 TTL/liveness 与诊断。
@@ -47,7 +48,8 @@
 ## Validation Requirements
 
 - `tests/node_identity_test.cpp` 必须覆盖首次创建、重启复用、cluster_id mismatch、node_type mismatch、损坏文件 fail-fast。
+- existing `identity_file` 若为 old-format / unknown-format / missing required new-format fields，必须 fail-fast，且不能当作 missing identity 重新创建。
+- existing `identity_file` 出现 corrupt / mismatch 时，不能自动覆盖，也不能静默补 `membership_state` / `persistent_generation`。
 - Metadata bootstrap voter 身份与 dynamic join candidate 身份必须分开测试。
 - ViewNode / StorageNode 重启必须验证同一 `node_id` + 新 incarnation。
 - 任何平台相关 atomic publish / durability 行为不能 silent no-op success；非等价平台行为必须记录明确错误或较弱保证。
-

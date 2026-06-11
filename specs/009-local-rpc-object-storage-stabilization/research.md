@@ -32,7 +32,7 @@
 
 ## Decision: identity_file Is Local Persistent Identity, Not A Preallocated Lease
 
-**Rationale**: `modules/cluster/node_identity.*` already implements `LoadOrCreateNodeIdentity`, first-start creation, restart reuse, mismatch diagnostics, and platform durability contracts. 009 should extend this model rather than require ViewNode preallocation. Missing identity_file is normal for first start; mismatch/corruption is a startup error.
+**Rationale**: `modules/cluster/node_identity.*` already implements `LoadOrCreateNodeIdentity`, first-start creation, restart reuse, mismatch diagnostics, and platform durability contracts. 009 should extend this model rather than require ViewNode preallocation. Missing identity_file is normal for first start; mismatch/corruption is a startup error. Because 009 has no deployed legacy identity population, the feature should support only the current schema and fail fast on old-format or missing-required-field files instead of auto-upgrading them.
 
 **Alternatives considered**:
 

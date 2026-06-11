@@ -28,17 +28,22 @@ Mitigation: Block single learner promote when target voter count is even. Implem
 
 Risk: Join touches `proto/`, `modules/raft/service`, `modules/raft/node`, `modules/raft/replication`, storage/restart tests, and app startup.
 
-Mitigation: Keep dynamic join additive. Validate with Raft unit tests before local RPC end-to-end tests. Do not alter existing static bootstrap behavior except where explicitly tested.
+Mitigation: Keep dynamic join scoped. Validate with Raft unit tests before local RPC end-to-end tests. Do not alter existing static bootstrap behavior except where explicitly tested.
 
 ## R6: Identity Changes Can Break Existing Static Example
 
 Risk: Tightening identity validation may reject current `examples/object-storage-local-3meta-6store` layout.
 
-Mitigation: Treat 008 example as compatibility baseline. Missing `identity_file` on first start must create identity; mismatch/corrupt cases fail fast only when truly invalid.
+Mitigation: Treat 008 example as preservation baseline. Missing `identity_file` on first start must create the current new-format identity; mismatch, corrupt, old-format, and missing-required-field cases must fail fast instead of auto-upgrading.
+
+## R8: Legacy Identity Compatibility Can Mask Invalid Node Identity
+
+Risk: Keeping silent v1/legacy compatibility can hide missing required fields, corrupt files, or invalid membership semantics by auto-filling defaults during load.
+
+Mitigation: 009 is pre-deployment for the new identity schema. Support only the current `node.identity` format. Existing malformed, old-format, or missing-required-field identity files must fail fast and must never auto-upgrade or auto-overwrite.
 
 ## R7: Test Scope Can Collapse Into Happy Path
 
 Risk: Dynamic registration could pass one local demo while missing restart, duplicate, TTL, stale heartbeat, old incarnation, leader failover, and odd-voter tests.
 
 Mitigation: Keep validation matrix mandatory for phase closure. Every phase task should name its CTest/example entry and failure class.
-

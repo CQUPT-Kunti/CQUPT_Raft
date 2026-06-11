@@ -59,6 +59,8 @@ namespace clusterdemo
                     .node_id = node_id,
                     .node_type = ClusterNodeType::kMetadata,
                     .raft_id = raft_id,
+                    .membership_state = NodeIdentityMembershipState::kVoter,
+                    .persistent_generation = 1,
                     .identity_version = kNodeIdentityCurrentVersion,
                     .created_at_unix_ms = 1710000000000LL,
                     .source = NodeIdentitySource::kConfigGenerator};
@@ -73,6 +75,8 @@ namespace clusterdemo
                     .node_id = node_id,
                     .node_type = ClusterNodeType::kMetadata,
                     .raft_id = raft_id,
+                    .membership_state = NodeIdentityMembershipState::kCandidate,
+                    .persistent_generation = 1,
                     .identity_version = kNodeIdentityCurrentVersion,
                     .created_at_unix_ms = 1710000000000LL,
                     .source = NodeIdentitySource::kExplicitOverride};
@@ -86,6 +90,8 @@ namespace clusterdemo
                     .node_id = node_id,
                     .node_type = ClusterNodeType::kStorage,
                     .raft_id = std::nullopt,
+                    .membership_state = NodeIdentityMembershipState::kNonRaft,
+                    .persistent_generation = 1,
                     .identity_version = kNodeIdentityCurrentVersion,
                     .created_at_unix_ms = 1710000000000LL,
                     .source = NodeIdentitySource::kViewNodeAllocator};
@@ -99,6 +105,8 @@ namespace clusterdemo
                     .node_id = node_id,
                     .node_type = ClusterNodeType::kView,
                     .raft_id = std::nullopt,
+                    .membership_state = NodeIdentityMembershipState::kNonRaft,
+                    .persistent_generation = 1,
                     .identity_version = kNodeIdentityCurrentVersion,
                     .created_at_unix_ms = 1710000000000LL,
                     .source = NodeIdentitySource::kConfigGenerator};
@@ -183,6 +191,9 @@ namespace clusterdemo
             EXPECT_EQ(load.identity->node_id, identity.node_id);
             EXPECT_EQ(load.identity->node_type, identity.node_type);
             EXPECT_EQ(load.identity->raft_id, identity.raft_id);
+            EXPECT_EQ(load.identity->membership_state, identity.membership_state);
+            EXPECT_EQ(load.identity->persistent_generation,
+                      identity.persistent_generation);
             EXPECT_EQ(load.identity->identity_version, identity.identity_version);
             EXPECT_EQ(load.identity->created_at_unix_ms, identity.created_at_unix_ms);
             EXPECT_EQ(load.identity->source, identity.source);
@@ -443,6 +454,9 @@ namespace clusterdemo
                       candidate_identity.node_id);
             ASSERT_TRUE(first_start.identity->raft_id.has_value());
             EXPECT_EQ(*first_start.identity->raft_id, 301);
+            EXPECT_EQ(first_start.identity->membership_state,
+                      NodeIdentityMembershipState::kCandidate);
+            EXPECT_EQ(first_start.identity->persistent_generation, 1U);
             EXPECT_EQ(first_start.identity->source,
                       NodeIdentitySource::kExplicitOverride);
 
@@ -454,9 +468,11 @@ namespace clusterdemo
             EXPECT_NE(persisted.find("node_id=meta-join-candidate-1"),
                       std::string::npos);
             EXPECT_NE(persisted.find("raft_id=301"), std::string::npos);
-            EXPECT_NE(persisted.find("source=explicit_override"),
+            EXPECT_NE(persisted.find("membership_state=candidate"),
                       std::string::npos);
-            EXPECT_EQ(persisted.find("membership_state="),
+            EXPECT_NE(persisted.find("persistent_generation=1"),
+                      std::string::npos);
+            EXPECT_NE(persisted.find("source=explicit_override"),
                       std::string::npos);
             EXPECT_EQ(persisted.find("initial_role="), std::string::npos);
             EXPECT_EQ(persisted.find("voter"), std::string::npos);
@@ -520,7 +536,7 @@ namespace clusterdemo
 
         TEST_F(
             NodeIdentityTest,
-            T009MetadataDynamicJoinCandidateWithoutRaftIdDocumentsCurrentGapForUncommittedIdentity)
+            T009MetadataDynamicJoinCandidateWithoutRaftIdPersistsJoiningStateWithoutBootstrapAuthority)
         {
             const auto data_dir =
                 MakeDataDir("t009-dynamic-join-candidate-no-raft");
@@ -550,15 +566,27 @@ namespace clusterdemo
                         .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
                         .expected_existing = {}}});
 
-            EXPECT_EQ(first_start.status,
-                      NodeIdentityStatusCode::kInvalidArgument);
-            EXPECT_FALSE(first_start.ok());
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
             EXPECT_FALSE(first_start.loaded_existing);
-            EXPECT_FALSE(first_start.created_new);
-            EXPECT_FALSE(std::filesystem::exists(identity_path));
-            EXPECT_TRUE(ValidationContains(first_start.validation,
-                                           NodeIdentityIssueCode::kMissingRaftId));
-            EXPECT_NE(first_start.diagnostic.find("raft_id"), std::string::npos);
+            EXPECT_TRUE(first_start.created_new);
+            EXPECT_TRUE(std::filesystem::exists(identity_path));
+            EXPECT_EQ(first_start.identity->cluster_id,
+                      candidate_identity.cluster_id);
+            EXPECT_EQ(first_start.identity->node_type,
+                      ClusterNodeType::kMetadata);
+            EXPECT_EQ(first_start.identity->node_id,
+                      candidate_identity.node_id);
+            EXPECT_FALSE(first_start.identity->raft_id.has_value());
+            EXPECT_EQ(first_start.identity->membership_state,
+                      NodeIdentityMembershipState::kCandidate);
+            EXPECT_EQ(first_start.identity->persistent_generation, 1U);
+
+            const auto persisted = ReadTextFile(identity_path);
+            EXPECT_NE(persisted.find("raft_id=\n"), std::string::npos);
+            EXPECT_NE(persisted.find("membership_state=candidate"),
+                      std::string::npos);
+            EXPECT_EQ(persisted.find("voter"), std::string::npos);
         }
 
         TEST_F(NodeIdentityTest,
@@ -1295,12 +1323,15 @@ namespace clusterdemo
 
             WriteTextFile(
                 identity_path,
-                "identity_version=1\n"
+                "identity_version=2\n"
                 "cluster_id=cluster-alpha\n"
                 "node_id=meta-node-1\n"
                 "node_type=metadata\n"
                 "raft_id=11\n"
-                "created_at_unix_ms=1710000000000\n");
+                "created_at_unix_ms=1710000000000\n"
+                "membership_state=not-a-valid-state\n"
+                "persistent_generation=1\n"
+                "source=config_generator\n");
 
             const auto load = LoadNodeIdentity(
                 NodeIdentityLoadOptions{
@@ -1313,6 +1344,147 @@ namespace clusterdemo
             EXPECT_TRUE(ValidationContains(load.validation,
                                            NodeIdentityIssueCode::kIdentityFileCorrupt));
             EXPECT_FALSE(load.diagnostic.empty());
+        }
+
+        TEST_F(
+            NodeIdentityTest,
+            RejectsLegacyV1IdentityWithoutCompatibility)
+        {
+            const auto data_dir = MakeDataDir("t011-legacy-identity");
+            const auto identity_path = ResolveNodeIdentityPath(data_dir);
+            const std::string legacy_content =
+                "identity_version=1\n"
+                "cluster_id=cluster-alpha\n"
+                "node_id=meta-legacy-1\n"
+                "node_type=metadata\n"
+                "raft_id=41\n"
+                "created_at_unix_ms=1710000000000\n"
+                "source=config_generator\n";
+
+            WriteTextFile(identity_path, legacy_content);
+
+            const auto load = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = ClusterId{"cluster-alpha"},
+                        .node_id = ClusterNodeId{"meta-legacy-1"},
+                        .node_type = ClusterNodeType::kMetadata,
+                        .raft_id = 41,
+                        .membership_state =
+                            NodeIdentityMembershipState::kVoter,
+                        .source = NodeIdentitySource::kConfigGenerator,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            EXPECT_EQ(load.status, NodeIdentityStatusCode::kCorrupt);
+            EXPECT_FALSE(load.ok());
+            EXPECT_FALSE(load.identity.has_value());
+            EXPECT_TRUE(ValidationContains(load.validation,
+                                           NodeIdentityIssueCode::kIdentityFileCorrupt));
+            EXPECT_NE(load.diagnostic.find("membership_state"),
+                      std::string::npos);
+            EXPECT_NE(load.diagnostic.find("persistent_generation"),
+                      std::string::npos);
+            EXPECT_EQ(ReadTextFile(identity_path), legacy_content);
+
+            const auto requested = MakeMetadataIdentity("meta-legacy-1", 41);
+            const auto load_or_create = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = requested.cluster_id,
+                            .node_id = requested.node_id,
+                            .node_type = ClusterNodeType::kMetadata,
+                            .raft_id = requested.raft_id,
+                            .source = requested.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = requested,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            EXPECT_EQ(load_or_create.status, NodeIdentityStatusCode::kCorrupt);
+            EXPECT_FALSE(load_or_create.ok());
+            EXPECT_FALSE(load_or_create.loaded_existing);
+            EXPECT_FALSE(load_or_create.created_new);
+            EXPECT_TRUE(ValidationContains(load_or_create.validation,
+                                           NodeIdentityIssueCode::kIdentityFileCorrupt));
+            EXPECT_EQ(ReadTextFile(identity_path), legacy_content);
+        }
+
+        TEST_F(NodeIdentityTest, MissingNewRequiredIdentityFieldsFailFast)
+        {
+            const auto data_dir = MakeDataDir("t011-missing-required-fields");
+            const auto identity_path = ResolveNodeIdentityPath(data_dir);
+            const std::string incomplete_content =
+                "identity_version=2\n"
+                "cluster_id=cluster-alpha\n"
+                "node_id=store-node-incomplete\n"
+                "node_type=storage\n"
+                "raft_id=\n"
+                "created_at_unix_ms=1710000000000\n"
+                "source=explicit_override\n";
+            WriteTextFile(identity_path, incomplete_content);
+
+            const auto load = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = ClusterId{"cluster-alpha"},
+                        .node_id = ClusterNodeId{"store-node-incomplete"},
+                        .node_type = ClusterNodeType::kStorage,
+                        .raft_id = std::nullopt,
+                        .source = NodeIdentitySource::kExplicitOverride,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            EXPECT_EQ(load.status, NodeIdentityStatusCode::kCorrupt);
+            EXPECT_FALSE(load.ok());
+            EXPECT_TRUE(ValidationContains(load.validation,
+                                           NodeIdentityIssueCode::kIdentityFileCorrupt));
+            EXPECT_NE(load.diagnostic.find("membership_state"),
+                      std::string::npos);
+            EXPECT_NE(load.diagnostic.find("persistent_generation"),
+                      std::string::npos);
+
+            const auto requested = MakeStorageIdentity("store-node-incomplete");
+            const auto load_or_create = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = requested.cluster_id,
+                            .node_id = requested.node_id,
+                            .node_type = ClusterNodeType::kStorage,
+                            .raft_id = std::nullopt,
+                            .source = requested.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = requested,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            EXPECT_EQ(load_or_create.status, NodeIdentityStatusCode::kCorrupt);
+            EXPECT_FALSE(load_or_create.ok());
+            EXPECT_FALSE(load_or_create.loaded_existing);
+            EXPECT_FALSE(load_or_create.created_new);
+            EXPECT_TRUE(ValidationContains(load_or_create.validation,
+                                           NodeIdentityIssueCode::kIdentityFileCorrupt));
+            EXPECT_EQ(ReadTextFile(identity_path), incomplete_content);
         }
 
         TEST_F(

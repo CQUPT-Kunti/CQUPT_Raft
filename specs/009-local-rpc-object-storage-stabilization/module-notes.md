@@ -47,6 +47,8 @@
 - 把“本地已有 `node.identity`”误写成“已经加入 Metadata/Raft voter 集合”。
 - 把 `cluster_config` 的初始 voter/learner 配置误写成后续 dynamic join / promote 的 authority。
 - 把 per-process incarnation / sequence 持久化成长期身份的一部分，导致重启后无法区分旧进程与新进程。
+- 把 old-format / 缺少新必填字段的 `node.identity` 当成可自动补齐或自动升级的输入。
+- 把 corrupt / old-format `node.identity` 当成 missing identity 并在启动时静默重建。
 
 ## ViewNode
 

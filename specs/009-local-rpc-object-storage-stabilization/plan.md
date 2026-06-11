@@ -120,8 +120,8 @@
 
 - Verified existing capabilities affected by this feature are identified and excluded from unnecessary replanning.
   - PASS: 008 static local RPC roundtrip, Metadata authority fixes, StorageNode chunk writes, and committed-membership quorum diagnostics are protected baselines.
-- Any protocol, public API, or persisted format change is either absent or explicitly justified with migration and regression coverage.
-  - PASS with scoped risk: 009 likely needs additive discovery / membership contracts such as ViewNode peer sync and Metadata join; existing semantics must remain stable. Any persisted registry format must be additive and versioned.
+- Any protocol, public API, or persisted format change is either absent or explicitly justified with regression coverage and explicit schema rules.
+  - PASS with scoped risk: 009 likely needs scoped discovery / membership contracts such as ViewNode peer sync and Metadata join; existing semantics must remain stable. For `node.identity`, 009 uses a new-only schema: old-format or missing-required-field files must fail fast, and future migration must be a separate task.
 - Durability, crash-recovery, and restart-recovery implications are stated for every affected path in `node`, `replication`, `storage`, or `state_machine`.
   - PASS with required tasks: identity persistence already exists; ViewNode registry persistence/recovery boundary and learner membership commit recovery must be specified before implementation.
 - Linux-specific validation is explicitly labeled, and Windows/macOS fallback, adaptation, or deferred follow-up is recorded.
@@ -252,7 +252,7 @@ Design artifacts:
 ## Post-Design Constitution Check
 
 - Preserve verified core: PASS. 008 local RPC roundtrip, Metadata authority behavior, committed quorum diagnostics, and StorageNode data-plane semantics are protected.
-- Protocol/public API/persisted format: PASS with scoped additive changes. New join / peer sync contracts are planned as additive; persisted registry format must be versioned if introduced.
+- Protocol/public API/persisted format: PASS with scoped changes. New join / peer sync contracts must preserve existing semantics. For `node.identity`, 009 does not keep legacy compatibility or automatic upgrade; if a future deployed migration is needed, it must be specified in a separate task.
 - Durability/recovery: PASS with required coverage. Identity, registry snapshot/restart, learner catch-up, and membership log commit recovery are explicit tasks.
 - Cross-platform: PASS. Linux validation is primary; Windows/macOS behavior is recorded as smoke/pending where not executable.
 - Observability/minimal surface: PASS. Tasks emphasize request_id, node_id, incarnation, sequence, membership state, quorum summary, and task reports.

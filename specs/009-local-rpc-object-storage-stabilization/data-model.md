@@ -10,14 +10,16 @@ Fields:
 - `node_type`: `view`、`storage`、`metadata`。
 - `node_id`: 长期逻辑身份，重启后复用。
 - `raft_id`: 仅 MetadataNode 使用；StorageNode / ViewNode 不应携带。
-- `membership_state`: Metadata dynamic join 可为 `joining`、`learner`、`voter`；Storage/View 不使用该字段作为 Raft authority。
+- `membership_state`: Metadata dynamic join 可为 `joining`、`candidate`、`learner`、`voter`；Storage/View 不使用该字段作为 Raft authority。
 - `created_at`: 首次创建时间。
-- `persistent_generation`: 本地身份文件版本/代际，用于未来兼容诊断。
+- `persistent_generation`: 当前新格式 identity 的本地代际 / schema generation / diagnostics 字段，不承担旧格式兼容职责。
 - `source`: config generator、local first-start、explicit local override、committed membership 等来源诊断。
 
 Validation:
 
 - Missing identity_file is valid for first start unless configuration requires pre-existing identity.
+- 009 只支持当前 `NodeIdentity` 新格式；existing identity 缺少 `membership_state`、`persistent_generation` 或其他必填字段时必须 fail-fast。
+- Existing legacy / old-format / unknown-format identity file must fail fast; no automatic upgrade, no silent field completion, and no auto-overwrite.
 - Existing identity mismatch on cluster_id/node_type/node_id/raft_id must fail fast.
 - Metadata bootstrap voter may create identity from bootstrap config.
 - Metadata dynamic join may create candidate identity, but cannot become voter by local write alone.

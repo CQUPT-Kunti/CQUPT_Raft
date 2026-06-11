@@ -11,7 +11,7 @@
 
 namespace clusterdemo
 {
-    inline constexpr std::uint32_t kNodeIdentityCurrentVersion{1};
+    inline constexpr std::uint32_t kNodeIdentityCurrentVersion{2};
     inline constexpr std::string_view kNodeIdentityFileName{"node.identity"};
 
     enum class NodeIdentitySource : std::uint8_t
@@ -33,6 +33,16 @@ namespace clusterdemo
         kIoError = 6,
         kDurabilityError = 7,
         kInternalError = 8,
+    };
+
+    enum class NodeIdentityMembershipState : std::uint8_t
+    {
+        kUnknown = 0,
+        kNonRaft = 1,
+        kJoining = 2,
+        kCandidate = 3,
+        kLearner = 4,
+        kVoter = 5,
     };
 
     // issue code 只描述身份文件和配置匹配边界，不表达 Raft membership
@@ -58,6 +68,9 @@ namespace clusterdemo
         kUnsupportedDurabilityMode = 16,
         kDurabilityPublishFailed = 17,
         kIoFailure = 18,
+        kInvalidMembershipState = 19,
+        kMembershipStateMismatch = 20,
+        kInvalidPersistentGeneration = 21,
     };
 
     enum class NodeIdentityDurabilityMode : std::uint8_t
@@ -80,6 +93,9 @@ namespace clusterdemo
         ClusterNodeId node_id;
         ClusterNodeType node_type{ClusterNodeType::kUnknown};
         std::optional<std::int32_t> raft_id;
+        NodeIdentityMembershipState membership_state{
+            NodeIdentityMembershipState::kUnknown};
+        std::uint64_t persistent_generation{1};
         std::uint32_t identity_version{kNodeIdentityCurrentVersion};
         std::int64_t created_at_unix_ms{0};
         NodeIdentitySource source{NodeIdentitySource::kUnknown};
@@ -93,6 +109,7 @@ namespace clusterdemo
         std::optional<ClusterNodeId> node_id;
         ClusterNodeType node_type{ClusterNodeType::kUnknown};
         std::optional<std::int32_t> raft_id;
+        std::optional<NodeIdentityMembershipState> membership_state;
         std::optional<NodeIdentitySource> source;
         bool require_raft_id_for_metadata{true};
         bool forbid_raft_id_for_non_metadata{true};
@@ -154,6 +171,7 @@ namespace clusterdemo
     struct NodeIdentityStoreResult
     {
         NodeIdentityStatusCode status{NodeIdentityStatusCode::kOk};
+        std::optional<NodeIdentity> identity;
         std::filesystem::path identity_path;
         NodeIdentityValidationResult validation;
         bool created{false};
@@ -216,6 +234,7 @@ namespace clusterdemo
         const NodeIdentityLoadOrCreateRequest &request);
 
     [[nodiscard]] const char *ToString(NodeIdentitySource source);
+    [[nodiscard]] const char *ToString(NodeIdentityMembershipState state);
     [[nodiscard]] const char *ToString(NodeIdentityStatusCode code);
     [[nodiscard]] const char *ToString(NodeIdentityIssueCode code);
     [[nodiscard]] const char *ToString(NodeIdentityDurabilityMode mode);
