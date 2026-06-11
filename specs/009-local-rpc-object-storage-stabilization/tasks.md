@@ -22,10 +22,10 @@
 **Purpose**: 锁定 008 真实入口和 009 文档边界，避免后续任务绕开现有路径。
 
 - [X] T001 Record report-derived example, scripts, app targets, CTest targets, and known gaps in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-01-survey.md` (验证: `specs/009-local-rpc-object-storage-stabilization/task-reports/local-rpc-object-storage-stabilization-report.md`)
-- [ ] T002 [P] Confirm `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/tingzhi.sh`, and `examples/object-storage-local-3meta-6store/rpc_demo.sh` remain the local RPC baseline in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: local RPC scripts)
-- [ ] T003 [P] Confirm CTest target and label coverage from `tests/CMakeLists.txt` in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: `test_view_node_discovery`, `test_node_identity`, `storage_heartbeat_registry`, `integrated_object_storage_e2e`, `integrated_object_storage_quorum`)
-- [ ] T004 [P] Confirm existing identity, ViewNode, StorageNode, Metadata, Raft membership entry points in `specs/009-local-rpc-object-storage-stabilization/module-notes.md` (验证: `tests/node_identity_test.cpp`, `tests/view_node_discovery_test.cpp`, `tests/storage_heartbeat_registry_test.cpp`, `tests/integrated_object_storage_quorum_test.cpp`)
-- [ ] T005 Add phase report template for later implementation results in `specs/009-local-rpc-object-storage-stabilization/task-reports/task-report-template.md` (验证: task report path exists and references project log rules)
+- [X] T002 [P] Confirm `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/tingzhi.sh`, and `examples/object-storage-local-3meta-6store/rpc_demo.sh` remain the local RPC baseline in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: local RPC scripts)
+- [X] T003 [P] Confirm CTest target and label coverage from `tests/CMakeLists.txt` in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: `test_view_node_discovery`, `test_node_identity`, `storage_heartbeat_registry`, `integrated_object_storage_e2e`, `integrated_object_storage_quorum`)
+- [X] T004 [P] Confirm existing identity, ViewNode, StorageNode, Metadata, Raft membership entry points in `specs/009-local-rpc-object-storage-stabilization/module-notes.md` (验证: `tests/node_identity_test.cpp`, `tests/view_node_discovery_test.cpp`, `tests/storage_heartbeat_registry_test.cpp`, `tests/integrated_object_storage_quorum_test.cpp`)
+- [X] T005 Add phase report template for later implementation results in `specs/009-local-rpc-object-storage-stabilization/task-reports/task-report-template.md` (验证: task report path exists and references project log rules)
 
 ---
 
@@ -35,18 +35,18 @@
 
 **Independent Test**: `tests/node_identity_test.cpp` 覆盖 Storage/View/Metadata bootstrap/Metadata dynamic join 的首次创建、重启复用、mismatch、corrupt file。
 
-- [ ] T006 [P] [US5] Add StorageNode first-start identity creation tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
-- [ ] T007 [P] [US5] Add ViewNode first-start identity creation and restart reuse tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
-- [ ] T008 [P] [US5] Add Metadata bootstrap voter identity tests with fixed `node_id` and `raft_id` in `tests/node_identity_test.cpp` (验证: `test_node_identity`, `cluster_config_test`)
-- [ ] T009 [P] [US5] Add Metadata dynamic join candidate identity tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
-- [ ] T010 [P] [US5] Add mismatch and corrupt identity fail-fast tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
-- [ ] T011 [US5] Extend identity data model for node type, optional `raft_id`, membership state, and persistent generation in `modules/cluster/node_identity.h` and `modules/cluster/node_identity.cpp` (验证: `test_node_identity`)
-- [ ] T012 [US5] Add atomic first-start identity creation and restart validation in `modules/cluster/node_identity.cpp` (验证: `test_node_identity`)
-- [ ] T013 [US5] Add process incarnation / boot epoch generation boundary in `modules/cluster/node_identity.cpp` or a new `modules/cluster` helper (验证: `test_node_identity`)
-- [ ] T014 [US5] Wire StorageNode identity load/create into `apps/storage_node_app.cpp` without requiring full topology config (验证: `storage_heartbeat_registry`, local RPC startup script)
-- [ ] T015 [US5] Wire ViewNode identity load/create into `apps/view_node_app.cpp` before self registration (验证: `test_view_node_discovery`)
-- [ ] T016 [US5] Wire Metadata bootstrap vs dynamic join identity modes into `apps/metadata_node_app.cpp` (验证: `cluster_config_test`, `test_node_identity`)
-- [ ] T017 [US5] Document platform durability behavior for identity atomic publish in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-02-identity.md` (验证: `test_node_identity`, Windows/macOS marked pending if not run)
+- [X] T006 [P] [US5] Add StorageNode first-start identity creation tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
+- [X] T007 [P] [US5] Add ViewNode first-start identity creation and restart reuse tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
+- [X] T008 [P] [US5] Add Metadata bootstrap voter identity tests with fixed `node_id` and `raft_id` in `tests/node_identity_test.cpp` (验证: `test_node_identity`, `cluster_config_test`)
+- [X] T009 [P] [US5] Add Metadata dynamic join candidate identity tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
+- [X] T010 [P] [US5] Add mismatch and corrupt identity fail-fast tests in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
+- [X] T011 [US5] Extend identity data model for node type, optional `raft_id`, membership state, and persistent generation in `modules/cluster/node_identity.h` and `modules/cluster/node_identity.cpp` (验证: `test_node_identity`)
+- [X] T012 [US5] Add atomic first-start identity creation and restart validation in `modules/cluster/node_identity.cpp` (验证: `test_node_identity`)
+- [X] T013 [US5] Add process incarnation / boot epoch generation boundary in `modules/cluster/node_identity.cpp` or a new `modules/cluster` helper (验证: `test_node_identity`)
+- [X] T014 [US5] Wire StorageNode identity load/create into `apps/storage_node_app.cpp` without requiring full topology config (验证: `storage_heartbeat_registry`, local RPC startup script)
+- [X] T015 [US5] Wire ViewNode identity load/create into `apps/view_node_app.cpp` before self registration (验证: `test_view_node_discovery`)
+- [X] T016 [US5] Wire Metadata bootstrap vs dynamic join identity modes into `apps/metadata_node_app.cpp` (验证: `cluster_config_test`, `test_node_identity`)
+- [X] T017 [US5] Document platform durability behavior for identity atomic publish in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-02-identity.md` (验证: `test_node_identity`, Windows/macOS marked pending if not run)
 
 ---
 
@@ -56,11 +56,11 @@
 
 **Independent Test**: 单 ViewNode 运行超过 dead TTL 后自身仍为 `LIVE`；停止 self refresh 后 TTL 转换正常。
 
-- [ ] T018 [P] [US1] Add deterministic self refresh beyond TTL test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T019 [P] [US1] Add self refresh disabled stale/suspect/dead transition test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T020 [P] [US1] Add ViewNode self liveness regression to local RPC status expectations in `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a new 009 example script (验证: `rpc_demo.sh status`)
-- [ ] T021 [US1] Add ViewNode self refresh state update path in `modules/view/view_registry.cpp` and `modules/view/view_registry.h` (验证: `test_view_node_discovery`)
-- [ ] T022 [US1] Start and stop ViewNode self refresh loop from `apps/view_node_app.cpp` with clean shutdown semantics (验证: `test_view_node_discovery`, local RPC startup/shutdown scripts)
+- [X] T018 [P] [US1] Add deterministic self refresh beyond TTL test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [X] T019 [P] [US1] Add self refresh disabled stale/suspect/dead transition test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [X] T020 [P] [US1] Add ViewNode self liveness regression to local RPC status expectations in `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a new 009 example script (验证: `rpc_demo.sh status`)
+- [X] T021 [US1] Add ViewNode self refresh state update path in `modules/view/view_registry.cpp` and `modules/view/view_registry.h` (验证: `test_view_node_discovery`)
+- [X] T022 [US1] Start and stop ViewNode self refresh loop from `apps/view_node_app.cpp` with clean shutdown semantics (验证: `test_view_node_discovery`, local RPC startup/shutdown scripts)
 - [ ] T023 [US1] Ensure self refresh payload includes node_id, endpoint, incarnation, sequence, observed_time, health, and liveness in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T024 [US1] Add diagnostics for ViewNode self refresh sequence and liveness in `modules/view/view_service_impl.cpp` (验证: `test_view_node_discovery`, `rpc_demo.sh status`)
 - [ ] T025 [US1] Record Linux validation and skipped platform checks in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-03-view-self-refresh.md` (验证: `test_view_node_discovery`)
