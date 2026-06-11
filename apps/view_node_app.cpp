@@ -52,6 +52,7 @@ namespace
         clusterdemo::NodeIdentitySource identity_source{
             clusterdemo::NodeIdentitySource::kConfigGenerator};
         viewdemo::ViewRegistryConfig registry_config;
+        std::chrono::milliseconds self_refresh_interval{0};
     };
 
     struct IdentityStartupState
@@ -102,6 +103,20 @@ namespace
                 .count());
     }
 
+    [[nodiscard]] bool SleepWithStop(const std::chrono::milliseconds duration)
+    {
+        constexpr auto kPollInterval = std::chrono::milliseconds(100);
+        auto remaining = duration;
+        while (!g_stop_requested.load() &&
+               remaining > std::chrono::milliseconds::zero())
+        {
+            const auto step = remaining < kPollInterval ? remaining : kPollInterval;
+            std::this_thread::sleep_for(step);
+            remaining -= step;
+        }
+        return !g_stop_requested.load();
+    }
+
     [[nodiscard]] bool IsValidEndpoint(const std::string_view endpoint)
     {
         if (endpoint.empty())
@@ -139,23 +154,73 @@ namespace
     [[nodiscard]] viewdemo::ViewRegistryConfig BuildRegistryConfig(
         const clusterdemo::ClusterTimeoutConfig &timeouts)
     {
+        constexpr auto kDefaultLivenessStaleTimeout = std::chrono::milliseconds(5000);
+        constexpr auto kDefaultLivenessDeadTimeout = std::chrono::milliseconds(15000);
+
         viewdemo::ViewRegistryConfig config;
-        config.stale_timeout = timeouts.liveness_stale_timeout;
-        config.dead_timeout = timeouts.liveness_dead_timeout;
+        config.stale_timeout =
+            timeouts.liveness_stale_timeout > std::chrono::milliseconds::zero()
+                ? timeouts.liveness_stale_timeout
+                : kDefaultLivenessStaleTimeout;
+        config.dead_timeout =
+            timeouts.liveness_dead_timeout > std::chrono::milliseconds::zero()
+                ? timeouts.liveness_dead_timeout
+                : kDefaultLivenessDeadTimeout;
 
         // startup 只做装配：suspect 超时从 cluster config 的 stale/dead 边界中间值推导，
         // 不把这段逻辑扩展成新的 discovery 业务语义。
-        if (timeouts.liveness_dead_timeout > timeouts.liveness_stale_timeout)
+        if (config.dead_timeout > config.stale_timeout)
         {
             const auto delta =
-                (timeouts.liveness_dead_timeout - timeouts.liveness_stale_timeout) / 2;
-            config.suspect_timeout = timeouts.liveness_stale_timeout + delta;
+                (config.dead_timeout - config.stale_timeout) / 2;
+            config.suspect_timeout = config.stale_timeout + delta;
         }
         else
         {
-            config.suspect_timeout = timeouts.liveness_stale_timeout;
+            config.suspect_timeout = config.stale_timeout;
         }
         return config;
+    }
+
+    [[nodiscard]] std::chrono::milliseconds ComputeSelfRefreshInterval(
+        const clusterdemo::ClusterTimeoutConfig &timeouts,
+        const viewdemo::ViewRegistryConfig &registry_config)
+    {
+        constexpr auto kDefaultSelfRefreshInterval = std::chrono::milliseconds(1000);
+        constexpr auto kMinimumSelfRefreshInterval = std::chrono::milliseconds(1);
+
+        auto interval =
+            timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
+                ? timeouts.heartbeat_interval
+                : kDefaultSelfRefreshInterval;
+        if (interval <= std::chrono::milliseconds::zero())
+        {
+            interval = kDefaultSelfRefreshInterval;
+        }
+
+        if (interval >= registry_config.stale_timeout)
+        {
+            if (registry_config.stale_timeout > kMinimumSelfRefreshInterval)
+            {
+                interval = registry_config.stale_timeout / 2;
+            }
+            else
+            {
+                interval = kMinimumSelfRefreshInterval;
+            }
+        }
+
+        if (interval >= registry_config.stale_timeout &&
+            registry_config.stale_timeout > kMinimumSelfRefreshInterval)
+        {
+            interval = registry_config.stale_timeout - kMinimumSelfRefreshInterval;
+        }
+
+        if (interval <= std::chrono::milliseconds::zero())
+        {
+            interval = kMinimumSelfRefreshInterval;
+        }
+        return interval;
     }
 
     void PrintUsage(std::ostream &out)
@@ -256,6 +321,27 @@ namespace
             selected = node;
         }
         return selected;
+    }
+
+    [[nodiscard]] viewdemo::HeartbeatNodeRequest MakeSelfRefreshRequest(
+        const ViewNodeStartupConfig &startup,
+        const clusterdemo::NodeIdentity &identity,
+        const clusterdemo::ProcessIncarnation &process_incarnation,
+        const std::uint64_t sequence)
+    {
+        auto observation = *MakeSelfRegistration(startup, identity);
+
+        viewdemo::HeartbeatNodeRequest request;
+        request.request_id =
+            "view-node-self-refresh-" + identity.node_id + "-" +
+            process_incarnation.incarnation_id + "-" +
+            std::to_string(sequence);
+        request.cluster_id = identity.cluster_id;
+        request.node_id = identity.node_id;
+        request.node_type = viewdemo::ViewNodeType::kView;
+        request.sequence = sequence;
+        request.observation = std::move(observation);
+        return request;
     }
 
     [[nodiscard]] ViewNodeStartupConfig ResolveStartupConfig(
@@ -448,6 +534,9 @@ namespace
         try
         {
             startup = ResolveStartupConfig(*loaded_config.config, args);
+            startup.self_refresh_interval = ComputeSelfRefreshInterval(
+                loaded_config.config->timeouts,
+                startup.registry_config);
         }
         catch (const std::exception &ex)
         {
@@ -459,6 +548,15 @@ namespace
         {
             std::cerr << "view_node_app config error: resolved endpoint is invalid: "
                       << startup.listen_endpoint << '\n';
+            return static_cast<int>(ExitCode::kConfigError);
+        }
+        if (startup.self_refresh_interval >= startup.registry_config.stale_timeout)
+        {
+            std::cerr
+                << "view_node_app config error: self refresh interval must be less than stale timeout"
+                << " interval_ms=" << startup.self_refresh_interval.count()
+                << " stale_timeout_ms="
+                << startup.registry_config.stale_timeout.count() << '\n';
             return static_cast<int>(ExitCode::kConfigError);
         }
 
@@ -539,6 +637,10 @@ namespace
                   << " node_id=" << identity_state.identity.node_id
                   << " incarnation_id="
                   << process_state.incarnation.incarnation_id
+                  << " self_refresh_interval_ms="
+                  << startup.self_refresh_interval.count()
+                  << " startup_sequence_base="
+                  << process_state.incarnation.startup_sequence_base
                   << " endpoint=" << startup.listen_endpoint
                   << " data_dir=" << startup.data_dir.generic_string()
                   << " identity_path=" <<
@@ -555,6 +657,41 @@ namespace
 #ifdef SIGTERM
         std::signal(SIGTERM, HandleSignal);
 #endif
+
+        std::thread self_refresh_thread(
+            [&startup, &identity_state, &process_state, &registry]() {
+                std::uint64_t next_sequence =
+                    process_state.incarnation.startup_sequence_base;
+                while (!g_stop_requested.load())
+                {
+                    if (!SleepWithStop(startup.self_refresh_interval))
+                    {
+                        break;
+                    }
+
+                    const auto refresh_result = registry->RefreshSelfNode(
+                        MakeSelfRefreshRequest(startup,
+                                               identity_state.identity,
+                                               process_state.incarnation,
+                                               next_sequence));
+                    if (!refresh_result.summary.ok())
+                    {
+                        std::cerr
+                            << "view_node_app self refresh failed"
+                            << " node_id=" << identity_state.identity.node_id
+                            << " incarnation_id="
+                            << process_state.incarnation.incarnation_id
+                            << " sequence=" << next_sequence
+                            << " status="
+                            << viewdemo::ToString(refresh_result.summary.status)
+                            << " message=" << refresh_result.summary.message
+                            << '\n';
+                        continue;
+                    }
+
+                    ++next_sequence;
+                }
+            });
 
         std::thread completion_queue_thread([&completion_queue]() {
             void *tag = nullptr;
@@ -573,6 +710,7 @@ namespace
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
+        self_refresh_thread.join();
         server->Shutdown();
         completion_queue->Shutdown();
         wait_thread.join();
