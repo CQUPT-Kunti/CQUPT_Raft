@@ -35,12 +35,21 @@ namespace viewdemo
         struct Record
         {
             NodeRegistration registration;
+            std::string incarnation_id;
             std::uint64_t registered_at_unix_ms{0};
             std::uint64_t last_seen_unix_ms{0};
             std::uint64_t last_sequence{0};
         };
 
         using Records = std::map<RecordKey, Record>;
+
+        struct ParsedProcessIncarnationId
+        {
+            NodeId node_id;
+            std::uint64_t started_at_unix_ns{0};
+            std::uint64_t pid{0};
+            std::uint64_t ordinal{0};
+        };
 
         bool IsValidNodeId(const std::string_view node_id)
         {
@@ -99,6 +108,170 @@ namespace viewdemo
         bool IsValidOptionalEndpoint(const std::string_view endpoint)
         {
             return endpoint.empty() || IsValidEndpoint(endpoint);
+        }
+
+        bool TryParseUnsignedU64(const std::string_view text,
+                                 std::uint64_t *value_out)
+        {
+            if (text.empty() ||
+                !std::all_of(text.begin(),
+                             text.end(),
+                             [](const unsigned char ch)
+                             { return std::isdigit(ch) != 0; }))
+            {
+                return false;
+            }
+
+            try
+            {
+                *value_out = std::stoull(std::string(text));
+                return true;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+        }
+
+        bool TryParseProcessIncarnationId(
+            const std::string_view incarnation_id,
+            ParsedProcessIncarnationId *parsed_out)
+        {
+            constexpr std::string_view kBootMarker = ":boot:";
+            const auto marker = incarnation_id.find(kBootMarker);
+            if (marker == std::string_view::npos || marker == 0 ||
+                marker + kBootMarker.size() >= incarnation_id.size())
+            {
+                return false;
+            }
+
+            ParsedProcessIncarnationId parsed;
+            parsed.node_id = std::string(incarnation_id.substr(0, marker));
+            if (!IsValidNodeId(parsed.node_id))
+            {
+                return false;
+            }
+
+            const auto remainder =
+                incarnation_id.substr(marker + kBootMarker.size());
+            const auto first_separator = remainder.find(':');
+            if (first_separator == std::string_view::npos || first_separator == 0 ||
+                first_separator + 1 >= remainder.size())
+            {
+                return false;
+            }
+
+            const auto second_separator =
+                remainder.find(':', first_separator + 1);
+            if (second_separator == std::string_view::npos ||
+                second_separator == first_separator + 1 ||
+                second_separator + 1 >= remainder.size())
+            {
+                return false;
+            }
+
+            const auto started_at_unix_ns =
+                remainder.substr(0, first_separator);
+            const auto pid = remainder.substr(
+                first_separator + 1,
+                second_separator - first_separator - 1);
+            const auto ordinal = remainder.substr(second_separator + 1);
+
+            if (!TryParseUnsignedU64(started_at_unix_ns,
+                                     &parsed.started_at_unix_ns) ||
+                !TryParseUnsignedU64(pid, &parsed.pid) ||
+                !TryParseUnsignedU64(ordinal, &parsed.ordinal))
+            {
+                return false;
+            }
+
+            *parsed_out = std::move(parsed);
+            return true;
+        }
+
+        enum class IncarnationDecision : std::uint8_t
+        {
+            kUnknown = 0,
+            kSame = 1,
+            kIncomingNewer = 2,
+            kIncomingOlder = 3,
+        };
+
+        IncarnationDecision CompareIncarnationIds(
+            const std::string_view existing_incarnation_id,
+            const std::string_view incoming_incarnation_id)
+        {
+            if (existing_incarnation_id.empty() || incoming_incarnation_id.empty())
+            {
+                return IncarnationDecision::kUnknown;
+            }
+            if (existing_incarnation_id == incoming_incarnation_id)
+            {
+                return IncarnationDecision::kSame;
+            }
+
+            ParsedProcessIncarnationId existing;
+            ParsedProcessIncarnationId incoming;
+            if (!TryParseProcessIncarnationId(existing_incarnation_id, &existing) ||
+                !TryParseProcessIncarnationId(incoming_incarnation_id, &incoming) ||
+                existing.node_id != incoming.node_id)
+            {
+                return IncarnationDecision::kUnknown;
+            }
+
+            return std::tie(incoming.started_at_unix_ns,
+                            incoming.pid,
+                            incoming.ordinal) >
+                           std::tie(existing.started_at_unix_ns,
+                                    existing.pid,
+                                    existing.ordinal)
+                       ? IncarnationDecision::kIncomingNewer
+                       : IncarnationDecision::kIncomingOlder;
+        }
+
+        bool ResolveSelfRefreshIncarnationId(const HeartbeatNodeRequest &request,
+                                             std::string *incarnation_id_out)
+        {
+            if (!request.incarnation_id.empty())
+            {
+                ParsedProcessIncarnationId parsed;
+                if (!TryParseProcessIncarnationId(request.incarnation_id,
+                                                  &parsed) ||
+                    parsed.node_id != request.node_id)
+                {
+                    return false;
+                }
+                *incarnation_id_out = request.incarnation_id;
+                return true;
+            }
+
+            const std::string prefix =
+                "view-node-self-refresh-" + request.node_id + "-";
+            if (request.request_id.rfind(prefix, 0) != 0)
+            {
+                return false;
+            }
+
+            const auto suffix_separator = request.request_id.rfind('-');
+            if (suffix_separator == std::string::npos ||
+                suffix_separator <= prefix.size() ||
+                suffix_separator + 1 >= request.request_id.size())
+            {
+                return false;
+            }
+
+            const auto incarnation_id = request.request_id.substr(
+                prefix.size(),
+                suffix_separator - prefix.size());
+            ParsedProcessIncarnationId parsed;
+            if (!TryParseProcessIncarnationId(incarnation_id, &parsed) ||
+                parsed.node_id != request.node_id)
+            {
+                return false;
+            }
+
+            *incarnation_id_out = incarnation_id;
+            return true;
         }
 
         ViewRegistryConfig NormalizeConfig(ViewRegistryConfig config)
@@ -472,6 +645,7 @@ namespace viewdemo
                 .cluster_id = record.registration.cluster_id,
                 .node_id = record.registration.node_id,
                 .node_type = record.registration.node_type,
+                .incarnation_id = record.incarnation_id,
                 .endpoint = record.registration.endpoint,
                 .control_plane_endpoint =
                     record.registration.control_plane_endpoint,
@@ -517,6 +691,31 @@ namespace viewdemo
             }
 
             return SequenceDecision::kApply;
+        }
+
+        SequenceDecision EvaluateSequenceDecisionWithIncarnation(
+            const Record &record,
+            const std::string_view incoming_incarnation_id,
+            const std::uint64_t incoming_sequence,
+            const std::uint64_t incoming_observed_at)
+        {
+            switch (CompareIncarnationIds(record.incarnation_id,
+                                          incoming_incarnation_id))
+            {
+            case IncarnationDecision::kIncomingOlder:
+                return SequenceDecision::kStale;
+            case IncarnationDecision::kIncomingNewer:
+                return SequenceDecision::kApply;
+            case IncarnationDecision::kSame:
+                break;
+            case IncarnationDecision::kUnknown:
+                break;
+            }
+
+            return EvaluateSequenceDecision(record.last_sequence,
+                                            record.last_seen_unix_ms,
+                                            incoming_sequence,
+                                            incoming_observed_at);
         }
 
         bool IsLiveForDiscovery(const ViewNodeSnapshot &snapshot,
@@ -864,6 +1063,21 @@ namespace viewdemo
         const HeartbeatNodeRequest &request)
     {
         HeartbeatNodeResult result;
+        if (!request.incarnation_id.empty())
+        {
+            ParsedProcessIncarnationId parsed;
+            if (!TryParseProcessIncarnationId(request.incarnation_id, &parsed) ||
+                parsed.node_id != request.node_id)
+            {
+                FillInvalidHeartbeatResult(
+                    &result,
+                    request,
+                    ViewRegistryStatusCode::kInvalidArgument,
+                    ViewRegistryIssueCode::kStaleHeartbeat,
+                    "heartbeat incarnation_id is invalid or does not match node_id");
+                return result;
+            }
+        }
         if (!IsValidClusterId(request.cluster_id))
         {
             FillInvalidHeartbeatResult(
@@ -965,9 +1179,9 @@ namespace viewdemo
         }
 
         result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(
-            existing->second.last_sequence,
-            existing->second.last_seen_unix_ms,
+        const auto decision = EvaluateSequenceDecisionWithIncarnation(
+            existing->second,
+            request.incarnation_id,
             request.sequence,
             observation.observed_at_unix_ms);
 
@@ -1009,6 +1223,10 @@ namespace viewdemo
         }
 
         MergeRegistrationFacts(&existing->second, observation);
+        if (!request.incarnation_id.empty())
+        {
+            existing->second.incarnation_id = request.incarnation_id;
+        }
         existing->second.last_sequence = request.sequence;
         existing->second.last_seen_unix_ms = observation.observed_at_unix_ms;
 
@@ -1029,10 +1247,26 @@ namespace viewdemo
     HeartbeatNodeResult ViewNodeRegistry::RefreshSelfNode(
         const HeartbeatNodeRequest &request)
     {
+        std::string incarnation_id;
+        if (!ResolveSelfRefreshIncarnationId(request, &incarnation_id))
+        {
+            HeartbeatNodeResult result;
+            FillInvalidHeartbeatResult(
+                &result,
+                request,
+                ViewRegistryStatusCode::kInvalidArgument,
+                ViewRegistryIssueCode::kStaleHeartbeat,
+                "self refresh request must carry a valid process incarnation");
+            return result;
+        }
+
+        HeartbeatNodeRequest refresh_request = request;
+        refresh_request.incarnation_id = std::move(incarnation_id);
+
         // self refresh 只是 ViewNode 对自己 observed state 的周期性更新，
         // 故意复用 heartbeat 的 sequence / observed_at / liveness 语义，
         // 避免把 self record 变成绕过 TTL 的永久 LIVE 特权。
-        return HeartbeatNode(request);
+        return HeartbeatNode(refresh_request);
     }
 
     LookupNodeResult ViewNodeRegistry::LookupNode(

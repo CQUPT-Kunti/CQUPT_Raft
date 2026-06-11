@@ -96,6 +96,13 @@ Metadata 观测状态在快照阶段会做保守归一化：
 - gRPC request/response 与 registry 类型之间的映射
 - `now_unix_ms` 注入
 - 异常收敛成明确的 gRPC internal failure
+- `GetClusterView` warning/diagnostic 输出补齐 ViewNode self refresh 状态：
+  - `source=self_refresh|registration_only`
+  - `incarnation`
+  - `last_sequence`
+  - `last_seen_unix_ms`
+  - `health`
+  - `liveness`
 
 其中 StorageNode first registration 的 `node_id` 路径已经接入：
 

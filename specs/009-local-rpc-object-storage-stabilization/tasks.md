@@ -61,8 +61,8 @@
 - [X] T020 [P] [US1] Add ViewNode self liveness regression to local RPC status expectations in `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a new 009 example script (验证: `rpc_demo.sh status`)
 - [X] T021 [US1] Add ViewNode self refresh state update path in `modules/view/view_registry.cpp` and `modules/view/view_registry.h` (验证: `test_view_node_discovery`)
 - [X] T022 [US1] Start and stop ViewNode self refresh loop from `apps/view_node_app.cpp` with clean shutdown semantics (验证: `test_view_node_discovery`, local RPC startup/shutdown scripts)
-- [ ] T023 [US1] Ensure self refresh payload includes node_id, endpoint, incarnation, sequence, observed_time, health, and liveness in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
-- [ ] T024 [US1] Add diagnostics for ViewNode self refresh sequence and liveness in `modules/view/view_service_impl.cpp` (验证: `test_view_node_discovery`, `rpc_demo.sh status`)
+- [X] T023 [US1] Ensure self refresh payload includes node_id, endpoint, incarnation, sequence, observed_time, health, and liveness in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
+- [X] T024 [US1] Add diagnostics for ViewNode self refresh sequence and liveness in `modules/view/view_service_impl.cpp` (验证: `test_view_node_discovery`, `rpc_demo.sh status`)
 - [ ] T025 [US1] Record Linux validation and skipped platform checks in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-03-view-self-refresh.md` (验证: `test_view_node_discovery`)
 
 ---

@@ -720,6 +720,65 @@ namespace viewdemo
             }
         }
 
+        std::string BuildViewSelfRefreshDiagnosticMessage(
+            const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            std::string message = "self_refresh_state";
+            const auto append_text_field =
+                [&message](const std::string_view key, const std::string_view value)
+            {
+                message.push_back(' ');
+                message.append(key);
+                message.push_back('=');
+                message.append(value);
+            };
+            const auto append_u64_field =
+                [&append_text_field](const std::string_view key,
+                                     const std::uint64_t value)
+            {
+                append_text_field(key, std::to_string(value));
+            };
+
+            const bool refreshed = !snapshot.incarnation_id.empty() ||
+                                   snapshot.last_sequence != 0;
+            append_text_field("source",
+                              refreshed ? "self_refresh" : "registration_only");
+            append_text_field("node_id",
+                              snapshot.node_id.empty() ? "<unknown>"
+                                                       : snapshot.node_id);
+            append_text_field("endpoint",
+                              snapshot.endpoint.empty() ? "<unknown>"
+                                                        : snapshot.endpoint);
+            append_text_field("incarnation",
+                              snapshot.incarnation_id.empty() ? "<none>"
+                                                              : snapshot.incarnation_id);
+            append_u64_field("sequence", snapshot.last_sequence);
+            append_u64_field("last_seen_unix_ms", snapshot.last_seen_unix_ms);
+            append_text_field("health", ToString(snapshot.health.health));
+            append_text_field("liveness", ToString(snapshot.liveness));
+            return message;
+        }
+
+        void AppendViewSelfRefreshDiagnostics(
+            const ClusterViewSnapshot &snapshot,
+            ::view::GetClusterViewResponse *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &view_node : snapshot.view_nodes)
+            {
+                auto *warning = response->add_warnings();
+                warning->set_code("self_refresh_state");
+                warning->set_message(
+                    BuildViewSelfRefreshDiagnosticMessage(view_node));
+                warning->set_node_id(view_node.node_id);
+                warning->set_endpoint(view_node.endpoint);
+            }
+        }
+
         template <typename Response>
         void SetInternalSummary(Response *response,
                                 std::string_view message,
@@ -1185,6 +1244,10 @@ namespace viewdemo
                 response->clear_leader_hint();
             }
             AppendWarnings(result.snapshot.diagnostics, response);
+            if (request->include_warnings())
+            {
+                AppendViewSelfRefreshDiagnostics(result.snapshot, response);
+            }
             return ::grpc::Status::OK;
         }
         catch (const std::exception &ex)

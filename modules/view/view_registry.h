@@ -196,6 +196,7 @@ namespace viewdemo
         ClusterId cluster_id;
         NodeId node_id;
         ViewNodeType node_type{ViewNodeType::kUnknown};
+        std::string incarnation_id;
         Endpoint endpoint;
         Endpoint control_plane_endpoint;
         Endpoint data_plane_endpoint;
@@ -273,6 +274,7 @@ namespace viewdemo
         ClusterId cluster_id;
         NodeId node_id;
         ViewNodeType node_type{ViewNodeType::kUnknown};
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         NodeRegistration observation;
     };

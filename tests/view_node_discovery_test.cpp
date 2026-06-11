@@ -30,6 +30,7 @@ namespace
     using viewdemo::ViewNodeHealth;
     using viewdemo::ViewNodeClient;
     using viewdemo::ViewNodeClientConfig;
+    using viewdemo::ViewRegistryDiagnostic;
     using viewdemo::ViewNodeLivenessState;
     using viewdemo::ViewNodeRegistry;
     using viewdemo::ViewNodeServiceImpl;
@@ -215,6 +216,25 @@ namespace
         return request;
     }
 
+    HeartbeatNodeRequest MakeSelfRefreshRequest(
+        std::string node_id,
+        const std::uint16_t port,
+        std::string incarnation_id,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms)
+    {
+        HeartbeatNodeRequest request = MakeHeartbeatRequest(ViewNodeType::kView,
+                                                            node_id,
+                                                            port,
+                                                            sequence,
+                                                            observed_at_unix_ms);
+        request.request_id = "view-node-self-refresh-" + request.node_id + "-" +
+                             incarnation_id + "-" +
+                             std::to_string(sequence);
+        request.incarnation_id = std::move(incarnation_id);
+        return request;
+    }
+
     void RegisterNodeOrAssert(ViewNodeRegistry *registry,
                               const RegisterNodeRequest &request)
     {
@@ -222,6 +242,22 @@ namespace
         ASSERT_EQ(result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(result.created);
         ASSERT_TRUE(result.snapshot.has_value());
+    }
+
+    [[nodiscard]] const ViewRegistryDiagnostic *FindDiagnosticByNodeIdAndMessage(
+        const std::vector<ViewRegistryDiagnostic> &diagnostics,
+        const std::string &node_id,
+        const std::string &message_fragment)
+    {
+        for (const auto &diagnostic : diagnostics)
+        {
+            if (diagnostic.node_id == node_id &&
+                diagnostic.message.find(message_fragment) != std::string::npos)
+            {
+                return &diagnostic;
+            }
+        }
+        return nullptr;
     }
 
     TEST(ViewNodeDiscoveryTest, RegisterStoresNodeFactsAndLookupOrClusterViewSorted)
@@ -715,15 +751,22 @@ namespace
         EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence, 0U);
 
         service.set_now_unix_ms(191);
-        auto self_refresh = MakeHeartbeatRequest(ViewNodeType::kView,
-                                                 "view-self-1",
-                                                 9700,
-                                                 1,
-                                                 191);
+        auto self_refresh = MakeSelfRefreshRequest(
+            "view-self-1",
+            9700,
+            "view-self-1:boot:191000000:42:1",
+            1,
+            191);
+        // app 层当前通过 request_id 间接携带 incarnation；这里清空显式字段，
+        // 直接覆盖 T023 的 registry 解析路径。
+        self_refresh.incarnation_id.clear();
         const auto self_refresh_result = service.RefreshSelfNode(self_refresh);
         ASSERT_EQ(self_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(self_refresh_result.applied);
         EXPECT_EQ(self_refresh_result.accepted_sequence, 1U);
+        ASSERT_TRUE(self_refresh_result.snapshot.has_value());
+        EXPECT_EQ(self_refresh_result.snapshot->incarnation_id,
+                  "view-self-1:boot:191000000:42:1");
 
         cluster_request.request_id =
             "integration-cluster-view-self-beyond-dead-ttl";
@@ -742,7 +785,236 @@ namespace
         EXPECT_GT(cluster_result.result.snapshot.view_nodes[0].last_seen_unix_ms,
                   100U);
         EXPECT_GT(cluster_result.result.snapshot.view_nodes[0].last_sequence, 0U);
-        EXPECT_TRUE(cluster_result.result.snapshot.diagnostics.empty());
+        const auto *self_refresh_diagnostic =
+            FindDiagnosticByNodeIdAndMessage(
+                cluster_result.result.snapshot.diagnostics,
+                "view-self-1",
+                "self_refresh_state source=self_refresh");
+        ASSERT_NE(self_refresh_diagnostic, nullptr);
+        EXPECT_NE(
+            self_refresh_diagnostic->message.find("liveness=live"),
+            std::string::npos);
+        EXPECT_NE(
+            self_refresh_diagnostic->message.find(
+                "incarnation=view-self-1:boot:191000000:42:1"),
+            std::string::npos);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         SelfRefreshPayloadIncludesIncarnationSequenceObservedTimeHealthAndEndpoint)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        ViewNodeRegistry registry(config);
+
+        auto self = MakeRegistration(ViewNodeType::kView,
+                                     "view-self-payload-1",
+                                     9706,
+                                     100);
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(
+                                 self,
+                                 "register-view-self-payload-1"));
+
+        const std::string old_incarnation =
+            "view-self-payload-1:boot:110000000:10:1";
+        const std::string new_incarnation =
+            "view-self-payload-1:boot:111000000:11:1";
+
+        auto old_refresh = MakeSelfRefreshRequest("view-self-payload-1",
+                                                  9706,
+                                                  old_incarnation,
+                                                  10,
+                                                  110);
+        old_refresh.observation.health.health = ViewNodeHealth::kDegraded;
+        old_refresh.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kMedium;
+        const auto old_refresh_result = registry.RefreshSelfNode(old_refresh);
+        ASSERT_EQ(old_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(old_refresh_result.applied);
+        ASSERT_TRUE(old_refresh_result.snapshot.has_value());
+        EXPECT_EQ(old_refresh_result.snapshot->incarnation_id, old_incarnation);
+        EXPECT_EQ(old_refresh_result.snapshot->last_sequence, 10U);
+        EXPECT_EQ(old_refresh_result.snapshot->last_seen_unix_ms, 110U);
+        EXPECT_EQ(old_refresh_result.snapshot->health.health,
+                  ViewNodeHealth::kDegraded);
+        EXPECT_EQ(old_refresh_result.snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+
+        auto new_refresh = MakeSelfRefreshRequest("view-self-payload-1",
+                                                  9706,
+                                                  new_incarnation,
+                                                  1,
+                                                  111);
+        new_refresh.observation.health.health = ViewNodeHealth::kDegraded;
+        new_refresh.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kMedium;
+        const auto new_refresh_result = registry.RefreshSelfNode(new_refresh);
+        ASSERT_EQ(new_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(new_refresh_result.applied);
+        ASSERT_TRUE(new_refresh_result.snapshot.has_value());
+        EXPECT_EQ(new_refresh_result.snapshot->incarnation_id, new_incarnation);
+        EXPECT_EQ(new_refresh_result.snapshot->last_sequence, 1U);
+        EXPECT_EQ(new_refresh_result.snapshot->last_seen_unix_ms, 111U);
+        EXPECT_EQ(new_refresh_result.snapshot->endpoint, self.endpoint);
+        EXPECT_EQ(new_refresh_result.snapshot->health.health,
+                  ViewNodeHealth::kDegraded);
+
+        auto same_incarnation_higher_sequence =
+            MakeSelfRefreshRequest("view-self-payload-1",
+                                   9706,
+                                   new_incarnation,
+                                   2,
+                                   112);
+        same_incarnation_higher_sequence.observation.health.health =
+            ViewNodeHealth::kHealthy;
+        same_incarnation_higher_sequence.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kLow;
+        const auto higher_sequence_result =
+            registry.RefreshSelfNode(same_incarnation_higher_sequence);
+        ASSERT_EQ(higher_sequence_result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(higher_sequence_result.applied);
+
+        auto stale_same_incarnation = MakeSelfRefreshRequest("view-self-payload-1",
+                                                             9706,
+                                                             new_incarnation,
+                                                             1,
+                                                             113);
+        stale_same_incarnation.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        const auto stale_same_incarnation_result =
+            registry.RefreshSelfNode(stale_same_incarnation);
+        ASSERT_EQ(stale_same_incarnation_result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_same_incarnation_result.stale_ignored);
+
+        auto old_incarnation_late = MakeSelfRefreshRequest("view-self-payload-1",
+                                                           9706,
+                                                           old_incarnation,
+                                                           99,
+                                                           114);
+        old_incarnation_late.observation.health.health =
+            ViewNodeHealth::kReadOnly;
+        const auto old_incarnation_late_result =
+            registry.RefreshSelfNode(old_incarnation_late);
+        ASSERT_EQ(old_incarnation_late_result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(old_incarnation_late_result.stale_ignored);
+
+        const auto lookup = registry.LookupNode(kClusterId,
+                                                "view-self-payload-1",
+                                                114);
+        ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup.snapshot.has_value());
+        EXPECT_EQ(lookup.snapshot->node_id, "view-self-payload-1");
+        EXPECT_EQ(lookup.snapshot->endpoint, self.endpoint);
+        EXPECT_EQ(lookup.snapshot->incarnation_id, new_incarnation);
+        EXPECT_EQ(lookup.snapshot->last_sequence, 2U);
+        EXPECT_EQ(lookup.snapshot->last_seen_unix_ms, 112U);
+        EXPECT_EQ(lookup.snapshot->health.health, ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationClusterViewExposesSelfRefreshSequenceLivenessDiagnostics)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        RunningViewNodeDiscoveryService service(config, 100);
+
+        auto self =
+            MakeRegistration(ViewNodeType::kView, "view-self-diag-1", 9707, 100);
+
+        const auto register_result = service.client().RegisterNode(
+            MakeRegisterRequest(self, "integration-register-view-self-diag-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        cluster_request.request_id = "integration-cluster-view-self-diag-initial";
+        auto cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        const auto *initial_diagnostic =
+            FindDiagnosticByNodeIdAndMessage(
+                cluster_result.result.snapshot.diagnostics,
+                "view-self-diag-1",
+                "self_refresh_state source=registration_only");
+        ASSERT_NE(initial_diagnostic, nullptr);
+        EXPECT_NE(initial_diagnostic->message.find("sequence=0"),
+                  std::string::npos);
+        EXPECT_NE(initial_diagnostic->message.find("liveness=live"),
+                  std::string::npos);
+        EXPECT_NE(initial_diagnostic->message.find("incarnation=<none>"),
+                  std::string::npos);
+
+        service.set_now_unix_ms(125);
+        const std::string incarnation_id =
+            "view-self-diag-1:boot:125000000:77:1";
+        auto self_refresh = MakeSelfRefreshRequest("view-self-diag-1",
+                                                   9707,
+                                                   incarnation_id,
+                                                   5,
+                                                   125);
+        const auto self_refresh_result = service.RefreshSelfNode(self_refresh);
+        ASSERT_EQ(self_refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(self_refresh_result.applied);
+
+        cluster_request.request_id = "integration-cluster-view-self-diag-live";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].last_sequence, 5U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+        const auto *live_diagnostic =
+            FindDiagnosticByNodeIdAndMessage(
+                cluster_result.result.snapshot.diagnostics,
+                "view-self-diag-1",
+                "self_refresh_state source=self_refresh");
+        ASSERT_NE(live_diagnostic, nullptr);
+        EXPECT_NE(live_diagnostic->message.find(
+                      std::string("endpoint=") + self.endpoint),
+                  std::string::npos);
+        EXPECT_NE(live_diagnostic->message.find(
+                      std::string("incarnation=") + incarnation_id),
+                  std::string::npos);
+        EXPECT_NE(live_diagnostic->message.find("sequence=5"),
+                  std::string::npos);
+        EXPECT_NE(live_diagnostic->message.find("last_seen_unix_ms=125"),
+                  std::string::npos);
+        EXPECT_NE(live_diagnostic->message.find("health=healthy"),
+                  std::string::npos);
+        EXPECT_NE(live_diagnostic->message.find("liveness=live"),
+                  std::string::npos);
+
+        service.set_now_unix_ms(161);
+        cluster_request.request_id = "integration-cluster-view-self-diag-stale";
+        cluster_result = service.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        EXPECT_EQ(cluster_result.result.snapshot.view_nodes[0].liveness,
+                  ViewNodeLivenessState::kStale);
+        const auto *stale_diagnostic =
+            FindDiagnosticByNodeIdAndMessage(
+                cluster_result.result.snapshot.diagnostics,
+                "view-self-diag-1",
+                "self_refresh_state source=self_refresh");
+        ASSERT_NE(stale_diagnostic, nullptr);
+        EXPECT_NE(stale_diagnostic->message.find("sequence=5"),
+                  std::string::npos);
+        EXPECT_NE(stale_diagnostic->message.find("liveness=stale"),
+                  std::string::npos);
     }
 
     TEST(ViewNodeDiscoveryTest,
