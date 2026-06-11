@@ -6,7 +6,7 @@
 |------|----------------|---------------------|-------|
 | Local RPC example | `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/rpc_demo.sh status`, `examples/object-storage-local-3meta-6store/rpc_demo.sh roundtrip`, `examples/object-storage-local-3meta-6store/tingzhi.sh` | Preserve 008 static 1 ViewNode + 3 MetadataNode + 6 StorageNode real roundtrip as the 009 local RPC preservation baseline | Client remains `storage_client`; test file directory remains `tests/test_file`; report confirms `CreateWritePlan -> WriteChunk -> CommitObject -> Download -> cmp` |
 | App targets | `view_node_app`, `metadata_node_app`, `storage_node_app`, `storage_client`, `raft_metadata_client` | Build only touched executable targets before example checks | Do not default to full build |
-| ViewNode registry | `tests/view_node_discovery_test.cpp` | Self refresh, TTL, peer sync, incarnation-aware merge | Must cover old incarnation / newer observed_time conflict |
+| ViewNode registry | `tests/view_node_discovery_test.cpp` | Self refresh, TTL, peer sync, incarnation-aware merge | Linux targeted validation through T034 covers self refresh, TTL, incarnation-aware ordering, adapter mapping, and conflict diagnostics on single-ViewNode paths; multi-ViewNode peer sync runtime remains pending |
 | Storage heartbeat | `tests/storage_heartbeat_registry_test.cpp` | Dynamic register, heartbeat content, stale heartbeat, duplicate register | Storage join is discovery-only |
 | Identity | `tests/node_identity_test.cpp` | First create, restart reuse, mismatch, corruption, type-specific Metadata rules | Missing identity_file is valid first-start input; existing legacy/old-format or missing-required-field identity files must fail fast with no auto-upgrade and no auto-overwrite |
 | Cluster config | `tests/cluster_config_test.cpp` | Config boundaries for view/storage/metadata and odd initial voters | Dynamic nodes should not require full topology |
@@ -82,6 +82,7 @@
 | Local RPC ViewNode self-liveness regression | `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/rpc_demo.sh status-self-liveness`, `examples/object-storage-local-3meta-6store/tingzhi.sh` | `storage_client status` 输出必须包含本地 ViewNode 自身记录及 `liveness`；跨过 dead TTL 后健康运行中的 ViewNode 仍应保持 `LIVE`，在 T021 之前若出现 `STALE` / `SUSPECT` / `DEAD` 应直接暴露失败 |
 | Single ViewNode self refresh | `tests/view_node_discovery_test.cpp` | ViewNode remains `LIVE` for at least 2x dead TTL while self refresh is enabled |
 | Self refresh stopped | `tests/view_node_discovery_test.cpp` | State transitions to `STALE` / `SUSPECT` / `DEAD` by TTL |
+| Single-View incarnation-aware merge ordering | `tests/view_node_discovery_test.cpp` | Higher incarnation wins, same-incarnation higher sequence wins, `observed_time` alone cannot override newer live state; service/client adapter still exposes incarnation/sequence facts |
 | Dual ViewNode sync | ViewNode discovery/peer sync test | State registered on one ViewNode appears on peer after sync |
 | Old incarnation rejected | ViewNode discovery/peer sync test | Older incarnation cannot override newer incarnation even with newer observed_time |
 | ViewNode failover | local RPC example or integration test | Client discovers metadata/storage through surviving ViewNode |
