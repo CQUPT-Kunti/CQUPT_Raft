@@ -78,7 +78,7 @@
 - [X] T028 [P] [US1] Add observed_time-only stale override rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
 - [X] T029 [P] [US5] Add identity restart old-incarnation rejection test in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
 - [X] T030 [US1] Add incarnation-aware observed state fields to `modules/view/view_registry.h` and implementation in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
-- [ ] T031 [US1] Implement deterministic merge ordering in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
+- [X] T031 [US1] Implement deterministic merge ordering in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T032 [US1] Add conflict diagnostics for duplicate node_id, endpoint, and data_dir fingerprint in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T033 [US1] Update ViewNode RPC/protobuf adapter mapping for incarnation and sequence in `modules/view/view_service_impl.cpp` and `modules/view/view_client.cpp` (验证: `test_view_node_discovery`)
 - [ ] T034 [US1] Record merge behavior and stale snapshot limitations in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-04-view-merge.md` (验证: `test_view_node_discovery`)

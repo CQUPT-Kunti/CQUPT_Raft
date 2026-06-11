@@ -199,9 +199,18 @@ namespace viewdemo
             const std::string_view existing_incarnation_id,
             const std::string_view incoming_incarnation_id)
         {
-            if (existing_incarnation_id.empty() || incoming_incarnation_id.empty())
+            if (existing_incarnation_id.empty() &&
+                incoming_incarnation_id.empty())
             {
-                return IncarnationDecision::kUnknown;
+                return IncarnationDecision::kSame;
+            }
+            if (existing_incarnation_id.empty())
+            {
+                return IncarnationDecision::kIncomingNewer;
+            }
+            if (incoming_incarnation_id.empty())
+            {
+                return IncarnationDecision::kIncomingOlder;
             }
             if (existing_incarnation_id == incoming_incarnation_id)
             {
@@ -214,7 +223,9 @@ namespace viewdemo
                 !TryParseProcessIncarnationId(incoming_incarnation_id, &incoming) ||
                 existing.node_id != incoming.node_id)
             {
-                return IncarnationDecision::kUnknown;
+                return incoming_incarnation_id > existing_incarnation_id
+                           ? IncarnationDecision::kIncomingNewer
+                           : IncarnationDecision::kIncomingOlder;
             }
 
             return std::tie(incoming.started_at_unix_ns,
@@ -693,29 +704,29 @@ namespace viewdemo
             return SequenceDecision::kApply;
         }
 
-        SequenceDecision EvaluateSequenceDecisionWithIncarnation(
-            const Record &record,
-            const std::string_view incoming_incarnation_id,
-            const std::uint64_t incoming_sequence,
-            const std::uint64_t incoming_observed_at)
+        SequenceDecision DetermineObservedStateMergeDecision(
+            const ViewNodeObservedState &existing_state,
+            const ViewNodeObservedState &incoming_state)
         {
-            switch (CompareIncarnationIds(record.observed_state.incarnation_id,
-                                          incoming_incarnation_id))
+            switch (CompareIncarnationIds(existing_state.incarnation_id,
+                                          incoming_state.incarnation_id))
             {
             case IncarnationDecision::kIncomingOlder:
                 return SequenceDecision::kStale;
             case IncarnationDecision::kIncomingNewer:
                 return SequenceDecision::kApply;
             case IncarnationDecision::kSame:
-                break;
             case IncarnationDecision::kUnknown:
-                break;
+                return EvaluateSequenceDecision(existing_state.sequence,
+                                                existing_state.observed_at_unix_ms,
+                                                incoming_state.sequence,
+                                                incoming_state.observed_at_unix_ms);
             }
 
-            return EvaluateSequenceDecision(record.observed_state.sequence,
-                                            record.observed_state.observed_at_unix_ms,
-                                            incoming_sequence,
-                                            incoming_observed_at);
+            return EvaluateSequenceDecision(existing_state.sequence,
+                                            existing_state.observed_at_unix_ms,
+                                            incoming_state.sequence,
+                                            incoming_state.observed_at_unix_ms);
         }
 
         bool IsLiveForDiscovery(const ViewNodeSnapshot &snapshot,
@@ -1179,11 +1190,12 @@ namespace viewdemo
         }
 
         result.accepted_sequence = existing->second.observed_state.sequence;
-        const auto decision = EvaluateSequenceDecisionWithIncarnation(
-            existing->second,
-            request.incarnation_id,
-            request.sequence,
-            observation.observed_at_unix_ms);
+        const auto decision = DetermineObservedStateMergeDecision(
+            existing->second.observed_state,
+            ViewNodeObservedState{
+                .incarnation_id = request.incarnation_id,
+                .sequence = request.sequence,
+                .observed_at_unix_ms = observation.observed_at_unix_ms});
 
         if (decision == SequenceDecision::kStale)
         {

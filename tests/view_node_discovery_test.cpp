@@ -1248,6 +1248,82 @@ namespace
     }
 
     TEST(ViewNodeDiscoveryTest,
+         MissingIncarnationCannotOverrideIncarnationAwareCurrentState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        ViewNodeRegistry registry(config);
+
+        auto self = MakeRegistration(ViewNodeType::kView,
+                                     "view-incarnation-required-1",
+                                     9711,
+                                     100);
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(
+                                 self,
+                                 "register-view-incarnation-required-1"));
+
+        const std::string current_incarnation =
+            "view-incarnation-required-1:boot:310000000:41:1";
+        auto current_refresh = MakeSelfRefreshRequest("view-incarnation-required-1",
+                                                      9711,
+                                                      current_incarnation,
+                                                      5,
+                                                      310);
+        current_refresh.observation.health.health = ViewNodeHealth::kHealthy;
+        current_refresh.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kLow;
+        const auto current_result = registry.RefreshSelfNode(current_refresh);
+        ASSERT_EQ(current_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_result.applied);
+        ASSERT_TRUE(current_result.snapshot.has_value());
+        ExpectObservedStateFacts(*current_result.snapshot,
+                                 current_incarnation,
+                                 5U,
+                                 310U);
+
+        auto missing_incarnation = MakeHeartbeatRequest(ViewNodeType::kView,
+                                                        "view-incarnation-required-1",
+                                                        9711,
+                                                        99,
+                                                        999);
+        missing_incarnation.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        missing_incarnation.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kFull;
+        missing_incarnation.incarnation_id.clear();
+        const auto stale_result = registry.HeartbeatNode(missing_incarnation);
+        ASSERT_EQ(stale_result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_result.stale_ignored);
+        EXPECT_FALSE(stale_result.applied);
+        EXPECT_EQ(stale_result.accepted_sequence, 5U);
+        ASSERT_TRUE(stale_result.snapshot.has_value());
+        ExpectObservedStateFacts(*stale_result.snapshot,
+                                 current_incarnation,
+                                 5U,
+                                 310U);
+        EXPECT_EQ(stale_result.snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(stale_result.snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(stale_result.snapshot->liveness, ViewNodeLivenessState::kLive);
+
+        const auto lookup = registry.LookupNode(kClusterId,
+                                                "view-incarnation-required-1",
+                                                999);
+        ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, current_incarnation, 5U, 310U);
+        EXPECT_EQ(lookup.snapshot->health.health, ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
          IntegrationClusterViewExposesSelfRefreshSequenceLivenessDiagnostics)
     {
         ViewRegistryConfig config;
