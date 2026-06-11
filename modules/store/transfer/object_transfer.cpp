@@ -67,6 +67,13 @@ namespace storedemo
             }
         }
 
+        [[nodiscard]] std::string MakeMetadataOperationRequestId(
+            std::string_view base_request_id,
+            std::string_view operation_suffix)
+        {
+            return std::string(base_request_id) + "/" + std::string(operation_suffix);
+        }
+
         [[nodiscard]] std::uint32_t RotateRight(const std::uint32_t value,
                                                 const std::uint32_t bits)
         {
@@ -1921,7 +1928,8 @@ namespace storedemo
                 result.session = Snapshot();
 
                 const auto commit_call = discovered_metadata_client->CommitObject(
-                    {.request_id = request_.request_id,
+                    {.request_id = MakeMetadataOperationRequestId(request_.request_id,
+                                                                 "commit"),
                      .bucket = request_.bucket,
                      .object_key = request_.object_key,
                      .object_id = result.write_plan->object_id,

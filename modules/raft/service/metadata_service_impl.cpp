@@ -931,6 +931,76 @@ namespace raftdemo
                                    response);
     }
 
+    // 受控前置校验：bucket 缺失时必须直接拒绝，不能让无效 CreateObject
+    // 提案进入已提交日志并污染 committed metadata apply 边界。
+    const bool local_node_is_leader =
+        status.role == "Leader" && status.leader_id == status.node_id;
+    if (local_node_is_leader)
+    {
+      if (const MetadataStateMachine *metadata_state_machine = node_.GetMetadataStateMachineV2();
+          metadata_state_machine != nullptr)
+      {
+        const auto bucket = metadata_state_machine->FindBucket(request->bucket());
+        if (!bucket.has_value() || bucket->deleted)
+        {
+          FillSummary(status,
+                      raft::METADATA_STATUS_CODE_NOT_FOUND,
+                      "not found: bucket does not exist",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      ObjectState::PENDING,
+                      std::nullopt,
+                      status.term,
+                      response->mutable_summary());
+          DecorateSummaryWithContext(status,
+                                     status.leader_id >= 0
+                                         ? std::optional<int>(status.leader_id)
+                                         : std::nullopt,
+                                     response->mutable_summary());
+          reactor->Finish(grpc::Status::OK);
+          return reactor;
+        }
+
+        const auto existing_object =
+            metadata_state_machine->FindObject(request->bucket(), request->object_key());
+        if (existing_object.has_value() && existing_object->state != ObjectState::DELETED)
+        {
+          FillSummary(status,
+                      raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+                      "state conflict: object already exists",
+                      request->request_id(),
+                      request->bucket(),
+                      request->object_key(),
+                      request->object_id(),
+                      ObjectState::PENDING,
+                      std::nullopt,
+                      status.term,
+                      response->mutable_summary());
+          DecorateSummaryWithContext(status,
+                                     status.leader_id >= 0
+                                         ? std::optional<int>(status.leader_id)
+                                         : std::nullopt,
+                                     response->mutable_summary());
+          reactor->Finish(grpc::Status::OK);
+          return reactor;
+        }
+
+        // CreateWritePlan 请求允许 version=0，由 MetadataService 在 leader
+        // 本地基于 committed metadata 边界分配稳定版本。
+        if (command.create_object->object_record.version == 0)
+        {
+          std::uint64_t resolved_version = 1;
+          if (existing_object.has_value() && existing_object->version != 0)
+          {
+            resolved_version = existing_object->version + 1;
+          }
+          command.create_object->object_record.version = resolved_version;
+        }
+      }
+    }
+
     const ProposeResult result = node_.ProposeMetadata(SerializeMetadataCommand(command));
     const NodeStatusSnapshot latest_status = node_.GetStatusSnapshot();
     const CommittedMembershipQuorumSummary quorum_summary =

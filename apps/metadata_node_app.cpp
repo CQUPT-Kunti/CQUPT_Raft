@@ -500,14 +500,19 @@ namespace
         node_config.address = startup.listen_endpoint;
         node_config.data_dir = startup.data_dir.string();
 
-        if (config.timeouts.heartbeat_interval > std::chrono::milliseconds::zero())
-        {
-            node_config.heartbeat_interval = config.timeouts.heartbeat_interval;
-        }
         if (config.timeouts.metadata_rpc_timeout > std::chrono::milliseconds::zero())
         {
             node_config.rpc_deadline = config.timeouts.metadata_rpc_timeout;
         }
+
+        // cluster config 里的 heartbeat_interval_ms 用于 ViewNode / StorageNode
+        // 的注册与观测心跳，不应直接复用成 Raft heartbeat。
+        // 否则当观测心跳配置到 1s 级别时，Raft follower 会在默认 300-600ms
+        // election timeout 内先超时发起选举，导致 leader 高频抖动。
+        //
+        // Metadata Raft 这里保持 NodeConfig 自带的毫秒级默认 heartbeat /
+        // election window，避免把 control-plane liveness 配置误注入到
+        // Raft consensus timing。
 
         node_config.peers.reserve(config.metadata_nodes.size());
         for (const auto &metadata_node : config.metadata_nodes)
