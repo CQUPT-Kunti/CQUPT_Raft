@@ -21,7 +21,7 @@
 
 **Purpose**: 锁定 008 真实入口和 009 文档边界，避免后续任务绕开现有路径。
 
-- [ ] T001 Record report-derived example, scripts, app targets, CTest targets, and known gaps in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-01-survey.md` (验证: `specs/009-local-rpc-object-storage-stabilization/task-reports/local-rpc-object-storage-stabilization-report.md`)
+- [X] T001 Record report-derived example, scripts, app targets, CTest targets, and known gaps in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-01-survey.md` (验证: `specs/009-local-rpc-object-storage-stabilization/task-reports/local-rpc-object-storage-stabilization-report.md`)
 - [ ] T002 [P] Confirm `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/tingzhi.sh`, and `examples/object-storage-local-3meta-6store/rpc_demo.sh` remain the local RPC baseline in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: local RPC scripts)
 - [ ] T003 [P] Confirm CTest target and label coverage from `tests/CMakeLists.txt` in `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` (验证: `test_view_node_discovery`, `test_node_identity`, `storage_heartbeat_registry`, `integrated_object_storage_e2e`, `integrated_object_storage_quorum`)
 - [ ] T004 [P] Confirm existing identity, ViewNode, StorageNode, Metadata, Raft membership entry points in `specs/009-local-rpc-object-storage-stabilization/module-notes.md` (验证: `tests/node_identity_test.cpp`, `tests/view_node_discovery_test.cpp`, `tests/storage_heartbeat_registry_test.cpp`, `tests/integrated_object_storage_quorum_test.cpp`)
