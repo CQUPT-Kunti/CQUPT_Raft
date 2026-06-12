@@ -814,6 +814,149 @@ namespace
     }
 
     TEST(ViewNodeDiscoveryTest,
+         MetadataObservedRegistrationRemainsObservationOnlyAndRespectsMergeAndLiveness)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        ViewNodeRegistry registry(config);
+
+        auto candidate = MakeRegistration(ViewNodeType::kMetadata,
+                                          "meta-candidate-1",
+                                          9411,
+                                          100);
+        candidate.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kFollower,
+            MetadataMembershipObservedState::kJoining,
+            1,
+            5);
+        RegisterNodeOrAssert(
+            &registry,
+            MakeRegisterRequest(candidate, "register-meta-candidate-1"));
+
+        const auto initial_lookup =
+            registry.LookupNode(kClusterId, "meta-candidate-1", 120);
+        ASSERT_EQ(initial_lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(initial_lookup.snapshot.has_value());
+        EXPECT_EQ(initial_lookup.snapshot->node_type, ViewNodeType::kMetadata);
+        EXPECT_EQ(initial_lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+        ASSERT_TRUE(initial_lookup.snapshot->metadata.has_value());
+        EXPECT_EQ(initial_lookup.snapshot->metadata->membership_state,
+                  MetadataMembershipObservedState::kJoining);
+        EXPECT_EQ(initial_lookup.snapshot->metadata->raft_role,
+                  MetadataRaftObservedRole::kFollower);
+        ExpectObservedStateFacts(*initial_lookup.snapshot, "", 0U, 100U);
+
+        DiscoverMetadataRequest live_request;
+        live_request.request_id = "discover-meta-candidate-live";
+        live_request.cluster_id = kClusterId;
+        live_request.prefer_leader = false;
+        live_request.live_only = true;
+
+        auto live_result = registry.DiscoverMetadata(live_request, 120);
+        ASSERT_EQ(live_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(live_result.metadata_nodes.size(), 1U);
+        EXPECT_EQ(live_result.metadata_nodes[0].node_id, "meta-candidate-1");
+        ASSERT_TRUE(live_result.metadata_nodes[0].metadata.has_value());
+        EXPECT_EQ(live_result.metadata_nodes[0].metadata->membership_state,
+                  MetadataMembershipObservedState::kJoining);
+        EXPECT_EQ(live_result.membership_epoch, 1U);
+        EXPECT_FALSE(live_result.leader_hint.has_value());
+
+        const std::string current_incarnation =
+            "meta-candidate-1:boot:300000000:1:1";
+        auto current = MakeHeartbeatRequest(ViewNodeType::kMetadata,
+                                            "meta-candidate-1",
+                                            9411,
+                                            7,
+                                            160);
+        current.incarnation_id = current_incarnation;
+        current.observation.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kFollower,
+            MetadataMembershipObservedState::kJoining,
+            2,
+            6);
+        const auto current_result = registry.HeartbeatNode(current);
+        ASSERT_EQ(current_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_result.applied);
+        EXPECT_EQ(current_result.accepted_sequence, 7U);
+
+        const std::string old_incarnation =
+            "meta-candidate-1:boot:200000000:1:1";
+        auto stale_voter = MakeHeartbeatRequest(ViewNodeType::kMetadata,
+                                                "meta-candidate-1",
+                                                9411,
+                                                99,
+                                                200);
+        stale_voter.incarnation_id = old_incarnation;
+        stale_voter.observation.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            99,
+            20,
+            MetadataLeaderHint{.node_id = "meta-candidate-1",
+                               .raft_id = std::optional<std::int32_t>{9},
+                               .endpoint = stale_voter.observation.endpoint,
+                               .observed_term = 20,
+                               .observed_at_unix_ms = 200});
+        const auto stale_result = registry.HeartbeatNode(stale_voter);
+        ASSERT_EQ(stale_result.summary.status, ViewRegistryStatusCode::kStaleIgnored);
+        EXPECT_TRUE(stale_result.stale_ignored);
+
+        const auto merged_lookup =
+            registry.LookupNode(kClusterId, "meta-candidate-1", 200);
+        ASSERT_EQ(merged_lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(merged_lookup.snapshot.has_value());
+        EXPECT_EQ(merged_lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+        ASSERT_TRUE(merged_lookup.snapshot->metadata.has_value());
+        EXPECT_EQ(merged_lookup.snapshot->metadata->membership_state,
+                  MetadataMembershipObservedState::kJoining);
+        EXPECT_EQ(merged_lookup.snapshot->metadata->raft_role,
+                  MetadataRaftObservedRole::kFollower);
+        EXPECT_FALSE(merged_lookup.snapshot->metadata->leader_hint.has_value());
+        ExpectObservedStateFacts(*merged_lookup.snapshot,
+                                 current_incarnation,
+                                 7U,
+                                 160U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-meta-candidate";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+        auto cluster_result = registry.GetClusterView(cluster_request, 200);
+        ASSERT_EQ(cluster_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.snapshot.metadata_nodes.size(), 1U);
+        const auto *metadata_snapshot = FindSnapshotByNodeId(
+            cluster_result.snapshot.metadata_nodes,
+            "meta-candidate-1");
+        ASSERT_NE(metadata_snapshot, nullptr);
+        EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kLive);
+        ASSERT_TRUE(metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(metadata_snapshot->metadata->membership_state,
+                  MetadataMembershipObservedState::kJoining);
+        EXPECT_EQ(metadata_snapshot->metadata->membership_epoch, 2U);
+
+        live_result = registry.DiscoverMetadata(live_request, 260);
+        ASSERT_EQ(live_result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(live_result.metadata_nodes.empty());
+        EXPECT_TRUE(ContainsDiagnosticCode(live_result.diagnostics,
+                                           ViewRegistryIssueCode::kLivenessExcluded));
+
+        cluster_result = registry.GetClusterView(cluster_request, 260);
+        ASSERT_EQ(cluster_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.snapshot.metadata_nodes.size(), 1U);
+        metadata_snapshot = FindSnapshotByNodeId(cluster_result.snapshot.metadata_nodes,
+                                                 "meta-candidate-1");
+        ASSERT_NE(metadata_snapshot, nullptr);
+        EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kDead);
+        ASSERT_TRUE(metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(metadata_snapshot->metadata->membership_state,
+                  MetadataMembershipObservedState::kJoining);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
          DiscoverStorageFiltersByCapacityZoneRackWritableAndLiveness)
     {
         ViewRegistryConfig config;

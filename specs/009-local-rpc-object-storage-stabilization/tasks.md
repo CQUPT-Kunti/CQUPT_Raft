@@ -129,10 +129,10 @@
 
 **Independent Test**: Dynamic MetadataNode candidate 通过 ViewNode 发现 leader，JoinMetadataCluster 只产生 learner/non-voter membership change。
 
-- [ ] T055 [P] [US4] Add dynamic Metadata candidate identity/config tests in `tests/cluster_config_test.cpp` and `tests/node_identity_test.cpp` (验证: `cluster_config_test`, `test_node_identity`)
-- [ ] T056 [P] [US4] Add JoinMetadataCluster leader validation tests in `tests/metadata_client_scenario_test.cpp` (验证: `metadata_client_scenario_test`)
-- [ ] T057 [P] [US4] Add duplicate join and pending membership change rejection tests in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T058 [P] [US4] Add ViewNode-observed metadata registration test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [x] T055 [P] [US4] Add dynamic Metadata candidate identity/config tests in `tests/cluster_config_test.cpp` and `tests/node_identity_test.cpp` (验证: `cluster_config_test`, `test_node_identity`)
+- [x] T056 [P] [US4] Add JoinMetadataCluster leader validation tests in `tests/metadata_client_scenario_test.cpp` (验证: `metadata_client_scenario_test`)
+- [X] T057 [P] [US4] Add duplicate join and pending membership change rejection tests in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T058 [P] [US4] Add ViewNode-observed metadata registration test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
 - [ ] T059 [US4] Add additive JoinMetadataCluster request/response contract in `proto/raft.proto` or `proto/metadata.proto` (验证: generated proto build, `metadata_client_scenario_test`)
 - [ ] T060 [US4] Implement Metadata leader join validation in `modules/raft/service/metadata_service_impl.cpp` (验证: `metadata_client_scenario_test`, `integrated_object_storage_quorum`)
 - [ ] T061 [US4] Add dynamic join mode wiring in `apps/metadata_node_app.cpp` without changing initial bootstrap voter startup (验证: `cluster_config_test`, local RPC startup)

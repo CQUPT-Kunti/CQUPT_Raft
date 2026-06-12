@@ -700,6 +700,8 @@ namespace clusterdemo
             ASSERT_EQ(generated.config.initial_raft_membership.learner_raft_ids.size(), 1U);
 
             ClusterConfig candidate_config = generated.config;
+            const auto candidate_raft_id =
+                candidate_config.metadata_nodes.back().raft_id;
             candidate_config.metadata_nodes.back().initial_role =
                 MetadataNodeInitialRole::kCandidate;
             candidate_config.initial_raft_membership.learner_raft_ids.clear();
@@ -707,6 +709,23 @@ namespace clusterdemo
             const ClusterConfigValidationResult validation =
                 ValidateClusterConfig(candidate_config);
             EXPECT_TRUE(validation.ok());
+            EXPECT_EQ(candidate_config.initial_raft_membership.voter_raft_ids.size(),
+                      3U);
+            EXPECT_TRUE(candidate_config.initial_raft_membership.learner_raft_ids.empty());
+            EXPECT_EQ(std::find(candidate_config.initial_raft_membership.voter_raft_ids.begin(),
+                                candidate_config.initial_raft_membership.voter_raft_ids.end(),
+                                candidate_raft_id),
+                      candidate_config.initial_raft_membership.voter_raft_ids.end());
+
+            const InitialRaftQuorumComputationResult quorum =
+                ComputeInitialRaftQuorum(candidate_config);
+            ASSERT_TRUE(quorum.ok()) << quorum.error_detail;
+            ASSERT_TRUE(quorum.summary.has_value());
+            EXPECT_EQ(quorum.summary->voter_count, 3U);
+            EXPECT_EQ(quorum.summary->election_quorum, 2U);
+            EXPECT_EQ(quorum.summary->commit_quorum, 2U);
+            EXPECT_EQ(quorum.summary->voter_raft_ids,
+                      candidate_config.initial_raft_membership.voter_raft_ids);
 
             const ClusterNodeResolutionResult resolved = ResolveClusterNodeConfig(
                 candidate_config,
@@ -719,6 +738,7 @@ namespace clusterdemo
                       MetadataNodeInitialRole::kCandidate);
             ASSERT_TRUE(resolved.resolved->raft_id.has_value());
             EXPECT_GT(*resolved.resolved->raft_id, 0);
+            EXPECT_EQ(*resolved.resolved->raft_id, candidate_raft_id);
 
             const std::filesystem::path json_path = MakeTempConfigPath(34);
             WriteConfigJson(json_path,
@@ -729,7 +749,15 @@ namespace clusterdemo
             ASSERT_EQ(loaded.config->metadata_nodes.size(), 4U);
             EXPECT_EQ(loaded.config->metadata_nodes.back().initial_role,
                       MetadataNodeInitialRole::kCandidate);
+            EXPECT_EQ(loaded.config->metadata_nodes.back().raft_id,
+                      candidate_raft_id);
             EXPECT_TRUE(loaded.config->initial_raft_membership.learner_raft_ids.empty());
+            EXPECT_EQ(loaded.config->initial_raft_membership.voter_raft_ids.size(),
+                      3U);
+            EXPECT_EQ(std::find(loaded.config->initial_raft_membership.voter_raft_ids.begin(),
+                                loaded.config->initial_raft_membership.voter_raft_ids.end(),
+                                candidate_raft_id),
+                      loaded.config->initial_raft_membership.voter_raft_ids.end());
 
             std::error_code remove_ec;
             std::filesystem::remove(json_path, remove_ec);
@@ -766,6 +794,42 @@ namespace clusterdemo
             EXPECT_EQ(issue->field_path, "metadata_nodes[3].initial_role");
             EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
             EXPECT_EQ(issue->node_id, "meta-candidate-d");
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_metadata_candidate_that_attempts_local_voter_role)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+            invalid_config.initial_raft_membership.learner_raft_ids.clear();
+            invalid_config.initial_raft_membership.voter_raft_ids.push_back(
+                invalid_config.metadata_nodes.back().raft_id);
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssue(validation,
+                          ClusterConfigIssueCode::kInvalidInitialMembership);
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
+            EXPECT_EQ(issue->node_id, "meta-candidate-d");
+            EXPECT_EQ(issue->field_path, "metadata_nodes[3].initial_role");
         }
 
         TEST(cluster_config_endpoint_allocation_test,

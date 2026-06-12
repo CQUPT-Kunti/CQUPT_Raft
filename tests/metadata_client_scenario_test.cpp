@@ -2,6 +2,8 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <google/protobuf/descriptor.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -154,6 +156,23 @@ namespace
   std::string ObjectIdentity(const std::string &bucket, const std::string &object_key)
   {
     return bucket + "\n" + object_key;
+  }
+
+  bool MetadataServiceHasMethod(const std::string &method_name)
+  {
+    const auto *file = raft::HeadObjectRequest::descriptor()->file();
+    if (file == nullptr)
+    {
+      return false;
+    }
+
+    const auto *service = file->FindServiceByName("MetadataService");
+    if (service == nullptr)
+    {
+      return false;
+    }
+
+    return service->FindMethodByName(method_name) != nullptr;
   }
 
   template <typename Response>
@@ -1309,6 +1328,54 @@ TEST_F(MetadataClientScenarioTest, ClientShowsRetryableAdmissionStatuses)
     EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
     EXPECT_TRUE(Contains(result.output, "request_id=" + request_id)) << result.output;
   }
+}
+
+TEST_F(MetadataClientScenarioTest,
+       JoinMetadataClusterContractIsNotYetExposedByMetadataServiceProto)
+{
+  EXPECT_FALSE(MetadataServiceHasMethod("JoinMetadataCluster"));
+  EXPECT_FALSE(MetadataServiceHasMethod("AddLearner"));
+}
+
+TEST_F(MetadataClientScenarioTest,
+       UnsupportedJoinMetadataClusterCliDoesNotBypassLeaderAuthority)
+{
+  const ClientRunResult result = RunClient(
+      {server_.address(), "join-metadata-cluster",
+       "--request-id", "req-join-leader-validation",
+       "--bucket", kBucket},
+      "join_metadata_cluster_unsupported");
+
+  ASSERT_EQ(result.exit_code, 2) << result.output;
+  EXPECT_TRUE(Contains(result.output,
+                       "unsupported command: join-metadata-cluster"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "Usage:")) << result.output;
+}
+
+TEST_F(MetadataClientScenarioTest,
+       FutureJoinLeaderValidationMustReturnNotLeaderAndLeaderHintForFollowerAuthority)
+{
+  server_.service().SetLeaderAddress("127.0.0.1:7412");
+  server_.service().ForceWriteResponse(
+      "req-join-authority-not-leader",
+      raft::METADATA_STATUS_CODE_NOT_LEADER,
+      "join authority belongs to metadata leader");
+
+  const ClientRunResult result = RunClient(
+      {server_.address(), "create-bucket",
+       "--request-id", "req-join-authority-not-leader",
+       "--bucket", "join-authority-probe"},
+      "join_authority_not_leader");
+
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=NOT_LEADER")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "leader_address=127.0.0.1:7412"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output,
+                       "message=\"join authority belongs to metadata leader\""))
+      << result.output;
 }
 
 TEST_F(MetadataClientScenarioTest, ClientShowsIdempotencyConflictAsNonRetryable)

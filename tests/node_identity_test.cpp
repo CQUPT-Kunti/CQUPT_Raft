@@ -1102,6 +1102,108 @@ namespace clusterdemo
 
         TEST_F(
             NodeIdentityTest,
+            T055MetadataDynamicJoinCandidateCannotPersistLocalVoterMembershipState)
+        {
+            const auto data_dir =
+                MakeDataDir("t055-dynamic-join-candidate-local-voter");
+            auto invalid_candidate_identity =
+                MakeMetadataDynamicJoinCandidateIdentity(
+                    "meta-join-candidate-local-voter",
+                    401);
+            invalid_candidate_identity.membership_state =
+                NodeIdentityMembershipState::kVoter;
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = invalid_candidate_identity.cluster_id,
+                            .node_id = invalid_candidate_identity.node_id,
+                            .node_type = ClusterNodeType::kMetadata,
+                            .raft_id = invalid_candidate_identity.raft_id,
+                            .source = invalid_candidate_identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = invalid_candidate_identity,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            EXPECT_EQ(first_start.status, NodeIdentityStatusCode::kInvalidArgument);
+            EXPECT_FALSE(first_start.ok());
+            EXPECT_FALSE(first_start.identity.has_value());
+            EXPECT_FALSE(std::filesystem::exists(first_start.identity_path));
+            EXPECT_TRUE(ValidationContains(first_start.validation,
+                                           NodeIdentityIssueCode::kInvalidMembershipState));
+            EXPECT_NE(first_start.diagnostic.find("must not persist voter membership_state"),
+                      std::string::npos);
+        }
+
+        TEST_F(
+            NodeIdentityTest,
+            T055MetadataDynamicJoinCandidateReloadAsCommittedVoterFailsOnMembershipStateMismatch)
+        {
+            const auto data_dir =
+                MakeDataDir("t055-dynamic-join-candidate-reload-voter");
+            const auto candidate_identity =
+                MakeMetadataDynamicJoinCandidateIdentity(
+                    "meta-join-candidate-reload-voter",
+                    402);
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = candidate_identity.cluster_id,
+                            .node_id = candidate_identity.node_id,
+                            .node_type = ClusterNodeType::kMetadata,
+                            .raft_id = candidate_identity.raft_id,
+                            .source = candidate_identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = candidate_identity,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+
+            const auto reload_as_committed_voter = LoadNodeIdentity(
+                NodeIdentityLoadOptions{
+                    .data_dir = data_dir,
+                    .expected = ExpectedNodeIdentity{
+                        .cluster_id = candidate_identity.cluster_id,
+                        .node_id = candidate_identity.node_id,
+                        .node_type = ClusterNodeType::kMetadata,
+                        .raft_id = candidate_identity.raft_id,
+                        .membership_state = NodeIdentityMembershipState::kVoter,
+                        .source = candidate_identity.source,
+                        .require_raft_id_for_metadata = true,
+                        .forbid_raft_id_for_non_metadata = true},
+                    .require_existing = true});
+
+            EXPECT_EQ(reload_as_committed_voter.status,
+                      NodeIdentityStatusCode::kConflict);
+            EXPECT_FALSE(reload_as_committed_voter.ok());
+            EXPECT_TRUE(ValidationContains(
+                reload_as_committed_voter.validation,
+                NodeIdentityIssueCode::kMembershipStateMismatch));
+            EXPECT_NE(reload_as_committed_voter.diagnostic.find("membership_state mismatch"),
+                      std::string::npos);
+        }
+
+        TEST_F(
+            NodeIdentityTest,
             T009MetadataDynamicJoinCandidateWithoutRaftIdPersistsJoiningStateWithoutBootstrapAuthority)
         {
             const auto data_dir =

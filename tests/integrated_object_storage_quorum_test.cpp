@@ -179,6 +179,37 @@ namespace raftdemo
             ASSERT_TRUE(result.snapshot.has_value());
         }
 
+        std::string DescribeCommittedMembershipSummary(
+            const CommittedMembershipQuorumSummary &summary)
+        {
+            std::ostringstream oss;
+            oss << "commit_index=" << summary.committed_log_index
+                << ", term=" << summary.committed_term
+                << ", voters=[";
+            for (std::size_t index = 0; index < summary.voter_ids.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    oss << ",";
+                }
+                oss << summary.voter_ids[index];
+            }
+            oss << "], learners=[";
+            for (std::size_t index = 0; index < summary.learner_ids.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    oss << ",";
+                }
+                oss << summary.learner_ids[index];
+            }
+            oss << "], voter_count=" << summary.voter_count
+                << ", learner_count=" << summary.learner_count
+                << ", quorum=" << summary.quorum_size
+                << ", local_role=" << static_cast<int>(summary.local_role);
+            return oss.str();
+        }
+
         std::filesystem::path TestBinaryDir()
         {
 #ifdef RAFT_TEST_BINARY_DIR
@@ -776,6 +807,39 @@ namespace raftdemo
             int base_port_{0};
         };
 
+        void ExpectCommittedMembershipUnchangedOnRunningNodes(
+            const QuorumTestCluster &cluster,
+            const std::vector<int> &expected_voter_ids,
+            const std::size_t expected_quorum_size)
+        {
+            for (std::size_t index = 0; index < cluster.Size(); ++index)
+            {
+                if (!cluster.IsRunning(index))
+                {
+                    continue;
+                }
+
+                const auto node = cluster.Node(index);
+                ASSERT_NE(node, nullptr);
+                const auto summary = node->GetCommittedMembershipQuorumSummary();
+                EXPECT_EQ(summary.voter_ids, expected_voter_ids)
+                    << "running node[" << index
+                    << "] unexpectedly changed committed voter set: "
+                    << DescribeCommittedMembershipSummary(summary);
+                EXPECT_TRUE(summary.learner_ids.empty())
+                    << "running node[" << index
+                    << "] should not expose committed learners before join membership is "
+                       "implemented: "
+                    << DescribeCommittedMembershipSummary(summary);
+                EXPECT_EQ(summary.voter_count, expected_voter_ids.size())
+                    << DescribeCommittedMembershipSummary(summary);
+                EXPECT_EQ(summary.learner_count, 0U)
+                    << DescribeCommittedMembershipSummary(summary);
+                EXPECT_EQ(summary.quorum_size, expected_quorum_size)
+                    << DescribeCommittedMembershipSummary(summary);
+            }
+        }
+
         TEST_F(IntegratedObjectStorageQuorumTest,
                ThreeVoterCommittedMembershipDoesNotShrinkQuorumWhenOnlyOneNodeRemainsLive)
         {
@@ -1186,6 +1250,398 @@ namespace raftdemo
                 5s,
                 &committed_replication_diagnostics))
                 << "ViewNode observation leaked into quorum calculation or object visibility; "
+                   "surviving committed majority did not converge on COMMITTED object. values="
+                << committed_replication_diagnostics
+                << ", commit_status=" << ProposeStatusName(commit_result.status)
+                << ", commit_message=" << commit_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               DuplicateObservedJoinCandidateDoesNotCreateDuplicateCommittedMembershipEntry)
+        {
+            constexpr const char *kBucket = "bucket-t057-duplicate";
+            constexpr const char *kObjectKey = "objects/duplicate-join-candidate.bin";
+            constexpr const char *kObjectId = "obj-t057-duplicate";
+            constexpr const char *kViewClusterId = "cluster-t057-duplicate";
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto original_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(original_leader, nullptr)
+                << "3-voter cluster failed to elect leader before duplicate join boundary "
+                   "test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t057-duplicate",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before duplicate join boundary test; status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != original_leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_FALSE(follower_indexes.empty());
+            const std::size_t stopped_voter_index = follower_indexes.front();
+            cluster.StopNode(stopped_voter_index);
+
+            const auto surviving_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(surviving_leader, nullptr)
+                << "3-voter cluster should keep 2-voter majority after stopping one voter; "
+                   "cluster="
+                << cluster.DescribeCluster();
+
+            ViewNodeRegistry registry;
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-1",
+                                         1,
+                                         static_cast<std::uint16_t>(base_port_ + 111),
+                                         100,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-1");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-2",
+                                         2,
+                                         static_cast<std::uint16_t>(base_port_ + 112),
+                                         101,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-2");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-3",
+                                         3,
+                                         static_cast<std::uint16_t>(base_port_ + 113),
+                                         102,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-3");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-join-candidate-a",
+                                         41,
+                                         static_cast<std::uint16_t>(base_port_ + 141),
+                                         200,
+                                         MetadataMembershipObservedState::kJoining),
+                "register-meta-join-candidate-a");
+            const auto duplicate_candidate_result = registry.RegisterNode(
+                MakeRegisterRequest(
+                    MakeMetadataRegistration(kViewClusterId,
+                                             "meta-join-candidate-a",
+                                             41,
+                                             static_cast<std::uint16_t>(base_port_ + 141),
+                                             260,
+                                             MetadataMembershipObservedState::kJoining),
+                    "register-meta-join-candidate-a-replay"));
+            ASSERT_TRUE(duplicate_candidate_result.summary.ok());
+            EXPECT_EQ(duplicate_candidate_result.summary.status,
+                      ViewRegistryStatusCode::kIdempotentReplay)
+                << "same candidate duplicate join should currently be treated as explicit "
+                   "idempotent replay instead of creating a second membership entry";
+
+            GetClusterViewRequest cluster_view_request;
+            cluster_view_request.request_id = "cluster-view-t057-duplicate";
+            cluster_view_request.cluster_id = kViewClusterId;
+            cluster_view_request.include_dead_nodes = true;
+            cluster_view_request.include_warnings = true;
+
+            const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
+            ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+
+            std::size_t candidate_count = 0;
+            for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
+            {
+                if (metadata_node.node_id == "meta-join-candidate-a")
+                {
+                    ++candidate_count;
+                    ASSERT_TRUE(metadata_node.metadata.has_value());
+                    EXPECT_EQ(metadata_node.metadata->membership_state,
+                              MetadataMembershipObservedState::kJoining);
+                    EXPECT_EQ(metadata_node.metadata->raft_id, 41);
+                }
+            }
+            EXPECT_EQ(candidate_count, 1U)
+                << "duplicate join candidate replay should remain a single observed candidate "
+                   "record instead of creating duplicate membership entries";
+            EXPECT_EQ(cluster_view.snapshot.metadata_nodes.size(), 4U);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(
+                                kBucket,
+                                kObjectKey,
+                                kObjectId,
+                                "create-object-t057-duplicate"),
+                            8s,
+                            &create_object_result,
+                            {stopped_voter_index}))
+                << "duplicate join candidate replay must not enlarge committed membership or "
+                   "quorum; surviving 2-voter majority should still create metadata. status="
+                << ProposeStatusName(create_object_result.status)
+                << ", message=" << create_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string pending_replication_diagnostics;
+            ASSERT_TRUE(WaitUntilPendingObjectReplicatedOnAllRunning(
+                            cluster,
+                            kBucket,
+                            kObjectKey,
+                            kObjectId,
+                            create_object_result.log_index,
+                            5s,
+                            &pending_replication_diagnostics))
+                << "PENDING object did not replicate across surviving committed majority after "
+                   "duplicate join candidate replay; values="
+                << pending_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(
+                                kBucket,
+                                kObjectKey,
+                                kObjectId,
+                                "commit-object-t057-duplicate"),
+                            8s,
+                            &commit_result,
+                            {stopped_voter_index}))
+                << "duplicate join candidate replay must not pollute committed membership; "
+                   "candidate cannot become voter without committed Raft membership change. "
+                   "status="
+                << ProposeStatusName(commit_result.status)
+                << ", message=" << commit_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string committed_replication_diagnostics;
+            EXPECT_TRUE(WaitUntilCommittedObjectOnAllRunning(
+                cluster,
+                kBucket,
+                kObjectKey,
+                kObjectId,
+                commit_result.log_index,
+                5s,
+                &committed_replication_diagnostics))
+                << "duplicate join candidate replay leaked into committed membership or quorum; "
+                   "surviving committed majority did not converge on COMMITTED object. values="
+                << committed_replication_diagnostics
+                << ", commit_status=" << ProposeStatusName(commit_result.status)
+                << ", commit_message=" << commit_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               PendingObservedJoinCandidatesDoNotPolluteCommittedMembershipOrQuorum)
+        {
+            constexpr const char *kBucket = "bucket-t057-pending";
+            constexpr const char *kObjectKey = "objects/pending-join-candidates.bin";
+            constexpr const char *kObjectId = "obj-t057-pending";
+            constexpr const char *kViewClusterId = "cluster-t057-pending";
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto original_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(original_leader, nullptr)
+                << "3-voter cluster failed to elect leader before pending join boundary "
+                   "test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t057-pending",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before pending join boundary test; status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != original_leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_FALSE(follower_indexes.empty());
+            const std::size_t stopped_voter_index = follower_indexes.front();
+            cluster.StopNode(stopped_voter_index);
+
+            const auto surviving_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(surviving_leader, nullptr)
+                << "3-voter cluster should keep a legal leader with one stopped voter; "
+                   "cluster="
+                << cluster.DescribeCluster();
+
+            ViewNodeRegistry registry;
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-1",
+                                         1,
+                                         static_cast<std::uint16_t>(base_port_ + 121),
+                                         100,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-1");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-2",
+                                         2,
+                                         static_cast<std::uint16_t>(base_port_ + 122),
+                                         101,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-2");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-committed-3",
+                                         3,
+                                         static_cast<std::uint16_t>(base_port_ + 123),
+                                         102,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-3");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-join-candidate-a",
+                                         51,
+                                         static_cast<std::uint16_t>(base_port_ + 151),
+                                         200,
+                                         MetadataMembershipObservedState::kJoining),
+                "register-meta-join-candidate-a");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kViewClusterId,
+                                         "meta-join-candidate-b",
+                                         52,
+                                         static_cast<std::uint16_t>(base_port_ + 152),
+                                         210,
+                                         MetadataMembershipObservedState::kJoining),
+                "register-meta-join-candidate-b");
+
+            GetClusterViewRequest cluster_view_request;
+            cluster_view_request.request_id = "cluster-view-t057-pending";
+            cluster_view_request.cluster_id = kViewClusterId;
+            cluster_view_request.include_dead_nodes = true;
+            cluster_view_request.include_warnings = true;
+
+            const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
+            ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+            ASSERT_EQ(cluster_view.snapshot.metadata_nodes.size(), 5U);
+
+            std::size_t joining_candidate_count = 0;
+            for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
+            {
+                if (metadata_node.node_id != "meta-join-candidate-a" &&
+                    metadata_node.node_id != "meta-join-candidate-b")
+                {
+                    continue;
+                }
+
+                ++joining_candidate_count;
+                ASSERT_TRUE(metadata_node.metadata.has_value());
+                EXPECT_EQ(metadata_node.metadata->membership_state,
+                          MetadataMembershipObservedState::kJoining);
+                EXPECT_NE(metadata_node.metadata->raft_id, 1);
+                EXPECT_NE(metadata_node.metadata->raft_id, 2);
+                EXPECT_NE(metadata_node.metadata->raft_id, 3);
+            }
+            EXPECT_EQ(joining_candidate_count, 2U)
+                << "pending join candidates should remain observed JOINING records only";
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(
+                                kBucket,
+                                kObjectKey,
+                                kObjectId,
+                                "create-object-t057-pending"),
+                            8s,
+                            &create_object_result,
+                            {stopped_voter_index}))
+                << "pending join candidates must not raise committed quorum or become voters; "
+                   "surviving 2-voter majority should still create metadata. status="
+                << ProposeStatusName(create_object_result.status)
+                << ", message=" << create_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string pending_replication_diagnostics;
+            ASSERT_TRUE(WaitUntilPendingObjectReplicatedOnAllRunning(
+                            cluster,
+                            kBucket,
+                            kObjectKey,
+                            kObjectId,
+                            create_object_result.log_index,
+                            5s,
+                            &pending_replication_diagnostics))
+                << "PENDING object did not replicate across surviving committed majority after "
+                   "observing pending join candidates; values="
+                << pending_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(
+                                kBucket,
+                                kObjectKey,
+                                kObjectId,
+                                "commit-object-t057-pending"),
+                            8s,
+                            &commit_result,
+                            {stopped_voter_index}))
+                << "pending join candidates must not pollute committed membership while "
+                   "membership change is unimplemented; status="
+                << ProposeStatusName(commit_result.status)
+                << ", message=" << commit_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string committed_replication_diagnostics;
+            EXPECT_TRUE(WaitUntilCommittedObjectOnAllRunning(
+                cluster,
+                kBucket,
+                kObjectKey,
+                kObjectId,
+                commit_result.log_index,
+                5s,
+                &committed_replication_diagnostics))
+                << "pending join observations leaked into committed membership or quorum; "
                    "surviving committed majority did not converge on COMMITTED object. values="
                 << committed_replication_diagnostics
                 << ", commit_status=" << ProposeStatusName(commit_result.status)
