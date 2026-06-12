@@ -127,3 +127,26 @@
   - macOS validation
   - local RPC multi-View smoke
   - long-running multi-View soak
+
+## US3 Phase 6 Closure Snapshot
+
+- Linux targeted validation:
+  - build targets: `test_storage_heartbeat_registry`, `test_integrated_object_storage_e2e`
+  - ctest regex: `(^storage_heartbeat_registry$|^IntegratedObjectStorageE2ETest\.)`
+  - result: PASS (`storage_heartbeat_registry` + `IntegratedObjectStorageE2ETest.*` enabled cases)
+  - logs:
+    - `tmp/test-logs/t054-build.log`
+    - `tmp/test-logs/t054-ctest.log`
+- Covered US3 areas:
+  - runtime StorageNode registration
+  - restart with same `node_id` and new `incarnation_id`
+  - duplicate `node_id` / endpoint conflict rejection
+  - heartbeat runtime facts for health, writable, capacity, load, disk pressure, `incarnation_id`, and `sequence`
+  - ViewNode observed-state merge feeding placement candidate discovery
+  - transfer path compatibility with future dynamic placement inputs
+  - committed manifest no-rebalance invariant
+- Skipped in T054:
+  - Windows validation
+  - macOS validation
+  - local RPC dynamic add-node smoke
+  - long-running dynamic-join soak

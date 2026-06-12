@@ -65,3 +65,9 @@ Mitigation: Treat current Linux PASS as single-View scope only. Keep peer-sync a
 Risk: T035-T043 complete the Linux targeted functional path for dual ViewNode peer sync, but they do not prove long-running convergence, repeated disconnect/retry stability, or Windows/macOS runtime behavior. A later regression could hide in retry/backoff timing or platform-specific networking/thread shutdown paths.
 
 Mitigation: Keep Linux targeted PASS scoped to `ViewNodeDiscovery` functional coverage. Record Windows/macOS as pending, keep local RPC multi-View smoke and soak validation as follow-up work, and do not claim cross-platform peer-sync runtime stability before those checks exist.
+
+## R12: Dynamic StorageNode Join Still Lacks Real Local RPC Add-Node Example Validation
+
+Risk: T045-T053 now validate StorageNode dynamic join semantics through registry tests, placement integration tests, transfer-path compatibility, and metadata manifest diagnostics, but the repository still lacks a completed local RPC example command that adds a new StorageNode to a running multi-process cluster and demonstrates the full runtime path end to end. Without that example, Linux PASS remains scoped to targeted test harnesses rather than the final example workflow.
+
+Mitigation: Keep current US3 PASS scoped to `storage_heartbeat_registry` and `IntegratedObjectStorageE2ETest.*`. Add real runtime add-node example commands and smoke validation in Phase 10/T089-T098 before claiming full local RPC dynamic-join workflow validation.

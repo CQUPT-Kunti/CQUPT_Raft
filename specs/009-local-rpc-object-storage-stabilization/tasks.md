@@ -119,7 +119,7 @@
 - [x] T051 [US3] Ensure ViewNode storage observed state merge feeds placement candidate discovery in `modules/view/view_registry.cpp` and `modules/store/placement/placement_manager.cpp` (验证: `integrated_object_storage_e2e`)
 - [x] T052 [US3] Preserve existing transfer path in `modules/store/transfer/object_transfer.cpp` while allowing future placement to include dynamic StorageNode (验证: `integrated_object_storage_e2e`)
 - [x] T053 [US3] Add no-rebalance invariant diagnostics for committed object manifest in `modules/store/transfer/metadata_transfer_client.cpp` or metadata integration path (验证: `integrated_object_storage_e2e`)
-- [ ] T054 [US3] Record dynamic StorageNode Linux validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-06-storage-dynamic-join.md` (验证: `storage_heartbeat_registry`, `integrated_object_storage_e2e`)
+- [x] T054 [US3] Record dynamic StorageNode Linux validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-06-storage-dynamic-join.md` (验证: `storage_heartbeat_registry`, `integrated_object_storage_e2e`)
 
 ---
 
