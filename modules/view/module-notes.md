@@ -108,6 +108,13 @@ Metadata 观测状态在快照阶段会做保守归一化：
   - request 中的 `incarnation_id`
   - snapshot 中的 `incarnation_id`
   - 与之对应的 `last_sequence` / `last_seen_unix_ms`
+- 当前还额外暴露 peer sync unary RPC adapter：
+  - `PullPeerViewSnapshot`
+  - `PushPeerViewSnapshot`
+- 这两条 RPC 只交换 observed registry snapshot，并复用现有
+  `RegisterNode + HeartbeatNode` 语义导入 peer state。
+- 它们不会把 ViewNode 提升为 Metadata/Raft membership authority，也不会
+  把 StorageNode registration 写入 Raft log。
 
 其中 StorageNode first registration 的 `node_id` 路径已经接入：
 
@@ -192,6 +199,11 @@ MetadataNode 在 ViewNode 中可以带：
 
 ## 与其他模块的交互
 
+- `apps/view_node_app.cpp`
+  - 当前会 load/create durable `node.identity`
+  - 进程启动时构建新的 process incarnation
+  - 启动后先注册本地 ViewNode 记录，再启动独立 self refresh loop
+  - 当前没有 peer sync background loop，也没有 registry persistence
 - `apps/metadata_node_app.cpp`
   - 启动后用 `ViewNodeClient` 注册自己并上报 leader/quorum 观测信息
 - `apps/storage_node_app.cpp`
@@ -214,15 +226,49 @@ MetadataNode 在 ViewNode 中可以带：
 
 ## 当前状态和后续边界
 
+- 当前恢复结论：
+  - `ViewNodeRegistry` 是 memory-only observed registry，不持久化到磁盘。
+  - 当前 durable 的只有 ViewNode 自己的 `node.identity`；registry 记录、
+    liveness、leader hint、冲突诊断和 peer observed snapshot 都不会跨重启保留。
+- 当前重启后会丢失的状态：
+  - 所有 ViewNode / MetadataNode / StorageNode 的内存 observed records
+  - 各节点的最后一次 `incarnation_id`、`sequence`、`last_seen_unix_ms`
+  - TTL/liveness 派生状态、leader hint、cluster view warnings/diagnostics
+  - 通过 peer sync RPC 导入但未重新收到的 peer observed snapshot
+- 当前重启后的重新收敛边界：
+  - 本地 ViewNode 自身状态由 `view_node_app.cpp` 的 startup register +
+    self refresh loop 重新建立
+  - MetadataNode / StorageNode 必须重新 register/heartbeat，ViewNode 才能重新看到
+    它们的 observed facts
+  - peer sync 当前只有 unary Pull/Push RPC contract，没有 background loop；
+    因此重启后是否从 peer rehydrate observed view，取决于后续 T040/T041 的运行时实现，
+    不能假设现在已经自动完成
+- 当前 peer sync snapshot 边界：
+  - peer sync 只是 observed-state sync，不是强一致状态复制
+  - 它不等于 registry persistence，也不等于 Raft log/snapshot recovery
+  - Pull/Push 只能帮助最终一致地重新传播观测事实，不能保证重启前最后一版
+    cluster view 在重启后立即恢复
+- 当前 authority 边界：
+  - ViewNode 不是 Metadata/Raft membership authority
+  - ViewNode 不决定 voter / learner membership
+  - ViewNode registry restart recovery 不等于 Raft recovery；Raft committed
+    membership、log、snapshot 的恢复仍只属于 Metadata/Raft 路径
+- 平台验证边界：
+  - Linux 路径下已经文档确认 self refresh / discovery / peer sync adapter 语义
+  - Windows/macOS 上没有单独验证 ViewNode registry restart recovery 行为；
+    当前只能标记 pending，不能写成 PASS
 - 已实现：
   - registry
   - service/client adapter
   - liveness 计算
   - leader hint 观测
   - StorageNode first registration / confirmation path
+  - ViewNode self refresh loop
+  - peer sync Pull/Push unary RPC contract / adapter
 - 未实现：
-  - ViewNode 自身高可用或复制
-  - registry 持久化
+  - registry persistence
+  - peer sync background loop / retry / active-active runtime convergence
+  - ViewNode 自身强一致高可用或复制
   - 多 ViewNode 共识
   - 认证授权和租户隔离
 

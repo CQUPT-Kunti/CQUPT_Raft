@@ -1,11 +1,13 @@
 #include "cluster/cluster_config.h"
 #include "cluster/node_identity.h"
+#include "view/view_client.h"
 #include "view/view_service_impl.h"
 #include "view/view_registry.h"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -14,10 +16,12 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -53,6 +57,10 @@ namespace
             clusterdemo::NodeIdentitySource::kConfigGenerator};
         viewdemo::ViewRegistryConfig registry_config;
         std::chrono::milliseconds self_refresh_interval{0};
+        std::vector<std::string> peer_seed_endpoints;
+        viewdemo::ViewNodeClientConfig peer_client_config;
+        std::chrono::milliseconds peer_sync_interval{0};
+        std::chrono::milliseconds peer_sync_max_backoff{0};
     };
 
     struct IdentityStartupState
@@ -67,6 +75,14 @@ namespace
     struct ProcessIncarnationStartupState
     {
         clusterdemo::ProcessIncarnation incarnation;
+    };
+
+    struct PeerSyncTarget
+    {
+        std::string endpoint;
+        std::shared_ptr<viewdemo::ViewNodeClient> client;
+        std::uint32_t consecutive_failures{0};
+        std::chrono::steady_clock::time_point next_attempt_at{};
     };
 
     class IdentityStartupError final : public std::runtime_error
@@ -223,6 +239,66 @@ namespace
         return interval;
     }
 
+    [[nodiscard]] std::chrono::milliseconds ComputePeerSyncInterval(
+        const clusterdemo::ClusterTimeoutConfig &timeouts)
+    {
+        constexpr auto kDefaultPeerSyncInterval = std::chrono::milliseconds(1000);
+        constexpr auto kMinimumPeerSyncInterval = std::chrono::milliseconds(100);
+
+        auto interval =
+            timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
+                ? timeouts.heartbeat_interval
+                : kDefaultPeerSyncInterval;
+        if (interval < kMinimumPeerSyncInterval)
+        {
+            interval = kMinimumPeerSyncInterval;
+        }
+        return interval;
+    }
+
+    [[nodiscard]] std::chrono::milliseconds ComputePeerSyncMaxBackoff(
+        const std::chrono::milliseconds base_interval)
+    {
+        constexpr auto kDefaultMaxBackoff = std::chrono::milliseconds(10'000);
+        return std::max(base_interval * 4, kDefaultMaxBackoff);
+    }
+
+    [[nodiscard]] std::chrono::milliseconds ComputePeerSyncBackoff(
+        const std::chrono::milliseconds base_interval,
+        const std::chrono::milliseconds max_backoff,
+        const std::uint32_t consecutive_failures)
+    {
+        if (consecutive_failures == 0)
+        {
+            return base_interval;
+        }
+
+        auto delay = base_interval;
+        for (std::uint32_t index = 1; index < consecutive_failures; ++index)
+        {
+            if (delay >= max_backoff / 2)
+            {
+                return max_backoff;
+            }
+            delay *= 2;
+        }
+        return std::min(delay, max_backoff);
+    }
+
+    [[nodiscard]] viewdemo::ViewNodeClientConfig BuildPeerSyncClientConfig(
+        const clusterdemo::ClusterTimeoutConfig &timeouts)
+    {
+        constexpr auto kDefaultPeerSyncTimeout = std::chrono::milliseconds(2000);
+
+        viewdemo::ViewNodeClientConfig config;
+        config.peer_sync_timeout =
+            timeouts.discovery_rpc_timeout > std::chrono::milliseconds::zero()
+                ? timeouts.discovery_rpc_timeout
+                : kDefaultPeerSyncTimeout;
+        config.wait_for_ready = false;
+        return config;
+    }
+
     void PrintUsage(std::ostream &out)
     {
         out << "Usage: view_node_app --config <path> [--node_id <id>] "
@@ -344,6 +420,224 @@ namespace
         return request;
     }
 
+    [[nodiscard]] viewdemo::ViewRegistryPeerSnapshot
+    ToRegistryPeerSnapshot(const viewdemo::ViewPeerSyncSnapshot &snapshot)
+    {
+        return viewdemo::ViewRegistryPeerSnapshot{
+            .cluster_id = snapshot.cluster_id,
+            .generated_at_unix_ms = snapshot.generated_at_unix_ms,
+            .view_nodes = snapshot.view_nodes,
+            .metadata_nodes = snapshot.metadata_nodes,
+            .storage_nodes = snapshot.storage_nodes,
+            .leader_hint = snapshot.leader_hint,
+        };
+    }
+
+    [[nodiscard]] viewdemo::ViewPeerSyncSnapshot
+    ToClientPeerSyncSnapshot(const viewdemo::ViewRegistryPeerSnapshot &snapshot)
+    {
+        return viewdemo::ViewPeerSyncSnapshot{
+            .cluster_id = snapshot.cluster_id,
+            .generated_at_unix_ms = snapshot.generated_at_unix_ms,
+            .view_nodes = snapshot.view_nodes,
+            .metadata_nodes = snapshot.metadata_nodes,
+            .storage_nodes = snapshot.storage_nodes,
+            .leader_hint = snapshot.leader_hint,
+        };
+    }
+
+    [[nodiscard]] std::string DescribeViewDiagnostics(
+        const std::vector<viewdemo::ViewRegistryDiagnostic> &diagnostics)
+    {
+        std::ostringstream oss;
+        for (std::size_t index = 0; index < diagnostics.size(); ++index)
+        {
+            if (index != 0)
+            {
+                oss << "; ";
+            }
+            oss << viewdemo::DescribeViewRegistryDiagnostic(diagnostics[index]);
+        }
+        return oss.str();
+    }
+
+    [[nodiscard]] std::vector<PeerSyncTarget> BuildPeerSyncTargets(
+        const ViewNodeStartupConfig &startup)
+    {
+        std::vector<PeerSyncTarget> targets;
+        std::unordered_set<std::string> seen_endpoints;
+        const auto now = std::chrono::steady_clock::now();
+
+        for (const auto &endpoint : startup.peer_seed_endpoints)
+        {
+            if (endpoint == startup.listen_endpoint)
+            {
+                std::cerr << "view_node_app peer sync skip self endpoint"
+                          << " endpoint=" << endpoint << '\n';
+                continue;
+            }
+            if (!seen_endpoints.insert(endpoint).second)
+            {
+                continue;
+            }
+
+            auto channel = grpc::CreateChannel(endpoint,
+                                               grpc::InsecureChannelCredentials());
+            targets.push_back(PeerSyncTarget{
+                .endpoint = endpoint,
+                .client = std::make_shared<viewdemo::ViewNodeClient>(
+                    std::move(channel),
+                    endpoint,
+                    startup.peer_client_config),
+                .consecutive_failures = 0,
+                .next_attempt_at = now,
+            });
+        }
+        return targets;
+    }
+
+    [[nodiscard]] bool SyncPeerObservedState(
+        const ViewNodeStartupConfig &startup,
+        const clusterdemo::NodeIdentity &identity,
+        const std::shared_ptr<viewdemo::ViewNodeRegistry> &registry,
+        PeerSyncTarget *target)
+    {
+        if (registry == nullptr || target == nullptr || target->client == nullptr)
+        {
+            return false;
+        }
+
+        const std::uint64_t now_unix_ms = NowUnixMs();
+        const std::string request_prefix =
+            "view-node-peer-sync-" + identity.node_id + "-" + target->endpoint +
+            "-" + std::to_string(now_unix_ms);
+
+        bool pull_import_ok = false;
+        const auto pull_result = target->client->PullPeerViewSnapshot(
+            viewdemo::PullPeerViewSnapshotRequest{
+                .request_id = request_prefix + "-pull",
+                .cluster_id = startup.cluster_id,
+                .include_dead_nodes = true,
+                .include_warnings = true,
+            });
+        if (!pull_result.transport_ok())
+        {
+            std::cerr << "view_node_app peer sync pull failed"
+                      << " node_id=" << identity.node_id
+                      << " peer_endpoint=" << target->endpoint
+                      << " grpc_status=" << static_cast<int>(pull_result.rpc.grpc_status_code)
+                      << " grpc_message=" << pull_result.rpc.grpc_error_message
+                      << '\n';
+        }
+        else if (!pull_result.result.ok())
+        {
+            std::cerr << "view_node_app peer sync pull rejected"
+                      << " node_id=" << identity.node_id
+                      << " peer_endpoint=" << target->endpoint
+                      << " status=" << viewdemo::ToString(pull_result.result.summary.status)
+                      << " message=" << pull_result.result.summary.message;
+            const auto diagnostics =
+                DescribeViewDiagnostics(pull_result.result.diagnostics);
+            if (!diagnostics.empty())
+            {
+                std::cerr << " diagnostics=" << diagnostics;
+            }
+            std::cerr << '\n';
+        }
+        else
+        {
+            const auto import_result = registry->ImportPeerSnapshot(
+                viewdemo::ImportPeerSnapshotRequest{
+                    .request_id = request_prefix + "-import",
+                    .cluster_id = startup.cluster_id,
+                    .snapshot =
+                        ToRegistryPeerSnapshot(pull_result.result.snapshot),
+                });
+            if (!import_result.summary.ok())
+            {
+                std::cerr << "view_node_app peer sync import failed"
+                          << " node_id=" << identity.node_id
+                          << " peer_endpoint=" << target->endpoint
+                          << " status=" << viewdemo::ToString(import_result.summary.status)
+                          << " message=" << import_result.summary.message;
+                const auto diagnostics =
+                    DescribeViewDiagnostics(import_result.diagnostics);
+                if (!diagnostics.empty())
+                {
+                    std::cerr << " diagnostics=" << diagnostics;
+                }
+                std::cerr << '\n';
+            }
+            else
+            {
+                pull_import_ok = true;
+            }
+        }
+
+        const auto export_result = registry->ExportPeerSnapshot(
+            viewdemo::ExportPeerSnapshotRequest{
+                .request_id = request_prefix + "-export",
+                .cluster_id = startup.cluster_id,
+                .include_dead_nodes = true,
+                .include_warnings = true,
+            },
+            now_unix_ms);
+        if (!export_result.ok())
+        {
+            std::cerr << "view_node_app peer sync export failed"
+                      << " node_id=" << identity.node_id
+                      << " peer_endpoint=" << target->endpoint
+                      << " status=" << viewdemo::ToString(export_result.summary.status)
+                      << " message=" << export_result.summary.message;
+            const auto diagnostics =
+                DescribeViewDiagnostics(export_result.diagnostics);
+            if (!diagnostics.empty())
+            {
+                std::cerr << " diagnostics=" << diagnostics;
+            }
+            std::cerr << '\n';
+            return false;
+        }
+
+        bool push_ok = false;
+        const auto push_result = target->client->PushPeerViewSnapshot(
+            viewdemo::PushPeerViewSnapshotRequest{
+                .request_id = request_prefix + "-push",
+                .cluster_id = startup.cluster_id,
+                .snapshot = ToClientPeerSyncSnapshot(export_result.snapshot),
+            });
+        if (!push_result.transport_ok())
+        {
+            std::cerr << "view_node_app peer sync push failed"
+                      << " node_id=" << identity.node_id
+                      << " peer_endpoint=" << target->endpoint
+                      << " grpc_status=" << static_cast<int>(push_result.rpc.grpc_status_code)
+                      << " grpc_message=" << push_result.rpc.grpc_error_message
+                      << '\n';
+        }
+        else if (!push_result.result.ok())
+        {
+            std::cerr << "view_node_app peer sync push rejected"
+                      << " node_id=" << identity.node_id
+                      << " peer_endpoint=" << target->endpoint
+                      << " status=" << viewdemo::ToString(push_result.result.summary.status)
+                      << " message=" << push_result.result.summary.message;
+            const auto diagnostics =
+                DescribeViewDiagnostics(push_result.result.diagnostics);
+            if (!diagnostics.empty())
+            {
+                std::cerr << " diagnostics=" << diagnostics;
+            }
+            std::cerr << '\n';
+        }
+        else
+        {
+            push_ok = true;
+        }
+
+        return pull_import_ok && push_ok;
+    }
+
     [[nodiscard]] ViewNodeStartupConfig ResolveStartupConfig(
         const clusterdemo::ClusterConfig &config,
         const ParsedArgs &args)
@@ -362,6 +656,8 @@ namespace
             {
                 startup.node_id = resolved.resolved->node_id;
                 startup.listen_endpoint = resolved.resolved->endpoint;
+                startup.peer_seed_endpoints =
+                    resolved.resolved->view_peer_seed_endpoints;
                 startup.data_dir = resolved.resolved->data_dir;
                 startup.identity_source = clusterdemo::NodeIdentitySource::kConfigGenerator;
             }
@@ -379,6 +675,7 @@ namespace
                 // 但不会静默覆盖多个未命名条目或其它 role 的节点。
                 startup.node_id = *args.node_id;
                 startup.listen_endpoint = unnamed_view->endpoint;
+                startup.peer_seed_endpoints = unnamed_view->peer_seeds;
                 startup.data_dir = unnamed_view->data_dir;
                 startup.identity_source = clusterdemo::NodeIdentitySource::kExplicitOverride;
             }
@@ -404,6 +701,8 @@ namespace
 
             startup.node_id = resolved.resolved->node_id;
             startup.listen_endpoint = resolved.resolved->endpoint;
+            startup.peer_seed_endpoints =
+                resolved.resolved->view_peer_seed_endpoints;
             startup.data_dir = resolved.resolved->data_dir;
             startup.identity_source = clusterdemo::NodeIdentitySource::kConfigGenerator;
         }
@@ -537,6 +836,12 @@ namespace
             startup.self_refresh_interval = ComputeSelfRefreshInterval(
                 loaded_config.config->timeouts,
                 startup.registry_config);
+            startup.peer_client_config = BuildPeerSyncClientConfig(
+                loaded_config.config->timeouts);
+            startup.peer_sync_interval = ComputePeerSyncInterval(
+                loaded_config.config->timeouts);
+            startup.peer_sync_max_backoff = ComputePeerSyncMaxBackoff(
+                startup.peer_sync_interval);
         }
         catch (const std::exception &ex)
         {
@@ -639,6 +944,10 @@ namespace
                   << process_state.incarnation.incarnation_id
                   << " self_refresh_interval_ms="
                   << startup.self_refresh_interval.count()
+                  << " peer_sync_interval_ms="
+                  << startup.peer_sync_interval.count()
+                  << " peer_seed_count="
+                  << startup.peer_seed_endpoints.size()
                   << " startup_sequence_base="
                   << process_state.incarnation.startup_sequence_base
                   << " endpoint=" << startup.listen_endpoint
@@ -657,6 +966,16 @@ namespace
 #ifdef SIGTERM
         std::signal(SIGTERM, HandleSignal);
 #endif
+
+        std::vector<PeerSyncTarget> peer_sync_targets =
+            BuildPeerSyncTargets(startup);
+        if (peer_sync_targets.empty())
+        {
+            std::cout << "view_node_app peer sync disabled"
+                      << " node_id=" << identity_state.identity.node_id
+                      << " reason=no_peer_seeds"
+                      << '\n';
+        }
 
         std::thread self_refresh_thread(
             [&startup, &identity_state, &process_state, &registry]() {
@@ -693,6 +1012,90 @@ namespace
                 }
             });
 
+        std::thread peer_sync_thread(
+            [&startup,
+             &identity_state,
+             &registry,
+             peer_sync_targets = std::move(peer_sync_targets)]() mutable {
+                while (!g_stop_requested.load())
+                {
+                    if (peer_sync_targets.empty())
+                    {
+                        break;
+                    }
+
+                    const auto now = std::chrono::steady_clock::now();
+                    auto next_wake_at = now + startup.peer_sync_interval;
+
+                    for (auto &target : peer_sync_targets)
+                    {
+                        if (target.next_attempt_at > now)
+                        {
+                            next_wake_at =
+                                std::min(next_wake_at, target.next_attempt_at);
+                            continue;
+                        }
+
+                        const bool sync_ok = SyncPeerObservedState(
+                            startup,
+                            identity_state.identity,
+                            registry,
+                            &target);
+                        const auto attempt_completed_at =
+                            std::chrono::steady_clock::now();
+
+                        if (sync_ok)
+                        {
+                            if (target.consecutive_failures > 0)
+                            {
+                                std::cout << "view_node_app peer sync recovered"
+                                          << " node_id="
+                                          << identity_state.identity.node_id
+                                          << " peer_endpoint=" << target.endpoint
+                                          << " previous_failures="
+                                          << target.consecutive_failures
+                                          << '\n';
+                            }
+                            target.consecutive_failures = 0;
+                            target.next_attempt_at =
+                                attempt_completed_at +
+                                startup.peer_sync_interval;
+                        }
+                        else
+                        {
+                            ++target.consecutive_failures;
+                            const auto backoff = ComputePeerSyncBackoff(
+                                startup.peer_sync_interval,
+                                startup.peer_sync_max_backoff,
+                                target.consecutive_failures);
+                            target.next_attempt_at =
+                                attempt_completed_at + backoff;
+                            std::cerr << "view_node_app peer sync backoff"
+                                      << " node_id="
+                                      << identity_state.identity.node_id
+                                      << " peer_endpoint=" << target.endpoint
+                                      << " failures="
+                                      << target.consecutive_failures
+                                      << " backoff_ms=" << backoff.count()
+                                      << '\n';
+                        }
+
+                        next_wake_at =
+                            std::min(next_wake_at, target.next_attempt_at);
+                    }
+
+                    const auto sleep_until =
+                        next_wake_at > std::chrono::steady_clock::now()
+                            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  next_wake_at - std::chrono::steady_clock::now())
+                            : std::chrono::milliseconds(50);
+                    if (!SleepWithStop(sleep_until))
+                    {
+                        break;
+                    }
+                }
+            });
+
         std::thread completion_queue_thread([&completion_queue]() {
             void *tag = nullptr;
             bool ok = false;
@@ -711,6 +1114,7 @@ namespace
         }
 
         self_refresh_thread.join();
+        peer_sync_thread.join();
         server->Shutdown();
         completion_queue->Shutdown();
         wait_thread.join();

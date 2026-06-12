@@ -74,8 +74,8 @@
 
 - `view_registry.*` 当前负责 observed registry、register/heartbeat、TTL liveness、metadata/storage discovery、cluster view、冲突诊断。
 - `view_service_impl.*` 负责 gRPC adapter，把 View RPC 映射到 registry。
-- `view_client.*` 负责 register、heartbeat、discover、cluster view 的 RPC client 映射和 transport diagnostics。
-- `apps/view_node_app.cpp` 当前负责 load/create identity、构建 registry、启动 gRPC server，并在启动时把本节点注册进 registry。
+- `view_client.*` 负责 register、heartbeat、discover、cluster view，以及 peer snapshot pull/push 的 RPC client 映射和 transport diagnostics。
+- `apps/view_node_app.cpp` 当前负责 load/create identity、构建 registry、启动 gRPC server，并在启动时把本节点注册进 registry 后启动 self refresh loop。
 - `tests/view_node_discovery_test.cpp` 当前已覆盖 register、heartbeat sequence、防 stale/duplicate、TTL、leader hint、storage filter、真实 RPC adapter。
 
 输入：
@@ -92,11 +92,30 @@
 
 - ViewNode 只负责 discovery / observation，不决定 Raft voter / learner membership。
 - ViewNode 可以暴露 `metadata.membership_state` 这样的 observed facts，但这不是 committed membership authority。
-- 009 必须有 self refresh；当前 `apps/view_node_app.cpp` 只在启动时 `RegisterNode` 一次，没有持续 self refresh loop，因此现状不能被误写成“已经满足 self liveness contract”。
-- ViewNode peer sync 在 009 中只能是 observed registry 的最终一致同步，不是强一致配置中心，也不是 membership config store。当前这组文件里尚未确认专门的 peer sync loop / RPC 入口，后续必须扩展这些现有入口，而不是新造 authority 路径。
+- 009 当前已经有 ViewNode self refresh loop；本地 ViewNode 自身状态在进程存活期间可通过 `RefreshSelfNode` 保持 `LIVE`。但这只覆盖本节点 observed state，不等于 registry restart persistence。
+- ViewNode peer sync 在 009 中只能是 observed registry 的最终一致同步，不是强一致配置中心，也不是 membership config store。当前已经有 `PullPeerViewSnapshot` / `PushPeerViewSnapshot` RPC contract / adapter，但还没有 peer sync background loop / retry / active-active runtime convergence；后续必须扩展这些现有入口，而不是新造 authority 路径。
 - merge 规则必须优先按 incarnation，再按 sequence。当前 registry 基线已具备 sequence / observed_at 防 stale 能力，但 009 后续要把旧进程与新进程隔离扩展到 incarnation-aware merge。
 - `observed_time` / `observed_at_unix_ms` 只用于 TTL、liveness 和诊断，不能单独覆盖更高 incarnation 的状态。
-- 如果 registry 继续保持内存型，重启后的恢复边界必须明确写成：靠 self refresh、node heartbeat、peer sync 重新收敛；不能把重启前 registry 当成 durable authority。
+- 当前 `ViewNodeRegistry` 就是内存型 observed registry，没有 registry persistence。重启后的恢复边界必须明确写成：靠 self refresh、node register/heartbeat、以及后续/手动 peer sync 重新收敛；不能把重启前 registry 当成 durable authority。
+
+当前 restart recovery boundary：
+
+- 当前 ViewNode registry 是 memory-only，不持久化。
+- 重启后会丢失：
+  - 所有内存 observed records
+  - `incarnation_id` / `sequence` / `last_seen_unix_ms`
+  - TTL/liveness 派生状态
+  - leader hint、cluster view warnings、冲突诊断
+  - 通过 peer sync RPC 导入但未重新收到的 peer observed snapshot
+- 重启后重新收敛依赖：
+  - `view_node_app.cpp` 启动后的 startup register + self refresh，先恢复本地 ViewNode 自身 observed state
+  - MetadataNode / StorageNode 重新 register / heartbeat，恢复它们各自的 observed facts
+  - peer ViewNode 重新做 pull/push sync；当前只存在 unary RPC contract，不存在自动 background sync loop
+- peer sync snapshot 只是 observed-state sync，不是强一致状态复制，也不是 registry durability / Raft recovery。
+- ViewNode registry restart recovery 不等于 Raft recovery；Raft committed log、snapshot、membership 恢复仍只属于 Metadata/Raft 模块。
+- ViewNode 不是 Metadata/Raft membership authority，也不决定 voter / learner membership。
+- 如果未来要做 registry persistence、snapshot versioning 或 crash/restart durable recovery，必须另开任务实现；本任务只定义当前 memory-only 边界。
+- Windows/macOS 上当前没有单独验证 ViewNode registry restart recovery 行为，只能记为 pending，不能写 PASS。
 
 容易误用点：
 

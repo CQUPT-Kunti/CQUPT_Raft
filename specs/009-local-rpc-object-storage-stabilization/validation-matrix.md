@@ -6,7 +6,7 @@
 |------|----------------|---------------------|-------|
 | Local RPC example | `examples/object-storage-local-3meta-6store/qidong.sh`, `examples/object-storage-local-3meta-6store/rpc_demo.sh status`, `examples/object-storage-local-3meta-6store/rpc_demo.sh roundtrip`, `examples/object-storage-local-3meta-6store/tingzhi.sh` | Preserve 008 static 1 ViewNode + 3 MetadataNode + 6 StorageNode real roundtrip as the 009 local RPC preservation baseline | Client remains `storage_client`; test file directory remains `tests/test_file`; report confirms `CreateWritePlan -> WriteChunk -> CommitObject -> Download -> cmp` |
 | App targets | `view_node_app`, `metadata_node_app`, `storage_node_app`, `storage_client`, `raft_metadata_client` | Build only touched executable targets before example checks | Do not default to full build |
-| ViewNode registry | `tests/view_node_discovery_test.cpp` | Self refresh, TTL, peer sync, incarnation-aware merge | Linux targeted validation through T034 covers self refresh, TTL, incarnation-aware ordering, adapter mapping, and conflict diagnostics on single-ViewNode paths; multi-ViewNode peer sync runtime remains pending |
+| ViewNode registry | `tests/view_node_discovery_test.cpp` | Self refresh, TTL, peer sync, incarnation-aware merge | Current registry recovery boundary is memory-only: Linux targeted validation covers self refresh, TTL, incarnation-aware ordering, adapter mapping, failover, and peer snapshot pull/push RPC on observed-state paths; restart rehydration still depends on self refresh + node register/heartbeat + pending peer sync runtime |
 | Storage heartbeat | `tests/storage_heartbeat_registry_test.cpp` | Dynamic register, heartbeat content, stale heartbeat, duplicate register | Storage join is discovery-only |
 | Identity | `tests/node_identity_test.cpp` | First create, restart reuse, mismatch, corruption, type-specific Metadata rules | Missing identity_file is valid first-start input; existing legacy/old-format or missing-required-field identity files must fail fast with no auto-upgrade and no auto-overwrite |
 | Cluster config | `tests/cluster_config_test.cpp` | Config boundaries for view/storage/metadata and odd initial voters | Dynamic nodes should not require full topology |
@@ -86,6 +86,7 @@
 | Dual ViewNode sync | ViewNode discovery/peer sync test | State registered on one ViewNode appears on peer after sync |
 | Old incarnation rejected | ViewNode discovery/peer sync test | Older incarnation cannot override newer incarnation even with newer observed_time |
 | ViewNode failover | local RPC example or integration test | Client discovers metadata/storage through surviving ViewNode |
+| ViewNode registry restart recovery boundary | `modules/view/module-notes.md`, feature `module-notes.md` | Current phase explicitly documents memory-only restart recovery; registry persistence remains future work and Windows/macOS restart validation stays pending |
 | StorageNode first start | `tests/node_identity_test.cpp`, storage dynamic join test | identity_file created, node_id persisted |
 | StorageNode restart | `tests/storage_heartbeat_registry_test.cpp` | Same node_id, new incarnation, stale old updates rejected |
 | StorageNode dynamic placement | `tests/integrated_object_storage_e2e_test.cpp`, local RPC example | New object can use newly joined StorageNode |
@@ -105,3 +106,24 @@
 - Phase 1 baseline confirmation may be document-only; when scripts are not executed, record `未执行脚本，原因：本任务为 Phase 1 文档基线确认`.
 - Skipped build/test due to build lock or missing platform must be recorded in `task-reports/`.
 - Windows/macOS without real environment should be marked pending, not assumed passed.
+
+## US2 Phase 5 Closure Snapshot
+
+- Linux targeted validation:
+  - build target: `test_view_node_discovery`
+  - ctest regex: `ViewNodeDiscovery`
+  - result: PASS (`28/28`)
+  - logs:
+    - `tmp/test-logs/t044-build.log`
+    - `tmp/test-logs/t044-ctest.log`
+- Covered US2 areas:
+  - dual ViewNode registry sync
+  - failover discovery
+  - peer snapshot old-incarnation rejection
+  - peer sync RPC export/import
+  - peer sync loop regression through `ViewNodeDiscovery` coverage
+- Skipped in T044:
+  - Windows validation
+  - macOS validation
+  - local RPC multi-View smoke
+  - long-running multi-View soak

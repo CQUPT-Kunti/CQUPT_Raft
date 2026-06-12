@@ -59,3 +59,9 @@ Mitigation: Keep Linux as the primary validated platform for now, record Windows
 Risk: T026-T033 now validate higher-incarnation wins, same-incarnation higher-sequence wins, conflict diagnostics, and service/client adapter mapping on single-ViewNode registry paths, but peer-sync network propagation and multi-ViewNode active-active convergence are still not implemented. A later peer-sync path could still drop `incarnation_id`, `sequence`, or stale-diagnostic information and reintroduce old-state overwrite bugs across ViewNodes.
 
 Mitigation: Treat current Linux PASS as single-View scope only. Keep peer-sync and multi-View failover validation explicitly pending for Phase 5. Any new peer snapshot/push-pull RPC must preserve incarnation-aware observed-state ordering and must not collapse ViewNode registry into membership authority.
+
+## R11: Multi-View Peer Sync Still Lacks Soak And Non-Linux Runtime Validation
+
+Risk: T035-T043 complete the Linux targeted functional path for dual ViewNode peer sync, but they do not prove long-running convergence, repeated disconnect/retry stability, or Windows/macOS runtime behavior. A later regression could hide in retry/backoff timing or platform-specific networking/thread shutdown paths.
+
+Mitigation: Keep Linux targeted PASS scoped to `ViewNodeDiscovery` functional coverage. Record Windows/macOS as pending, keep local RPC multi-View smoke and soak validation as follow-up work, and do not claim cross-platform peer-sync runtime stability before those checks exist.
