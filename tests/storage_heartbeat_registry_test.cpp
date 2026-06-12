@@ -23,6 +23,7 @@ namespace
     using storedemo::StorageNodeRegistryHealthFacts;
     using storedemo::StorageNodeRegistryLiveness;
     using storedemo::StorageNodeRegistryLoadFacts;
+    using storedemo::StorageNodeRegistryNodeSnapshot;
     using storedemo::StorageNodeStatusCode;
     using storedemo::UpdateStorageNodeHeartbeatRequest;
 
@@ -127,6 +128,20 @@ namespace
         ASSERT_TRUE(result.created);
     }
 
+    const StorageNodeRegistryNodeSnapshot *FindNodeSnapshotById(
+        const std::vector<StorageNodeRegistryNodeSnapshot> &nodes,
+        const std::string &node_id)
+    {
+        for (const auto &node : nodes)
+        {
+            if (node.node_id == node_id)
+            {
+                return &node;
+            }
+        }
+        return nullptr;
+    }
+
     TEST(StorageHeartbeatRegistryTest, RegisterStoresNodeFactsAndStableSortedViews)
     {
         StorageNodeRegistry registry;
@@ -166,6 +181,81 @@ namespace
     }
 
     TEST(StorageHeartbeatRegistryTest,
+         RuntimeRegistrationAddsNewNodeToObservedRegistryViews)
+    {
+        StorageNodeRegistry registry;
+        const auto initial = MakeRegisterRequest(1, 100);
+        RegisterNodeOrAssert(&registry, initial);
+
+        const auto before_join = registry.ListNodes(120);
+        ASSERT_EQ(before_join.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(before_join.nodes.size(), 1U);
+        ASSERT_NE(FindNodeSnapshotById(before_join.nodes, initial.node_id), nullptr);
+
+        auto runtime_join = MakeRegisterRequest(7, 160);
+        runtime_join.facts.capacity.total_capacity_bytes = 65'536;
+        runtime_join.facts.capacity.used_capacity_bytes = 8'192;
+        runtime_join.facts.capacity.available_capacity_bytes = 57'344;
+        runtime_join.facts.capacity.chunk_count = 123;
+        runtime_join.facts.failure_domain.zone = "zone-runtime";
+        runtime_join.facts.failure_domain.rack = "rack-runtime";
+
+        const auto join_result = registry.RegisterStorageNode(runtime_join);
+        ASSERT_EQ(join_result.status, StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(join_result.created);
+        EXPECT_FALSE(join_result.idempotent);
+        EXPECT_EQ(join_result.snapshot.node_id, runtime_join.node_id);
+        EXPECT_EQ(join_result.snapshot.endpoint, runtime_join.endpoint);
+        EXPECT_EQ(join_result.snapshot.last_sequence, 0U);
+        EXPECT_EQ(join_result.snapshot.last_seen_unix_ms,
+                  runtime_join.observed_at_unix_ms);
+        EXPECT_EQ(join_result.snapshot.liveness, StorageNodeRegistryLiveness::kLive);
+
+        EXPECT_EQ(registry.size(), 2U);
+
+        const auto lookup_runtime = registry.LookupNode(runtime_join.node_id, 170);
+        ASSERT_EQ(lookup_runtime.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup_runtime.snapshot.endpoint, runtime_join.endpoint);
+        EXPECT_EQ(lookup_runtime.snapshot.last_sequence, 0U);
+        EXPECT_EQ(lookup_runtime.snapshot.last_seen_unix_ms,
+                  runtime_join.observed_at_unix_ms);
+        EXPECT_EQ(lookup_runtime.snapshot.liveness, StorageNodeRegistryLiveness::kLive);
+        EXPECT_EQ(lookup_runtime.snapshot.facts.capacity.total_capacity_bytes,
+                  runtime_join.facts.capacity.total_capacity_bytes);
+        EXPECT_EQ(lookup_runtime.snapshot.facts.capacity.chunk_count,
+                  runtime_join.facts.capacity.chunk_count);
+        EXPECT_EQ(lookup_runtime.snapshot.facts.failure_domain.zone,
+                  runtime_join.facts.failure_domain.zone);
+        EXPECT_EQ(lookup_runtime.snapshot.facts.failure_domain.rack,
+                  runtime_join.facts.failure_domain.rack);
+
+        const auto after_join = registry.ListNodes(170);
+        ASSERT_EQ(after_join.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(after_join.nodes.size(), 2U);
+        const auto *initial_snapshot =
+            FindNodeSnapshotById(after_join.nodes, initial.node_id);
+        const auto *runtime_snapshot =
+            FindNodeSnapshotById(after_join.nodes, runtime_join.node_id);
+        ASSERT_NE(initial_snapshot, nullptr);
+        ASSERT_NE(runtime_snapshot, nullptr);
+        EXPECT_EQ(runtime_snapshot->endpoint, runtime_join.endpoint);
+        EXPECT_EQ(runtime_snapshot->liveness, StorageNodeRegistryLiveness::kLive);
+        EXPECT_EQ(initial_snapshot->endpoint, initial.endpoint);
+        EXPECT_EQ(initial_snapshot->last_seen_unix_ms, initial.observed_at_unix_ms);
+        EXPECT_EQ(initial_snapshot->last_sequence, 0U);
+
+        const auto snapshot = registry.Snapshot(170);
+        ASSERT_EQ(snapshot.status, StorageNodeStatusCode::kOk);
+        ASSERT_EQ(snapshot.nodes.size(), 2U);
+        const auto *runtime_from_snapshot =
+            FindNodeSnapshotById(snapshot.nodes, runtime_join.node_id);
+        ASSERT_NE(runtime_from_snapshot, nullptr);
+        EXPECT_EQ(runtime_from_snapshot->endpoint, runtime_join.endpoint);
+        EXPECT_EQ(runtime_from_snapshot->liveness,
+                  StorageNodeRegistryLiveness::kLive);
+    }
+
+    TEST(StorageHeartbeatRegistryTest,
          DuplicateRegisterIsIdempotentAndConflictsOnIdentityOrEndpointMismatch)
     {
         StorageNodeRegistry registry;
@@ -199,6 +289,146 @@ namespace
         EXPECT_EQ(endpoint_result.status, StorageNodeStatusCode::kConflict);
 
         EXPECT_EQ(registry.size(), 1U);
+    }
+
+    TEST(StorageHeartbeatRegistryTest,
+         DuplicateNodeIdOrEndpointConflictDoesNotPolluteTrustedHealthyRecord)
+    {
+        StorageNodeRegistry registry;
+        const auto registration = MakeRegisterRequest(1, 100);
+        RegisterNodeOrAssert(&registry, registration);
+
+        auto trusted_heartbeat = MakeHeartbeatRequest(1, 7, 160);
+        trusted_heartbeat.facts = MakeFacts(1,
+                                            32'768,
+                                            12'288,
+                                            StorageNodeHealth::kHealthy,
+                                            StorageNodeDiskPressure::kLow);
+        trusted_heartbeat.facts.health.io_error_count = 3;
+        trusted_heartbeat.facts.load.load.active_reads = 8;
+        trusted_heartbeat.facts.load.load.active_writes = 3;
+        trusted_heartbeat.facts.load.load.queued_ops = 11;
+        trusted_heartbeat.facts.capacity.chunk_count = 77;
+
+        const auto trusted_result =
+            registry.UpdateStorageNodeHeartbeat(trusted_heartbeat);
+        ASSERT_EQ(trusted_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(trusted_result.applied);
+        ASSERT_EQ(trusted_result.accepted_sequence, 7U);
+
+        auto duplicate_node_id = registration;
+        duplicate_node_id.endpoint = "127.0.0.1:7999";
+        duplicate_node_id.observed_at_unix_ms = 170;
+        duplicate_node_id.facts = MakeFacts(1,
+                                            4'096,
+                                            1'024,
+                                            StorageNodeHealth::kUnavailable,
+                                            StorageNodeDiskPressure::kFull);
+        const auto duplicate_node_id_result =
+            registry.RegisterStorageNode(duplicate_node_id);
+        EXPECT_EQ(duplicate_node_id_result.status, StorageNodeStatusCode::kConflict);
+        EXPECT_EQ(duplicate_node_id_result.error_detail,
+                  "node_id is already registered with a different endpoint");
+
+        auto duplicate_endpoint = MakeRegisterRequest(2, 171);
+        duplicate_endpoint.endpoint = registration.endpoint;
+        duplicate_endpoint.facts = MakeFacts(2,
+                                             4'096,
+                                             1'024,
+                                             StorageNodeHealth::kUnavailable,
+                                             StorageNodeDiskPressure::kFull);
+        const auto duplicate_endpoint_result =
+            registry.RegisterStorageNode(duplicate_endpoint);
+        EXPECT_EQ(duplicate_endpoint_result.status, StorageNodeStatusCode::kConflict);
+        EXPECT_EQ(duplicate_endpoint_result.error_detail,
+                  "endpoint is already registered to a different node_id");
+
+        auto conflicting_heartbeat = MakeHeartbeatRequest(1, 8, 180);
+        conflicting_heartbeat.endpoint = "127.0.0.1:7999";
+        conflicting_heartbeat.facts = MakeFacts(1,
+                                                4'096,
+                                                1'024,
+                                                StorageNodeHealth::kUnavailable,
+                                                StorageNodeDiskPressure::kFull);
+        conflicting_heartbeat.facts.health.io_error_count = 99;
+        conflicting_heartbeat.facts.load.load.active_reads = 1;
+        conflicting_heartbeat.facts.load.load.active_writes = 1;
+        conflicting_heartbeat.facts.load.load.queued_ops = 1;
+        const auto conflicting_heartbeat_result =
+            registry.UpdateStorageNodeHeartbeat(conflicting_heartbeat);
+        EXPECT_EQ(conflicting_heartbeat_result.status,
+                  StorageNodeStatusCode::kConflict);
+        EXPECT_EQ(conflicting_heartbeat_result.error_detail,
+                  "node_id heartbeat endpoint does not match registration");
+        EXPECT_FALSE(conflicting_heartbeat_result.applied);
+
+        const auto lookup_after_conflicts = registry.LookupNode(registration.node_id,
+                                                                181);
+        ASSERT_EQ(lookup_after_conflicts.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.node_id, registration.node_id);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.endpoint, registration.endpoint);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.last_sequence, 7U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.last_seen_unix_ms, 160U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.capacity.total_capacity_bytes,
+                  32'768U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.capacity.chunk_count, 77U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.health.health,
+                  StorageNodeHealth::kHealthy);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kLow);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.health.io_error_count, 3U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.load.load.active_reads, 8U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.load.load.active_writes, 3U);
+        EXPECT_EQ(lookup_after_conflicts.snapshot.facts.load.load.queued_ops, 11U);
+        EXPECT_EQ(registry.size(), 1U);
+
+        auto duplicate_restart = registration;
+        duplicate_restart.observed_at_unix_ms = 182;
+        duplicate_restart.facts = MakeFacts(1,
+                                            65'536,
+                                            8'192,
+                                            StorageNodeHealth::kDegraded,
+                                            StorageNodeDiskPressure::kMedium);
+        const auto duplicate_restart_result =
+            registry.RegisterStorageNode(duplicate_restart);
+        ASSERT_EQ(duplicate_restart_result.status, StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(duplicate_restart_result.idempotent);
+        EXPECT_FALSE(duplicate_restart_result.created);
+
+        auto valid_higher_sequence = MakeHeartbeatRequest(1, 9, 190);
+        valid_higher_sequence.facts = MakeFacts(1,
+                                                65'536,
+                                                8'192,
+                                                StorageNodeHealth::kDegraded,
+                                                StorageNodeDiskPressure::kMedium);
+        valid_higher_sequence.facts.health.io_error_count = 4;
+        valid_higher_sequence.facts.load.load.active_reads = 10;
+        valid_higher_sequence.facts.load.load.active_writes = 4;
+        valid_higher_sequence.facts.load.load.queued_ops = 12;
+        valid_higher_sequence.facts.capacity.chunk_count = 88;
+        const auto valid_higher_sequence_result =
+            registry.UpdateStorageNodeHeartbeat(valid_higher_sequence);
+        ASSERT_EQ(valid_higher_sequence_result.status, StorageNodeStatusCode::kOk);
+        EXPECT_TRUE(valid_higher_sequence_result.applied);
+        EXPECT_EQ(valid_higher_sequence_result.accepted_sequence, 9U);
+
+        const auto lookup_after_valid_update =
+            registry.LookupNode(registration.node_id, 191);
+        ASSERT_EQ(lookup_after_valid_update.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.endpoint, registration.endpoint);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.last_sequence, 9U);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.last_seen_unix_ms, 190U);
+        EXPECT_EQ(
+            lookup_after_valid_update.snapshot.facts.capacity.total_capacity_bytes,
+            65'536U);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.facts.capacity.chunk_count,
+                  88U);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.facts.health.health,
+                  StorageNodeHealth::kDegraded);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kMedium);
+        EXPECT_EQ(lookup_after_valid_update.snapshot.facts.health.io_error_count,
+                  4U);
     }
 
     TEST(StorageHeartbeatRegistryTest,
@@ -342,6 +572,114 @@ namespace
         const auto dead = registry.LookupNode(request.node_id, 191);
         ASSERT_EQ(dead.status, StorageNodeStatusCode::kOk);
         EXPECT_EQ(dead.snapshot.liveness, StorageNodeRegistryLiveness::kDead);
+    }
+
+    TEST(StorageHeartbeatRegistryTest,
+         RestartSameNodeIdShouldAcceptNewIncarnationAndRejectOldProcessState)
+    {
+        StorageNodeRegistry registry;
+        const auto registration = MakeRegisterRequest(1, 100);
+        RegisterNodeOrAssert(&registry, registration);
+
+        const std::string old_incarnation =
+            "store-node-1:boot:100000000:71:1";
+        const std::string new_incarnation =
+            "store-node-1:boot:220000000:72:1";
+
+        auto old_process_live = MakeHeartbeatRequest(1, 7, 160);
+        old_process_live.incarnation_id = old_incarnation;
+        old_process_live.facts = MakeFacts(1,
+                                           32'768,
+                                           12'288,
+                                           StorageNodeHealth::kDegraded,
+                                           StorageNodeDiskPressure::kMedium);
+        old_process_live.facts.health.io_error_count = 9;
+        old_process_live.facts.load.load.active_reads = 8;
+        old_process_live.facts.load.load.active_writes = 3;
+        old_process_live.facts.load.load.queued_ops = 11;
+        const auto old_process_result =
+            registry.UpdateStorageNodeHeartbeat(old_process_live);
+        ASSERT_EQ(old_process_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(old_process_result.applied);
+        ASSERT_EQ(old_process_result.accepted_sequence, 7U);
+
+        auto restarted_process = MakeHeartbeatRequest(1, 1, 220);
+        restarted_process.incarnation_id = new_incarnation;
+        restarted_process.facts = MakeFacts(1,
+                                            65'536,
+                                            4'096,
+                                            StorageNodeHealth::kHealthy,
+                                            StorageNodeDiskPressure::kLow);
+        restarted_process.facts.health.io_error_count = 1;
+        restarted_process.facts.load.load.active_reads = 2;
+        restarted_process.facts.load.load.active_writes = 1;
+        restarted_process.facts.load.load.queued_ops = 0;
+
+        auto restarted_register = registration;
+        restarted_register.incarnation_id = new_incarnation;
+        restarted_register.observed_at_unix_ms = 220;
+        restarted_register.facts = restarted_process.facts;
+        const auto restarted_register_result =
+            registry.RegisterStorageNode(restarted_register);
+        ASSERT_EQ(restarted_register_result.status, StorageNodeStatusCode::kOk);
+        EXPECT_FALSE(restarted_register_result.created);
+        EXPECT_FALSE(restarted_register_result.idempotent);
+        EXPECT_EQ(restarted_register_result.snapshot.incarnation_id,
+                  new_incarnation);
+        EXPECT_EQ(restarted_register_result.snapshot.last_sequence, 0U);
+        EXPECT_EQ(restarted_register_result.snapshot.last_seen_unix_ms, 220U);
+        EXPECT_EQ(
+            restarted_register_result.snapshot.facts.capacity.total_capacity_bytes,
+            65'536U);
+        EXPECT_EQ(restarted_register_result.snapshot.facts.health.health,
+                  StorageNodeHealth::kHealthy);
+        EXPECT_EQ(restarted_register_result.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kLow);
+
+        const auto restarted_result =
+            registry.UpdateStorageNodeHeartbeat(restarted_process);
+        ASSERT_EQ(restarted_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(restarted_result.applied);
+        EXPECT_EQ(restarted_result.accepted_sequence, 1U);
+        EXPECT_EQ(restarted_result.snapshot.incarnation_id, new_incarnation);
+        EXPECT_EQ(restarted_result.snapshot.last_sequence, 1U);
+        EXPECT_EQ(restarted_result.snapshot.last_seen_unix_ms, 220U);
+        EXPECT_EQ(restarted_result.snapshot.facts.capacity.total_capacity_bytes,
+                  65'536U);
+        EXPECT_EQ(restarted_result.snapshot.facts.health.health,
+                  StorageNodeHealth::kHealthy);
+        EXPECT_EQ(restarted_result.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kLow);
+
+        auto old_process_late = MakeHeartbeatRequest(1, 8, 240);
+        old_process_late.incarnation_id = old_incarnation;
+        old_process_late.facts = MakeFacts(1,
+                                           4'096,
+                                           1'024,
+                                           StorageNodeHealth::kUnavailable,
+                                           StorageNodeDiskPressure::kFull);
+        old_process_late.facts.health.io_error_count = 99;
+        old_process_late.facts.load.load.active_reads = 1;
+        old_process_late.facts.load.load.active_writes = 1;
+        old_process_late.facts.load.load.queued_ops = 1;
+
+        const auto old_process_late_result =
+            registry.UpdateStorageNodeHeartbeat(old_process_late);
+        EXPECT_EQ(old_process_late_result.status,
+                  StorageNodeStatusCode::kAlreadyExists);
+        EXPECT_TRUE(old_process_late_result.stale_ignored);
+
+        const auto lookup = registry.LookupNode(registration.node_id, 250);
+        ASSERT_EQ(lookup.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup.snapshot.node_id, registration.node_id);
+        EXPECT_EQ(lookup.snapshot.incarnation_id, new_incarnation);
+        EXPECT_EQ(lookup.snapshot.last_sequence, 1U);
+        EXPECT_EQ(lookup.snapshot.last_seen_unix_ms, 220U);
+        EXPECT_EQ(lookup.snapshot.facts.capacity.total_capacity_bytes, 65'536U);
+        EXPECT_EQ(lookup.snapshot.facts.health.health,
+                  StorageNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kLow);
     }
 
     TEST(StorageHeartbeatRegistryTest, InvalidInputAndUnknownNodePathsReturnExplicitErrors)

@@ -2,6 +2,7 @@
 #include "raft/state_machine/metadata_state_machine.h"
 #include "support/metadata_test_utils.h"
 #include "cluster/cluster_config.h"
+#include "store/placement/placement_manager.h"
 
 #include "metadata.pb.h"
 #include "store/common/store_types.h"
@@ -291,6 +292,122 @@ namespace
             1717555300001ULL,
             1717555300999ULL};
         return command;
+    }
+
+    std::vector<raftdemo::ChunkRef> MakeDynamicStoragePlacementLegacyChunks()
+    {
+        return {
+            raftdemo::ChunkRef{"chunk-t048-0",
+                               0,
+                               256,
+                               {"store-a", "store-b"},
+                               "sha256:t048-chunk-0"},
+            raftdemo::ChunkRef{"chunk-t048-1",
+                               256,
+                               256,
+                               {"store-b"},
+                               "sha256:t048-chunk-1"}};
+    }
+
+    raftdemo::MetadataCommand MakeDynamicStoragePlacementCommitCommand()
+    {
+        raftdemo::MetadataCommand command;
+        command.command_type = raftdemo::MetadataCommandType::kCommitObject;
+        command.request_id = "commit-object-t048-old";
+        command.commit_object = raftdemo::CommitObjectCommandPayload{
+            "bucket-t048",
+            "objects/legacy-before-join.bin",
+            "obj-t048-old",
+            1,
+            512,
+            "sha256:obj-t048-old",
+            MakeDynamicStoragePlacementLegacyChunks(),
+            1717555400999ULL};
+        command.request_context = raftdemo::RequestRecord{
+            "commit-object-t048-old",
+            raftdemo::MetadataRequestType::kCommitObject,
+            "bucket-t048",
+            "objects/legacy-before-join.bin",
+            "accepted",
+            0,
+            1717555400001ULL,
+            1717555400999ULL};
+        return command;
+    }
+
+    storedemo::ViewNodeBackedStorageNodeSnapshot MakeLiveViewStorageSnapshot(
+        std::string node_id,
+        std::string endpoint,
+        const std::uint64_t available_capacity_bytes,
+        std::string zone,
+        const std::uint64_t observed_at_unix_ms,
+        const std::uint64_t source_sequence)
+    {
+        storedemo::ViewNodeBackedStorageNodeSnapshot snapshot;
+        snapshot.candidate.node_id = std::move(node_id);
+        snapshot.candidate.endpoint = std::move(endpoint);
+        snapshot.candidate.health = storedemo::StorageNodeHealth::kHealthy;
+        snapshot.candidate.disk_pressure = storedemo::StorageNodeDiskPressure::kLow;
+        snapshot.candidate.total_capacity_bytes =
+            available_capacity_bytes + (64ULL * 1024ULL * 1024ULL);
+        snapshot.candidate.used_capacity_bytes = 32ULL * 1024ULL * 1024ULL;
+        snapshot.candidate.available_capacity_bytes = available_capacity_bytes;
+        snapshot.candidate.zone = std::move(zone);
+        snapshot.liveness = storedemo::ViewNodeStorageLiveness::kLive;
+        snapshot.last_seen_unix_ms = observed_at_unix_ms;
+        snapshot.observed_at_unix_ms = observed_at_unix_ms;
+        snapshot.source_sequence = source_sequence;
+        snapshot.has_complete_facts = true;
+        snapshot.has_valid_capacity_facts = true;
+        return snapshot;
+    }
+
+    storedemo::ViewNodeBackedStorageNodeSnapshotResult
+    MakeViewBackedStorageSnapshotResult(
+        std::vector<storedemo::ViewNodeBackedStorageNodeSnapshot> nodes,
+        const std::uint64_t snapshot_epoch,
+        const std::uint64_t generated_at_unix_ms)
+    {
+        storedemo::ViewNodeBackedStorageNodeSnapshotResult result;
+        result.status = storedemo::StorageNodeStatusCode::kOk;
+        result.snapshot_epoch = snapshot_epoch;
+        result.generated_at_unix_ms = generated_at_unix_ms;
+        result.nodes = std::move(nodes);
+        return result;
+    }
+
+    storedemo::PlacementRequest MakePlacementRequest(
+        std::string object_id,
+        const std::uint64_t version,
+        const std::uint32_t chunk_index,
+        const std::uint64_t chunk_size_bytes,
+        const std::size_t replica_count,
+        const std::size_t minimum_successful_writes,
+        const std::uint64_t decision_epoch)
+    {
+        storedemo::PlacementRequest request;
+        request.identity.object_id = std::move(object_id);
+        request.identity.version = version;
+        request.identity.chunk_index = chunk_index;
+        request.chunk_size_bytes = chunk_size_bytes;
+        request.policy.replica_count = replica_count;
+        request.policy.minimum_successful_writes = minimum_successful_writes;
+        request.decision_epoch = decision_epoch;
+        return request;
+    }
+
+    bool DecisionContainsReplicaNode(
+        const storedemo::PlacementDecisionResult &result,
+        std::string_view node_id)
+    {
+        for (const auto &candidate : result.decision.replica_nodes)
+        {
+            if (candidate.node_id == node_id)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     void ExpectChunkRefsEqual(const std::vector<raftdemo::ChunkRef> &actual,
@@ -975,6 +1092,138 @@ TEST(IntegratedObjectStorageE2ETest,
                                                                  "obj-t027",
                                                                  "commit-object-t027")
                              .commit_object->chunks);
+}
+
+TEST(IntegratedObjectStorageE2ETest,
+     DynamicStorageNodePlacementSeesNewNodeWithoutRewritingCommittedManifest)
+{
+    raftdemo::MetadataStateMachine machine;
+    std::uint64_t index = 1;
+
+    ASSERT_TRUE(ApplyMetadataCommand(machine,
+                                     index++,
+                                     MakeCreateBucketCommand("bucket-t048",
+                                                             "create-bucket-t048"))
+                    .Ok);
+    ASSERT_TRUE(ApplyMetadataCommand(machine,
+                                     index++,
+                                     raftdemo::test::MakeCreateObjectCommand(
+                                         "bucket-t048",
+                                         "objects/legacy-before-join.bin",
+                                         "obj-t048-old",
+                                         "create-object-t048-old"))
+                    .Ok);
+    ASSERT_TRUE(ApplyMetadataCommand(machine,
+                                     index++,
+                                     MakeDynamicStoragePlacementCommitCommand())
+                    .Ok);
+
+    const auto original_head = machine.HeadObject(
+        {.bucket = "bucket-t048", .object_key = "objects/legacy-before-join.bin"});
+    ASSERT_EQ(original_head.result.code, raftdemo::MetadataStatusCode::kOk);
+    ASSERT_TRUE(original_head.record.has_value());
+    ASSERT_TRUE(original_head.record->IsCommitted());
+    const std::vector<raftdemo::ChunkRef> original_manifest =
+        original_head.record->chunks;
+    ExpectChunkRefsEqual(original_manifest,
+                         MakeDynamicStoragePlacementLegacyChunks());
+
+    storedemo::PlacementManager placement_manager;
+    const auto initial_view_snapshot = MakeViewBackedStorageSnapshotResult(
+        {MakeLiveViewStorageSnapshot("store-a",
+                                     "127.0.0.1:7501",
+                                     192ULL * 1024ULL * 1024ULL,
+                                     "zone-a",
+                                     1717555401000ULL,
+                                     1),
+         MakeLiveViewStorageSnapshot("store-b",
+                                     "127.0.0.1:7502",
+                                     160ULL * 1024ULL * 1024ULL,
+                                     "zone-b",
+                                     1717555401000ULL,
+                                     1)},
+        1,
+        1717555401000ULL);
+
+    const auto placement_before_join = placement_manager.SelectPlacement(
+        MakePlacementRequest("obj-t048-future-before-join",
+                             1,
+                             0,
+                             256,
+                             2,
+                             2,
+                             101),
+        initial_view_snapshot);
+    ASSERT_TRUE(placement_before_join.ok()) << placement_before_join.error_detail;
+    ASSERT_EQ(placement_before_join.decision.replica_nodes.size(), 2U);
+    EXPECT_TRUE(DecisionContainsReplicaNode(placement_before_join, "store-a"));
+    EXPECT_TRUE(DecisionContainsReplicaNode(placement_before_join, "store-b"));
+    EXPECT_FALSE(DecisionContainsReplicaNode(placement_before_join, "store-c"));
+
+    auto expanded_view_snapshot = initial_view_snapshot;
+    expanded_view_snapshot.snapshot_epoch = 2;
+    expanded_view_snapshot.generated_at_unix_ms = 1717555402000ULL;
+    expanded_view_snapshot.nodes.push_back(
+        MakeLiveViewStorageSnapshot("store-c",
+                                    "127.0.0.1:7503",
+                                    128ULL * 1024ULL * 1024ULL,
+                                    "zone-c",
+                                    1717555402000ULL,
+                                    2));
+
+    const auto placement_after_join = placement_manager.SelectPlacement(
+        MakePlacementRequest("obj-t048-future-after-join",
+                             1,
+                             0,
+                             256,
+                             3,
+                             2,
+                             102),
+        expanded_view_snapshot);
+    ASSERT_TRUE(placement_after_join.ok()) << placement_after_join.error_detail;
+    ASSERT_EQ(placement_after_join.decision.replica_nodes.size(), 3U);
+    EXPECT_TRUE(DecisionContainsReplicaNode(placement_after_join, "store-a"));
+    EXPECT_TRUE(DecisionContainsReplicaNode(placement_after_join, "store-b"));
+    EXPECT_TRUE(DecisionContainsReplicaNode(placement_after_join, "store-c"));
+
+    const auto committed_head_after_join = machine.HeadObject(
+        {.bucket = "bucket-t048", .object_key = "objects/legacy-before-join.bin"});
+    ASSERT_EQ(committed_head_after_join.result.code,
+              raftdemo::MetadataStatusCode::kOk);
+    ASSERT_TRUE(committed_head_after_join.record.has_value());
+    ASSERT_TRUE(committed_head_after_join.record->IsCommitted());
+    ExpectChunkRefsEqual(committed_head_after_join.record->chunks,
+                         original_manifest);
+
+    const auto committed_chunks_after_join =
+        machine.FindChunkRefs("bucket-t048", "objects/legacy-before-join.bin");
+    ASSERT_TRUE(committed_chunks_after_join.has_value());
+    ExpectChunkRefsEqual(*committed_chunks_after_join, original_manifest);
+
+    const auto generated =
+        clusterdemo::GenerateDeterministicClusterConfig(
+            MakeAppConfigSmokeGenerationRequest());
+    ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+    const auto quorum_before_join =
+        clusterdemo::ComputeInitialRaftQuorum(generated.config);
+    ASSERT_TRUE(quorum_before_join.ok()) << quorum_before_join.error_detail;
+    ASSERT_TRUE(quorum_before_join.summary.has_value());
+    EXPECT_EQ(quorum_before_join.summary->voter_raft_ids,
+              generated.config.initial_raft_membership.voter_raft_ids);
+    EXPECT_EQ(quorum_before_join.summary->voter_count, 3U);
+    EXPECT_EQ(quorum_before_join.summary->commit_quorum, 2U);
+
+    const auto quorum_after_join =
+        clusterdemo::ComputeInitialRaftQuorum(generated.config);
+    ASSERT_TRUE(quorum_after_join.ok()) << quorum_after_join.error_detail;
+    ASSERT_TRUE(quorum_after_join.summary.has_value());
+    EXPECT_EQ(quorum_after_join.summary->voter_raft_ids,
+              quorum_before_join.summary->voter_raft_ids);
+    EXPECT_EQ(quorum_after_join.summary->commit_quorum, 2U);
+    EXPECT_EQ(clusterdemo::ComputeInitialRaftQuorumSize(
+                  generated.config.initial_raft_membership),
+              2U);
 }
 
 TEST(IntegratedObjectStorageE2ETest,

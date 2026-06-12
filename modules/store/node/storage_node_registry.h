@@ -67,6 +67,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryFacts facts;
     };
@@ -75,6 +76,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryFacts facts;
@@ -84,6 +86,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryHealthFacts health;
@@ -93,6 +96,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryCapacityFacts capacity;
@@ -102,6 +106,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryLoadFacts load;
@@ -111,6 +116,7 @@ namespace storedemo
     {
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t last_sequence{0};
         std::uint64_t last_seen_unix_ms{0};
         StorageNodeRegistryLiveness liveness{StorageNodeRegistryLiveness::kDead};
@@ -221,6 +227,7 @@ namespace storedemo
         struct Record
         {
             std::string endpoint;
+            std::string incarnation_id;
             StorageNodeRegistryFacts facts;
             std::uint64_t last_sequence{0};
             std::uint64_t last_seen_unix_ms{0};
