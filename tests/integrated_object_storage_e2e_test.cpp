@@ -459,6 +459,22 @@ namespace
         }
     }
 
+    bool ManifestContainsReplicaNode(
+        const std::vector<raftdemo::ChunkRef> &manifest,
+        std::string_view node_id)
+    {
+        for (const auto &chunk : manifest)
+        {
+            if (std::find(chunk.replica_nodes.begin(),
+                          chunk.replica_nodes.end(),
+                          node_id) != chunk.replica_nodes.end())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     struct AppConfigNodeSmokeView
     {
         clusterdemo::ClusterNodeType node_type{clusterdemo::ClusterNodeType::kUnknown};
@@ -1163,6 +1179,7 @@ TEST(IntegratedObjectStorageE2ETest,
         original_head.record->chunks;
     ExpectChunkRefsEqual(original_manifest,
                          MakeDynamicStoragePlacementLegacyChunks());
+    EXPECT_FALSE(ManifestContainsReplicaNode(original_manifest, "store-c"));
 
     viewdemo::ViewNodeRegistry registry;
     const auto register_store_a = registry.RegisterNode(
@@ -1270,11 +1287,15 @@ TEST(IntegratedObjectStorageE2ETest,
     ASSERT_TRUE(committed_head_after_join.record->IsCommitted());
     ExpectChunkRefsEqual(committed_head_after_join.record->chunks,
                          original_manifest);
+    EXPECT_FALSE(ManifestContainsReplicaNode(committed_head_after_join.record->chunks,
+                                             "store-c"));
 
     const auto committed_chunks_after_join =
         machine.FindChunkRefs("bucket-t048", "objects/legacy-before-join.bin");
     ASSERT_TRUE(committed_chunks_after_join.has_value());
     ExpectChunkRefsEqual(*committed_chunks_after_join, original_manifest);
+    EXPECT_FALSE(ManifestContainsReplicaNode(*committed_chunks_after_join,
+                                             "store-c"));
 
     const auto generated =
         clusterdemo::GenerateDeterministicClusterConfig(

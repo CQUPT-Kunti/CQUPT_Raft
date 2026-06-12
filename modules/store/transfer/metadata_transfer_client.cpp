@@ -308,6 +308,21 @@ namespace storedemo
             return diagnostic;
         }
 
+        MetadataTransferDiagnostic MakeCommittedManifestBoundaryDiagnostic(
+            const MetadataTransferSummary &summary,
+            const MetadataTransferClientCallDiagnostics &rpc)
+        {
+            MetadataTransferDiagnostic diagnostic =
+                MakeDiagnostic(summary, rpc);
+            diagnostic.status = MetadataTransferStatusCode::kOk;
+            diagnostic.retryable = false;
+            diagnostic.message =
+                "committed manifest is served from metadata committed state; "
+                "dynamic StorageNode discovery only affects future placement "
+                "and must not rewrite or rebalance existing manifest replica facts";
+            return diagnostic;
+        }
+
         TransferObjectChecksumFacts InferObjectChecksumFacts(
             const std::uint64_t size,
             const std::string &etag)
@@ -1280,6 +1295,10 @@ namespace storedemo
                 call_result.result.manifest =
                     BuildCommittedManifest(proto_response.object());
                 call_result.result.visible_for_read = true;
+                call_result.result.diagnostics.push_back(
+                    MakeCommittedManifestBoundaryDiagnostic(
+                        call_result.result.summary,
+                        call_result.rpc));
             }
 
             if (redirected_stub != nullptr)
