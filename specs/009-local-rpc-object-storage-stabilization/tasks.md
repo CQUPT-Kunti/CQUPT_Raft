@@ -114,7 +114,7 @@
 - [x] T046 [P] [US3] Add StorageNode restart same node_id new incarnation test in `tests/storage_heartbeat_registry_test.cpp` (验证: `storage_heartbeat_registry`)
 - [X] T047 [P] [US3] Add duplicate node_id/endpoint conflict test in `tests/storage_heartbeat_registry_test.cpp` (验证: `storage_heartbeat_registry`)
 - [x] T048 [P] [US3] Add dynamic StorageNode placement integration test in `tests/integrated_object_storage_e2e_test.cpp` (验证: `integrated_object_storage_e2e`)
-- [ ] T049 [US3] Extend StorageNode heartbeat payload with capacity, load, disk pressure, health, writable status, incarnation, and sequence in `modules/store/node/storage_node_service.cpp` and `modules/store/node/storage_node_client.cpp` (验证: `storage_heartbeat_registry`)
+- [x] T049 [US3] Extend StorageNode heartbeat payload with capacity, load, disk pressure, health, writable status, incarnation, and sequence in `modules/store/node/storage_node_service.cpp` and `modules/store/node/storage_node_client.cpp` (验证: `storage_heartbeat_registry`)
 - [ ] T050 [US3] Make StorageNode app register/heartbeat to ViewNode seed list or first available ViewNode in `apps/storage_node_app.cpp` (验证: `storage_heartbeat_registry`, local RPC startup)
 - [ ] T051 [US3] Ensure ViewNode storage observed state merge feeds placement candidate discovery in `modules/view/view_registry.cpp` and `modules/store/placement/placement_manager.cpp` (验证: `integrated_object_storage_e2e`)
 - [ ] T052 [US3] Preserve existing transfer path in `modules/store/transfer/object_transfer.cpp` while allowing future placement to include dynamic StorageNode (验证: `integrated_object_storage_e2e`)

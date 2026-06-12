@@ -400,6 +400,7 @@ namespace storedemo
             out_health->set_health(ToProtoNodeHealth(health.health));
             out_health->set_disk_pressure(ToProtoDiskPressure(health.disk_pressure));
             out_health->set_io_error_count(health.io_error_count);
+            out_health->set_writable(health.writable);
         }
 
         void FillProtoLoadReport(const StorageNodeRegistryLoadFacts &load,
@@ -446,6 +447,7 @@ namespace storedemo
             out_snapshot->set_last_sequence(snapshot.last_sequence);
             out_snapshot->set_last_seen_unix_ms(snapshot.last_seen_unix_ms);
             out_snapshot->set_liveness(ToProtoLiveness(snapshot.liveness));
+            out_snapshot->set_incarnation_id(snapshot.incarnation_id);
             FillProtoFacts(snapshot.facts, out_snapshot->mutable_facts());
         }
 
@@ -501,6 +503,7 @@ namespace storedemo
             }
 
             out_health->io_error_count = proto_health.io_error_count();
+            out_health->writable = proto_health.writable();
             return StorageNodeStatusCode::kOk;
         }
 
@@ -1149,6 +1152,7 @@ namespace storedemo
 
             registry_request->node_id = request.node_id();
             registry_request->endpoint = request.endpoint();
+            registry_request->incarnation_id = request.incarnation_id();
             registry_request->observed_at_unix_ms = request.observed_at_unix_ms();
 
             std::string error_detail;
@@ -1183,6 +1187,7 @@ namespace storedemo
             const auto &heartbeat = request.heartbeat();
             registry_request->node_id = heartbeat.node_id();
             registry_request->endpoint = heartbeat.endpoint();
+            registry_request->incarnation_id = heartbeat.incarnation_id();
             registry_request->sequence = heartbeat.sequence();
             registry_request->observed_at_unix_ms = heartbeat.observed_at_unix_ms();
 
@@ -1211,6 +1216,7 @@ namespace storedemo
 
             registry_request->node_id = request.node_id();
             registry_request->endpoint = request.endpoint();
+            registry_request->incarnation_id = request.incarnation_id();
             registry_request->sequence = request.sequence();
             registry_request->observed_at_unix_ms = request.observed_at_unix_ms();
 
@@ -1239,6 +1245,7 @@ namespace storedemo
 
             registry_request->node_id = request.node_id();
             registry_request->endpoint = request.endpoint();
+            registry_request->incarnation_id = request.incarnation_id();
             registry_request->sequence = request.sequence();
             registry_request->observed_at_unix_ms = request.observed_at_unix_ms();
 
@@ -1268,6 +1275,7 @@ namespace storedemo
 
             registry_request->node_id = request.node_id();
             registry_request->endpoint = request.endpoint();
+            registry_request->incarnation_id = request.incarnation_id();
             registry_request->sequence = request.sequence();
             registry_request->observed_at_unix_ms = request.observed_at_unix_ms();
 

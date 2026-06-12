@@ -181,6 +181,40 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
+        bool NormalizeWritableStatus(const StorageNodeRegistryHealthFacts &health)
+        {
+            if (!health.writable)
+            {
+                return false;
+            }
+
+            if (health.health == StorageNodeHealth::kReadOnly ||
+                health.health == StorageNodeHealth::kUnavailable)
+            {
+                return false;
+            }
+
+            if (health.disk_pressure == StorageNodeDiskPressure::kFull)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        StorageNodeRegistryHealthFacts NormalizeHealthFacts(
+            StorageNodeRegistryHealthFacts health)
+        {
+            health.writable = NormalizeWritableStatus(health);
+            return health;
+        }
+
+        StorageNodeRegistryFacts NormalizeRegistryFacts(StorageNodeRegistryFacts facts)
+        {
+            facts.health = NormalizeHealthFacts(std::move(facts.health));
+            return facts;
+        }
+
         StorageNodeStatusCode ValidateRegisterRequest(
             const RegisterStorageNodeRequest &request,
             std::string *error_detail)
@@ -451,7 +485,7 @@ namespace storedemo
         {
             record->endpoint = std::move(endpoint);
             record->incarnation_id = std::move(incarnation_id);
-            record->facts = facts;
+            record->facts = NormalizeRegistryFacts(facts);
             record->last_sequence = 0;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }
@@ -464,7 +498,7 @@ namespace storedemo
                             const std::uint64_t observed_at_unix_ms)
         {
             record->incarnation_id.assign(incarnation_id);
-            record->facts = facts;
+            record->facts = NormalizeRegistryFacts(facts);
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }
@@ -477,7 +511,7 @@ namespace storedemo
                               const std::uint64_t observed_at_unix_ms)
         {
             record->incarnation_id.assign(incarnation_id);
-            record->facts.health = health;
+            record->facts.health = NormalizeHealthFacts(health);
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }

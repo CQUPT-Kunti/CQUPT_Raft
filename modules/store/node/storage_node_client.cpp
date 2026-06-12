@@ -473,6 +473,7 @@ namespace storedemo
             out_health->set_health(ToProtoNodeHealth(health.health));
             out_health->set_disk_pressure(ToProtoDiskPressure(health.disk_pressure));
             out_health->set_io_error_count(health.io_error_count);
+            out_health->set_writable(health.writable);
         }
 
         void FillProtoLoadReport(
@@ -558,6 +559,7 @@ namespace storedemo
             }
 
             out_health->io_error_count = proto_health.io_error_count();
+            out_health->writable = proto_health.writable();
             return StorageNodeStatusCode::kOk;
         }
 
@@ -640,6 +642,7 @@ namespace storedemo
             StorageNodeRegistryNodeSnapshot snapshot;
             snapshot.node_id = proto_snapshot.node_id();
             snapshot.endpoint = proto_snapshot.endpoint();
+            snapshot.incarnation_id = proto_snapshot.incarnation_id();
             snapshot.last_sequence = proto_snapshot.last_sequence();
             snapshot.last_seen_unix_ms = proto_snapshot.last_seen_unix_ms();
 
@@ -674,6 +677,7 @@ namespace storedemo
             proto_request->set_request_id(request.request_id);
             proto_request->set_node_id(request.node_id);
             proto_request->set_endpoint(request.endpoint);
+            proto_request->set_incarnation_id(request.incarnation_id);
             proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
             FillProtoFacts(request.facts, proto_request->mutable_facts());
         }
@@ -692,6 +696,7 @@ namespace storedemo
             auto *heartbeat = proto_request->mutable_heartbeat();
             heartbeat->set_node_id(request.node_id);
             heartbeat->set_endpoint(request.endpoint);
+            heartbeat->set_incarnation_id(request.incarnation_id);
             heartbeat->set_sequence(request.sequence);
             heartbeat->set_observed_at_unix_ms(request.observed_at_unix_ms);
             FillProtoFacts(request.facts, heartbeat->mutable_facts());
@@ -710,6 +715,7 @@ namespace storedemo
             proto_request->set_request_id(request.request_id);
             proto_request->set_node_id(request.node_id);
             proto_request->set_endpoint(request.endpoint);
+            proto_request->set_incarnation_id(request.incarnation_id);
             proto_request->set_sequence(request.sequence);
             proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
             FillProtoHealthReport(request.health, proto_request->mutable_health());
@@ -728,6 +734,7 @@ namespace storedemo
             proto_request->set_request_id(request.request_id);
             proto_request->set_node_id(request.node_id);
             proto_request->set_endpoint(request.endpoint);
+            proto_request->set_incarnation_id(request.incarnation_id);
             proto_request->set_sequence(request.sequence);
             proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
             FillProtoCapacityReport(request.capacity, proto_request->mutable_capacity());
@@ -746,6 +753,7 @@ namespace storedemo
             proto_request->set_request_id(request.request_id);
             proto_request->set_node_id(request.node_id);
             proto_request->set_endpoint(request.endpoint);
+            proto_request->set_incarnation_id(request.incarnation_id);
             proto_request->set_sequence(request.sequence);
             proto_request->set_observed_at_unix_ms(request.observed_at_unix_ms);
             FillProtoLoadReport(request.load, proto_request->mutable_load());

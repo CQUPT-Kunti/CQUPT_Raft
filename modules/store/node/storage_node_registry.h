@@ -39,6 +39,7 @@ namespace storedemo
         StorageNodeHealth health{StorageNodeHealth::kHealthy};
         StorageNodeDiskPressure disk_pressure{StorageNodeDiskPressure::kLow};
         std::uint64_t io_error_count{0};
+        bool writable{true};
     };
 
     struct StorageNodeRegistryLoadFacts

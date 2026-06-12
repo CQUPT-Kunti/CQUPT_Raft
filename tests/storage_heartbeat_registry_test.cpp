@@ -45,6 +45,7 @@ namespace
         facts.health.health = health;
         facts.health.disk_pressure = disk_pressure;
         facts.health.io_error_count = index;
+        facts.health.writable = true;
         facts.load.load.active_reads = static_cast<std::uint32_t>(index);
         facts.load.load.active_writes = static_cast<std::uint32_t>(index + 1);
         facts.load.load.queued_ops = static_cast<std::uint32_t>(index + 2);
@@ -444,6 +445,7 @@ namespace
                                     StorageNodeHealth::kDegraded,
                                     StorageNodeDiskPressure::kMedium);
         heartbeat.facts.health.io_error_count = 9;
+        heartbeat.facts.health.writable = false;
         heartbeat.facts.load.load.active_reads = 8;
         heartbeat.facts.load.load.active_writes = 3;
         heartbeat.facts.load.load.queued_ops = 11;
@@ -492,6 +494,7 @@ namespace
                   StorageNodeHealth::kDegraded);
         EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
                   StorageNodeDiskPressure::kMedium);
+        EXPECT_FALSE(lookup.snapshot.facts.health.writable);
         EXPECT_EQ(lookup.snapshot.facts.load.write_admission_overloaded, true);
     }
 
@@ -505,6 +508,7 @@ namespace
         health_report.health.health = StorageNodeHealth::kDegraded;
         health_report.health.disk_pressure = StorageNodeDiskPressure::kHigh;
         health_report.health.io_error_count = 6;
+        health_report.health.writable = false;
         const auto health_result = registry.ReportHealth(health_report);
         ASSERT_EQ(health_result.status, StorageNodeStatusCode::kOk);
         EXPECT_TRUE(health_result.applied);
@@ -537,6 +541,7 @@ namespace
         EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
                   StorageNodeDiskPressure::kHigh);
         EXPECT_EQ(lookup.snapshot.facts.health.io_error_count, 6U);
+        EXPECT_FALSE(lookup.snapshot.facts.health.writable);
         EXPECT_EQ(lookup.snapshot.facts.capacity.total_capacity_bytes, 16'384U);
         EXPECT_EQ(lookup.snapshot.facts.capacity.used_capacity_bytes, 4'096U);
         EXPECT_EQ(lookup.snapshot.facts.capacity.available_capacity_bytes, 12'288U);
@@ -594,6 +599,7 @@ namespace
                                            StorageNodeHealth::kDegraded,
                                            StorageNodeDiskPressure::kMedium);
         old_process_live.facts.health.io_error_count = 9;
+        old_process_live.facts.health.writable = false;
         old_process_live.facts.load.load.active_reads = 8;
         old_process_live.facts.load.load.active_writes = 3;
         old_process_live.facts.load.load.queued_ops = 11;
@@ -611,6 +617,7 @@ namespace
                                             StorageNodeHealth::kHealthy,
                                             StorageNodeDiskPressure::kLow);
         restarted_process.facts.health.io_error_count = 1;
+        restarted_process.facts.health.writable = true;
         restarted_process.facts.load.load.active_reads = 2;
         restarted_process.facts.load.load.active_writes = 1;
         restarted_process.facts.load.load.queued_ops = 0;
@@ -650,6 +657,7 @@ namespace
                   StorageNodeHealth::kHealthy);
         EXPECT_EQ(restarted_result.snapshot.facts.health.disk_pressure,
                   StorageNodeDiskPressure::kLow);
+        EXPECT_TRUE(restarted_result.snapshot.facts.health.writable);
 
         auto old_process_late = MakeHeartbeatRequest(1, 8, 240);
         old_process_late.incarnation_id = old_incarnation;
@@ -659,6 +667,7 @@ namespace
                                            StorageNodeHealth::kUnavailable,
                                            StorageNodeDiskPressure::kFull);
         old_process_late.facts.health.io_error_count = 99;
+        old_process_late.facts.health.writable = false;
         old_process_late.facts.load.load.active_reads = 1;
         old_process_late.facts.load.load.active_writes = 1;
         old_process_late.facts.load.load.queued_ops = 1;
@@ -680,6 +689,73 @@ namespace
                   StorageNodeHealth::kHealthy);
         EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
                   StorageNodeDiskPressure::kLow);
+        EXPECT_TRUE(lookup.snapshot.facts.health.writable);
+    }
+
+    TEST(StorageHeartbeatRegistryTest,
+         HealthWritableStateTracksHeartbeatAndRejectsConflictingOlderIncarnation)
+    {
+        StorageNodeRegistry registry;
+        auto registration = MakeRegisterRequest(2, 100);
+        registration.incarnation_id = "store-node-2:boot:100000000:81:1";
+        RegisterNodeOrAssert(&registry, registration);
+
+        auto non_writable = MakeHeartbeatRequest(2, 3, 130);
+        non_writable.incarnation_id = registration.incarnation_id;
+        non_writable.facts = MakeFacts(2,
+                                       24'576,
+                                       20'480,
+                                       StorageNodeHealth::kReadOnly,
+                                       StorageNodeDiskPressure::kHigh);
+        non_writable.facts.health.writable = false;
+        non_writable.facts.load.write_admission_overloaded = true;
+        const auto non_writable_result =
+            registry.UpdateStorageNodeHeartbeat(non_writable);
+        ASSERT_EQ(non_writable_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(non_writable_result.applied);
+        EXPECT_FALSE(non_writable_result.snapshot.facts.health.writable);
+        EXPECT_EQ(non_writable_result.snapshot.incarnation_id,
+                  registration.incarnation_id);
+
+        auto newer_incarnation = MakeHeartbeatRequest(2, 1, 200);
+        newer_incarnation.incarnation_id = "store-node-2:boot:200000000:82:1";
+        newer_incarnation.facts = MakeFacts(2,
+                                            32'768,
+                                            4'096,
+                                            StorageNodeHealth::kHealthy,
+                                            StorageNodeDiskPressure::kLow);
+        newer_incarnation.facts.health.writable = true;
+        const auto writable_result =
+            registry.UpdateStorageNodeHeartbeat(newer_incarnation);
+        ASSERT_EQ(writable_result.status, StorageNodeStatusCode::kOk);
+        ASSERT_TRUE(writable_result.applied);
+        EXPECT_TRUE(writable_result.snapshot.facts.health.writable);
+        EXPECT_EQ(writable_result.snapshot.incarnation_id,
+                  newer_incarnation.incarnation_id);
+
+        auto old_read_only = MakeHeartbeatRequest(2, 4, 240);
+        old_read_only.incarnation_id = registration.incarnation_id;
+        old_read_only.facts = MakeFacts(2,
+                                        4'096,
+                                        4'096,
+                                        StorageNodeHealth::kUnavailable,
+                                        StorageNodeDiskPressure::kFull);
+        old_read_only.facts.health.writable = false;
+        const auto old_read_only_result =
+            registry.UpdateStorageNodeHeartbeat(old_read_only);
+        EXPECT_EQ(old_read_only_result.status,
+                  StorageNodeStatusCode::kAlreadyExists);
+        EXPECT_TRUE(old_read_only_result.stale_ignored);
+
+        const auto lookup = registry.LookupNode(registration.node_id, 250);
+        ASSERT_EQ(lookup.status, StorageNodeStatusCode::kOk);
+        EXPECT_EQ(lookup.snapshot.incarnation_id, newer_incarnation.incarnation_id);
+        EXPECT_EQ(lookup.snapshot.last_sequence, 1U);
+        EXPECT_EQ(lookup.snapshot.facts.health.health,
+                  StorageNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot.facts.health.disk_pressure,
+                  StorageNodeDiskPressure::kLow);
+        EXPECT_TRUE(lookup.snapshot.facts.health.writable);
     }
 
     TEST(StorageHeartbeatRegistryTest, InvalidInputAndUnknownNodePathsReturnExplicitErrors)

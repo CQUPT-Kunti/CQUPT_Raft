@@ -99,6 +99,7 @@ message StorageNodeHealthReport {
   StorageNodeHealth health = 1;
   StorageNodeDiskPressure disk_pressure = 2;
   uint64 io_error_count = 3;
+  bool writable = 4;
 }
 
 message StorageNodeLoadReport {
@@ -122,6 +123,7 @@ message StorageNodeHeartbeat {
   uint64 sequence = 3;
   uint64 observed_at_unix_ms = 4;
   StorageNodeFacts facts = 5;
+  string incarnation_id = 6;
 }
 
 message StorageNodeRegistrySnapshot {
@@ -131,6 +133,7 @@ message StorageNodeRegistrySnapshot {
   uint64 last_seen_unix_ms = 4;
   StorageNodeLivenessState liveness = 5;
   StorageNodeFacts facts = 6;
+  string incarnation_id = 7;
 }
 
 message RegisterStorageNodeRequest {
@@ -139,6 +142,7 @@ message RegisterStorageNodeRequest {
   string endpoint = 3;
   uint64 observed_at_unix_ms = 4;
   StorageNodeFacts facts = 5;
+  string incarnation_id = 6;
 }
 
 message RegisterStorageNodeResponse {
@@ -169,6 +173,7 @@ message ReportHealthRequest {
   uint64 sequence = 4;
   uint64 observed_at_unix_ms = 5;
   StorageNodeHealthReport health = 6;
+  string incarnation_id = 7;
 }
 
 message ReportCapacityRequest {
@@ -178,6 +183,7 @@ message ReportCapacityRequest {
   uint64 sequence = 4;
   uint64 observed_at_unix_ms = 5;
   StorageNodeCapacityReport capacity = 6;
+  string incarnation_id = 7;
 }
 
 message ReportLoadRequest {
@@ -187,6 +193,7 @@ message ReportLoadRequest {
   uint64 sequence = 4;
   uint64 observed_at_unix_ms = 5;
   StorageNodeLoadReport load = 6;
+  string incarnation_id = 7;
 }
 
 message WriteChunkRequest {
