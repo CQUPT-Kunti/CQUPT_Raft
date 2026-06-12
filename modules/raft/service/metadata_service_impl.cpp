@@ -1,7 +1,11 @@
 #include "raft/service/metadata_service_impl.h"
 
+#include "metadata.pb.h"
+
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -16,6 +20,29 @@
 
 namespace raftdemo
 {
+  struct MetadataJoinPendingCandidate
+  {
+    std::string request_id;
+    std::string cluster_id;
+    std::string node_id;
+    std::int32_t candidate_raft_id{0};
+    std::string candidate_client_address;
+    std::string candidate_raft_address;
+    std::string candidate_incarnation_id;
+    std::uint64_t candidate_sequence{0};
+    std::uint64_t persistent_generation{0};
+    std::string data_dir_fingerprint;
+    raft::JoinMetadataCandidateStateHint local_state_hint{
+        raft::JOIN_METADATA_CANDIDATE_STATE_HINT_UNSPECIFIED};
+    std::uint64_t accepted_membership_epoch{0};
+  };
+
+  struct MetadataServiceImpl::JoinValidationState
+  {
+    std::mutex mu;
+    std::optional<MetadataJoinPendingCandidate> pending_candidate;
+  };
+
   namespace
   {
 
@@ -282,10 +309,10 @@ namespace raftdemo
         return;
       }
       summary->set_message(BuildDiagnosticMessage(summary->message(),
-                                                 status,
-                                                 quorum_summary,
-                                                 fallback_leader_id,
-                                                 emphasize_quorum_boundary));
+                                                  status,
+                                                  quorum_summary,
+                                                  fallback_leader_id,
+                                                  emphasize_quorum_boundary));
       FillLeaderHint(status, fallback_leader_id, summary->mutable_leader_hint());
     }
 
@@ -798,9 +825,178 @@ namespace raftdemo
       return reactor;
     }
 
+    bool IsJoinCandidateStateHintValid(
+        const raft::JoinMetadataCandidateStateHint state_hint)
+    {
+      return state_hint == raft::JOIN_METADATA_CANDIDATE_STATE_HINT_JOINING ||
+             state_hint == raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE;
+    }
+
+    bool HasCommittedVoterRaftId(const CommittedMembershipQuorumSummary &quorum_summary,
+                                 const std::int32_t candidate_raft_id)
+    {
+      return std::find(quorum_summary.voter_ids.begin(),
+                       quorum_summary.voter_ids.end(),
+                       candidate_raft_id) != quorum_summary.voter_ids.end();
+    }
+
+    std::optional<std::string> ValidateJoinMetadataClusterRequest(
+        const raft::JoinMetadataClusterRequest &request,
+        const CommittedMembershipQuorumSummary &quorum_summary)
+    {
+      if (request.request_id().empty())
+      {
+        return "request_id is required";
+      }
+      if (request.cluster_id().empty())
+      {
+        return "cluster_id is required";
+      }
+      if (request.node_id().empty())
+      {
+        return "node_id is required";
+      }
+      if (request.candidate_raft_id() <= 0)
+      {
+        return "candidate_raft_id must be positive";
+      }
+      if (request.candidate_client_address().empty())
+      {
+        return "candidate_client_address is required";
+      }
+      if (request.candidate_raft_address().empty())
+      {
+        return "candidate_raft_address is required";
+      }
+      if (request.candidate_incarnation_id().empty())
+      {
+        return "candidate_incarnation_id is required";
+      }
+      if (request.candidate_sequence() == 0)
+      {
+        return "candidate_sequence must be non-zero";
+      }
+      if (request.persistent_generation() == 0)
+      {
+        return "persistent_generation must be non-zero";
+      }
+      if (request.data_dir_fingerprint().empty())
+      {
+        return "data_dir_fingerprint is required";
+      }
+      if (!IsJoinCandidateStateHintValid(request.local_state_hint()))
+      {
+        return "local_state_hint must be joining or candidate";
+      }
+      if (HasCommittedVoterRaftId(quorum_summary, request.candidate_raft_id()))
+      {
+        return "candidate_raft_id already exists in committed voter set";
+      }
+      return std::nullopt;
+    }
+
+    MetadataJoinPendingCandidate
+    MakePendingJoinCandidate(const raft::JoinMetadataClusterRequest &request,
+                             const std::uint64_t membership_epoch)
+    {
+      MetadataJoinPendingCandidate candidate;
+      candidate.request_id = request.request_id();
+      candidate.cluster_id = request.cluster_id();
+      candidate.node_id = request.node_id();
+      candidate.candidate_raft_id = request.candidate_raft_id();
+      candidate.candidate_client_address = request.candidate_client_address();
+      candidate.candidate_raft_address = request.candidate_raft_address();
+      candidate.candidate_incarnation_id = request.candidate_incarnation_id();
+      candidate.candidate_sequence = request.candidate_sequence();
+      candidate.persistent_generation = request.persistent_generation();
+      candidate.data_dir_fingerprint = request.data_dir_fingerprint();
+      candidate.local_state_hint = request.local_state_hint();
+      candidate.accepted_membership_epoch = membership_epoch;
+      return candidate;
+    }
+
+    bool IsSamePendingCandidate(
+        const MetadataJoinPendingCandidate &pending,
+        const raft::JoinMetadataClusterRequest &request)
+    {
+      return pending.cluster_id == request.cluster_id() &&
+             pending.node_id == request.node_id() &&
+             pending.candidate_raft_id == request.candidate_raft_id() &&
+             pending.candidate_client_address == request.candidate_client_address() &&
+             pending.candidate_raft_address == request.candidate_raft_address() &&
+             pending.candidate_incarnation_id == request.candidate_incarnation_id() &&
+             pending.persistent_generation == request.persistent_generation() &&
+             pending.data_dir_fingerprint == request.data_dir_fingerprint() &&
+             pending.local_state_hint == request.local_state_hint();
+    }
+
+    bool ConflictsWithPendingCandidate(
+        const MetadataJoinPendingCandidate &pending,
+        const raft::JoinMetadataClusterRequest &request)
+    {
+      if (pending.cluster_id != request.cluster_id())
+      {
+        return false;
+      }
+      return pending.node_id == request.node_id() ||
+             pending.candidate_raft_id == request.candidate_raft_id() ||
+             pending.candidate_client_address == request.candidate_client_address() ||
+             pending.candidate_raft_address == request.candidate_raft_address() ||
+             pending.data_dir_fingerprint == request.data_dir_fingerprint();
+    }
+
+    grpc::ServerUnaryReactor *FinishJoinMetadataClusterResponse(
+        grpc::CallbackServerContext *context,
+        const NodeStatusSnapshot &status,
+        const CommittedMembershipQuorumSummary &quorum_summary,
+        const raft::JoinMetadataClusterRequest &request,
+        const raft::MetadataStatusCode code,
+        const raft::JoinMetadataClusterDisposition disposition,
+        const std::string &message,
+        const std::uint64_t membership_epoch,
+        raft::JoinMetadataClusterResponse *response)
+    {
+      auto *reactor = context->DefaultReactor();
+      FillSummary(status,
+                  code,
+                  message,
+                  request.request_id(),
+                  "",
+                  "",
+                  "",
+                  std::nullopt,
+                  std::nullopt,
+                  status.term,
+                  response->mutable_summary());
+      DecorateSummaryWithDiagnostics(status,
+                                     quorum_summary,
+                                     status.leader_id >= 0
+                                         ? std::optional<int>(status.leader_id)
+                                         : std::nullopt,
+                                     true,
+                                     response->mutable_summary());
+      response->set_disposition(disposition);
+      response->set_requested_membership(
+          raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      response->set_committed_membership_changed(false);
+      response->set_membership_epoch(membership_epoch);
+      response->set_canonical_node_id(request.node_id());
+      if (request.candidate_raft_id() > 0)
+      {
+        response->set_assigned_raft_id(request.candidate_raft_id());
+      }
+      reactor->Finish(grpc::Status::OK);
+      return reactor;
+    }
+
   } // namespace
 
-  MetadataServiceImpl::MetadataServiceImpl(RaftNode &node) : node_(node) {}
+  MetadataServiceImpl::MetadataServiceImpl(RaftNode &node)
+      : node_(node), join_validation_state_(std::make_unique<JoinValidationState>())
+  {
+  }
+
+  MetadataServiceImpl::~MetadataServiceImpl() = default;
 
   grpc::ServerUnaryReactor *MetadataServiceImpl::CreateBucket(
       grpc::CallbackServerContext *context,
@@ -1366,6 +1562,130 @@ namespace raftdemo
     auto *reactor = context->DefaultReactor();
     reactor->Finish(grpc::Status::OK);
     return reactor;
+  }
+
+  grpc::ServerUnaryReactor *MetadataServiceImpl::JoinMetadataCluster(
+      grpc::CallbackServerContext *context,
+      const raft::JoinMetadataClusterRequest *request,
+      raft::JoinMetadataClusterResponse *response)
+  {
+    const NodeStatusSnapshot status = node_.GetStatusSnapshot();
+    const CommittedMembershipQuorumSummary quorum_summary =
+        node_.GetCommittedMembershipQuorumSummary();
+
+    if (IsDeadlineExpired(context))
+    {
+      return FinishJoinMetadataClusterResponse(
+          context,
+          status,
+          quorum_summary,
+          *request,
+          raft::METADATA_STATUS_CODE_TIMEOUT,
+          raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED,
+          "join validation deadline already expired before admission",
+          quorum_summary.committed_log_index,
+          response);
+    }
+
+    if (!node_.IsRunning())
+    {
+      return FinishJoinMetadataClusterResponse(context,
+                                               status,
+                                               quorum_summary,
+                                               *request,
+                                               raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE,
+                                               raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED,
+                                               "node is stopping",
+                                               quorum_summary.committed_log_index,
+                                               response);
+    }
+
+    if (status.role != "Leader")
+    {
+      return FinishJoinMetadataClusterResponse(
+          context,
+          status,
+          quorum_summary,
+          *request,
+          raft::METADATA_STATUS_CODE_NOT_LEADER,
+          raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER,
+          "join authority belongs to metadata leader",
+          quorum_summary.committed_log_index,
+          response);
+    }
+
+    if (const auto validation_error =
+            ValidateJoinMetadataClusterRequest(*request, quorum_summary);
+        validation_error.has_value())
+    {
+      return FinishJoinMetadataClusterResponse(
+          context,
+          status,
+          quorum_summary,
+          *request,
+          raft::METADATA_STATUS_CODE_INVALID_ARGUMENT,
+          raft::JOIN_METADATA_CLUSTER_DISPOSITION_INVALID_CANDIDATE,
+          *validation_error,
+          quorum_summary.committed_log_index,
+          response);
+    }
+
+    std::lock_guard<std::mutex> lock(join_validation_state_->mu);
+    if (join_validation_state_->pending_candidate.has_value())
+    {
+      const auto &pending = *join_validation_state_->pending_candidate;
+      if (IsSamePendingCandidate(pending, *request))
+      {
+        return FinishJoinMetadataClusterResponse(
+            context,
+            status,
+            quorum_summary,
+            *request,
+            raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY,
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE,
+            "duplicate join request for pending candidate",
+            pending.accepted_membership_epoch,
+            response);
+      }
+
+      if (ConflictsWithPendingCandidate(pending, *request))
+      {
+        return FinishJoinMetadataClusterResponse(
+            context,
+            status,
+            quorum_summary,
+            *request,
+            raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED,
+            "conflicting join request for candidate identity already pending",
+            pending.accepted_membership_epoch,
+            response);
+      }
+
+      return FinishJoinMetadataClusterResponse(
+          context,
+          status,
+          quorum_summary,
+          *request,
+          raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+          raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE,
+          "pending membership change already exists",
+          pending.accepted_membership_epoch,
+          response);
+    }
+
+    join_validation_state_->pending_candidate =
+        MakePendingJoinCandidate(*request, quorum_summary.committed_log_index);
+    return FinishJoinMetadataClusterResponse(
+        context,
+        status,
+        quorum_summary,
+        *request,
+        raft::METADATA_STATUS_CODE_OK,
+        raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT,
+        "join validation accepted on leader; no committed membership change performed",
+        quorum_summary.committed_log_index,
+        response);
   }
 
 } // namespace raftdemo

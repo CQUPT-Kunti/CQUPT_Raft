@@ -2,6 +2,9 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <memory>
+
+#include "metadata.pb.h"
 #include "metadata.grpc.pb.h"
 
 namespace raftdemo
@@ -13,6 +16,7 @@ namespace raftdemo
   {
   public:
     explicit MetadataServiceImpl(RaftNode &node);
+    ~MetadataServiceImpl() override;
 
     grpc::ServerUnaryReactor *CreateBucket(
         grpc::CallbackServerContext *context,
@@ -54,8 +58,16 @@ namespace raftdemo
         const raft::ListObjectsRequest *request,
         raft::ListObjectsResponse *response) override;
 
+    grpc::ServerUnaryReactor *JoinMetadataCluster(
+        grpc::CallbackServerContext *context,
+        const raft::JoinMetadataClusterRequest *request,
+        raft::JoinMetadataClusterResponse *response) override;
+
   private:
+    struct JoinValidationState;
+
     RaftNode &node_;
+    std::unique_ptr<JoinValidationState> join_validation_state_;
   };
 
 } // namespace raftdemo

@@ -134,7 +134,7 @@
 - [X] T057 [P] [US4] Add duplicate join and pending membership change rejection tests in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [x] T058 [P] [US4] Add ViewNode-observed metadata registration test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
 - [x] T059 [US4] Add additive JoinMetadataCluster request/response contract in `proto/raft.proto` or `proto/metadata.proto` (验证: generated proto build, `metadata_client_scenario_test`)
-- [ ] T060 [US4] Implement Metadata leader join validation in `modules/raft/service/metadata_service_impl.cpp` (验证: `metadata_client_scenario_test`, `integrated_object_storage_quorum`)
+- [x] T060 [US4] Implement Metadata leader join validation in `modules/raft/service/metadata_service_impl.cpp` (验证: `metadata_client_scenario_test`, `integrated_object_storage_quorum`)
 - [ ] T061 [US4] Add dynamic join mode wiring in `apps/metadata_node_app.cpp` without changing initial bootstrap voter startup (验证: `cluster_config_test`, local RPC startup)
 - [ ] T062 [US4] Add leader discovery through ViewNode candidates and `NOT_LEADER` fallback in `apps/metadata_node_app.cpp` or metadata client helper (验证: `metadata_client_scenario_test`)
 - [ ] T063 [US4] Add AddLearner proposal path stub/implementation boundary in `modules/raft/node/raft_node.cpp` and `modules/raft/node/raft_node.h` (验证: `integrated_object_storage_quorum`)

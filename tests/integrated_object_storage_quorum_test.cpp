@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <grpcpp/grpcpp.h>
+
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -12,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "metadata.grpc.pb.h"
 #include "metadata_raft_test_utils.h"
 #include "raft/common/config.h"
 #include "raft/common/propose.h"
@@ -166,6 +169,48 @@ namespace raftdemo
             request.request_id = request_id;
             request.registration = std::move(registration);
             return request;
+        }
+
+        raft::JoinMetadataClusterRequest MakeJoinMetadataClusterRequest(
+            const std::string &request_id,
+            const std::string &cluster_id,
+            const std::string &node_id,
+            const std::int32_t candidate_raft_id,
+            const std::uint16_t candidate_client_port,
+            const std::uint16_t candidate_raft_port)
+        {
+            raft::JoinMetadataClusterRequest request;
+            request.set_request_id(request_id);
+            request.set_cluster_id(cluster_id);
+            request.set_node_id(node_id);
+            request.set_candidate_raft_id(candidate_raft_id);
+            request.set_candidate_client_address("127.0.0.1:" +
+                                                 std::to_string(candidate_client_port));
+            request.set_candidate_raft_address("127.0.0.1:" +
+                                               std::to_string(candidate_raft_port));
+            request.set_candidate_incarnation_id(node_id + ":boot:1710000000");
+            request.set_candidate_sequence(1);
+            request.set_persistent_generation(1);
+            request.set_data_dir_fingerprint("fingerprint-" + node_id);
+            request.set_local_state_hint(
+                raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+            request.set_observed_view_node_id("view-1");
+            request.set_observed_time_unix_ms(1710000000123ULL);
+            request.set_observed_metadata_endpoint("127.0.0.1:" +
+                                                   std::to_string(candidate_client_port));
+            return request;
+        }
+
+        grpc::Status JoinMetadataClusterViaAddress(
+            const std::string &address,
+            const raft::JoinMetadataClusterRequest &request,
+            raft::JoinMetadataClusterResponse *response)
+        {
+            auto channel =
+                grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+            auto stub = raft::MetadataService::NewStub(channel);
+            grpc::ClientContext context;
+            return stub->JoinMetadataCluster(&context, request, response);
         }
 
         void RegisterNodeOrAssert(ViewNodeRegistry *registry,
@@ -1647,6 +1692,177 @@ namespace raftdemo
                 << ", commit_status=" << ProposeStatusName(commit_result.status)
                 << ", commit_message=" << commit_result.message
                 << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               JoinMetadataClusterFollowerRejectsAuthorityAndReturnsLeaderHint)
+        {
+            constexpr const char *kClusterId = "cluster-t060-follower";
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before JoinMetadataCluster "
+                   "follower validation test; cluster="
+                << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_FALSE(follower_indexes.empty());
+            const std::size_t follower_index = follower_indexes.front();
+
+            const NodeStatusSnapshot leader_status = leader->GetStatusSnapshot();
+            const NodeStatusSnapshot follower_status =
+                cluster.Node(follower_index)->GetStatusSnapshot();
+
+            raft::JoinMetadataClusterRequest request =
+                MakeJoinMetadataClusterRequest("req-join-follower-authority",
+                                               kClusterId,
+                                               "meta-join-candidate-follower",
+                                               41,
+                                               static_cast<std::uint16_t>(base_port_ + 1410),
+                                               static_cast<std::uint16_t>(base_port_ + 2410));
+            raft::JoinMetadataClusterResponse response;
+            const grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(follower_status.address, request, &response);
+
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER);
+            EXPECT_EQ(response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER);
+            EXPECT_EQ(response.requested_membership(),
+                      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+            EXPECT_FALSE(response.committed_membership_changed());
+            EXPECT_EQ(response.summary().request_id(), request.request_id());
+            EXPECT_EQ(response.summary().leader_hint().leader_id(), leader_status.node_id);
+            EXPECT_EQ(response.summary().leader_hint().leader_address(),
+                      leader_status.address);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               JoinMetadataClusterLeaderValidatesInvalidDuplicateAndPendingWithoutChangingCommittedMembership)
+        {
+            constexpr const char *kClusterId = "cluster-t060-leader";
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before JoinMetadataCluster "
+                   "leader validation test; cluster="
+                << cluster.DescribeCluster();
+
+            const NodeStatusSnapshot leader_status = leader->GetStatusSnapshot();
+
+            raft::JoinMetadataClusterRequest invalid_request =
+                MakeJoinMetadataClusterRequest("req-join-invalid",
+                                               kClusterId,
+                                               "meta-join-invalid",
+                                               0,
+                                               static_cast<std::uint16_t>(base_port_ + 1510),
+                                               static_cast<std::uint16_t>(base_port_ + 2510));
+            invalid_request.set_candidate_raft_id(0);
+            raft::JoinMetadataClusterResponse invalid_response;
+            grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(leader_status.address,
+                                             invalid_request,
+                                             &invalid_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(invalid_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_INVALID_ARGUMENT);
+            EXPECT_EQ(invalid_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_INVALID_CANDIDATE);
+            EXPECT_FALSE(invalid_response.committed_membership_changed());
+
+            raft::JoinMetadataClusterRequest accepted_request =
+                MakeJoinMetadataClusterRequest("req-join-accepted",
+                                               kClusterId,
+                                               "meta-join-candidate-a",
+                                               51,
+                                               static_cast<std::uint16_t>(base_port_ + 1520),
+                                               static_cast<std::uint16_t>(base_port_ + 2520));
+            raft::JoinMetadataClusterResponse accepted_response;
+            rpc_status = JoinMetadataClusterViaAddress(leader_status.address,
+                                                       accepted_request,
+                                                       &accepted_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(accepted_response.summary().code(), raft::METADATA_STATUS_CODE_OK);
+            EXPECT_EQ(accepted_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+            EXPECT_EQ(accepted_response.requested_membership(),
+                      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+            EXPECT_FALSE(accepted_response.committed_membership_changed());
+            EXPECT_EQ(accepted_response.canonical_node_id(),
+                      accepted_request.node_id());
+            EXPECT_EQ(accepted_response.assigned_raft_id(),
+                      accepted_request.candidate_raft_id());
+
+            raft::JoinMetadataClusterResponse duplicate_response;
+            rpc_status = JoinMetadataClusterViaAddress(leader_status.address,
+                                                       accepted_request,
+                                                       &duplicate_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(duplicate_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+            EXPECT_EQ(duplicate_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE);
+            EXPECT_FALSE(duplicate_response.committed_membership_changed());
+
+            raft::JoinMetadataClusterRequest pending_request =
+                MakeJoinMetadataClusterRequest("req-join-pending",
+                                               kClusterId,
+                                               "meta-join-candidate-b",
+                                               52,
+                                               static_cast<std::uint16_t>(base_port_ + 1530),
+                                               static_cast<std::uint16_t>(base_port_ + 2530));
+            raft::JoinMetadataClusterResponse pending_response;
+            rpc_status = JoinMetadataClusterViaAddress(leader_status.address,
+                                                       pending_request,
+                                                       &pending_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(pending_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_STATE_CONFLICT);
+            EXPECT_EQ(pending_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE);
+            EXPECT_FALSE(pending_response.committed_membership_changed());
+
+            raft::JoinMetadataClusterRequest conflicting_request =
+                MakeJoinMetadataClusterRequest("req-join-conflict",
+                                               kClusterId,
+                                               accepted_request.node_id(),
+                                               accepted_request.candidate_raft_id(),
+                                               static_cast<std::uint16_t>(base_port_ + 1540),
+                                               static_cast<std::uint16_t>(base_port_ + 2540));
+            raft::JoinMetadataClusterResponse conflicting_response;
+            rpc_status = JoinMetadataClusterViaAddress(leader_status.address,
+                                                       conflicting_request,
+                                                       &conflicting_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(conflicting_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_STATE_CONFLICT);
+            EXPECT_EQ(conflicting_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED);
+            EXPECT_FALSE(conflicting_response.committed_membership_changed());
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
         }
     } // namespace
 } // namespace raftdemo
