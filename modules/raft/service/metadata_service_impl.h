@@ -64,10 +64,7 @@ namespace raftdemo
         raft::JoinMetadataClusterResponse *response) override;
 
   private:
-    struct JoinValidationState;
-
     RaftNode &node_;
-    std::unique_ptr<JoinValidationState> join_validation_state_;
   };
 
 } // namespace raftdemo

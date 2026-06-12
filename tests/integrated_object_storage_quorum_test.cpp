@@ -66,6 +66,29 @@ namespace raftdemo
             return "Unknown";
         }
 
+        std::string AddLearnerProposalStatusName(
+            const AddLearnerProposalStatus status)
+        {
+            switch (status)
+            {
+            case AddLearnerProposalStatus::kAcceptedPendingCommit:
+                return "AcceptedPendingCommit";
+            case AddLearnerProposalStatus::kDuplicate:
+                return "Duplicate";
+            case AddLearnerProposalStatus::kPendingMembershipChange:
+                return "PendingMembershipChange";
+            case AddLearnerProposalStatus::kRejected:
+                return "Rejected";
+            case AddLearnerProposalStatus::kNotLeader:
+                return "NotLeader";
+            case AddLearnerProposalStatus::kNodeStopping:
+                return "NodeStopping";
+            case AddLearnerProposalStatus::kInvalidArgument:
+                return "InvalidArgument";
+            }
+            return "Unknown";
+        }
+
         bool Contains(const std::string &text, const std::string &needle)
         {
             return text.find(needle) != std::string::npos;
@@ -199,6 +222,27 @@ namespace raftdemo
             request.set_observed_metadata_endpoint("127.0.0.1:" +
                                                    std::to_string(candidate_client_port));
             return request;
+        }
+
+        AddLearnerProposalRequest MakeAddLearnerProposalRequest(
+            const raft::JoinMetadataClusterRequest &request)
+        {
+            AddLearnerProposalRequest proposal_request;
+            proposal_request.cluster_id = request.cluster_id();
+            proposal_request.node_id = request.node_id();
+            proposal_request.candidate_raft_id = request.candidate_raft_id();
+            proposal_request.candidate_client_address =
+                request.candidate_client_address();
+            proposal_request.candidate_raft_address =
+                request.candidate_raft_address();
+            proposal_request.candidate_incarnation_id =
+                request.candidate_incarnation_id();
+            proposal_request.candidate_sequence = request.candidate_sequence();
+            proposal_request.persistent_generation =
+                request.persistent_generation();
+            proposal_request.data_dir_fingerprint =
+                request.data_dir_fingerprint();
+            return proposal_request;
         }
 
         grpc::Status JoinMetadataClusterViaAddress(
@@ -1692,6 +1736,96 @@ namespace raftdemo
                 << ", commit_status=" << ProposeStatusName(commit_result.status)
                 << ", commit_message=" << commit_result.message
                 << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               AddLearnerProposalPathRejectsFollowerAndPreservesDuplicatePendingBoundary)
+        {
+            constexpr const char *kClusterId = "cluster-t063-node";
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before AddLearner proposal "
+                   "path test; cluster="
+                << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_FALSE(follower_indexes.empty());
+            const auto follower = cluster.Node(follower_indexes.front());
+            ASSERT_NE(follower, nullptr);
+
+            const auto accepted_request = MakeAddLearnerProposalRequest(
+                MakeJoinMetadataClusterRequest("req-add-learner-accepted",
+                                               kClusterId,
+                                               "meta-join-candidate-a",
+                                               61,
+                                               static_cast<std::uint16_t>(base_port_ + 1610),
+                                               static_cast<std::uint16_t>(base_port_ + 2610)));
+            const auto accepted_result = leader->ProposeAddLearner(accepted_request);
+            EXPECT_EQ(accepted_result.status,
+                      AddLearnerProposalStatus::kAcceptedPendingCommit)
+                << accepted_result.message;
+            EXPECT_FALSE(accepted_result.committed_membership_changed);
+            EXPECT_EQ(accepted_result.canonical_node_id, accepted_request.node_id);
+            EXPECT_EQ(accepted_result.assigned_raft_id,
+                      accepted_request.candidate_raft_id);
+            EXPECT_TRUE(Contains(accepted_result.message,
+                                 "committed membership log proposal"))
+                << accepted_result.message;
+
+            const auto duplicate_result = leader->ProposeAddLearner(accepted_request);
+            EXPECT_EQ(duplicate_result.status,
+                      AddLearnerProposalStatus::kDuplicate)
+                << duplicate_result.message;
+            EXPECT_FALSE(duplicate_result.committed_membership_changed);
+
+            auto conflicting_request = accepted_request;
+            conflicting_request.candidate_client_address =
+                "127.0.0.1:" + std::to_string(static_cast<std::uint32_t>(base_port_) + 1620);
+            conflicting_request.candidate_raft_address =
+                "127.0.0.1:" + std::to_string(static_cast<std::uint32_t>(base_port_) + 2620);
+            conflicting_request.candidate_incarnation_id =
+                "meta-join-candidate-a:boot:1710000001";
+            const auto conflicting_result = leader->ProposeAddLearner(conflicting_request);
+            EXPECT_EQ(conflicting_result.status,
+                      AddLearnerProposalStatus::kRejected)
+                << conflicting_result.message;
+            EXPECT_FALSE(conflicting_result.committed_membership_changed);
+
+            const auto pending_request = MakeAddLearnerProposalRequest(
+                MakeJoinMetadataClusterRequest("req-add-learner-pending",
+                                               kClusterId,
+                                               "meta-join-candidate-b",
+                                               62,
+                                               static_cast<std::uint16_t>(base_port_ + 1630),
+                                               static_cast<std::uint16_t>(base_port_ + 2630)));
+            const auto pending_result = leader->ProposeAddLearner(pending_request);
+            EXPECT_EQ(pending_result.status,
+                      AddLearnerProposalStatus::kPendingMembershipChange)
+                << pending_result.message;
+            EXPECT_FALSE(pending_result.committed_membership_changed);
+
+            const auto follower_result = follower->ProposeAddLearner(accepted_request);
+            EXPECT_EQ(follower_result.status,
+                      AddLearnerProposalStatus::kNotLeader)
+                << follower_result.message;
+            EXPECT_FALSE(follower_result.committed_membership_changed);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
         }
 
         TEST_F(IntegratedObjectStorageQuorumTest,

@@ -115,6 +115,49 @@ namespace raftdemo
     CommittedMembershipRole local_role{CommittedMembershipRole::kUnknown};
   };
 
+  enum class AddLearnerProposalStatus : std::uint8_t
+  {
+    kAcceptedPendingCommit = 0,
+    kDuplicate = 1,
+    kPendingMembershipChange = 2,
+    kRejected = 3,
+    kNotLeader = 4,
+    kNodeStopping = 5,
+    kInvalidArgument = 6,
+  };
+
+  struct AddLearnerProposalRequest
+  {
+    std::string cluster_id;
+    std::string node_id;
+    std::int32_t candidate_raft_id{0};
+    std::string candidate_client_address;
+    std::string candidate_raft_address;
+    std::string candidate_incarnation_id;
+    std::uint64_t candidate_sequence{0};
+    std::uint64_t persistent_generation{0};
+    std::string data_dir_fingerprint;
+  };
+
+  struct AddLearnerProposalResult
+  {
+    AddLearnerProposalStatus status{
+        AddLearnerProposalStatus::kRejected};
+    int leader_id{-1};
+    std::uint64_t term{0};
+    std::uint64_t membership_epoch{0};
+    bool committed_membership_changed{false};
+    std::string canonical_node_id;
+    std::int32_t assigned_raft_id{0};
+    std::string message;
+
+    [[nodiscard]] bool ok() const
+    {
+      return status == AddLearnerProposalStatus::kAcceptedPendingCommit ||
+             status == AddLearnerProposalStatus::kDuplicate;
+    }
+  };
+
   class RaftNode : public std::enable_shared_from_this<RaftNode>
   {
   public:
@@ -146,6 +189,12 @@ namespace raftdemo
     NodeMetricsSnapshot GetMetricsSnapshot() const;
     // 只读诊断接口：返回当前已提交 membership / quorum 摘要，不提供任何可变入口。
     CommittedMembershipQuorumSummary GetCommittedMembershipQuorumSummary() const;
+    // AddLearner proposal path 目前只提供 leader admission / duplicate /
+    // pending-conflict 边界。它不会直接修改 voter set，也不会伪造 committed
+    // membership 成功；后续真实 membership log proposal/catch-up/promote
+    // 需要在此边界之上继续实现。
+    AddLearnerProposalResult ProposeAddLearner(
+        const AddLearnerProposalRequest &request);
     bool IsRunning() const;
 
   private:
@@ -195,6 +244,20 @@ namespace raftdemo
     {
       std::string fingerprint;
       ProposeResult result;
+    };
+
+    struct PendingAddLearnerProposal
+    {
+      std::string cluster_id;
+      std::string node_id;
+      std::int32_t candidate_raft_id{0};
+      std::string candidate_client_address;
+      std::string candidate_raft_address;
+      std::string candidate_incarnation_id;
+      std::uint64_t candidate_sequence{0};
+      std::uint64_t persistent_generation{0};
+      std::string data_dir_fingerprint;
+      std::uint64_t accepted_membership_epoch{0};
     };
 
     friend class Replicator;
@@ -324,6 +387,7 @@ namespace raftdemo
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
+    std::optional<PendingAddLearnerProposal> pending_add_learner_proposal_;
     std::unordered_map<std::string, std::shared_ptr<MetadataProposalTracker>>
         metadata_inflight_proposals_;
     std::unordered_map<std::string, CompletedMetadataProposal>

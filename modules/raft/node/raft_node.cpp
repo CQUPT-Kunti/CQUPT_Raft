@@ -151,6 +151,62 @@ namespace raftdemo
       return voter_count / 2 + 1;
     }
 
+    std::optional<std::string> ValidateAddLearnerProposalRequest(
+        const AddLearnerProposalRequest &request)
+    {
+      if (request.cluster_id.empty())
+      {
+        return "cluster_id is required";
+      }
+      if (request.node_id.empty())
+      {
+        return "node_id is required";
+      }
+      if (request.candidate_raft_id <= 0)
+      {
+        return "candidate_raft_id must be positive";
+      }
+      if (request.candidate_client_address.empty())
+      {
+        return "candidate_client_address is required";
+      }
+      if (request.candidate_raft_address.empty())
+      {
+        return "candidate_raft_address is required";
+      }
+      if (request.candidate_incarnation_id.empty())
+      {
+        return "candidate_incarnation_id is required";
+      }
+      if (request.candidate_sequence == 0)
+      {
+        return "candidate_sequence must be non-zero";
+      }
+      if (request.persistent_generation == 0)
+      {
+        return "persistent_generation must be non-zero";
+      }
+      if (request.data_dir_fingerprint.empty())
+      {
+        return "data_dir_fingerprint is required";
+      }
+      return std::nullopt;
+    }
+
+    bool HasCommittedVoterRaftId(const NodeConfig &config,
+                                 const std::int32_t candidate_raft_id)
+    {
+      if (candidate_raft_id == config.node_id)
+      {
+        return true;
+      }
+      return std::any_of(config.peers.begin(),
+                         config.peers.end(),
+                         [candidate_raft_id](const PeerConfig &peer) {
+                           return peer.node_id == candidate_raft_id;
+                         });
+    }
+
   } // namespace
 
   RaftNode::RaftNode(NodeConfig config)
@@ -554,6 +610,117 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return summary;
   }
 
+  AddLearnerProposalResult RaftNode::ProposeAddLearner(
+      const AddLearnerProposalRequest &request)
+  {
+    AddLearnerProposalResult result;
+    result.canonical_node_id = request.node_id;
+    result.assigned_raft_id = request.candidate_raft_id;
+
+    if (const auto validation_error = ValidateAddLearnerProposalRequest(request);
+        validation_error.has_value())
+    {
+      result.status = AddLearnerProposalStatus::kInvalidArgument;
+      result.message = *validation_error;
+      return result;
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    result.leader_id = leader_id_;
+    result.term = current_term_;
+    result.membership_epoch = commit_index_;
+
+    if (!running_.load())
+    {
+      result.status = AddLearnerProposalStatus::kNodeStopping;
+      result.message = "node is stopping";
+      return result;
+    }
+
+    if (role_ != Role::kLeader)
+    {
+      result.status = AddLearnerProposalStatus::kNotLeader;
+      result.message = "AddLearner authority belongs to the current leader";
+      return result;
+    }
+
+    result.leader_id = config_.node_id;
+
+    if (HasCommittedVoterRaftId(config_, request.candidate_raft_id))
+    {
+      result.status = AddLearnerProposalStatus::kRejected;
+      result.message = "candidate_raft_id already exists in committed voter set";
+      return result;
+    }
+
+    const auto is_same_pending = [&](const PendingAddLearnerProposal &pending) {
+      return pending.cluster_id == request.cluster_id &&
+             pending.node_id == request.node_id &&
+             pending.candidate_raft_id == request.candidate_raft_id &&
+             pending.candidate_client_address == request.candidate_client_address &&
+             pending.candidate_raft_address == request.candidate_raft_address &&
+             pending.candidate_incarnation_id == request.candidate_incarnation_id &&
+             pending.candidate_sequence == request.candidate_sequence &&
+             pending.persistent_generation == request.persistent_generation &&
+             pending.data_dir_fingerprint == request.data_dir_fingerprint;
+    };
+
+    const auto conflicts_with_pending = [&](const PendingAddLearnerProposal &pending) {
+      if (pending.cluster_id != request.cluster_id)
+      {
+        return false;
+      }
+      return pending.node_id == request.node_id ||
+             pending.candidate_raft_id == request.candidate_raft_id ||
+             pending.candidate_client_address == request.candidate_client_address ||
+             pending.candidate_raft_address == request.candidate_raft_address ||
+             pending.data_dir_fingerprint == request.data_dir_fingerprint;
+    };
+
+    if (pending_add_learner_proposal_.has_value())
+    {
+      const auto &pending = *pending_add_learner_proposal_;
+      result.membership_epoch = pending.accepted_membership_epoch;
+      if (is_same_pending(pending))
+      {
+        result.status = AddLearnerProposalStatus::kDuplicate;
+        result.message =
+            "duplicate AddLearner proposal for pending learner candidate";
+        return result;
+      }
+
+      if (conflicts_with_pending(pending))
+      {
+        result.status = AddLearnerProposalStatus::kRejected;
+        result.message =
+            "conflicting AddLearner proposal for learner candidate already pending";
+        return result;
+      }
+
+      result.status = AddLearnerProposalStatus::kPendingMembershipChange;
+      result.message = "pending AddLearner proposal already exists";
+      return result;
+    }
+
+    pending_add_learner_proposal_ = PendingAddLearnerProposal{
+        .cluster_id = request.cluster_id,
+        .node_id = request.node_id,
+        .candidate_raft_id = request.candidate_raft_id,
+        .candidate_client_address = request.candidate_client_address,
+        .candidate_raft_address = request.candidate_raft_address,
+        .candidate_incarnation_id = request.candidate_incarnation_id,
+        .candidate_sequence = request.candidate_sequence,
+        .persistent_generation = request.persistent_generation,
+        .data_dir_fingerprint = request.data_dir_fingerprint,
+        .accepted_membership_epoch = commit_index_,
+    };
+    result.status = AddLearnerProposalStatus::kAcceptedPendingCommit;
+    result.membership_epoch = commit_index_;
+    result.message =
+        "AddLearner proposal path admitted on leader; committed membership log proposal, learner catch-up and promote-to-voter remain unimplemented";
+    return result;
+  }
+
   std::string RaftNode::Describe() const
   {
     const NodeStatusSnapshot status = GetStatusSnapshot();
@@ -955,6 +1122,11 @@ void RaftNode::SendHeartbeats()
       heartbeat_timer_id_.reset();
     }
 
+    if (role_ != Role::kLeader)
+    {
+      pending_add_learner_proposal_.reset();
+    }
+
     ResetElectionTimerLocked();
 
     bool persist_ok = true;
@@ -987,6 +1159,7 @@ void RaftNode::SendHeartbeats()
     CancelElectionTimerLocked();
 
     const auto last_log_index = LastLogIndexLocked();
+    pending_add_learner_proposal_.reset();
     next_index_.clear();
     match_index_.clear();
     match_index_[config_.node_id] = last_log_index;

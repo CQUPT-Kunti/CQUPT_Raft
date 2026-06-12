@@ -20,29 +20,6 @@
 
 namespace raftdemo
 {
-  struct MetadataJoinPendingCandidate
-  {
-    std::string request_id;
-    std::string cluster_id;
-    std::string node_id;
-    std::int32_t candidate_raft_id{0};
-    std::string candidate_client_address;
-    std::string candidate_raft_address;
-    std::string candidate_incarnation_id;
-    std::uint64_t candidate_sequence{0};
-    std::uint64_t persistent_generation{0};
-    std::string data_dir_fingerprint;
-    raft::JoinMetadataCandidateStateHint local_state_hint{
-        raft::JOIN_METADATA_CANDIDATE_STATE_HINT_UNSPECIFIED};
-    std::uint64_t accepted_membership_epoch{0};
-  };
-
-  struct MetadataServiceImpl::JoinValidationState
-  {
-    std::mutex mu;
-    std::optional<MetadataJoinPendingCandidate> pending_candidate;
-  };
-
   namespace
   {
 
@@ -895,54 +872,68 @@ namespace raftdemo
       return std::nullopt;
     }
 
-    MetadataJoinPendingCandidate
-    MakePendingJoinCandidate(const raft::JoinMetadataClusterRequest &request,
-                             const std::uint64_t membership_epoch)
-    {
-      MetadataJoinPendingCandidate candidate;
-      candidate.request_id = request.request_id();
-      candidate.cluster_id = request.cluster_id();
-      candidate.node_id = request.node_id();
-      candidate.candidate_raft_id = request.candidate_raft_id();
-      candidate.candidate_client_address = request.candidate_client_address();
-      candidate.candidate_raft_address = request.candidate_raft_address();
-      candidate.candidate_incarnation_id = request.candidate_incarnation_id();
-      candidate.candidate_sequence = request.candidate_sequence();
-      candidate.persistent_generation = request.persistent_generation();
-      candidate.data_dir_fingerprint = request.data_dir_fingerprint();
-      candidate.local_state_hint = request.local_state_hint();
-      candidate.accepted_membership_epoch = membership_epoch;
-      return candidate;
-    }
-
-    bool IsSamePendingCandidate(
-        const MetadataJoinPendingCandidate &pending,
+    AddLearnerProposalRequest BuildAddLearnerProposalRequest(
         const raft::JoinMetadataClusterRequest &request)
     {
-      return pending.cluster_id == request.cluster_id() &&
-             pending.node_id == request.node_id() &&
-             pending.candidate_raft_id == request.candidate_raft_id() &&
-             pending.candidate_client_address == request.candidate_client_address() &&
-             pending.candidate_raft_address == request.candidate_raft_address() &&
-             pending.candidate_incarnation_id == request.candidate_incarnation_id() &&
-             pending.persistent_generation == request.persistent_generation() &&
-             pending.data_dir_fingerprint == request.data_dir_fingerprint() &&
-             pending.local_state_hint == request.local_state_hint();
+      AddLearnerProposalRequest proposal_request;
+      proposal_request.cluster_id = request.cluster_id();
+      proposal_request.node_id = request.node_id();
+      proposal_request.candidate_raft_id = request.candidate_raft_id();
+      proposal_request.candidate_client_address =
+          request.candidate_client_address();
+      proposal_request.candidate_raft_address =
+          request.candidate_raft_address();
+      proposal_request.candidate_incarnation_id =
+          request.candidate_incarnation_id();
+      proposal_request.candidate_sequence = request.candidate_sequence();
+      proposal_request.persistent_generation =
+          request.persistent_generation();
+      proposal_request.data_dir_fingerprint = request.data_dir_fingerprint();
+      return proposal_request;
     }
 
-    bool ConflictsWithPendingCandidate(
-        const MetadataJoinPendingCandidate &pending,
-        const raft::JoinMetadataClusterRequest &request)
+    raft::MetadataStatusCode ToJoinMetadataStatusCode(
+        const AddLearnerProposalResult &result)
     {
-      if (pending.cluster_id != request.cluster_id())
+      switch (result.status)
       {
-        return false;
+      case AddLearnerProposalStatus::kAcceptedPendingCommit:
+        return raft::METADATA_STATUS_CODE_OK;
+      case AddLearnerProposalStatus::kDuplicate:
+        return raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY;
+      case AddLearnerProposalStatus::kPendingMembershipChange:
+      case AddLearnerProposalStatus::kRejected:
+        return raft::METADATA_STATUS_CODE_STATE_CONFLICT;
+      case AddLearnerProposalStatus::kNotLeader:
+        return raft::METADATA_STATUS_CODE_NOT_LEADER;
+      case AddLearnerProposalStatus::kNodeStopping:
+        return raft::METADATA_STATUS_CODE_SERVICE_UNAVAILABLE;
+      case AddLearnerProposalStatus::kInvalidArgument:
+        return raft::METADATA_STATUS_CODE_INVALID_ARGUMENT;
       }
-      return pending.node_id == request.node_id() ||
-             pending.candidate_raft_id == request.candidate_raft_id() ||
-             pending.candidate_client_address == request.candidate_client_address() ||
-             pending.candidate_raft_address == request.candidate_raft_address() ||
-             pending.data_dir_fingerprint == request.data_dir_fingerprint();
+      return raft::METADATA_STATUS_CODE_INTERNAL_ERROR;
+    }
+
+    raft::JoinMetadataClusterDisposition ToJoinMetadataDisposition(
+        const AddLearnerProposalResult &result)
+    {
+      switch (result.status)
+      {
+      case AddLearnerProposalStatus::kAcceptedPendingCommit:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT;
+      case AddLearnerProposalStatus::kDuplicate:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE;
+      case AddLearnerProposalStatus::kPendingMembershipChange:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE;
+      case AddLearnerProposalStatus::kNotLeader:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER;
+      case AddLearnerProposalStatus::kInvalidArgument:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_INVALID_CANDIDATE;
+      case AddLearnerProposalStatus::kRejected:
+      case AddLearnerProposalStatus::kNodeStopping:
+      default:
+        return raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED;
+      }
     }
 
     grpc::ServerUnaryReactor *FinishJoinMetadataClusterResponse(
@@ -992,7 +983,7 @@ namespace raftdemo
   } // namespace
 
   MetadataServiceImpl::MetadataServiceImpl(RaftNode &node)
-      : node_(node), join_validation_state_(std::make_unique<JoinValidationState>())
+      : node_(node)
   {
   }
 
@@ -1630,61 +1621,17 @@ namespace raftdemo
           response);
     }
 
-    std::lock_guard<std::mutex> lock(join_validation_state_->mu);
-    if (join_validation_state_->pending_candidate.has_value())
-    {
-      const auto &pending = *join_validation_state_->pending_candidate;
-      if (IsSamePendingCandidate(pending, *request))
-      {
-        return FinishJoinMetadataClusterResponse(
-            context,
-            status,
-            quorum_summary,
-            *request,
-            raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY,
-            raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE,
-            "duplicate join request for pending candidate",
-            pending.accepted_membership_epoch,
-            response);
-      }
-
-      if (ConflictsWithPendingCandidate(pending, *request))
-      {
-        return FinishJoinMetadataClusterResponse(
-            context,
-            status,
-            quorum_summary,
-            *request,
-            raft::METADATA_STATUS_CODE_STATE_CONFLICT,
-            raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED,
-            "conflicting join request for candidate identity already pending",
-            pending.accepted_membership_epoch,
-            response);
-      }
-
-      return FinishJoinMetadataClusterResponse(
-          context,
-          status,
-          quorum_summary,
-          *request,
-          raft::METADATA_STATUS_CODE_STATE_CONFLICT,
-          raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE,
-          "pending membership change already exists",
-          pending.accepted_membership_epoch,
-          response);
-    }
-
-    join_validation_state_->pending_candidate =
-        MakePendingJoinCandidate(*request, quorum_summary.committed_log_index);
+    const AddLearnerProposalResult proposal_result =
+        node_.ProposeAddLearner(BuildAddLearnerProposalRequest(*request));
     return FinishJoinMetadataClusterResponse(
         context,
         status,
         quorum_summary,
         *request,
-        raft::METADATA_STATUS_CODE_OK,
-        raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT,
-        "join validation accepted on leader; no committed membership change performed",
-        quorum_summary.committed_log_index,
+        ToJoinMetadataStatusCode(proposal_result),
+        ToJoinMetadataDisposition(proposal_result),
+        proposal_result.message,
+        proposal_result.membership_epoch,
         response);
   }
 
