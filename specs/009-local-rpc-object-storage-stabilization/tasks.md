@@ -91,9 +91,9 @@
 
 **Independent Test**: 向一个 ViewNode 注册状态，另一个 ViewNode 通过 peer sync 可见；停一个 ViewNode 后 survivor 仍能 discovery。
 
-- [ ] T035 [P] [US2] Add dual ViewNode registry sync test in `tests/view_node_discovery_test.cpp` or a new `tests/view_node_peer_sync_test.cpp` (验证: `test_view_node_discovery`)
-- [ ] T036 [P] [US2] Add ViewNode failover discovery test in `tests/view_node_discovery_test.cpp` or integration test (验证: `test_view_node_discovery`, local RPC status)
-- [ ] T037 [P] [US2] Add peer snapshot old-incarnation rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
+- [x] T035 [P] [US2] Add dual ViewNode registry sync test in `tests/view_node_discovery_test.cpp` or a new `tests/view_node_peer_sync_test.cpp` (验证: `test_view_node_discovery`)
+- [x] T036 [P] [US2] Add ViewNode failover discovery test in `tests/view_node_discovery_test.cpp` or integration test (验证: `test_view_node_discovery`, local RPC status)
+- [X] T037 [P] [US2] Add peer snapshot old-incarnation rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
 - [ ] T038 [US2] Add peer ViewNode seed configuration parsing in `modules/cluster/cluster_config.cpp` and `modules/cluster/cluster_config.h` (验证: `cluster_config_test`)
 - [ ] T039 [US2] Add ViewNode peer sync client/server contract in `proto/view.proto` and adapters in `modules/view/view_service_impl.cpp` and `modules/view/view_client.cpp` (验证: `test_view_node_discovery`)
 - [ ] T040 [US2] Implement Push/Pull/Merge observed registry sync in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)

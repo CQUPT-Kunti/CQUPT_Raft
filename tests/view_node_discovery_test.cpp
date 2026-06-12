@@ -153,11 +153,7 @@ namespace
 
         ~RunningViewNodeDiscoveryService()
         {
-            if (server_ != nullptr)
-            {
-                server_->Shutdown();
-                server_->Wait();
-            }
+            Stop();
         }
 
         RunningViewNodeDiscoveryService(
@@ -178,6 +174,16 @@ namespace
         void set_now_unix_ms(const std::uint64_t now_unix_ms)
         {
             now_unix_ms_ = now_unix_ms;
+        }
+
+        void Stop()
+        {
+            if (server_ != nullptr)
+            {
+                server_->Shutdown();
+                server_->Wait();
+                server_.reset();
+            }
         }
 
         [[nodiscard]] viewdemo::HeartbeatNodeResult RefreshSelfNode(
@@ -260,6 +266,20 @@ namespace
         return nullptr;
     }
 
+    [[nodiscard]] const viewdemo::ViewNodeSnapshot *FindSnapshotByNodeId(
+        const std::vector<viewdemo::ViewNodeSnapshot> &snapshots,
+        const std::string &node_id)
+    {
+        for (const auto &snapshot : snapshots)
+        {
+            if (snapshot.node_id == node_id)
+            {
+                return &snapshot;
+            }
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] bool ContainsDiagnosticCode(
         const std::vector<ViewRegistryDiagnostic> &diagnostics,
         const ViewRegistryIssueCode code)
@@ -287,6 +307,68 @@ namespace
         EXPECT_EQ(snapshot.last_sequence, snapshot.observed_state.sequence);
         EXPECT_EQ(snapshot.last_seen_unix_ms,
                   snapshot.observed_state.observed_at_unix_ms);
+    }
+
+    [[nodiscard]] NodeRegistration RegistrationFromSnapshot(
+        const viewdemo::ViewNodeSnapshot &snapshot)
+    {
+        NodeRegistration registration;
+        registration.cluster_id = snapshot.cluster_id;
+        registration.node_id = snapshot.node_id;
+        registration.node_type = snapshot.node_type;
+        registration.endpoint = snapshot.endpoint;
+        registration.control_plane_endpoint = snapshot.control_plane_endpoint;
+        registration.data_plane_endpoint = snapshot.data_plane_endpoint;
+        registration.data_dir_fingerprint = snapshot.data_dir_fingerprint;
+        registration.observed_at_unix_ms =
+            snapshot.observed_state.observed_at_unix_ms;
+        registration.failure_domain = snapshot.failure_domain;
+        registration.health = snapshot.health;
+        registration.capacity = snapshot.capacity;
+        registration.load = snapshot.load;
+        registration.metadata = snapshot.metadata;
+        return registration;
+    }
+
+    void SyncSnapshotToPeerRegistry(ViewNodeRegistry *peer,
+                                    const viewdemo::ViewNodeSnapshot &snapshot,
+                                    const std::string &request_prefix)
+    {
+        ASSERT_NE(peer, nullptr);
+
+        RegisterNodeRequest register_request;
+        register_request.request_id =
+            request_prefix + "-register-" + snapshot.node_id;
+        register_request.registration = RegistrationFromSnapshot(snapshot);
+        const auto register_result = peer->RegisterNode(register_request);
+        ASSERT_TRUE(register_result.summary.status == ViewRegistryStatusCode::kOk ||
+                    register_result.summary.status ==
+                        ViewRegistryStatusCode::kIdempotentReplay);
+        ASSERT_TRUE(register_result.snapshot.has_value());
+
+        if (snapshot.observed_state.sequence == 0U)
+        {
+            return;
+        }
+
+        HeartbeatNodeRequest heartbeat_request;
+        heartbeat_request.request_id =
+            request_prefix + "-heartbeat-" + snapshot.node_id + "-" +
+            std::to_string(snapshot.observed_state.sequence);
+        heartbeat_request.cluster_id = snapshot.cluster_id;
+        heartbeat_request.node_id = snapshot.node_id;
+        heartbeat_request.node_type = snapshot.node_type;
+        heartbeat_request.incarnation_id = snapshot.observed_state.incarnation_id;
+        heartbeat_request.sequence = snapshot.observed_state.sequence;
+        heartbeat_request.observation = RegistrationFromSnapshot(snapshot);
+
+        const auto heartbeat_result = peer->HeartbeatNode(heartbeat_request);
+        ASSERT_TRUE(heartbeat_result.summary.status == ViewRegistryStatusCode::kOk ||
+                    heartbeat_result.summary.status ==
+                        ViewRegistryStatusCode::kIdempotentReplay ||
+                    heartbeat_result.summary.status ==
+                        ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(heartbeat_result.snapshot.has_value());
     }
 
     TEST(ViewNodeDiscoveryTest, RegisterStoresNodeFactsAndLookupOrClusterViewSorted)
@@ -1452,6 +1534,267 @@ namespace
         EXPECT_EQ(lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
     }
 
+    TEST(ViewNodeDiscoveryTest, DualViewRegistrySyncPropagatesObservedStateToPeer)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        ViewNodeRegistry registry_a(config);
+        ViewNodeRegistry registry_b(config);
+
+        auto storage = MakeRegistration(ViewNodeType::kStorage,
+                                        "store-peer-sync-1",
+                                        9712,
+                                        100);
+        storage.failure_domain.zone = "zone-peer-a";
+        storage.failure_domain.rack = "rack-peer-1";
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+        storage.load.active_reads = 7;
+        storage.load.active_writes = 5;
+        storage.load.queued_ops = 11;
+        RegisterNodeOrAssert(&registry_a,
+                             MakeRegisterRequest(storage,
+                                                "register-store-peer-sync-1"));
+
+        const std::string incarnation_id =
+            "store-peer-sync-1:boot:220000000:61:1";
+
+        auto sequence_7 = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                               "store-peer-sync-1",
+                                               9712,
+                                               7,
+                                               220);
+        sequence_7.incarnation_id = incarnation_id;
+        sequence_7.observation.health.health = ViewNodeHealth::kDegraded;
+        sequence_7.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kMedium;
+        const auto sequence_7_result = registry_a.HeartbeatNode(sequence_7);
+        ASSERT_EQ(sequence_7_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(sequence_7_result.applied);
+        ASSERT_TRUE(sequence_7_result.snapshot.has_value());
+        ExpectObservedStateFacts(*sequence_7_result.snapshot,
+                                 incarnation_id,
+                                 7U,
+                                 220U);
+
+        auto sequence_8 = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                               "store-peer-sync-1",
+                                               9712,
+                                               8,
+                                               230);
+        sequence_8.incarnation_id = incarnation_id;
+        sequence_8.observation.health.health = ViewNodeHealth::kHealthy;
+        sequence_8.observation.health.disk_pressure = ViewNodeDiskPressure::kLow;
+        sequence_8.observation.load.active_reads = 9;
+        sequence_8.observation.load.active_writes = 6;
+        sequence_8.observation.load.queued_ops = 13;
+        const auto sequence_8_result = registry_a.HeartbeatNode(sequence_8);
+        ASSERT_EQ(sequence_8_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(sequence_8_result.applied);
+        ASSERT_TRUE(sequence_8_result.snapshot.has_value());
+        ExpectObservedStateFacts(*sequence_8_result.snapshot,
+                                 incarnation_id,
+                                 8U,
+                                 230U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-peer-sync-source";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+        const auto cluster_view_a = registry_a.GetClusterView(cluster_request, 230);
+        ASSERT_EQ(cluster_view_a.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_view_a.snapshot.storage_nodes.size(), 1U);
+        const auto &latest_snapshot = cluster_view_a.snapshot.storage_nodes[0];
+        ExpectObservedStateFacts(latest_snapshot, incarnation_id, 8U, 230U);
+        EXPECT_EQ(latest_snapshot.health.health, ViewNodeHealth::kHealthy);
+        EXPECT_EQ(latest_snapshot.endpoint, storage.endpoint);
+
+        // 这里显式做 test-level snapshot replay，模拟后续 peer sync 的
+        // observed-state 传播；本任务不实现生产网络同步逻辑。
+        SyncSnapshotToPeerRegistry(&registry_b,
+                                   latest_snapshot,
+                                   "peer-sync-latest");
+
+        DiscoverStorageRequest discover_request;
+        discover_request.request_id = "discover-peer-synced-storage";
+        discover_request.cluster_id = kClusterId;
+        discover_request.live_only = true;
+        discover_request.require_writable = false;
+        const auto discover_result = registry_b.DiscoverStorage(discover_request,
+                                                                230);
+        ASSERT_EQ(discover_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(discover_result.storage_nodes.size(), 1U);
+        ExpectObservedStateFacts(discover_result.storage_nodes[0],
+                                 incarnation_id,
+                                 8U,
+                                 230U);
+        EXPECT_EQ(discover_result.storage_nodes[0].node_id, "store-peer-sync-1");
+        EXPECT_EQ(discover_result.storage_nodes[0].endpoint, storage.endpoint);
+        EXPECT_EQ(discover_result.storage_nodes[0].health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(discover_result.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+
+        SyncSnapshotToPeerRegistry(&registry_b,
+                                   *sequence_7_result.snapshot,
+                                   "peer-sync-stale-replay");
+
+        const auto lookup_after_stale_replay =
+            registry_b.LookupNode(kClusterId, "store-peer-sync-1", 999);
+        ASSERT_EQ(lookup_after_stale_replay.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup_after_stale_replay.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup_after_stale_replay.snapshot,
+                                 incarnation_id,
+                                 8U,
+                                 230U);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->load.active_reads, 9U);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->load.active_writes, 6U);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->load.queued_ops, 13U);
+        EXPECT_EQ(lookup_after_stale_replay.snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         PeerSnapshotOldIncarnationCannotOverrideLocalNewLiveState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(100);
+        config.suspect_timeout = std::chrono::milliseconds(200);
+        config.dead_timeout = std::chrono::milliseconds(300);
+        ViewNodeRegistry source_registry(config);
+        ViewNodeRegistry peer_registry(config);
+
+        auto storage = MakeRegistration(ViewNodeType::kStorage,
+                                        "store-peer-old-incarnation-1",
+                                        9713,
+                                        100);
+        storage.failure_domain.zone = "zone-peer-b";
+        storage.failure_domain.rack = "rack-peer-2";
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+
+        RegisterNodeOrAssert(&source_registry,
+                             MakeRegisterRequest(
+                                 storage,
+                                 "register-source-store-peer-old-incarnation-1"));
+        RegisterNodeOrAssert(&peer_registry,
+                             MakeRegisterRequest(
+                                 storage,
+                                 "register-peer-store-peer-old-incarnation-1"));
+
+        const std::string old_incarnation =
+            "store-peer-old-incarnation-1:boot:100000000:71:1";
+        const std::string current_incarnation =
+            "store-peer-old-incarnation-1:boot:220000000:72:1";
+
+        auto current_live = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                 "store-peer-old-incarnation-1",
+                                                 9713,
+                                                 1,
+                                                 220);
+        current_live.incarnation_id = current_incarnation;
+        current_live.observation.health.health = ViewNodeHealth::kHealthy;
+        current_live.observation.health.disk_pressure = ViewNodeDiskPressure::kLow;
+        current_live.observation.load.active_reads = 9;
+        current_live.observation.load.active_writes = 6;
+        current_live.observation.load.queued_ops = 13;
+        const auto current_live_result = peer_registry.HeartbeatNode(current_live);
+        ASSERT_EQ(current_live_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_live_result.applied);
+        ASSERT_TRUE(current_live_result.snapshot.has_value());
+        ExpectObservedStateFacts(*current_live_result.snapshot,
+                                 current_incarnation,
+                                 1U,
+                                 220U);
+        EXPECT_EQ(current_live_result.snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(current_live_result.snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+
+        auto old_peer_observation = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                         "store-peer-old-incarnation-1",
+                                                         9713,
+                                                         99,
+                                                         240);
+        old_peer_observation.incarnation_id = old_incarnation;
+        old_peer_observation.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        old_peer_observation.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kFull;
+        old_peer_observation.observation.load.active_reads = 1;
+        old_peer_observation.observation.load.active_writes = 1;
+        old_peer_observation.observation.load.queued_ops = 1;
+        const auto old_peer_result =
+            source_registry.HeartbeatNode(old_peer_observation);
+        ASSERT_EQ(old_peer_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(old_peer_result.applied);
+        ASSERT_TRUE(old_peer_result.snapshot.has_value());
+        ExpectObservedStateFacts(*old_peer_result.snapshot,
+                                 old_incarnation,
+                                 99U,
+                                 240U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-peer-old-incarnation-source";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto source_cluster_view =
+            source_registry.GetClusterView(cluster_request, 600);
+        ASSERT_EQ(source_cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(source_cluster_view.snapshot.storage_nodes.size(), 1U);
+        const auto &old_peer_snapshot = source_cluster_view.snapshot.storage_nodes[0];
+        ExpectObservedStateFacts(old_peer_snapshot, old_incarnation, 99U, 240U);
+        EXPECT_EQ(old_peer_snapshot.liveness, ViewNodeLivenessState::kDead);
+        EXPECT_EQ(old_peer_snapshot.health.health, ViewNodeHealth::kUnavailable);
+        EXPECT_GT(old_peer_snapshot.last_seen_unix_ms,
+                  current_live_result.snapshot->last_seen_unix_ms);
+
+        // 当前还没有专门的 peer snapshot import API；测试通过现有
+        // snapshot replay helper 约束后续 T039/T040 必须复用同一套
+        // incarnation/sequence 排序，不能让旧 peer snapshot 覆盖本地新状态。
+        SyncSnapshotToPeerRegistry(&peer_registry,
+                                   old_peer_snapshot,
+                                   "peer-sync-old-incarnation");
+
+        const auto lookup_after_old_peer_snapshot =
+            peer_registry.LookupNode(kClusterId,
+                                     "store-peer-old-incarnation-1",
+                                     260);
+        ASSERT_EQ(lookup_after_old_peer_snapshot.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup_after_old_peer_snapshot.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup_after_old_peer_snapshot.snapshot,
+                                 current_incarnation,
+                                 1U,
+                                 220U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->incarnation_id,
+                  current_incarnation);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->last_sequence, 1U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->last_seen_unix_ms,
+                  220U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.active_reads, 9U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.active_writes, 6U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.queued_ops, 13U);
+        EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+    }
+
     TEST(ViewNodeDiscoveryTest,
          IntegrationClusterViewExposesSelfRefreshSequenceLivenessDiagnostics)
     {
@@ -2011,5 +2354,174 @@ namespace
         ASSERT_FALSE(cluster_result.result.snapshot.diagnostics.empty());
         EXPECT_EQ(cluster_result.result.snapshot.diagnostics[0].code,
                   ViewRegistryIssueCode::kLivenessExcluded);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationFailoverDiscoveryUsesSurvivorObservedRegistryState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        RunningViewNodeDiscoveryService primary(config, 180);
+        RunningViewNodeDiscoveryService survivor(config, 180);
+
+        const auto register_on =
+            [](RunningViewNodeDiscoveryService &service,
+               NodeRegistration registration,
+               const std::string &request_id) {
+                const auto result = service.client().RegisterNode(
+                    MakeRegisterRequest(std::move(registration), request_id));
+                ASSERT_TRUE(result.transport_ok());
+                ASSERT_EQ(result.result.summary.status, ViewRegistryStatusCode::kOk);
+                ASSERT_TRUE(result.result.created);
+            };
+
+        auto primary_view =
+            MakeRegistration(ViewNodeType::kView, "view-failover-primary-1", 9721, 100);
+        auto survivor_view =
+            MakeRegistration(ViewNodeType::kView, "view-failover-survivor-1", 9722, 100);
+        auto metadata =
+            MakeRegistration(ViewNodeType::kMetadata, "meta-failover-1", 9723, 180);
+        metadata.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            9,
+            15,
+            MetadataLeaderHint{.node_id = "meta-failover-1",
+                               .raft_id = std::optional<std::int32_t>{3},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 15,
+                               .observed_at_unix_ms = 180});
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-failover-1", 9724, 181);
+        storage.failure_domain.zone = "zone-f";
+        storage.failure_domain.rack = "rack-2";
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+        storage.health.health = ViewNodeHealth::kHealthy;
+
+        register_on(primary,
+                    primary_view,
+                    "integration-register-primary-view-on-primary");
+        register_on(primary,
+                    survivor_view,
+                    "integration-register-survivor-view-on-primary");
+        register_on(primary,
+                    metadata,
+                    "integration-register-meta-on-primary");
+        register_on(primary,
+                    storage,
+                    "integration-register-store-on-primary");
+
+        register_on(survivor,
+                    primary_view,
+                    "integration-register-primary-view-on-survivor");
+        register_on(survivor,
+                    survivor_view,
+                    "integration-register-survivor-view-on-survivor");
+        register_on(survivor,
+                    metadata,
+                    "integration-register-meta-on-survivor");
+        register_on(survivor,
+                    storage,
+                    "integration-register-store-on-survivor");
+
+        const auto refresh_result = survivor.RefreshSelfNode(
+            MakeSelfRefreshRequest("view-failover-survivor-1",
+                                   9722,
+                                   "view-failover-survivor-1:boot:180000000:17:1",
+                                   7,
+                                   180));
+        ASSERT_EQ(refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(refresh_result.applied);
+
+        primary.Stop();
+        survivor.set_now_unix_ms(191);
+
+        DiscoverMetadataRequest metadata_request;
+        metadata_request.request_id = "integration-failover-discover-metadata";
+        metadata_request.cluster_id = kClusterId;
+        metadata_request.prefer_leader = true;
+        metadata_request.live_only = true;
+
+        const auto metadata_result =
+            survivor.client().DiscoverMetadata(metadata_request);
+        ASSERT_TRUE(metadata_result.transport_ok());
+        ASSERT_EQ(metadata_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(metadata_result.result.metadata_nodes.size(), 1U);
+        EXPECT_EQ(metadata_result.result.metadata_nodes[0].node_id,
+                  "meta-failover-1");
+        ASSERT_TRUE(metadata_result.result.metadata_nodes[0].metadata.has_value());
+        EXPECT_EQ(
+            metadata_result.result.metadata_nodes[0].metadata->membership_state,
+            MetadataMembershipObservedState::kVoter);
+        ASSERT_TRUE(metadata_result.result.leader_hint.has_value());
+        EXPECT_EQ(metadata_result.result.leader_hint->node_id,
+                  "meta-failover-1");
+
+        DiscoverStorageRequest storage_request;
+        storage_request.request_id = "integration-failover-discover-storage";
+        storage_request.cluster_id = kClusterId;
+        storage_request.live_only = true;
+        storage_request.minimum_available_capacity_bytes = 8'192;
+        storage_request.require_writable = true;
+        storage_request.zone = "zone-f";
+        storage_request.rack = "rack-2";
+
+        const auto storage_result = survivor.client().DiscoverStorage(storage_request);
+        ASSERT_TRUE(storage_result.transport_ok());
+        ASSERT_EQ(storage_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(storage_result.result.storage_nodes.size(), 1U);
+        EXPECT_EQ(storage_result.result.storage_nodes[0].node_id,
+                  "store-failover-1");
+        EXPECT_EQ(storage_result.result.storage_nodes[0].liveness,
+                  ViewNodeLivenessState::kLive);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "integration-failover-cluster-view";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto cluster_result = survivor.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 2U);
+        ASSERT_EQ(cluster_result.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+
+        const auto *dead_primary_view = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.view_nodes,
+            "view-failover-primary-1");
+        ASSERT_NE(dead_primary_view, nullptr);
+        EXPECT_EQ(dead_primary_view->liveness, ViewNodeLivenessState::kDead);
+        EXPECT_EQ(dead_primary_view->last_seen_unix_ms, 100U);
+        EXPECT_EQ(dead_primary_view->last_sequence, 0U);
+
+        const auto *live_survivor_view = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.view_nodes,
+            "view-failover-survivor-1");
+        ASSERT_NE(live_survivor_view, nullptr);
+        ExpectObservedStateFacts(*live_survivor_view,
+                                 "view-failover-survivor-1:boot:180000000:17:1",
+                                 7U,
+                                 180U);
+        EXPECT_EQ(live_survivor_view->liveness, ViewNodeLivenessState::kLive);
+
+        const auto *metadata_snapshot = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.metadata_nodes,
+            "meta-failover-1");
+        ASSERT_NE(metadata_snapshot, nullptr);
+        EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kLive);
+
+        const auto *storage_snapshot = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.storage_nodes,
+            "store-failover-1");
+        ASSERT_NE(storage_snapshot, nullptr);
+        EXPECT_EQ(storage_snapshot->liveness, ViewNodeLivenessState::kLive);
     }
 } // namespace
