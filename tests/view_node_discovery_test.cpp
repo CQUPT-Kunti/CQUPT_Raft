@@ -12,6 +12,7 @@
 #include "view/view_client.h"
 #include "view/view_registry.h"
 #include "view/view_service_impl.h"
+#include "store/placement/placement_manager.h"
 
 namespace
 {
@@ -267,6 +268,22 @@ namespace
             }
         }
         return nullptr;
+    }
+
+    [[nodiscard]] bool ContainsPlacementExclusionReason(
+        const storedemo::PlacementDecisionResult &result,
+        const std::string &node_id,
+        const std::string &reason_fragment)
+    {
+        for (const auto &exclusion : result.decision.excluded_nodes)
+        {
+            if (exclusion.node_id == node_id &&
+                exclusion.reason.find(reason_fragment) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     [[nodiscard]] const viewdemo::ViewNodeSnapshot *FindSnapshotByNodeId(
@@ -884,6 +901,141 @@ namespace
         EXPECT_TRUE(saw_capacity);
         EXPECT_TRUE(saw_health);
         EXPECT_TRUE(saw_liveness);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         PlacementCandidateDiscoveryConsumesMergedObservedStorageState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+        ViewNodeRegistry registry(config);
+
+        auto merged =
+            MakeRegistration(ViewNodeType::kStorage, "store-placement-1", 9511, 180);
+        merged.capacity.total_capacity_bytes = 16'384;
+        merged.capacity.used_capacity_bytes = 4'096;
+        merged.capacity.available_capacity_bytes = 12'288;
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(merged,
+                                                 "register-store-placement-1"));
+
+        const std::string current_incarnation =
+            "store-placement-1:boot:220000000:121:1";
+        auto current_live = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                 "store-placement-1",
+                                                 9511,
+                                                 7,
+                                                 220);
+        current_live.incarnation_id = current_incarnation;
+        current_live.observation.health.health = ViewNodeHealth::kHealthy;
+        current_live.observation.health.disk_pressure = ViewNodeDiskPressure::kLow;
+        current_live.observation.capacity.total_capacity_bytes = 16'384;
+        current_live.observation.capacity.used_capacity_bytes = 2'048;
+        current_live.observation.capacity.available_capacity_bytes = 14'336;
+        current_live.observation.load.active_reads = 2;
+        current_live.observation.load.active_writes = 1;
+        current_live.observation.load.queued_ops = 0;
+        const auto current_live_result = registry.HeartbeatNode(current_live);
+        ASSERT_EQ(current_live_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_live_result.applied);
+
+        const std::string old_incarnation =
+            "store-placement-1:boot:100000000:120:1";
+        auto old_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                  "store-placement-1",
+                                                  9511,
+                                                  99,
+                                                  240);
+        old_heartbeat.incarnation_id = old_incarnation;
+        old_heartbeat.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        old_heartbeat.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kFull;
+        old_heartbeat.observation.capacity.total_capacity_bytes = 16'384;
+        old_heartbeat.observation.capacity.used_capacity_bytes = 16'384;
+        old_heartbeat.observation.capacity.available_capacity_bytes = 0;
+        old_heartbeat.observation.load.active_reads = 9;
+        old_heartbeat.observation.load.active_writes = 9;
+        old_heartbeat.observation.load.queued_ops = 9;
+        const auto stale_result = registry.HeartbeatNode(old_heartbeat);
+        ASSERT_EQ(stale_result.summary.status,
+                  ViewRegistryStatusCode::kStaleIgnored);
+        ASSERT_TRUE(stale_result.stale_ignored);
+
+        auto read_only =
+            MakeRegistration(ViewNodeType::kStorage, "store-placement-2", 9512, 220);
+        read_only.capacity.total_capacity_bytes = 8'192;
+        read_only.capacity.used_capacity_bytes = 1'024;
+        read_only.capacity.available_capacity_bytes = 7'168;
+        read_only.health.health = ViewNodeHealth::kReadOnly;
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(read_only,
+                                                 "register-store-placement-2"));
+
+        auto high_pressure =
+            MakeRegistration(ViewNodeType::kStorage, "store-placement-3", 9513, 220);
+        high_pressure.capacity.total_capacity_bytes = 8'192;
+        high_pressure.capacity.used_capacity_bytes = 1'024;
+        high_pressure.capacity.available_capacity_bytes = 7'168;
+        high_pressure.health.health = ViewNodeHealth::kHealthy;
+        high_pressure.health.disk_pressure = ViewNodeDiskPressure::kHigh;
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(high_pressure,
+                                                 "register-store-placement-3"));
+
+        auto dead =
+            MakeRegistration(ViewNodeType::kStorage, "store-placement-4", 9514, 100);
+        dead.capacity.total_capacity_bytes = 8'192;
+        dead.capacity.used_capacity_bytes = 1'024;
+        dead.capacity.available_capacity_bytes = 7'168;
+        RegisterNodeOrAssert(&registry,
+                             MakeRegisterRequest(dead,
+                                                 "register-store-placement-4"));
+
+        storedemo::PlacementManager placement_manager;
+        storedemo::PlacementRequest placement_request;
+        placement_request.identity.object_id = "obj-placement-view-1";
+        placement_request.identity.version = 1;
+        placement_request.identity.chunk_index = 0;
+        placement_request.chunk_size_bytes = 256;
+        placement_request.policy.replica_count = 1;
+        placement_request.policy.minimum_successful_writes = 1;
+        placement_request.decision_epoch = 51;
+
+        DiscoverStorageRequest discover_request;
+        discover_request.request_id = "discover-placement-candidates";
+        discover_request.cluster_id = kClusterId;
+        discover_request.live_only = false;
+        discover_request.require_writable = false;
+
+        const auto placement_result = placement_manager.SelectPlacement(
+            placement_request,
+            registry,
+            discover_request,
+            220);
+        ASSERT_TRUE(placement_result.ok()) << placement_result.error_detail;
+        ASSERT_EQ(placement_result.decision.replica_nodes.size(), 1U);
+        EXPECT_EQ(placement_result.decision.replica_nodes[0].node_id,
+                  "store-placement-1");
+        EXPECT_EQ(placement_result.decision.replica_nodes[0].health,
+                  storedemo::StorageNodeHealth::kHealthy);
+        EXPECT_EQ(
+            placement_result.decision.replica_nodes[0].available_capacity_bytes,
+            14'336U);
+        EXPECT_TRUE(ContainsPlacementExclusionReason(
+            placement_result,
+            "store-placement-2",
+            "ReadOnly"));
+        EXPECT_TRUE(ContainsPlacementExclusionReason(
+            placement_result,
+            "store-placement-3",
+            "disk pressure is too high"));
+        EXPECT_TRUE(ContainsPlacementExclusionReason(
+            placement_result,
+            "store-placement-4",
+            "not live: Dead"));
     }
 
     TEST(ViewNodeDiscoveryTest, ClusterViewCanExcludeDeadNodesAndEmitWarnings)

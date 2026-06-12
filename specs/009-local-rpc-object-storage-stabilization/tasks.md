@@ -116,7 +116,7 @@
 - [x] T048 [P] [US3] Add dynamic StorageNode placement integration test in `tests/integrated_object_storage_e2e_test.cpp` (验证: `integrated_object_storage_e2e`)
 - [x] T049 [US3] Extend StorageNode heartbeat payload with capacity, load, disk pressure, health, writable status, incarnation, and sequence in `modules/store/node/storage_node_service.cpp` and `modules/store/node/storage_node_client.cpp` (验证: `storage_heartbeat_registry`)
 - [x] T050 [US3] Make StorageNode app register/heartbeat to ViewNode seed list or first available ViewNode in `apps/storage_node_app.cpp` (验证: `storage_heartbeat_registry`, local RPC startup)
-- [ ] T051 [US3] Ensure ViewNode storage observed state merge feeds placement candidate discovery in `modules/view/view_registry.cpp` and `modules/store/placement/placement_manager.cpp` (验证: `integrated_object_storage_e2e`)
+- [x] T051 [US3] Ensure ViewNode storage observed state merge feeds placement candidate discovery in `modules/view/view_registry.cpp` and `modules/store/placement/placement_manager.cpp` (验证: `integrated_object_storage_e2e`)
 - [ ] T052 [US3] Preserve existing transfer path in `modules/store/transfer/object_transfer.cpp` while allowing future placement to include dynamic StorageNode (验证: `integrated_object_storage_e2e`)
 - [ ] T053 [US3] Add no-rebalance invariant diagnostics for committed object manifest in `modules/store/transfer/metadata_transfer_client.cpp` or metadata integration path (验证: `integrated_object_storage_e2e`)
 - [ ] T054 [US3] Record dynamic StorageNode Linux validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-06-storage-dynamic-join.md` (验证: `storage_heartbeat_registry`, `integrated_object_storage_e2e`)

@@ -3,6 +3,7 @@
 #include "support/metadata_test_utils.h"
 #include "cluster/cluster_config.h"
 #include "store/placement/placement_manager.h"
+#include "view/view_registry.h"
 
 #include "metadata.pb.h"
 #include "store/common/store_types.h"
@@ -335,45 +336,79 @@ namespace
         return command;
     }
 
-    storedemo::ViewNodeBackedStorageNodeSnapshot MakeLiveViewStorageSnapshot(
+    viewdemo::NodeRegistration MakeViewStorageRegistration(
+        std::string cluster_id,
         std::string node_id,
-        std::string endpoint,
-        const std::uint64_t available_capacity_bytes,
-        std::string zone,
+        const std::uint16_t port,
         const std::uint64_t observed_at_unix_ms,
-        const std::uint64_t source_sequence)
+        const std::uint64_t total_capacity_bytes,
+        const std::uint64_t used_capacity_bytes,
+        const std::uint64_t available_capacity_bytes,
+        std::string zone)
     {
-        storedemo::ViewNodeBackedStorageNodeSnapshot snapshot;
-        snapshot.candidate.node_id = std::move(node_id);
-        snapshot.candidate.endpoint = std::move(endpoint);
-        snapshot.candidate.health = storedemo::StorageNodeHealth::kHealthy;
-        snapshot.candidate.disk_pressure = storedemo::StorageNodeDiskPressure::kLow;
-        snapshot.candidate.total_capacity_bytes =
-            available_capacity_bytes + (64ULL * 1024ULL * 1024ULL);
-        snapshot.candidate.used_capacity_bytes = 32ULL * 1024ULL * 1024ULL;
-        snapshot.candidate.available_capacity_bytes = available_capacity_bytes;
-        snapshot.candidate.zone = std::move(zone);
-        snapshot.liveness = storedemo::ViewNodeStorageLiveness::kLive;
-        snapshot.last_seen_unix_ms = observed_at_unix_ms;
-        snapshot.observed_at_unix_ms = observed_at_unix_ms;
-        snapshot.source_sequence = source_sequence;
-        snapshot.has_complete_facts = true;
-        snapshot.has_valid_capacity_facts = true;
-        return snapshot;
+        viewdemo::NodeRegistration registration;
+        registration.cluster_id = std::move(cluster_id);
+        registration.node_id = std::move(node_id);
+        registration.node_type = viewdemo::ViewNodeType::kStorage;
+        registration.endpoint = "127.0.0.1:" + std::to_string(port);
+        registration.control_plane_endpoint =
+            "127.0.0.1:" + std::to_string(static_cast<std::uint32_t>(port) + 1000);
+        registration.data_plane_endpoint =
+            "127.0.0.1:" + std::to_string(static_cast<std::uint32_t>(port) + 2000);
+        registration.data_dir_fingerprint =
+            "fingerprint-" + registration.node_id;
+        registration.observed_at_unix_ms = observed_at_unix_ms;
+        registration.failure_domain.zone = std::move(zone);
+        registration.failure_domain.rack = "rack-a";
+        registration.health.health = viewdemo::ViewNodeHealth::kHealthy;
+        registration.health.disk_pressure = viewdemo::ViewNodeDiskPressure::kLow;
+        registration.capacity.total_capacity_bytes = total_capacity_bytes;
+        registration.capacity.used_capacity_bytes = used_capacity_bytes;
+        registration.capacity.available_capacity_bytes =
+            available_capacity_bytes;
+        registration.capacity.chunk_count = 8;
+        return registration;
     }
 
-    storedemo::ViewNodeBackedStorageNodeSnapshotResult
-    MakeViewBackedStorageSnapshotResult(
-        std::vector<storedemo::ViewNodeBackedStorageNodeSnapshot> nodes,
-        const std::uint64_t snapshot_epoch,
-        const std::uint64_t generated_at_unix_ms)
+    viewdemo::RegisterNodeRequest MakeViewRegisterRequest(
+        viewdemo::NodeRegistration registration,
+        std::string request_id)
     {
-        storedemo::ViewNodeBackedStorageNodeSnapshotResult result;
-        result.status = storedemo::StorageNodeStatusCode::kOk;
-        result.snapshot_epoch = snapshot_epoch;
-        result.generated_at_unix_ms = generated_at_unix_ms;
-        result.nodes = std::move(nodes);
-        return result;
+        viewdemo::RegisterNodeRequest request;
+        request.request_id = std::move(request_id);
+        request.registration = std::move(registration);
+        return request;
+    }
+
+    viewdemo::HeartbeatNodeRequest MakeViewStorageHeartbeatRequest(
+        std::string cluster_id,
+        std::string node_id,
+        const std::uint16_t port,
+        std::string incarnation_id,
+        const std::uint64_t sequence,
+        const std::uint64_t observed_at_unix_ms,
+        const std::uint64_t total_capacity_bytes,
+        const std::uint64_t used_capacity_bytes,
+        const std::uint64_t available_capacity_bytes,
+        std::string zone)
+    {
+        viewdemo::HeartbeatNodeRequest request;
+        request.request_id =
+            "heartbeat-" + node_id + "-" + std::to_string(sequence);
+        request.cluster_id = std::move(cluster_id);
+        request.node_id = std::move(node_id);
+        request.node_type = viewdemo::ViewNodeType::kStorage;
+        request.incarnation_id = std::move(incarnation_id);
+        request.sequence = sequence;
+        request.observation = MakeViewStorageRegistration(request.cluster_id,
+                                                          request.node_id,
+                                                          port,
+                                                          observed_at_unix_ms,
+                                                          total_capacity_bytes,
+                                                          used_capacity_bytes,
+                                                          available_capacity_bytes,
+                                                          std::move(zone));
+        return request;
     }
 
     storedemo::PlacementRequest MakePlacementRequest(
@@ -1097,6 +1132,7 @@ TEST(IntegratedObjectStorageE2ETest,
 TEST(IntegratedObjectStorageE2ETest,
      DynamicStorageNodePlacementSeesNewNodeWithoutRewritingCommittedManifest)
 {
+    const std::string cluster_id = "cluster-t048";
     raftdemo::MetadataStateMachine machine;
     std::uint64_t index = 1;
 
@@ -1128,22 +1164,40 @@ TEST(IntegratedObjectStorageE2ETest,
     ExpectChunkRefsEqual(original_manifest,
                          MakeDynamicStoragePlacementLegacyChunks());
 
+    viewdemo::ViewNodeRegistry registry;
+    const auto register_store_a = registry.RegisterNode(
+        MakeViewRegisterRequest(
+            MakeViewStorageRegistration(cluster_id,
+                                        "store-a",
+                                        7501,
+                                        1717555401000ULL,
+                                        256ULL * 1024ULL * 1024ULL,
+                                        64ULL * 1024ULL * 1024ULL,
+                                        192ULL * 1024ULL * 1024ULL,
+                                        "zone-a"),
+            "register-store-a"));
+    ASSERT_EQ(register_store_a.summary.status,
+              viewdemo::ViewRegistryStatusCode::kOk);
+    const auto register_store_b = registry.RegisterNode(
+        MakeViewRegisterRequest(
+            MakeViewStorageRegistration(cluster_id,
+                                        "store-b",
+                                        7502,
+                                        1717555401000ULL,
+                                        224ULL * 1024ULL * 1024ULL,
+                                        64ULL * 1024ULL * 1024ULL,
+                                        160ULL * 1024ULL * 1024ULL,
+                                        "zone-b"),
+            "register-store-b"));
+    ASSERT_EQ(register_store_b.summary.status,
+              viewdemo::ViewRegistryStatusCode::kOk);
+
     storedemo::PlacementManager placement_manager;
-    const auto initial_view_snapshot = MakeViewBackedStorageSnapshotResult(
-        {MakeLiveViewStorageSnapshot("store-a",
-                                     "127.0.0.1:7501",
-                                     192ULL * 1024ULL * 1024ULL,
-                                     "zone-a",
-                                     1717555401000ULL,
-                                     1),
-         MakeLiveViewStorageSnapshot("store-b",
-                                     "127.0.0.1:7502",
-                                     160ULL * 1024ULL * 1024ULL,
-                                     "zone-b",
-                                     1717555401000ULL,
-                                     1)},
-        1,
-        1717555401000ULL);
+    viewdemo::DiscoverStorageRequest discover_request;
+    discover_request.request_id = "discover-storage-before-join";
+    discover_request.cluster_id = cluster_id;
+    discover_request.live_only = false;
+    discover_request.require_writable = false;
 
     const auto placement_before_join = placement_manager.SelectPlacement(
         MakePlacementRequest("obj-t048-future-before-join",
@@ -1153,24 +1207,44 @@ TEST(IntegratedObjectStorageE2ETest,
                              2,
                              2,
                              101),
-        initial_view_snapshot);
+        registry,
+        discover_request,
+        1717555401000ULL);
     ASSERT_TRUE(placement_before_join.ok()) << placement_before_join.error_detail;
     ASSERT_EQ(placement_before_join.decision.replica_nodes.size(), 2U);
     EXPECT_TRUE(DecisionContainsReplicaNode(placement_before_join, "store-a"));
     EXPECT_TRUE(DecisionContainsReplicaNode(placement_before_join, "store-b"));
     EXPECT_FALSE(DecisionContainsReplicaNode(placement_before_join, "store-c"));
 
-    auto expanded_view_snapshot = initial_view_snapshot;
-    expanded_view_snapshot.snapshot_epoch = 2;
-    expanded_view_snapshot.generated_at_unix_ms = 1717555402000ULL;
-    expanded_view_snapshot.nodes.push_back(
-        MakeLiveViewStorageSnapshot("store-c",
-                                    "127.0.0.1:7503",
-                                    128ULL * 1024ULL * 1024ULL,
-                                    "zone-c",
-                                    1717555402000ULL,
-                                    2));
+    const auto register_store_c = registry.RegisterNode(
+        MakeViewRegisterRequest(
+            MakeViewStorageRegistration(cluster_id,
+                                        "store-c",
+                                        7503,
+                                        1717555402000ULL,
+                                        192ULL * 1024ULL * 1024ULL,
+                                        64ULL * 1024ULL * 1024ULL,
+                                        128ULL * 1024ULL * 1024ULL,
+                                        "zone-c"),
+            "register-store-c"));
+    ASSERT_EQ(register_store_c.summary.status,
+              viewdemo::ViewRegistryStatusCode::kOk);
+    const auto heartbeat_store_c = registry.HeartbeatNode(
+        MakeViewStorageHeartbeatRequest(cluster_id,
+                                        "store-c",
+                                        7503,
+                                        "store-c:boot:1717555402000000000:201:1",
+                                        1,
+                                        1717555402000ULL,
+                                        192ULL * 1024ULL * 1024ULL,
+                                        64ULL * 1024ULL * 1024ULL,
+                                        128ULL * 1024ULL * 1024ULL,
+                                        "zone-c"));
+    ASSERT_EQ(heartbeat_store_c.summary.status,
+              viewdemo::ViewRegistryStatusCode::kOk);
+    ASSERT_TRUE(heartbeat_store_c.applied);
 
+    discover_request.request_id = "discover-storage-after-join";
     const auto placement_after_join = placement_manager.SelectPlacement(
         MakePlacementRequest("obj-t048-future-after-join",
                              1,
@@ -1179,7 +1253,9 @@ TEST(IntegratedObjectStorageE2ETest,
                              3,
                              2,
                              102),
-        expanded_view_snapshot);
+        registry,
+        discover_request,
+        1717555402000ULL);
     ASSERT_TRUE(placement_after_join.ok()) << placement_after_join.error_detail;
     ASSERT_EQ(placement_after_join.decision.replica_nodes.size(), 3U);
     EXPECT_TRUE(DecisionContainsReplicaNode(placement_after_join, "store-a"));

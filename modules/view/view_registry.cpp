@@ -936,10 +936,11 @@ namespace viewdemo
 
         bool IsWritableStorageNode(const ViewNodeSnapshot &snapshot)
         {
-            return snapshot.health.health != ViewNodeHealth::kUnavailable &&
-                   snapshot.health.health != ViewNodeHealth::kReadOnly &&
-                   snapshot.health.health != ViewNodeHealth::kDraining &&
+            return snapshot.health.health == ViewNodeHealth::kHealthy &&
+                   snapshot.health.disk_pressure != ViewNodeDiskPressure::kHigh &&
                    snapshot.health.disk_pressure != ViewNodeDiskPressure::kFull &&
+                   snapshot.capacity.total_capacity_bytes > 0 &&
+                   snapshot.capacity.available_capacity_bytes > 0 &&
                    !snapshot.load.write_admission_overloaded;
         }
 
