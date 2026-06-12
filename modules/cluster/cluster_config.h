@@ -103,6 +103,7 @@ namespace clusterdemo
         // 允许为空；后续可由配置生成器或 identity 流程补全稳定 node_id。
         std::optional<ClusterNodeId> node_id;
         std::string endpoint;
+        std::vector<std::string> peer_seeds;
         std::filesystem::path data_dir;
     };
 
@@ -237,6 +238,7 @@ namespace clusterdemo
         ClusterNodeType node_type{ClusterNodeType::kUnknown};
         ClusterNodeId node_id;
         std::string endpoint;
+        std::vector<std::string> view_peer_seed_endpoints;
         std::filesystem::path data_dir;
         std::optional<std::filesystem::path> snapshot_dir;
         std::optional<std::int32_t> raft_id;

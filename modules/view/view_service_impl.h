@@ -69,6 +69,17 @@ namespace viewdemo
             const ::view::GetClusterViewRequest *request,
             ::view::GetClusterViewResponse *response) override;
 
+        // Pull/Push 只交换 observed registry state，不授予 membership authority。
+        ::grpc::Status PullPeerViewSnapshot(
+            ::grpc::ServerContext *context,
+            const ::view::PullPeerViewSnapshotRequest *request,
+            ::view::PullPeerViewSnapshotResponse *response) override;
+
+        ::grpc::Status PushPeerViewSnapshot(
+            ::grpc::ServerContext *context,
+            const ::view::PushPeerViewSnapshotRequest *request,
+            ::view::PushPeerViewSnapshotResponse *response) override;
+
         [[nodiscard]] const std::shared_ptr<ViewNodeRegistry> &registry() const;
         [[nodiscard]] const ViewNodeServiceImplConfig &config() const;
 

@@ -15,6 +15,7 @@
 
 - `node_identity.*` 负责本地持久身份 `node.identity` 的路径解析、load/store/load-or-create、期望身份匹配校验、冲突/损坏 fail-fast、durability publish 边界。
 - `cluster_config.*` 负责 cluster json 的生成、加载、按 `role + node_id` 精确解析、初始 voter/learner membership 校验和初始 quorum 诊断。
+- `cluster_config.*` 现在额外负责 ViewNode `peer_seeds` 配置的表达、JSON 解析、字段校验和按 ViewNode 解析后的 peer seed 暴露；它只提供 peer endpoint 输入，不实现 peer sync 网络逻辑。
 - `tests/node_identity_test.cpp` 当前已覆盖首次创建、重启复用、mismatch、corrupt、Metadata `raft_id` 边界。
 - `tests/cluster_config_test.cpp` 当前已覆盖初始 voter 奇数约束、learner/voter 归属、role resolution、quorum helper。
 
@@ -22,13 +23,14 @@
 
 - `data_dir` / `identity_file`。
 - `ExpectedNodeIdentity` 中的 `cluster_id`、`node_id`、`node_type`、可选 `raft_id`、可选 `source`。
-- cluster config 中的 `view_nodes`、`metadata_nodes`、`storage_nodes`、`initial_raft_membership`。
+- cluster config 中的 `view_nodes`、`view_nodes[].peer_seeds`、`metadata_nodes`、`storage_nodes`、`initial_raft_membership`。
 
 输出：
 
 - 本地 durable `NodeIdentity`。
 - 基于已验证 `NodeIdentity` 生成的 process incarnation / boot epoch 边界。
 - 按 role 解析后的单节点配置。
+- 对 ViewNode 额外暴露的 peer ViewNode seed endpoint 列表。
 - 仅供配置校验和诊断使用的初始 quorum / membership 摘要。
 
 边界：
@@ -43,11 +45,13 @@
 - Metadata bootstrap voter 可以从 bootstrap config 固定出 `node_id + raft_id + initial_role`。
 - Metadata dynamic join 只能创建 joining/candidate identity；本地文件不能让自己直接成为 voter。
 - `cluster_config.initial_raft_membership` 只描述初始 membership 边界，不是运行时 membership change 入口。
+- `view_nodes[].peer_seeds` 只是 ViewNode peer sync 的静态 seed 输入；它不是 Raft peer 列表，不参与 voter/learner membership authority，也不能替代服务发现的最终一致同步逻辑。
 
 容易误用点：
 
 - 把“本地已有 `node.identity`”误写成“已经加入 Metadata/Raft voter 集合”。
 - 把 `cluster_config` 的初始 voter/learner 配置误写成后续 dynamic join / promote 的 authority。
+- 把 `view_nodes[].peer_seeds` 误写成 Metadata/Raft peers，或者把它当成强一致配置中心输入。
 - 把 per-process incarnation / sequence 持久化成长期身份的一部分，导致重启后无法区分旧进程与新进程。
 - 把 process incarnation / boot epoch 当成 Raft membership authority、`membership_state` 或 committed membership 变更入口。
 - 把 old-format / 缺少新必填字段的 `node.identity` 当成可自动补齐或自动升级的输入。

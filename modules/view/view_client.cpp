@@ -93,6 +93,25 @@ namespace viewdemo
             }
         }
 
+        view::ViewNodeLivenessState ToProtoLiveness(
+            const ViewNodeLivenessState liveness)
+        {
+            switch (liveness)
+            {
+            case ViewNodeLivenessState::kLive:
+                return view::VIEW_NODE_LIVENESS_STATE_LIVE;
+            case ViewNodeLivenessState::kStale:
+                return view::VIEW_NODE_LIVENESS_STATE_STALE;
+            case ViewNodeLivenessState::kSuspect:
+                return view::VIEW_NODE_LIVENESS_STATE_SUSPECT;
+            case ViewNodeLivenessState::kDead:
+                return view::VIEW_NODE_LIVENESS_STATE_DEAD;
+            case ViewNodeLivenessState::kUnknown:
+            default:
+                return view::VIEW_NODE_LIVENESS_STATE_UNSPECIFIED;
+            }
+        }
+
         view::ViewNodeHealth ToProtoHealth(const ViewNodeHealth health)
         {
             switch (health)
@@ -584,6 +603,59 @@ namespace viewdemo
             }
         }
 
+        void FillProtoSnapshot(const ViewNodeSnapshot &snapshot,
+                               view::ViewNodeSnapshot *proto)
+        {
+            if (proto == nullptr)
+            {
+                return;
+            }
+
+            proto->set_cluster_id(snapshot.cluster_id);
+            proto->set_node_id(snapshot.node_id);
+            proto->set_node_type(ToProtoNodeType(snapshot.node_type));
+            proto->set_incarnation_id(snapshot.incarnation_id);
+            proto->set_endpoint(snapshot.endpoint);
+            proto->set_control_plane_endpoint(snapshot.control_plane_endpoint);
+            proto->set_data_plane_endpoint(snapshot.data_plane_endpoint);
+            proto->set_data_dir_fingerprint(snapshot.data_dir_fingerprint);
+            proto->set_registered_at_unix_ms(snapshot.registered_at_unix_ms);
+            proto->set_last_seen_unix_ms(snapshot.last_seen_unix_ms);
+            proto->set_last_sequence(snapshot.last_sequence);
+            proto->set_liveness(ToProtoLiveness(snapshot.liveness));
+            proto->mutable_failure_domain()->set_zone(
+                snapshot.failure_domain.zone);
+            proto->mutable_failure_domain()->set_rack(
+                snapshot.failure_domain.rack);
+            proto->mutable_health()->set_health(
+                ToProtoHealth(snapshot.health.health));
+            proto->mutable_health()->set_disk_pressure(
+                ToProtoDiskPressure(snapshot.health.disk_pressure));
+            proto->mutable_health()->set_io_error_count(
+                snapshot.health.io_error_count);
+            proto->mutable_capacity()->set_total_capacity_bytes(
+                snapshot.capacity.total_capacity_bytes);
+            proto->mutable_capacity()->set_used_capacity_bytes(
+                snapshot.capacity.used_capacity_bytes);
+            proto->mutable_capacity()->set_available_capacity_bytes(
+                snapshot.capacity.available_capacity_bytes);
+            proto->mutable_capacity()->set_chunk_count(
+                snapshot.capacity.chunk_count);
+            proto->mutable_load()->set_active_reads(snapshot.load.active_reads);
+            proto->mutable_load()->set_active_writes(
+                snapshot.load.active_writes);
+            proto->mutable_load()->set_queued_ops(snapshot.load.queued_ops);
+            proto->mutable_load()->set_write_admission_overloaded(
+                snapshot.load.write_admission_overloaded);
+            proto->mutable_load()->set_read_admission_overloaded(
+                snapshot.load.read_admission_overloaded);
+            if (snapshot.metadata.has_value())
+            {
+                FillProtoMetadataObservation(*snapshot.metadata,
+                                             proto->mutable_metadata());
+            }
+        }
+
         ViewNodeSnapshot FromProtoSnapshot(const view::ViewNodeSnapshot &proto)
         {
             ViewNodeSnapshot snapshot;
@@ -828,6 +900,108 @@ namespace viewdemo
                                       result->summary.request_id,
                                       result->summary.cluster_id,
                                       result->summary.node_id);
+        }
+
+        void FillProtoPeerSyncSnapshot(const ViewPeerSyncSnapshot &snapshot,
+                                       view::ViewPeerSyncSnapshot *proto)
+        {
+            if (proto == nullptr)
+            {
+                return;
+            }
+
+            proto->set_cluster_id(snapshot.cluster_id);
+            proto->set_generated_at_unix_ms(snapshot.generated_at_unix_ms);
+            for (const auto &view_node : snapshot.view_nodes)
+            {
+                FillProtoSnapshot(view_node, proto->add_view_nodes());
+            }
+            for (const auto &metadata_node : snapshot.metadata_nodes)
+            {
+                FillProtoSnapshot(metadata_node, proto->add_metadata_nodes());
+            }
+            for (const auto &storage_node : snapshot.storage_nodes)
+            {
+                FillProtoSnapshot(storage_node, proto->add_storage_nodes());
+            }
+            if (snapshot.leader_hint.has_value())
+            {
+                FillProtoLeaderHint(*snapshot.leader_hint,
+                                    proto->mutable_leader_hint());
+            }
+        }
+
+        ViewPeerSyncSnapshot FromProtoPeerSyncSnapshot(
+            const view::ViewPeerSyncSnapshot &proto)
+        {
+            ViewPeerSyncSnapshot snapshot;
+            snapshot.cluster_id = proto.cluster_id();
+            snapshot.generated_at_unix_ms = proto.generated_at_unix_ms();
+            snapshot.view_nodes.reserve(
+                static_cast<std::size_t>(proto.view_nodes_size()));
+            snapshot.metadata_nodes.reserve(
+                static_cast<std::size_t>(proto.metadata_nodes_size()));
+            snapshot.storage_nodes.reserve(
+                static_cast<std::size_t>(proto.storage_nodes_size()));
+            for (const auto &view_node : proto.view_nodes())
+            {
+                snapshot.view_nodes.push_back(FromProtoSnapshot(view_node));
+            }
+            for (const auto &metadata_node : proto.metadata_nodes())
+            {
+                snapshot.metadata_nodes.push_back(
+                    FromProtoSnapshot(metadata_node));
+            }
+            for (const auto &storage_node : proto.storage_nodes())
+            {
+                snapshot.storage_nodes.push_back(
+                    FromProtoSnapshot(storage_node));
+            }
+            if (proto.has_leader_hint())
+            {
+                snapshot.leader_hint = FromProtoLeaderHint(proto.leader_hint());
+            }
+            return snapshot;
+        }
+
+        void FillPullPeerViewSnapshotResponse(
+            const view::PullPeerViewSnapshotResponse &proto,
+            PullPeerViewSnapshotResult *result)
+        {
+            if (result == nullptr)
+            {
+                return;
+            }
+            FillResponseSummary(proto.summary(), &result->summary);
+            if (proto.has_snapshot())
+            {
+                result->snapshot = FromProtoPeerSyncSnapshot(proto.snapshot());
+            }
+            result->diagnostics = WarningsToDiagnostics(proto.warnings(),
+                                                        result->summary.request_id,
+                                                        result->summary.cluster_id,
+                                                        result->summary.node_id);
+        }
+
+        void FillPushPeerViewSnapshotResponse(
+            const view::PushPeerViewSnapshotResponse &proto,
+            PushPeerViewSnapshotResult *result)
+        {
+            if (result == nullptr)
+            {
+                return;
+            }
+            FillResponseSummary(proto.summary(), &result->summary);
+            result->received_node_count = proto.received_node_count();
+            result->accepted_node_count = proto.accepted_node_count();
+            result->applied_node_count = proto.applied_node_count();
+            result->stale_ignored_node_count =
+                proto.stale_ignored_node_count();
+            result->conflict_node_count = proto.conflict_node_count();
+            result->diagnostics = WarningsToDiagnostics(proto.warnings(),
+                                                        result->summary.request_id,
+                                                        result->summary.cluster_id,
+                                                        result->summary.node_id);
         }
     } // namespace
 
@@ -1079,6 +1253,94 @@ namespace viewdemo
         }
 
         FillClusterViewResponse(proto_response, &call_result.result);
+        call_result.rpc.retryable =
+            IsRetryableRegistryStatus(call_result.result.summary.status);
+        return call_result;
+    }
+
+    ViewNodeClientPullPeerViewSnapshotResult
+    ViewNodeClient::PullPeerViewSnapshot(const PullPeerViewSnapshotRequest &request,
+                                         ViewNodeClientCallOptions options)
+    {
+        const auto effective_timeout =
+            ResolveTimeout(config_.peer_sync_timeout, options);
+        const bool wait_for_ready =
+            ResolveWaitForReady(config_.wait_for_ready, options);
+
+        ViewNodeClientPullPeerViewSnapshotResult call_result;
+        call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                             request.cluster_id,
+                                             {},
+                                             target_endpoint_,
+                                             effective_timeout,
+                                             wait_for_ready);
+
+        grpc::ClientContext context;
+        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+        view::PullPeerViewSnapshotRequest proto_request;
+        proto_request.set_request_id(request.request_id);
+        proto_request.set_cluster_id(request.cluster_id);
+        proto_request.set_include_dead_nodes(request.include_dead_nodes);
+        proto_request.set_include_warnings(request.include_warnings);
+
+        view::PullPeerViewSnapshotResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->PullPeerViewSnapshot(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+            FillTransportFailureSummary(call_result.rpc, &call_result.result.summary);
+            call_result.result.diagnostics.push_back(
+                MakeTransportDiagnostic(call_result.rpc));
+            return call_result;
+        }
+
+        FillPullPeerViewSnapshotResponse(proto_response, &call_result.result);
+        call_result.rpc.retryable =
+            IsRetryableRegistryStatus(call_result.result.summary.status);
+        return call_result;
+    }
+
+    ViewNodeClientPushPeerViewSnapshotResult
+    ViewNodeClient::PushPeerViewSnapshot(const PushPeerViewSnapshotRequest &request,
+                                         ViewNodeClientCallOptions options)
+    {
+        const auto effective_timeout =
+            ResolveTimeout(config_.peer_sync_timeout, options);
+        const bool wait_for_ready =
+            ResolveWaitForReady(config_.wait_for_ready, options);
+
+        ViewNodeClientPushPeerViewSnapshotResult call_result;
+        call_result.rpc = MakeRpcDiagnostics(request.request_id,
+                                             request.cluster_id,
+                                             {},
+                                             target_endpoint_,
+                                             effective_timeout,
+                                             wait_for_ready);
+
+        grpc::ClientContext context;
+        ApplyRpcOptions(effective_timeout, wait_for_ready, &context);
+
+        view::PushPeerViewSnapshotRequest proto_request;
+        proto_request.set_request_id(request.request_id);
+        proto_request.set_cluster_id(request.cluster_id);
+        FillProtoPeerSyncSnapshot(request.snapshot,
+                                  proto_request.mutable_snapshot());
+
+        view::PushPeerViewSnapshotResponse proto_response;
+        const grpc::Status grpc_status =
+            stub_->PushPeerViewSnapshot(&context, proto_request, &proto_response);
+        if (!grpc_status.ok())
+        {
+            FillRpcFailureDiagnostics(grpc_status, &call_result.rpc);
+            FillTransportFailureSummary(call_result.rpc, &call_result.result.summary);
+            call_result.result.diagnostics.push_back(
+                MakeTransportDiagnostic(call_result.rpc));
+            return call_result;
+        }
+
+        FillPushPeerViewSnapshotResponse(proto_response, &call_result.result);
         call_result.rpc.retryable =
             IsRetryableRegistryStatus(call_result.result.summary.status);
         return call_result;

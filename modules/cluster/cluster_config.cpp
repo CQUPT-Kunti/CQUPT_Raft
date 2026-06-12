@@ -1118,6 +1118,30 @@ namespace clusterdemo
             return ExpectString(*value, key);
         }
 
+        [[nodiscard]] std::vector<std::string> OptionalStringArrayField(
+            const JsonValue::Object &object,
+            const std::string_view key)
+        {
+            const JsonValue *value = FindObjectField(object, key);
+            if (value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(value->storage))
+            {
+                return {};
+            }
+
+            const JsonValue::Array &array = ExpectArray(*value, key);
+            std::vector<std::string> strings;
+            strings.reserve(array.size());
+            for (std::size_t index = 0; index < array.size(); ++index)
+            {
+                strings.push_back(
+                    ExpectString(array[index],
+                                 std::string(key) + "[" +
+                                     std::to_string(index) + "]"));
+            }
+            return strings;
+        }
+
         [[nodiscard]] ClusterChecksumAlgorithm ParseChecksumAlgorithm(
             const std::string &value)
         {
@@ -1170,6 +1194,7 @@ namespace clusterdemo
                     .endpoint = ExpectString(
                         RequireObjectField(node, "endpoint", "view_node"),
                         "view_node.endpoint"),
+                    .peer_seeds = OptionalStringArrayField(node, "peer_seeds"),
                     .data_dir = std::filesystem::path(ExpectString(
                         RequireObjectField(node, "data_dir", "view_node"),
                         "view_node.data_dir")),
@@ -1376,6 +1401,7 @@ namespace clusterdemo
         std::unordered_set<std::string> seen_endpoints;
         std::unordered_set<std::string> seen_paths;
         std::unordered_set<std::int32_t> seen_raft_ids;
+        std::unordered_set<std::string> configured_view_endpoints;
 
         for (std::size_t index = 0; index < config.view_nodes.size(); ++index)
         {
@@ -1419,6 +1445,7 @@ namespace clusterdemo
             }
             else
             {
+                configured_view_endpoints.insert(node.endpoint);
                 RegisterUniqueValue(&result,
                                     &seen_endpoints,
                                     node.endpoint,
@@ -1452,6 +1479,69 @@ namespace clusterdemo
                                     node.node_id.value_or(""),
                                     node.endpoint,
                                     node.data_dir);
+            }
+        }
+
+        for (std::size_t index = 0; index < config.view_nodes.size(); ++index)
+        {
+            const ViewNodeConfig &node = config.view_nodes[index];
+            const std::string field_prefix =
+                "view_nodes[" + std::to_string(index) + "]";
+            std::unordered_set<std::string> seen_peer_seeds;
+
+            for (std::size_t peer_index = 0; peer_index < node.peer_seeds.size();
+                 ++peer_index)
+            {
+                const std::string &peer_seed = node.peer_seeds[peer_index];
+                const std::string field_path =
+                    field_prefix + ".peer_seeds[" + std::to_string(peer_index) + "]";
+
+                if (!ParseEndpoint(peer_seed, nullptr, nullptr))
+                {
+                    AppendIssue(&result,
+                                ClusterConfigIssueCode::kInvalidEndpoint,
+                                field_path,
+                                "peer seed must use host:port format with port in 1..65535",
+                                ClusterNodeType::kView,
+                                node.node_id.value_or(""),
+                                peer_seed);
+                    continue;
+                }
+
+                if (!seen_peer_seeds.insert(peer_seed).second)
+                {
+                    AppendIssue(&result,
+                                ClusterConfigIssueCode::kDuplicateEndpoint,
+                                field_path,
+                                "peer seed endpoint must not be duplicated within one ViewNode peer seed list",
+                                ClusterNodeType::kView,
+                                node.node_id.value_or(""),
+                                peer_seed);
+                }
+
+                if (peer_seed == node.endpoint)
+                {
+                    AppendIssue(&result,
+                                ClusterConfigIssueCode::kIdentityConfigMismatch,
+                                field_path,
+                                "peer seed must not point to the same ViewNode endpoint",
+                                ClusterNodeType::kView,
+                                node.node_id.value_or(""),
+                                peer_seed);
+                    continue;
+                }
+
+                if (configured_view_endpoints.find(peer_seed) ==
+                    configured_view_endpoints.end())
+                {
+                    AppendIssue(&result,
+                                ClusterConfigIssueCode::kInvalidEndpoint,
+                                field_path,
+                                "peer seed must match another configured ViewNode endpoint",
+                                ClusterNodeType::kView,
+                                node.node_id.value_or(""),
+                                peer_seed);
+                }
             }
         }
 
@@ -2001,6 +2091,7 @@ namespace clusterdemo
             config.view_nodes.push_back(ViewNodeConfig{
                 .node_id = assignment->node_id,
                 .endpoint = assignment->endpoint,
+                .peer_seeds = {},
                 .data_dir = MakeRoleDataDir(request.base_dir,
                                             "view",
                                             assignment->node_id),
@@ -2156,6 +2247,7 @@ namespace clusterdemo
                         .node_type = ClusterNodeType::kView,
                         .node_id = *node.node_id,
                         .endpoint = node.endpoint,
+                        .view_peer_seed_endpoints = node.peer_seeds,
                         .data_dir = node.data_dir,
                         .snapshot_dir = std::nullopt,
                         .raft_id = std::nullopt,
@@ -2177,6 +2269,7 @@ namespace clusterdemo
                         .node_type = ClusterNodeType::kMetadata,
                         .node_id = node.node_id,
                         .endpoint = node.endpoint,
+                        .view_peer_seed_endpoints = {},
                         .data_dir = node.data_dir,
                         .snapshot_dir = node.snapshot_dir,
                         .raft_id = node.raft_id,
@@ -2198,6 +2291,7 @@ namespace clusterdemo
                         .node_type = ClusterNodeType::kStorage,
                         .node_id = *node.node_id,
                         .endpoint = node.endpoint,
+                        .view_peer_seed_endpoints = {},
                         .data_dir = node.data_dir,
                         .snapshot_dir = std::nullopt,
                         .raft_id = std::nullopt,
@@ -2395,6 +2489,17 @@ namespace clusterdemo
                 oss << "      \"node_id\": null,\n";
             }
             oss << "      \"endpoint\": " << JsonString(node.endpoint) << ",\n";
+            oss << "      \"peer_seeds\": [";
+            for (std::size_t peer_index = 0; peer_index < node.peer_seeds.size();
+                 ++peer_index)
+            {
+                if (peer_index != 0)
+                {
+                    oss << ", ";
+                }
+                oss << JsonString(node.peer_seeds[peer_index]);
+            }
+            oss << "],\n";
             oss << "      \"data_dir\": " << JsonPath(node.data_dir) << "\n";
             oss << "    }";
             if (index + 1 != config.view_nodes.size())

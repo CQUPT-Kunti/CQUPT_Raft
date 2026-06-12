@@ -25,6 +25,8 @@ namespace
     using viewdemo::MetadataNodeObservation;
     using viewdemo::MetadataRaftObservedRole;
     using viewdemo::NodeRegistration;
+    using viewdemo::PullPeerViewSnapshotRequest;
+    using viewdemo::PushPeerViewSnapshotRequest;
     using viewdemo::RegisterNodeRequest;
     using viewdemo::ViewNodeDiskPressure;
     using viewdemo::ViewNodeHealth;
@@ -147,6 +149,7 @@ namespace
                     .heartbeat_timeout = std::chrono::seconds(5),
                     .discovery_timeout = std::chrono::seconds(5),
                     .cluster_view_timeout = std::chrono::seconds(5),
+                    .peer_sync_timeout = std::chrono::seconds(5),
                     .wait_for_ready = true,
                 });
         }
@@ -1792,6 +1795,301 @@ namespace
         EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.active_writes, 6U);
         EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.queued_ops, 13U);
         EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationPeerSyncRpcExportsAndImportsObservedState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        RunningViewNodeDiscoveryService source(config, 230);
+        RunningViewNodeDiscoveryService peer(config, 230);
+
+        auto source_view = MakeRegistration(ViewNodeType::kView,
+                                            "view-peer-rpc-source-1",
+                                            9725,
+                                            100);
+        auto metadata = MakeRegistration(ViewNodeType::kMetadata,
+                                         "meta-peer-rpc-1",
+                                         9726,
+                                         220);
+        metadata.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kLearner,
+            12,
+            18,
+            MetadataLeaderHint{.node_id = "meta-peer-rpc-1",
+                               .raft_id = std::optional<std::int32_t>{5},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 18,
+                               .observed_at_unix_ms = 220});
+
+        auto storage = MakeRegistration(ViewNodeType::kStorage,
+                                        "store-peer-rpc-1",
+                                        9727,
+                                        225);
+        storage.failure_domain.zone = "zone-peer-rpc";
+        storage.failure_domain.rack = "rack-peer-rpc";
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+        storage.health.health = ViewNodeHealth::kHealthy;
+
+        auto register_result = source.client().RegisterNode(
+            MakeRegisterRequest(source_view,
+                                "integration-register-view-peer-rpc-source-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        register_result = source.client().RegisterNode(
+            MakeRegisterRequest(metadata, "integration-register-meta-peer-rpc-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        register_result = source.client().RegisterNode(
+            MakeRegisterRequest(storage, "integration-register-store-peer-rpc-1"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        const auto refresh_result = source.RefreshSelfNode(
+            MakeSelfRefreshRequest("view-peer-rpc-source-1",
+                                   9725,
+                                   "view-peer-rpc-source-1:boot:230000000:41:1",
+                                   3,
+                                   230));
+        ASSERT_EQ(refresh_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(refresh_result.applied);
+
+        auto storage_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                      "store-peer-rpc-1",
+                                                      9727,
+                                                      8,
+                                                      230);
+        storage_heartbeat.incarnation_id =
+            "store-peer-rpc-1:boot:230000000:42:1";
+        storage_heartbeat.observation.health.health = ViewNodeHealth::kDegraded;
+        storage_heartbeat.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kMedium;
+        storage_heartbeat.observation.load.active_reads = 9;
+        storage_heartbeat.observation.load.active_writes = 6;
+        storage_heartbeat.observation.load.queued_ops = 13;
+        const auto heartbeat_result =
+            source.client().HeartbeatNode(storage_heartbeat);
+        ASSERT_TRUE(heartbeat_result.transport_ok());
+        ASSERT_EQ(heartbeat_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(heartbeat_result.result.applied);
+
+        PullPeerViewSnapshotRequest pull_request;
+        pull_request.request_id = "integration-pull-peer-view-snapshot";
+        pull_request.cluster_id = kClusterId;
+        pull_request.include_dead_nodes = true;
+        pull_request.include_warnings = true;
+
+        const auto pull_result = source.client().PullPeerViewSnapshot(pull_request);
+        ASSERT_TRUE(pull_result.transport_ok());
+        ASSERT_EQ(pull_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(pull_result.result.snapshot.cluster_id, kClusterId);
+        EXPECT_EQ(pull_result.result.snapshot.generated_at_unix_ms, 230U);
+        ASSERT_EQ(pull_result.result.snapshot.view_nodes.size(), 1U);
+        ASSERT_EQ(pull_result.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(pull_result.result.snapshot.storage_nodes.size(), 1U);
+        EXPECT_TRUE(ContainsDiagnosticCode(pull_result.result.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
+        ExpectObservedStateFacts(pull_result.result.snapshot.view_nodes[0],
+                                 "view-peer-rpc-source-1:boot:230000000:41:1",
+                                 3U,
+                                 230U);
+        ASSERT_TRUE(
+            pull_result.result.snapshot.metadata_nodes[0].metadata.has_value());
+        EXPECT_EQ(
+            pull_result.result.snapshot.metadata_nodes[0].metadata->membership_state,
+            MetadataMembershipObservedState::kLearner);
+        ExpectObservedStateFacts(pull_result.result.snapshot.storage_nodes[0],
+                                 "store-peer-rpc-1:boot:230000000:42:1",
+                                 8U,
+                                 230U);
+
+        PushPeerViewSnapshotRequest push_request;
+        push_request.request_id = "integration-push-peer-view-snapshot";
+        push_request.cluster_id = kClusterId;
+        push_request.snapshot = pull_result.result.snapshot;
+
+        const auto push_result = peer.client().PushPeerViewSnapshot(push_request);
+        ASSERT_TRUE(push_result.transport_ok());
+        ASSERT_EQ(push_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(push_result.result.received_node_count, 3U);
+        EXPECT_EQ(push_result.result.accepted_node_count, 3U);
+        EXPECT_EQ(push_result.result.conflict_node_count, 0U);
+        EXPECT_TRUE(ContainsDiagnosticCode(push_result.result.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "integration-cluster-view-peer-rpc-imported";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto cluster_result = peer.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.view_nodes.size(), 1U);
+        ASSERT_EQ(cluster_result.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+
+        const auto *view_snapshot = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.view_nodes,
+            "view-peer-rpc-source-1");
+        ASSERT_NE(view_snapshot, nullptr);
+        ExpectObservedStateFacts(*view_snapshot,
+                                 "view-peer-rpc-source-1:boot:230000000:41:1",
+                                 3U,
+                                 230U);
+
+        const auto *metadata_snapshot = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.metadata_nodes,
+            "meta-peer-rpc-1");
+        ASSERT_NE(metadata_snapshot, nullptr);
+        ASSERT_TRUE(metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(metadata_snapshot->metadata->membership_state,
+                  MetadataMembershipObservedState::kLearner);
+        ASSERT_TRUE(cluster_result.result.snapshot.leader_hint.has_value());
+        EXPECT_EQ(cluster_result.result.snapshot.leader_hint->node_id,
+                  "meta-peer-rpc-1");
+
+        const auto *storage_snapshot = FindSnapshotByNodeId(
+            cluster_result.result.snapshot.storage_nodes,
+            "store-peer-rpc-1");
+        ASSERT_NE(storage_snapshot, nullptr);
+        ExpectObservedStateFacts(*storage_snapshot,
+                                 "store-peer-rpc-1:boot:230000000:42:1",
+                                 8U,
+                                 230U);
+        EXPECT_EQ(storage_snapshot->health.health, ViewNodeHealth::kDegraded);
+        EXPECT_EQ(storage_snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kMedium);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         IntegrationPeerSyncRpcOldIncarnationCannotOverrideNewerState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        RunningViewNodeDiscoveryService old_source(config, 240);
+        RunningViewNodeDiscoveryService current_peer(config, 260);
+
+        auto storage = MakeRegistration(ViewNodeType::kStorage,
+                                        "store-peer-rpc-old-inc-1",
+                                        9728,
+                                        100);
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+
+        auto register_result = old_source.client().RegisterNode(
+            MakeRegisterRequest(storage,
+                                "integration-register-old-source-store-peer-rpc"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        register_result = current_peer.client().RegisterNode(
+            MakeRegisterRequest(storage,
+                                "integration-register-current-peer-store-peer-rpc"));
+        ASSERT_TRUE(register_result.transport_ok());
+        ASSERT_EQ(register_result.result.summary.status, ViewRegistryStatusCode::kOk);
+
+        auto old_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                  "store-peer-rpc-old-inc-1",
+                                                  9728,
+                                                  99,
+                                                  240);
+        old_heartbeat.incarnation_id =
+            "store-peer-rpc-old-inc-1:boot:100000000:51:1";
+        old_heartbeat.observation.health.health = ViewNodeHealth::kUnavailable;
+        old_heartbeat.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kFull;
+        const auto old_heartbeat_result =
+            old_source.client().HeartbeatNode(old_heartbeat);
+        ASSERT_TRUE(old_heartbeat_result.transport_ok());
+        ASSERT_EQ(old_heartbeat_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(old_heartbeat_result.result.applied);
+
+        auto current_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                      "store-peer-rpc-old-inc-1",
+                                                      9728,
+                                                      5,
+                                                      230);
+        current_heartbeat.incarnation_id =
+            "store-peer-rpc-old-inc-1:boot:230000000:52:1";
+        current_heartbeat.observation.health.health = ViewNodeHealth::kHealthy;
+        current_heartbeat.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kLow;
+        current_heartbeat.observation.load.active_reads = 9;
+        current_heartbeat.observation.load.active_writes = 6;
+        current_heartbeat.observation.load.queued_ops = 13;
+        const auto current_heartbeat_result =
+            current_peer.client().HeartbeatNode(current_heartbeat);
+        ASSERT_TRUE(current_heartbeat_result.transport_ok());
+        ASSERT_EQ(current_heartbeat_result.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_heartbeat_result.result.applied);
+
+        PullPeerViewSnapshotRequest pull_request;
+        pull_request.request_id = "integration-pull-peer-old-incarnation";
+        pull_request.cluster_id = kClusterId;
+        pull_request.include_dead_nodes = true;
+        pull_request.include_warnings = true;
+
+        const auto pull_result =
+            old_source.client().PullPeerViewSnapshot(pull_request);
+        ASSERT_TRUE(pull_result.transport_ok());
+        ASSERT_EQ(pull_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(pull_result.result.snapshot.storage_nodes.size(), 1U);
+        ExpectObservedStateFacts(pull_result.result.snapshot.storage_nodes[0],
+                                 "store-peer-rpc-old-inc-1:boot:100000000:51:1",
+                                 99U,
+                                 240U);
+
+        PushPeerViewSnapshotRequest push_request;
+        push_request.request_id = "integration-push-peer-old-incarnation";
+        push_request.cluster_id = kClusterId;
+        push_request.snapshot = pull_result.result.snapshot;
+
+        const auto push_result =
+            current_peer.client().PushPeerViewSnapshot(push_request);
+        ASSERT_TRUE(push_result.transport_ok());
+        ASSERT_EQ(push_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(push_result.result.received_node_count, 1U);
+        EXPECT_EQ(push_result.result.accepted_node_count, 1U);
+        EXPECT_EQ(push_result.result.conflict_node_count, 0U);
+        EXPECT_EQ(push_result.result.stale_ignored_node_count, 1U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id =
+            "integration-cluster-view-peer-old-incarnation-after-rpc-push";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto cluster_result =
+            current_peer.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(cluster_result.transport_ok());
+        ASSERT_EQ(cluster_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(cluster_result.result.snapshot.storage_nodes.size(), 1U);
+        ExpectObservedStateFacts(cluster_result.result.snapshot.storage_nodes[0],
+                                 "store-peer-rpc-old-inc-1:boot:230000000:52:1",
+                                 5U,
+                                 230U);
+        EXPECT_EQ(cluster_result.result.snapshot.storage_nodes[0].health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(
+            cluster_result.result.snapshot.storage_nodes[0].health.disk_pressure,
+            ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(cluster_result.result.snapshot.storage_nodes[0].liveness,
                   ViewNodeLivenessState::kLive);
     }
 

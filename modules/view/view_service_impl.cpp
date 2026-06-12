@@ -703,6 +703,43 @@ namespace viewdemo
             }
         }
 
+        void FillProtoPeerSyncSnapshot(const ClusterViewSnapshot &snapshot,
+                                       const ClusterId &cluster_id,
+                                       ::view::ViewPeerSyncSnapshot *proto_snapshot)
+        {
+            if (proto_snapshot == nullptr)
+            {
+                return;
+            }
+
+            proto_snapshot->set_cluster_id(cluster_id);
+            proto_snapshot->set_generated_at_unix_ms(
+                snapshot.observed_at_unix_ms);
+            for (const auto &view_node : snapshot.view_nodes)
+            {
+                FillProtoSnapshot(view_node, proto_snapshot->add_view_nodes());
+            }
+            for (const auto &metadata_node : snapshot.metadata_nodes)
+            {
+                FillProtoSnapshot(metadata_node,
+                                  proto_snapshot->add_metadata_nodes());
+            }
+            for (const auto &storage_node : snapshot.storage_nodes)
+            {
+                FillProtoSnapshot(storage_node,
+                                  proto_snapshot->add_storage_nodes());
+            }
+            if (snapshot.leader_hint.has_value())
+            {
+                FillProtoLeaderHint(*snapshot.leader_hint,
+                                    proto_snapshot->mutable_leader_hint());
+            }
+            else
+            {
+                proto_snapshot->clear_leader_hint();
+            }
+        }
+
         template <typename Response>
         void AppendWarnings(
             const std::vector<ViewRegistryDiagnostic> &diagnostics,
@@ -720,6 +757,27 @@ namespace viewdemo
                 warning->set_endpoint(diagnostic.endpoint);
                 warning->set_sequence(diagnostic.sequence);
             }
+        }
+
+        template <typename Response>
+        void AppendNonAuthorityBoundaryWarning(const ClusterId &cluster_id,
+                                               const RequestId &request_id,
+                                               Response *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            auto *warning = response->add_warnings();
+            warning->set_code(ToString(ViewRegistryIssueCode::kNonAuthorityBoundary));
+            warning->set_message(
+                "peer sync exchanges observed registry state only; it does not change Raft membership, quorum, or committed object visibility");
+            warning->clear_node_id();
+            warning->clear_endpoint();
+            warning->set_sequence(0);
+            static_cast<void>(cluster_id);
+            static_cast<void>(request_id);
         }
 
         std::string BuildViewSelfRefreshDiagnosticMessage(
@@ -843,6 +901,153 @@ namespace viewdemo
                     "view registry is not configured");
             }
             return ::grpc::Status::OK;
+        }
+
+        NodeRegistration RegistrationFromSnapshotProto(
+            const ::view::ViewNodeSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
+        {
+            NodeRegistration registration;
+            registration.cluster_id =
+                snapshot.cluster_id().empty() ? fallback_cluster_id
+                                              : snapshot.cluster_id();
+            registration.node_id = snapshot.node_id();
+            registration.node_type = FromProtoNodeType(snapshot.node_type());
+            registration.endpoint = snapshot.endpoint();
+            registration.control_plane_endpoint =
+                snapshot.control_plane_endpoint();
+            registration.data_plane_endpoint =
+                snapshot.data_plane_endpoint();
+            registration.data_dir_fingerprint =
+                snapshot.data_dir_fingerprint();
+            registration.observed_at_unix_ms = snapshot.last_seen_unix_ms();
+            registration.failure_domain.zone =
+                snapshot.failure_domain().zone();
+            registration.failure_domain.rack =
+                snapshot.failure_domain().rack();
+            registration.health.health =
+                FromProtoHealth(snapshot.health().health());
+            registration.health.disk_pressure =
+                FromProtoDiskPressure(snapshot.health().disk_pressure());
+            registration.health.io_error_count =
+                snapshot.health().io_error_count();
+            registration.capacity.total_capacity_bytes =
+                snapshot.capacity().total_capacity_bytes();
+            registration.capacity.used_capacity_bytes =
+                snapshot.capacity().used_capacity_bytes();
+            registration.capacity.available_capacity_bytes =
+                snapshot.capacity().available_capacity_bytes();
+            registration.capacity.chunk_count =
+                snapshot.capacity().chunk_count();
+            registration.load.active_reads = snapshot.load().active_reads();
+            registration.load.active_writes = snapshot.load().active_writes();
+            registration.load.queued_ops = snapshot.load().queued_ops();
+            registration.load.write_admission_overloaded =
+                snapshot.load().write_admission_overloaded();
+            registration.load.read_admission_overloaded =
+                snapshot.load().read_admission_overloaded();
+            if (snapshot.has_metadata())
+            {
+                registration.metadata =
+                    FromProtoMetadataObservation(snapshot.metadata());
+            }
+            return registration;
+        }
+
+        bool SnapshotClusterIdsMatch(const ::google::protobuf::RepeatedPtrField<
+                                         ::view::ViewNodeSnapshot> &snapshots,
+                                     const ClusterId &cluster_id)
+        {
+            for (const auto &snapshot : snapshots)
+            {
+                if (!snapshot.cluster_id().empty() &&
+                    snapshot.cluster_id() != cluster_id)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        struct PeerSyncImportCounters
+        {
+            std::uint32_t received_node_count{0};
+            std::uint32_t accepted_node_count{0};
+            std::uint32_t applied_node_count{0};
+            std::uint32_t stale_ignored_node_count{0};
+            std::uint32_t conflict_node_count{0};
+        };
+
+        void ApplyPeerSyncCategory(
+            const ::google::protobuf::RepeatedPtrField<::view::ViewNodeSnapshot>
+                &snapshots,
+            const RequestId &request_id,
+            const ClusterId &cluster_id,
+            ViewNodeRegistry *registry,
+            PeerSyncImportCounters *counters,
+            ::view::PushPeerViewSnapshotResponse *response)
+        {
+            if (registry == nullptr || counters == nullptr || response == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &snapshot : snapshots)
+            {
+                ++counters->received_node_count;
+
+                const auto registration =
+                    RegistrationFromSnapshotProto(snapshot, cluster_id);
+                const auto register_result = registry->RegisterNode(
+                    RegisterNodeRequest{
+                        .request_id =
+                            request_id + "/peer-register/" + snapshot.node_id(),
+                        .registration = registration});
+                AppendWarnings(register_result.diagnostics, response);
+                if (!register_result.ok())
+                {
+                    ++counters->conflict_node_count;
+                    continue;
+                }
+
+                ++counters->accepted_node_count;
+                if (register_result.created)
+                {
+                    ++counters->applied_node_count;
+                }
+
+                if (snapshot.last_sequence() == 0)
+                {
+                    continue;
+                }
+
+                const auto heartbeat_result = registry->HeartbeatNode(
+                    HeartbeatNodeRequest{
+                        .request_id = request_id + "/peer-heartbeat/" +
+                                      snapshot.node_id() + "/" +
+                                      std::to_string(snapshot.last_sequence()),
+                        .cluster_id = cluster_id,
+                        .node_id = snapshot.node_id(),
+                        .node_type = FromProtoNodeType(snapshot.node_type()),
+                        .incarnation_id = snapshot.incarnation_id(),
+                        .sequence = snapshot.last_sequence(),
+                        .observation = registration});
+                AppendWarnings(heartbeat_result.diagnostics, response);
+                if (!heartbeat_result.ok())
+                {
+                    ++counters->conflict_node_count;
+                    continue;
+                }
+
+                if (heartbeat_result.applied)
+                {
+                    ++counters->applied_node_count;
+                }
+                if (heartbeat_result.stale_ignored)
+                {
+                    ++counters->stale_ignored_node_count;
+                }
+            }
         }
 
         ::grpc::Status MakeInternalStatus(const std::string_view rpc_name,
@@ -1269,6 +1474,185 @@ namespace viewdemo
                                request->request_id(),
                                request->cluster_id());
             return MakeUnknownInternalStatus("GetClusterView");
+        }
+    }
+
+    ::grpc::Status ViewNodeServiceImpl::PullPeerViewSnapshot(
+        ::grpc::ServerContext *context,
+        const ::view::PullPeerViewSnapshotRequest *request,
+        ::view::PullPeerViewSnapshotResponse *response)
+    {
+        static_cast<void>(context);
+        if (request == nullptr)
+        {
+            SetInternalSummary(response, "request must not be null");
+            return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                                  "request must not be null");
+        }
+
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
+        if (!state.ok())
+        {
+            return state;
+        }
+
+        try
+        {
+            const auto result = registry_->GetClusterView(
+                GetClusterViewRequest{.request_id = request->request_id(),
+                                      .cluster_id = request->cluster_id(),
+                                      .include_dead_nodes =
+                                          request->include_dead_nodes(),
+                                      .include_warnings =
+                                          request->include_warnings()},
+                ResolveNowUnixMs(config_));
+
+            FillProtoSummary(result.summary, response->mutable_summary());
+            FillProtoPeerSyncSnapshot(result.snapshot,
+                                     request->cluster_id(),
+                                     response->mutable_snapshot());
+            AppendWarnings(result.snapshot.diagnostics, response);
+            AppendNonAuthorityBoundaryWarning(request->cluster_id(),
+                                              request->request_id(),
+                                              response);
+            return ::grpc::Status::OK;
+        }
+        catch (const std::exception &ex)
+        {
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeInternalStatus("PullPeerViewSnapshot", ex);
+        }
+        catch (...)
+        {
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeUnknownInternalStatus("PullPeerViewSnapshot");
+        }
+    }
+
+    ::grpc::Status ViewNodeServiceImpl::PushPeerViewSnapshot(
+        ::grpc::ServerContext *context,
+        const ::view::PushPeerViewSnapshotRequest *request,
+        ::view::PushPeerViewSnapshotResponse *response)
+    {
+        static_cast<void>(context);
+        if (request == nullptr)
+        {
+            SetInternalSummary(response, "request must not be null");
+            return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                                  "request must not be null");
+        }
+
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
+        if (!state.ok())
+        {
+            return state;
+        }
+
+        if (!request->snapshot().cluster_id().empty() &&
+            request->snapshot().cluster_id() != request->cluster_id())
+        {
+            FillProtoSummary(
+                ViewRegistryResponseSummary{
+                    .status = ViewRegistryStatusCode::kInvalidArgument,
+                    .message =
+                        "peer sync snapshot cluster_id must match request cluster_id",
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .node_id = {},
+                    .retry_after_ms = 0},
+                response->mutable_summary());
+            return ::grpc::Status::OK;
+        }
+
+        if (!SnapshotClusterIdsMatch(request->snapshot().view_nodes(),
+                                     request->cluster_id()) ||
+            !SnapshotClusterIdsMatch(request->snapshot().metadata_nodes(),
+                                     request->cluster_id()) ||
+            !SnapshotClusterIdsMatch(request->snapshot().storage_nodes(),
+                                     request->cluster_id()))
+        {
+            FillProtoSummary(
+                ViewRegistryResponseSummary{
+                    .status = ViewRegistryStatusCode::kInvalidArgument,
+                    .message =
+                        "peer sync node snapshot cluster_id must match request cluster_id",
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .node_id = {},
+                    .retry_after_ms = 0},
+                response->mutable_summary());
+            return ::grpc::Status::OK;
+        }
+
+        try
+        {
+            PeerSyncImportCounters counters;
+            ApplyPeerSyncCategory(request->snapshot().view_nodes(),
+                                  request->request_id(),
+                                  request->cluster_id(),
+                                  registry_.get(),
+                                  &counters,
+                                  response);
+            ApplyPeerSyncCategory(request->snapshot().metadata_nodes(),
+                                  request->request_id(),
+                                  request->cluster_id(),
+                                  registry_.get(),
+                                  &counters,
+                                  response);
+            ApplyPeerSyncCategory(request->snapshot().storage_nodes(),
+                                  request->request_id(),
+                                  request->cluster_id(),
+                                  registry_.get(),
+                                  &counters,
+                                  response);
+
+            FillProtoSummary(
+                ViewRegistryResponseSummary{
+                    .status = ViewRegistryStatusCode::kOk,
+                    .message = "peer sync observed-state import completed",
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .node_id = {},
+                    .retry_after_ms = 0},
+                response->mutable_summary());
+            response->set_received_node_count(counters.received_node_count);
+            response->set_accepted_node_count(counters.accepted_node_count);
+            response->set_applied_node_count(counters.applied_node_count);
+            response->set_stale_ignored_node_count(
+                counters.stale_ignored_node_count);
+            response->set_conflict_node_count(counters.conflict_node_count);
+            AppendNonAuthorityBoundaryWarning(request->cluster_id(),
+                                              request->request_id(),
+                                              response);
+            return ::grpc::Status::OK;
+        }
+        catch (const std::exception &ex)
+        {
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeInternalStatus("PushPeerViewSnapshot", ex);
+        }
+        catch (...)
+        {
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeUnknownInternalStatus("PushPeerViewSnapshot");
         }
     }
 

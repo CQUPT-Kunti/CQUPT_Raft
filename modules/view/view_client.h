@@ -21,6 +21,7 @@ namespace viewdemo
         std::chrono::milliseconds heartbeat_timeout{0};
         std::chrono::milliseconds discovery_timeout{0};
         std::chrono::milliseconds cluster_view_timeout{0};
+        std::chrono::milliseconds peer_sync_timeout{0};
         bool wait_for_ready{false};
     };
 
@@ -78,6 +79,64 @@ namespace viewdemo
     using ViewNodeClientGetClusterViewResult =
         ViewNodeClientCallResult<GetClusterViewResult>;
 
+    struct ViewPeerSyncSnapshot
+    {
+        ClusterId cluster_id;
+        std::uint64_t generated_at_unix_ms{0};
+        std::vector<ViewNodeSnapshot> view_nodes;
+        std::vector<ViewNodeSnapshot> metadata_nodes;
+        std::vector<ViewNodeSnapshot> storage_nodes;
+        std::optional<MetadataLeaderHint> leader_hint;
+    };
+
+    struct PullPeerViewSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        bool include_dead_nodes{true};
+        bool include_warnings{true};
+    };
+
+    struct PullPeerViewSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        ViewPeerSyncSnapshot snapshot;
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
+    struct PushPeerViewSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        ViewPeerSyncSnapshot snapshot;
+    };
+
+    struct PushPeerViewSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        std::uint32_t received_node_count{0};
+        std::uint32_t accepted_node_count{0};
+        std::uint32_t applied_node_count{0};
+        std::uint32_t stale_ignored_node_count{0};
+        std::uint32_t conflict_node_count{0};
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
+    using ViewNodeClientPullPeerViewSnapshotResult =
+        ViewNodeClientCallResult<PullPeerViewSnapshotResult>;
+    using ViewNodeClientPushPeerViewSnapshotResult =
+        ViewNodeClientCallResult<PushPeerViewSnapshotResult>;
+
     // ViewNodeClient 只负责把调用方的注册、心跳、发现和 cluster view 请求
     // 映射到 ViewNodeService RPC，并返回 transport + observation 诊断边界。
     // 它不负责对象 COMMITTED 可见性、Raft membership 变更、quorum 计算、
@@ -127,6 +186,17 @@ namespace viewdemo
         // 它不授予任何 membership 或对象状态 authority。
         ViewNodeClientGetClusterViewResult GetClusterView(
             const GetClusterViewRequest &request,
+            ViewNodeClientCallOptions options = {});
+
+        // Pull 只导出 observed registry snapshot，不能直接决定 membership。
+        ViewNodeClientPullPeerViewSnapshotResult PullPeerViewSnapshot(
+            const PullPeerViewSnapshotRequest &request,
+            ViewNodeClientCallOptions options = {});
+
+        // Push 只把 peer observed-state replay 到本地 registry adapter 边界。
+        // 它不能绕过 registry merge 语义，也不能修改 Raft membership。
+        ViewNodeClientPushPeerViewSnapshotResult PushPeerViewSnapshot(
+            const PushPeerViewSnapshotRequest &request,
             ViewNodeClientCallOptions options = {});
 
         [[nodiscard]] std::string_view target_endpoint() const;
