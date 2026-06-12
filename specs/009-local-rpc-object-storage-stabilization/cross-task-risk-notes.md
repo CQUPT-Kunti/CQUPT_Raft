@@ -71,3 +71,9 @@ Mitigation: Keep Linux targeted PASS scoped to `ViewNodeDiscovery` functional co
 Risk: T045-T053 now validate StorageNode dynamic join semantics through registry tests, placement integration tests, transfer-path compatibility, and metadata manifest diagnostics, but the repository still lacks a completed local RPC example command that adds a new StorageNode to a running multi-process cluster and demonstrates the full runtime path end to end. Without that example, Linux PASS remains scoped to targeted test harnesses rather than the final example workflow.
 
 Mitigation: Keep current US3 PASS scoped to `storage_heartbeat_registry` and `IntegratedObjectStorageE2ETest.*`. Add real runtime add-node example commands and smoke validation in Phase 10/T089-T098 before claiming full local RPC dynamic-join workflow validation.
+
+## R13: Dynamic Metadata Join Still Stops At Validation And Admission Boundary
+
+Risk: T055-T065 now validate dynamic Metadata candidate identity/config, `JoinMetadataCluster` proto contract, metadata leader authority, ViewNode discovery fallback, and `AddLearner` admission boundary, but the runtime still stops before committed learner membership change, learner catch-up, InstallSnapshot catch-up, promote-to-voter, odd-voter-safe promotion, and local RPC dynamic metadata add-node smoke. Multi-ViewNode peer sync effects on metadata join discovery are also not fully exercised beyond targeted tests.
+
+Mitigation: Keep current US4 PASS scoped to validation/boundary semantics only. Treat T066-T098 as required follow-up for learner replication, snapshot catch-up, promotion safety, local RPC runtime smoke, and broader multi-ViewNode discovery validation before claiming full dynamic Metadata membership lifecycle support.

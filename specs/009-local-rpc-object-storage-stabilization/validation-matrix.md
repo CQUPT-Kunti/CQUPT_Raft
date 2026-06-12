@@ -150,3 +150,34 @@
   - macOS validation
   - local RPC dynamic add-node smoke
   - long-running dynamic-join soak
+
+## US4 Phase 7 Closure Snapshot
+
+- Linux targeted validation:
+  - build targets: `test_metadata_client_scenario`, `integrated_object_storage_quorum`, `test_view_node_discovery`
+  - ctest regex:
+    - `^MetadataClientScenarioTest\.`
+    - `^IntegratedObjectStorageQuorumTest\.`
+    - `^ViewNodeDiscoveryTest\.`
+  - result: PASS
+  - logs:
+    - `tmp/test-logs/t065-build.log`
+    - `tmp/test-logs/t065-metadata-client.log`
+    - `tmp/test-logs/t065-integrated-quorum.log`
+    - `tmp/test-logs/t065-view-node.log`
+- Covered US4 areas:
+  - dynamic Metadata candidate identity/config boundary
+  - JoinMetadataCluster additive proto contract
+  - Metadata leader-only join validation and follower `NOT_LEADER` + leader hint
+  - metadata_node_app dynamic join candidate wiring
+  - ViewNode metadata candidate discovery and `NOT_LEADER` fallback
+  - AddLearner leader admission / duplicate / pending / conflict boundary
+  - ViewNode observed metadata non-authoritative safety
+  - committed membership / quorum unchanged by observed voter or observed joining candidate
+- Skipped in T065:
+  - local RPC dynamic metadata join smoke
+  - learner AppendEntries catch-up
+  - learner InstallSnapshot catch-up
+  - promote-to-voter / odd-voter-safe promotion
+  - Windows validation
+  - macOS validation
