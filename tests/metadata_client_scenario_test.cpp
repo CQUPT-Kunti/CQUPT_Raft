@@ -175,6 +175,13 @@ namespace
     return service->FindMethodByName(method_name) != nullptr;
   }
 
+  bool MessageHasField(const google::protobuf::Descriptor *descriptor,
+                       const std::string &field_name)
+  {
+    return descriptor != nullptr &&
+           descriptor->FindFieldByName(field_name) != nullptr;
+  }
+
   template <typename Response>
   struct ReplayEntry
   {
@@ -1331,10 +1338,81 @@ TEST_F(MetadataClientScenarioTest, ClientShowsRetryableAdmissionStatuses)
 }
 
 TEST_F(MetadataClientScenarioTest,
-       JoinMetadataClusterContractIsNotYetExposedByMetadataServiceProto)
+       JoinMetadataClusterContractIsExposedByMetadataServiceProto)
 {
-  EXPECT_FALSE(MetadataServiceHasMethod("JoinMetadataCluster"));
+  EXPECT_TRUE(MetadataServiceHasMethod("JoinMetadataCluster"));
   EXPECT_FALSE(MetadataServiceHasMethod("AddLearner"));
+
+  const auto *request_descriptor = raft::JoinMetadataClusterRequest::descriptor();
+  ASSERT_NE(request_descriptor, nullptr);
+  EXPECT_TRUE(MessageHasField(request_descriptor, "request_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "cluster_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "node_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_raft_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_client_address"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_raft_address"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_incarnation_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_sequence"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "persistent_generation"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "data_dir_fingerprint"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "local_state_hint"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_view_node_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_time_unix_ms"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_metadata_endpoint"));
+
+  const auto *response_descriptor = raft::JoinMetadataClusterResponse::descriptor();
+  ASSERT_NE(response_descriptor, nullptr);
+  EXPECT_TRUE(MessageHasField(response_descriptor, "summary"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "disposition"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "requested_membership"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "committed_membership_changed"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "membership_epoch"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "canonical_node_id"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "assigned_raft_id"));
+
+  raft::JoinMetadataClusterRequest request;
+  request.set_request_id("req-join-contract");
+  request.set_cluster_id("cluster-alpha");
+  request.set_node_id("meta-candidate-1");
+  request.set_candidate_raft_id(401);
+  request.set_candidate_client_address("127.0.0.1:7501");
+  request.set_candidate_raft_address("127.0.0.1:7601");
+  request.set_candidate_incarnation_id("meta-candidate-1:boot:123");
+  request.set_candidate_sequence(7);
+  request.set_persistent_generation(1);
+  request.set_data_dir_fingerprint("fp-meta-candidate-1");
+  request.set_local_state_hint(
+      raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+  request.set_observed_view_node_id("view-1");
+  request.set_observed_time_unix_ms(1710000000123ULL);
+  request.set_observed_metadata_endpoint("127.0.0.1:7501");
+
+  raft::JoinMetadataClusterResponse response;
+  response.mutable_summary()->set_code(raft::METADATA_STATUS_CODE_NOT_LEADER);
+  response.mutable_summary()->set_message("join authority belongs to metadata leader");
+  response.mutable_summary()->set_request_id(request.request_id());
+  response.mutable_summary()->mutable_leader_hint()->set_leader_id(2);
+  response.mutable_summary()->mutable_leader_hint()->set_leader_address(
+      "127.0.0.1:7412");
+  response.set_disposition(
+      raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER);
+  response.set_requested_membership(
+      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+  response.set_committed_membership_changed(false);
+  response.set_membership_epoch(3);
+  response.set_canonical_node_id(request.node_id());
+  response.set_assigned_raft_id(request.candidate_raft_id());
+
+  EXPECT_EQ(response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER);
+  EXPECT_EQ(response.disposition(),
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER);
+  EXPECT_EQ(response.requested_membership(),
+            raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+  EXPECT_FALSE(response.committed_membership_changed());
+  EXPECT_EQ(response.summary().leader_hint().leader_address(),
+            "127.0.0.1:7412");
+  EXPECT_NE(response.disposition(),
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
 }
 
 TEST_F(MetadataClientScenarioTest,
