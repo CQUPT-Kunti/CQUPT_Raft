@@ -736,6 +736,150 @@ namespace viewdemo
             return snapshot;
         }
 
+        ViewRegistryPeerSnapshot MakePeerSnapshot(
+            const ClusterId &cluster_id,
+            const ClusterViewSnapshot &snapshot)
+        {
+            ViewRegistryPeerSnapshot peer_snapshot;
+            peer_snapshot.cluster_id = cluster_id;
+            peer_snapshot.generated_at_unix_ms = snapshot.observed_at_unix_ms;
+            peer_snapshot.view_nodes = snapshot.view_nodes;
+            peer_snapshot.metadata_nodes = snapshot.metadata_nodes;
+            peer_snapshot.storage_nodes = snapshot.storage_nodes;
+            peer_snapshot.leader_hint = snapshot.leader_hint;
+            return peer_snapshot;
+        }
+
+        NodeRegistration RegistrationFromPeerSnapshot(
+            const ViewNodeSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
+        {
+            NodeRegistration registration;
+            registration.cluster_id = snapshot.cluster_id.empty()
+                                          ? fallback_cluster_id
+                                          : snapshot.cluster_id;
+            registration.node_id = snapshot.node_id;
+            registration.node_type = snapshot.node_type;
+            registration.endpoint = snapshot.endpoint;
+            registration.control_plane_endpoint = snapshot.control_plane_endpoint;
+            registration.data_plane_endpoint = snapshot.data_plane_endpoint;
+            registration.data_dir_fingerprint = snapshot.data_dir_fingerprint;
+            registration.observed_at_unix_ms = snapshot.last_seen_unix_ms;
+            registration.failure_domain = snapshot.failure_domain;
+            registration.health = snapshot.health;
+            registration.capacity = snapshot.capacity;
+            registration.load = snapshot.load;
+            registration.metadata = snapshot.metadata;
+            return registration;
+        }
+
+        bool SnapshotClusterIdsMatch(
+            const std::vector<ViewNodeSnapshot> &snapshots,
+            const ClusterId &cluster_id)
+        {
+            return std::all_of(
+                snapshots.begin(),
+                snapshots.end(),
+                [&cluster_id](const ViewNodeSnapshot &snapshot)
+                {
+                    return snapshot.cluster_id.empty() ||
+                           snapshot.cluster_id == cluster_id;
+                });
+        }
+
+        void FillInvalidImportResult(ImportPeerSnapshotResult *result,
+                                     const ImportPeerSnapshotRequest &request,
+                                     const std::string &message)
+        {
+            SetSummary(&result->summary,
+                       ViewRegistryStatusCode::kInvalidArgument,
+                       message,
+                       request.request_id,
+                       request.cluster_id,
+                       {});
+            result->diagnostics.push_back(
+                MakeDiagnostic(ViewRegistryIssueCode::kClusterMismatch,
+                               message,
+                               request.request_id,
+                               request.cluster_id,
+                               {},
+                               {}));
+        }
+
+        void ImportPeerSnapshotCategory(
+            ViewNodeRegistry *registry,
+            const std::vector<ViewNodeSnapshot> &snapshots,
+            const RequestId &request_id,
+            const ClusterId &cluster_id,
+            ImportPeerSnapshotResult *result)
+        {
+            if (registry == nullptr || result == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &snapshot : snapshots)
+            {
+                ++result->received_node_count;
+
+                const auto registration =
+                    RegistrationFromPeerSnapshot(snapshot, cluster_id);
+                const auto register_result = registry->RegisterNode(
+                    RegisterNodeRequest{
+                        .request_id = request_id + "/peer-register/" +
+                                      snapshot.node_id,
+                        .registration = registration});
+                result->diagnostics.insert(result->diagnostics.end(),
+                                           register_result.diagnostics.begin(),
+                                           register_result.diagnostics.end());
+                if (!register_result.ok())
+                {
+                    ++result->conflict_node_count;
+                    continue;
+                }
+
+                ++result->accepted_node_count;
+                if (register_result.created)
+                {
+                    ++result->applied_node_count;
+                }
+
+                if (snapshot.last_sequence == 0U)
+                {
+                    continue;
+                }
+
+                const auto heartbeat_result = registry->HeartbeatNode(
+                    HeartbeatNodeRequest{
+                        .request_id = request_id + "/peer-heartbeat/" +
+                                      snapshot.node_id + "/" +
+                                      std::to_string(snapshot.last_sequence),
+                        .cluster_id = cluster_id,
+                        .node_id = snapshot.node_id,
+                        .node_type = snapshot.node_type,
+                        .incarnation_id = snapshot.incarnation_id,
+                        .sequence = snapshot.last_sequence,
+                        .observation = registration});
+                result->diagnostics.insert(result->diagnostics.end(),
+                                           heartbeat_result.diagnostics.begin(),
+                                           heartbeat_result.diagnostics.end());
+                if (!heartbeat_result.ok())
+                {
+                    ++result->conflict_node_count;
+                    continue;
+                }
+
+                if (heartbeat_result.applied)
+                {
+                    ++result->applied_node_count;
+                }
+                if (heartbeat_result.stale_ignored)
+                {
+                    ++result->stale_ignored_node_count;
+                }
+            }
+        }
+
         SequenceDecision EvaluateSequenceDecision(
             const std::uint64_t last_sequence,
             const std::uint64_t last_seen_unix_ms,
@@ -1682,6 +1826,89 @@ namespace viewdemo
         SetSummary(&result.summary,
                    ViewRegistryStatusCode::kOk,
                    "cluster view snapshot generated",
+                   request.request_id,
+                   request.cluster_id,
+                   {});
+        return result;
+    }
+
+    ExportPeerSnapshotResult ViewNodeRegistry::ExportPeerSnapshot(
+        const ExportPeerSnapshotRequest &request,
+        const std::uint64_t now_unix_ms) const
+    {
+        const auto cluster_view = GetClusterView(
+            GetClusterViewRequest{.request_id = request.request_id,
+                                  .cluster_id = request.cluster_id,
+                                  .include_dead_nodes = request.include_dead_nodes,
+                                  .include_warnings = request.include_warnings},
+            now_unix_ms);
+
+        ExportPeerSnapshotResult result;
+        result.summary = cluster_view.summary;
+        result.snapshot = MakePeerSnapshot(request.cluster_id,
+                                           cluster_view.snapshot);
+        result.diagnostics = cluster_view.snapshot.diagnostics;
+        return result;
+    }
+
+    ImportPeerSnapshotResult ViewNodeRegistry::ImportPeerSnapshot(
+        const ImportPeerSnapshotRequest &request)
+    {
+        ImportPeerSnapshotResult result;
+        if (!IsValidClusterId(request.cluster_id))
+        {
+            SetSummary(&result.summary,
+                       ViewRegistryStatusCode::kInvalidArgument,
+                       "cluster_id must contain only alnum, '-' or '_'",
+                       request.request_id,
+                       request.cluster_id,
+                       {});
+            return result;
+        }
+
+        if (!request.snapshot.cluster_id.empty() &&
+            request.snapshot.cluster_id != request.cluster_id)
+        {
+            FillInvalidImportResult(
+                &result,
+                request,
+                "peer sync snapshot cluster_id must match request cluster_id");
+            return result;
+        }
+
+        if (!SnapshotClusterIdsMatch(request.snapshot.view_nodes,
+                                     request.cluster_id) ||
+            !SnapshotClusterIdsMatch(request.snapshot.metadata_nodes,
+                                     request.cluster_id) ||
+            !SnapshotClusterIdsMatch(request.snapshot.storage_nodes,
+                                     request.cluster_id))
+        {
+            FillInvalidImportResult(
+                &result,
+                request,
+                "peer sync node snapshot cluster_id must match request cluster_id");
+            return result;
+        }
+
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.view_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.metadata_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.storage_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+
+        SetSummary(&result.summary,
+                   ViewRegistryStatusCode::kOk,
+                   "peer sync observed-state import completed",
                    request.request_id,
                    request.cluster_id,
                    {});

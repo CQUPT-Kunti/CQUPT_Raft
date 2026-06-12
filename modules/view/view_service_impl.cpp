@@ -703,8 +703,7 @@ namespace viewdemo
             }
         }
 
-        void FillProtoPeerSyncSnapshot(const ClusterViewSnapshot &snapshot,
-                                       const ClusterId &cluster_id,
+        void FillProtoPeerSyncSnapshot(const ViewRegistryPeerSnapshot &snapshot,
                                        ::view::ViewPeerSyncSnapshot *proto_snapshot)
         {
             if (proto_snapshot == nullptr)
@@ -712,9 +711,9 @@ namespace viewdemo
                 return;
             }
 
-            proto_snapshot->set_cluster_id(cluster_id);
+            proto_snapshot->set_cluster_id(snapshot.cluster_id);
             proto_snapshot->set_generated_at_unix_ms(
-                snapshot.observed_at_unix_ms);
+                snapshot.generated_at_unix_ms);
             for (const auto &view_node : snapshot.view_nodes)
             {
                 FillProtoSnapshot(view_node, proto_snapshot->add_view_nodes());
@@ -903,151 +902,101 @@ namespace viewdemo
             return ::grpc::Status::OK;
         }
 
-        NodeRegistration RegistrationFromSnapshotProto(
+        ViewNodeSnapshot FromProtoSnapshot(
             const ::view::ViewNodeSnapshot &snapshot,
             const ClusterId &fallback_cluster_id)
         {
-            NodeRegistration registration;
-            registration.cluster_id =
-                snapshot.cluster_id().empty() ? fallback_cluster_id
-                                              : snapshot.cluster_id();
-            registration.node_id = snapshot.node_id();
-            registration.node_type = FromProtoNodeType(snapshot.node_type());
-            registration.endpoint = snapshot.endpoint();
-            registration.control_plane_endpoint =
+            ViewNodeSnapshot result;
+            result.cluster_id = snapshot.cluster_id().empty()
+                                    ? fallback_cluster_id
+                                    : snapshot.cluster_id();
+            result.node_id = snapshot.node_id();
+            result.node_type = FromProtoNodeType(snapshot.node_type());
+            result.incarnation_id = snapshot.incarnation_id();
+            result.endpoint = snapshot.endpoint();
+            result.control_plane_endpoint =
                 snapshot.control_plane_endpoint();
-            registration.data_plane_endpoint =
+            result.data_plane_endpoint =
                 snapshot.data_plane_endpoint();
-            registration.data_dir_fingerprint =
+            result.data_dir_fingerprint =
                 snapshot.data_dir_fingerprint();
-            registration.observed_at_unix_ms = snapshot.last_seen_unix_ms();
-            registration.failure_domain.zone =
+            result.observed_state.incarnation_id = result.incarnation_id;
+            result.observed_state.sequence = snapshot.last_sequence();
+            result.observed_state.observed_at_unix_ms =
+                snapshot.last_seen_unix_ms();
+            result.registered_at_unix_ms = snapshot.registered_at_unix_ms();
+            result.last_seen_unix_ms = snapshot.last_seen_unix_ms();
+            result.last_sequence = snapshot.last_sequence();
+            result.liveness = FromProtoLiveness(snapshot.liveness());
+            result.failure_domain.zone =
                 snapshot.failure_domain().zone();
-            registration.failure_domain.rack =
+            result.failure_domain.rack =
                 snapshot.failure_domain().rack();
-            registration.health.health =
+            result.health.health =
                 FromProtoHealth(snapshot.health().health());
-            registration.health.disk_pressure =
+            result.health.disk_pressure =
                 FromProtoDiskPressure(snapshot.health().disk_pressure());
-            registration.health.io_error_count =
+            result.health.io_error_count =
                 snapshot.health().io_error_count();
-            registration.capacity.total_capacity_bytes =
+            result.capacity.total_capacity_bytes =
                 snapshot.capacity().total_capacity_bytes();
-            registration.capacity.used_capacity_bytes =
+            result.capacity.used_capacity_bytes =
                 snapshot.capacity().used_capacity_bytes();
-            registration.capacity.available_capacity_bytes =
+            result.capacity.available_capacity_bytes =
                 snapshot.capacity().available_capacity_bytes();
-            registration.capacity.chunk_count =
+            result.capacity.chunk_count =
                 snapshot.capacity().chunk_count();
-            registration.load.active_reads = snapshot.load().active_reads();
-            registration.load.active_writes = snapshot.load().active_writes();
-            registration.load.queued_ops = snapshot.load().queued_ops();
-            registration.load.write_admission_overloaded =
+            result.load.active_reads = snapshot.load().active_reads();
+            result.load.active_writes = snapshot.load().active_writes();
+            result.load.queued_ops = snapshot.load().queued_ops();
+            result.load.write_admission_overloaded =
                 snapshot.load().write_admission_overloaded();
-            registration.load.read_admission_overloaded =
+            result.load.read_admission_overloaded =
                 snapshot.load().read_admission_overloaded();
             if (snapshot.has_metadata())
             {
-                registration.metadata =
+                result.metadata =
                     FromProtoMetadataObservation(snapshot.metadata());
             }
-            return registration;
+            return result;
         }
 
-        bool SnapshotClusterIdsMatch(const ::google::protobuf::RepeatedPtrField<
-                                         ::view::ViewNodeSnapshot> &snapshots,
-                                     const ClusterId &cluster_id)
+        ViewRegistryPeerSnapshot FromProtoPeerSyncSnapshot(
+            const ::view::ViewPeerSyncSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
         {
-            for (const auto &snapshot : snapshots)
+            ViewRegistryPeerSnapshot result;
+            result.cluster_id = snapshot.cluster_id().empty()
+                                    ? fallback_cluster_id
+                                    : snapshot.cluster_id();
+            result.generated_at_unix_ms = snapshot.generated_at_unix_ms();
+            result.view_nodes.reserve(
+                static_cast<std::size_t>(snapshot.view_nodes_size()));
+            result.metadata_nodes.reserve(
+                static_cast<std::size_t>(snapshot.metadata_nodes_size()));
+            result.storage_nodes.reserve(
+                static_cast<std::size_t>(snapshot.storage_nodes_size()));
+            for (const auto &view_node : snapshot.view_nodes())
             {
-                if (!snapshot.cluster_id().empty() &&
-                    snapshot.cluster_id() != cluster_id)
-                {
-                    return false;
-                }
+                result.view_nodes.push_back(
+                    FromProtoSnapshot(view_node, result.cluster_id));
             }
-            return true;
-        }
-
-        struct PeerSyncImportCounters
-        {
-            std::uint32_t received_node_count{0};
-            std::uint32_t accepted_node_count{0};
-            std::uint32_t applied_node_count{0};
-            std::uint32_t stale_ignored_node_count{0};
-            std::uint32_t conflict_node_count{0};
-        };
-
-        void ApplyPeerSyncCategory(
-            const ::google::protobuf::RepeatedPtrField<::view::ViewNodeSnapshot>
-                &snapshots,
-            const RequestId &request_id,
-            const ClusterId &cluster_id,
-            ViewNodeRegistry *registry,
-            PeerSyncImportCounters *counters,
-            ::view::PushPeerViewSnapshotResponse *response)
-        {
-            if (registry == nullptr || counters == nullptr || response == nullptr)
+            for (const auto &metadata_node : snapshot.metadata_nodes())
             {
-                return;
+                result.metadata_nodes.push_back(
+                    FromProtoSnapshot(metadata_node, result.cluster_id));
             }
-
-            for (const auto &snapshot : snapshots)
+            for (const auto &storage_node : snapshot.storage_nodes())
             {
-                ++counters->received_node_count;
-
-                const auto registration =
-                    RegistrationFromSnapshotProto(snapshot, cluster_id);
-                const auto register_result = registry->RegisterNode(
-                    RegisterNodeRequest{
-                        .request_id =
-                            request_id + "/peer-register/" + snapshot.node_id(),
-                        .registration = registration});
-                AppendWarnings(register_result.diagnostics, response);
-                if (!register_result.ok())
-                {
-                    ++counters->conflict_node_count;
-                    continue;
-                }
-
-                ++counters->accepted_node_count;
-                if (register_result.created)
-                {
-                    ++counters->applied_node_count;
-                }
-
-                if (snapshot.last_sequence() == 0)
-                {
-                    continue;
-                }
-
-                const auto heartbeat_result = registry->HeartbeatNode(
-                    HeartbeatNodeRequest{
-                        .request_id = request_id + "/peer-heartbeat/" +
-                                      snapshot.node_id() + "/" +
-                                      std::to_string(snapshot.last_sequence()),
-                        .cluster_id = cluster_id,
-                        .node_id = snapshot.node_id(),
-                        .node_type = FromProtoNodeType(snapshot.node_type()),
-                        .incarnation_id = snapshot.incarnation_id(),
-                        .sequence = snapshot.last_sequence(),
-                        .observation = registration});
-                AppendWarnings(heartbeat_result.diagnostics, response);
-                if (!heartbeat_result.ok())
-                {
-                    ++counters->conflict_node_count;
-                    continue;
-                }
-
-                if (heartbeat_result.applied)
-                {
-                    ++counters->applied_node_count;
-                }
-                if (heartbeat_result.stale_ignored)
-                {
-                    ++counters->stale_ignored_node_count;
-                }
+                result.storage_nodes.push_back(
+                    FromProtoSnapshot(storage_node, result.cluster_id));
             }
+            if (snapshot.has_leader_hint())
+            {
+                result.leader_hint =
+                    FromProtoLeaderHint(snapshot.leader_hint());
+            }
+            return result;
         }
 
         ::grpc::Status MakeInternalStatus(const std::string_view rpc_name,
@@ -1501,20 +1450,18 @@ namespace viewdemo
 
         try
         {
-            const auto result = registry_->GetClusterView(
-                GetClusterViewRequest{.request_id = request->request_id(),
-                                      .cluster_id = request->cluster_id(),
-                                      .include_dead_nodes =
-                                          request->include_dead_nodes(),
-                                      .include_warnings =
-                                          request->include_warnings()},
+            const auto result = registry_->ExportPeerSnapshot(
+                ExportPeerSnapshotRequest{
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .include_dead_nodes = request->include_dead_nodes(),
+                    .include_warnings = request->include_warnings()},
                 ResolveNowUnixMs(config_));
 
             FillProtoSummary(result.summary, response->mutable_summary());
             FillProtoPeerSyncSnapshot(result.snapshot,
-                                     request->cluster_id(),
                                      response->mutable_snapshot());
-            AppendWarnings(result.snapshot.diagnostics, response);
+            AppendWarnings(result.diagnostics, response);
             AppendNonAuthorityBoundaryWarning(request->cluster_id(),
                                               request->request_id(),
                                               response);
@@ -1560,79 +1507,23 @@ namespace viewdemo
             return state;
         }
 
-        if (!request->snapshot().cluster_id().empty() &&
-            request->snapshot().cluster_id() != request->cluster_id())
-        {
-            FillProtoSummary(
-                ViewRegistryResponseSummary{
-                    .status = ViewRegistryStatusCode::kInvalidArgument,
-                    .message =
-                        "peer sync snapshot cluster_id must match request cluster_id",
-                    .request_id = request->request_id(),
-                    .cluster_id = request->cluster_id(),
-                    .node_id = {},
-                    .retry_after_ms = 0},
-                response->mutable_summary());
-            return ::grpc::Status::OK;
-        }
-
-        if (!SnapshotClusterIdsMatch(request->snapshot().view_nodes(),
-                                     request->cluster_id()) ||
-            !SnapshotClusterIdsMatch(request->snapshot().metadata_nodes(),
-                                     request->cluster_id()) ||
-            !SnapshotClusterIdsMatch(request->snapshot().storage_nodes(),
-                                     request->cluster_id()))
-        {
-            FillProtoSummary(
-                ViewRegistryResponseSummary{
-                    .status = ViewRegistryStatusCode::kInvalidArgument,
-                    .message =
-                        "peer sync node snapshot cluster_id must match request cluster_id",
-                    .request_id = request->request_id(),
-                    .cluster_id = request->cluster_id(),
-                    .node_id = {},
-                    .retry_after_ms = 0},
-                response->mutable_summary());
-            return ::grpc::Status::OK;
-        }
-
         try
         {
-            PeerSyncImportCounters counters;
-            ApplyPeerSyncCategory(request->snapshot().view_nodes(),
-                                  request->request_id(),
-                                  request->cluster_id(),
-                                  registry_.get(),
-                                  &counters,
-                                  response);
-            ApplyPeerSyncCategory(request->snapshot().metadata_nodes(),
-                                  request->request_id(),
-                                  request->cluster_id(),
-                                  registry_.get(),
-                                  &counters,
-                                  response);
-            ApplyPeerSyncCategory(request->snapshot().storage_nodes(),
-                                  request->request_id(),
-                                  request->cluster_id(),
-                                  registry_.get(),
-                                  &counters,
-                                  response);
-
-            FillProtoSummary(
-                ViewRegistryResponseSummary{
-                    .status = ViewRegistryStatusCode::kOk,
-                    .message = "peer sync observed-state import completed",
+            const auto result = registry_->ImportPeerSnapshot(
+                ImportPeerSnapshotRequest{
                     .request_id = request->request_id(),
                     .cluster_id = request->cluster_id(),
-                    .node_id = {},
-                    .retry_after_ms = 0},
-                response->mutable_summary());
-            response->set_received_node_count(counters.received_node_count);
-            response->set_accepted_node_count(counters.accepted_node_count);
-            response->set_applied_node_count(counters.applied_node_count);
+                    .snapshot = FromProtoPeerSyncSnapshot(request->snapshot(),
+                                                          request->cluster_id())});
+
+            FillProtoSummary(result.summary, response->mutable_summary());
+            response->set_received_node_count(result.received_node_count);
+            response->set_accepted_node_count(result.accepted_node_count);
+            response->set_applied_node_count(result.applied_node_count);
             response->set_stale_ignored_node_count(
-                counters.stale_ignored_node_count);
-            response->set_conflict_node_count(counters.conflict_node_count);
+                result.stale_ignored_node_count);
+            response->set_conflict_node_count(result.conflict_node_count);
+            AppendWarnings(result.diagnostics, response);
             AppendNonAuthorityBoundaryWarning(request->cluster_id(),
                                               request->request_id(),
                                               response);

@@ -96,7 +96,7 @@
 - [X] T037 [P] [US2] Add peer snapshot old-incarnation rejection test in `tests/view_node_discovery_test.cpp` (验证: `test_view_node_discovery`)
 - [x] T038 [US2] Add peer ViewNode seed configuration parsing in `modules/cluster/cluster_config.cpp` and `modules/cluster/cluster_config.h` (验证: `cluster_config_test`)
 - [x] T039 [US2] Add ViewNode peer sync client/server contract in `proto/view.proto` and adapters in `modules/view/view_service_impl.cpp` and `modules/view/view_client.cpp` (验证: `test_view_node_discovery`)
-- [ ] T040 [US2] Implement Push/Pull/Merge observed registry sync in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
+- [X] T040 [US2] Implement Push/Pull/Merge observed registry sync in `modules/view/view_registry.cpp` (验证: `test_view_node_discovery`)
 - [ ] T041 [US2] Start peer sync loop and retry/backoff from `apps/view_node_app.cpp` (验证: `test_view_node_discovery`, local RPC startup/shutdown scripts)
 - [ ] T042 [US2] Define ViewNode registry persistence or memory-only restart recovery boundary in `modules/view/module-notes.md` and feature `module-notes.md` (验证: `test_view_node_discovery`)
 - [ ] T043 [US2] Add CMake wiring for any new ViewNode peer sync test in `tests/CMakeLists.txt` (验证: CTest label `view-node`)

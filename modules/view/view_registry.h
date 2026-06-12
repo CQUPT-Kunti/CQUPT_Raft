@@ -398,6 +398,59 @@ namespace viewdemo
         }
     };
 
+    struct ViewRegistryPeerSnapshot
+    {
+        ClusterId cluster_id;
+        std::uint64_t generated_at_unix_ms{0};
+        std::vector<ViewNodeSnapshot> view_nodes;
+        std::vector<ViewNodeSnapshot> metadata_nodes;
+        std::vector<ViewNodeSnapshot> storage_nodes;
+        std::optional<MetadataLeaderHint> leader_hint;
+    };
+
+    struct ExportPeerSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        bool include_dead_nodes{true};
+        bool include_warnings{true};
+    };
+
+    struct ExportPeerSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        ViewRegistryPeerSnapshot snapshot;
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
+    struct ImportPeerSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        ViewRegistryPeerSnapshot snapshot;
+    };
+
+    struct ImportPeerSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        std::uint32_t received_node_count{0};
+        std::uint32_t accepted_node_count{0};
+        std::uint32_t applied_node_count{0};
+        std::uint32_t stale_ignored_node_count{0};
+        std::uint32_t conflict_node_count{0};
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
     // ViewNodeRegistry 是 discovery-only / observation-only registry。
     // T016 在 .cpp 中实现注册幂等、heartbeat sequence 排序、
     // liveness transition 和 discovery snapshot。这里不包含 gRPC 映射。
@@ -438,6 +491,18 @@ namespace viewdemo
         [[nodiscard]] GetClusterViewResult GetClusterView(
             const GetClusterViewRequest &request,
             std::uint64_t now_unix_ms) const;
+
+        // 导出 observed registry snapshot，供 peer ViewNode 做最终一致同步。
+        // 该快照不授予 Raft membership、quorum 或对象可见性 authority。
+        [[nodiscard]] ExportPeerSnapshotResult ExportPeerSnapshot(
+            const ExportPeerSnapshotRequest &request,
+            std::uint64_t now_unix_ms) const;
+
+        // 导入 peer 导出的 observed registry snapshot，并复用现有
+        // register/heartbeat deterministic merge ordering。
+        // 该入口只同步 observed state，不改变 Raft membership。
+        ImportPeerSnapshotResult ImportPeerSnapshot(
+            const ImportPeerSnapshotRequest &request);
 
         [[nodiscard]] std::size_t size() const;
         [[nodiscard]] const ViewRegistryConfig &config() const;

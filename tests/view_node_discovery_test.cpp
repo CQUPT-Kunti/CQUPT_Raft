@@ -312,25 +312,22 @@ namespace
                   snapshot.observed_state.observed_at_unix_ms);
     }
 
-    [[nodiscard]] NodeRegistration RegistrationFromSnapshot(
-        const viewdemo::ViewNodeSnapshot &snapshot)
+    [[nodiscard]] viewdemo::ExportPeerSnapshotResult ExportPeerSnapshotOrAssert(
+        const ViewNodeRegistry &registry,
+        const std::string &request_id,
+        const std::uint64_t now_unix_ms)
     {
-        NodeRegistration registration;
-        registration.cluster_id = snapshot.cluster_id;
-        registration.node_id = snapshot.node_id;
-        registration.node_type = snapshot.node_type;
-        registration.endpoint = snapshot.endpoint;
-        registration.control_plane_endpoint = snapshot.control_plane_endpoint;
-        registration.data_plane_endpoint = snapshot.data_plane_endpoint;
-        registration.data_dir_fingerprint = snapshot.data_dir_fingerprint;
-        registration.observed_at_unix_ms =
-            snapshot.observed_state.observed_at_unix_ms;
-        registration.failure_domain = snapshot.failure_domain;
-        registration.health = snapshot.health;
-        registration.capacity = snapshot.capacity;
-        registration.load = snapshot.load;
-        registration.metadata = snapshot.metadata;
-        return registration;
+        const auto result = registry.ExportPeerSnapshot(
+            viewdemo::ExportPeerSnapshotRequest{
+                .request_id = request_id,
+                .cluster_id = kClusterId,
+                .include_dead_nodes = true,
+                .include_warnings = true},
+            now_unix_ms);
+        EXPECT_EQ(result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(result.snapshot.cluster_id, kClusterId);
+        EXPECT_EQ(result.snapshot.generated_at_unix_ms, now_unix_ms);
+        return result;
     }
 
     void SyncSnapshotToPeerRegistry(ViewNodeRegistry *peer,
@@ -339,39 +336,34 @@ namespace
     {
         ASSERT_NE(peer, nullptr);
 
-        RegisterNodeRequest register_request;
-        register_request.request_id =
-            request_prefix + "-register-" + snapshot.node_id;
-        register_request.registration = RegistrationFromSnapshot(snapshot);
-        const auto register_result = peer->RegisterNode(register_request);
-        ASSERT_TRUE(register_result.summary.status == ViewRegistryStatusCode::kOk ||
-                    register_result.summary.status ==
-                        ViewRegistryStatusCode::kIdempotentReplay);
-        ASSERT_TRUE(register_result.snapshot.has_value());
-
-        if (snapshot.observed_state.sequence == 0U)
+        viewdemo::ViewRegistryPeerSnapshot peer_snapshot;
+        peer_snapshot.cluster_id = snapshot.cluster_id;
+        peer_snapshot.generated_at_unix_ms =
+            snapshot.observed_state.observed_at_unix_ms;
+        switch (snapshot.node_type)
         {
-            return;
+        case ViewNodeType::kView:
+            peer_snapshot.view_nodes.push_back(snapshot);
+            break;
+        case ViewNodeType::kMetadata:
+            peer_snapshot.metadata_nodes.push_back(snapshot);
+            break;
+        case ViewNodeType::kStorage:
+            peer_snapshot.storage_nodes.push_back(snapshot);
+            break;
+        case ViewNodeType::kUnknown:
+            FAIL() << "snapshot node_type must not be unknown";
         }
 
-        HeartbeatNodeRequest heartbeat_request;
-        heartbeat_request.request_id =
-            request_prefix + "-heartbeat-" + snapshot.node_id + "-" +
-            std::to_string(snapshot.observed_state.sequence);
-        heartbeat_request.cluster_id = snapshot.cluster_id;
-        heartbeat_request.node_id = snapshot.node_id;
-        heartbeat_request.node_type = snapshot.node_type;
-        heartbeat_request.incarnation_id = snapshot.observed_state.incarnation_id;
-        heartbeat_request.sequence = snapshot.observed_state.sequence;
-        heartbeat_request.observation = RegistrationFromSnapshot(snapshot);
-
-        const auto heartbeat_result = peer->HeartbeatNode(heartbeat_request);
-        ASSERT_TRUE(heartbeat_result.summary.status == ViewRegistryStatusCode::kOk ||
-                    heartbeat_result.summary.status ==
-                        ViewRegistryStatusCode::kIdempotentReplay ||
-                    heartbeat_result.summary.status ==
-                        ViewRegistryStatusCode::kStaleIgnored);
-        ASSERT_TRUE(heartbeat_result.snapshot.has_value());
+        const auto import_result = peer->ImportPeerSnapshot(
+            viewdemo::ImportPeerSnapshotRequest{
+                .request_id = request_prefix + "-import-" + snapshot.node_id,
+                .cluster_id = snapshot.cluster_id,
+                .snapshot = std::move(peer_snapshot)});
+        ASSERT_EQ(import_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(import_result.received_node_count, 1U);
+        ASSERT_EQ(import_result.accepted_node_count, 1U);
+        ASSERT_EQ(import_result.conflict_node_count, 0U);
     }
 
     TEST(ViewNodeDiscoveryTest, RegisterStoresNodeFactsAndLookupOrClusterViewSorted)
@@ -1603,24 +1595,25 @@ namespace
                                  8U,
                                  230U);
 
-        GetClusterViewRequest cluster_request;
-        cluster_request.request_id = "cluster-view-peer-sync-source";
-        cluster_request.cluster_id = kClusterId;
-        cluster_request.include_dead_nodes = true;
-        cluster_request.include_warnings = true;
-        const auto cluster_view_a = registry_a.GetClusterView(cluster_request, 230);
-        ASSERT_EQ(cluster_view_a.summary.status, ViewRegistryStatusCode::kOk);
-        ASSERT_EQ(cluster_view_a.snapshot.storage_nodes.size(), 1U);
-        const auto &latest_snapshot = cluster_view_a.snapshot.storage_nodes[0];
+        const auto export_result = ExportPeerSnapshotOrAssert(
+            registry_a,
+            "export-peer-sync-source",
+            230);
+        ASSERT_EQ(export_result.snapshot.storage_nodes.size(), 1U);
+        const auto &latest_snapshot = export_result.snapshot.storage_nodes[0];
         ExpectObservedStateFacts(latest_snapshot, incarnation_id, 8U, 230U);
         EXPECT_EQ(latest_snapshot.health.health, ViewNodeHealth::kHealthy);
         EXPECT_EQ(latest_snapshot.endpoint, storage.endpoint);
 
-        // 这里显式做 test-level snapshot replay，模拟后续 peer sync 的
-        // observed-state 传播；本任务不实现生产网络同步逻辑。
-        SyncSnapshotToPeerRegistry(&registry_b,
-                                   latest_snapshot,
-                                   "peer-sync-latest");
+        const auto import_result = registry_b.ImportPeerSnapshot(
+            viewdemo::ImportPeerSnapshotRequest{
+                .request_id = "import-peer-sync-latest",
+                .cluster_id = kClusterId,
+                .snapshot = export_result.snapshot});
+        ASSERT_EQ(import_result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(import_result.received_node_count, 1U);
+        EXPECT_EQ(import_result.accepted_node_count, 1U);
+        EXPECT_EQ(import_result.conflict_node_count, 0U);
 
         DiscoverStorageRequest discover_request;
         discover_request.request_id = "discover-peer-synced-storage";
@@ -1747,29 +1740,28 @@ namespace
                                  99U,
                                  240U);
 
-        GetClusterViewRequest cluster_request;
-        cluster_request.request_id = "cluster-view-peer-old-incarnation-source";
-        cluster_request.cluster_id = kClusterId;
-        cluster_request.include_dead_nodes = true;
-        cluster_request.include_warnings = true;
-
-        const auto source_cluster_view =
-            source_registry.GetClusterView(cluster_request, 600);
-        ASSERT_EQ(source_cluster_view.summary.status, ViewRegistryStatusCode::kOk);
-        ASSERT_EQ(source_cluster_view.snapshot.storage_nodes.size(), 1U);
-        const auto &old_peer_snapshot = source_cluster_view.snapshot.storage_nodes[0];
+        const auto export_result = ExportPeerSnapshotOrAssert(
+            source_registry,
+            "export-peer-old-incarnation-source",
+            600);
+        ASSERT_EQ(export_result.snapshot.storage_nodes.size(), 1U);
+        const auto &old_peer_snapshot = export_result.snapshot.storage_nodes[0];
         ExpectObservedStateFacts(old_peer_snapshot, old_incarnation, 99U, 240U);
         EXPECT_EQ(old_peer_snapshot.liveness, ViewNodeLivenessState::kDead);
         EXPECT_EQ(old_peer_snapshot.health.health, ViewNodeHealth::kUnavailable);
         EXPECT_GT(old_peer_snapshot.last_seen_unix_ms,
                   current_live_result.snapshot->last_seen_unix_ms);
 
-        // 当前还没有专门的 peer snapshot import API；测试通过现有
-        // snapshot replay helper 约束后续 T039/T040 必须复用同一套
-        // incarnation/sequence 排序，不能让旧 peer snapshot 覆盖本地新状态。
-        SyncSnapshotToPeerRegistry(&peer_registry,
-                                   old_peer_snapshot,
-                                   "peer-sync-old-incarnation");
+        const auto import_result = peer_registry.ImportPeerSnapshot(
+            viewdemo::ImportPeerSnapshotRequest{
+                .request_id = "import-peer-old-incarnation",
+                .cluster_id = kClusterId,
+                .snapshot = export_result.snapshot});
+        ASSERT_EQ(import_result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(import_result.received_node_count, 1U);
+        EXPECT_EQ(import_result.accepted_node_count, 1U);
+        EXPECT_EQ(import_result.stale_ignored_node_count, 1U);
+        EXPECT_EQ(import_result.conflict_node_count, 0U);
 
         const auto lookup_after_old_peer_snapshot =
             peer_registry.LookupNode(kClusterId,
@@ -1796,6 +1788,168 @@ namespace
         EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->load.queued_ops, 13U);
         EXPECT_EQ(lookup_after_old_peer_snapshot.snapshot->liveness,
                   ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         PeerSnapshotLowerSequenceWithLaterObservedTimeCannotOverrideLiveState)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        ViewNodeRegistry source_registry(config);
+        ViewNodeRegistry peer_registry(config);
+
+        auto storage = MakeRegistration(ViewNodeType::kStorage,
+                                        "store-peer-lower-sequence-1",
+                                        9714,
+                                        100);
+        storage.capacity.total_capacity_bytes = 16'384;
+        storage.capacity.used_capacity_bytes = 4'096;
+        storage.capacity.available_capacity_bytes = 12'288;
+
+        RegisterNodeOrAssert(&source_registry,
+                             MakeRegisterRequest(
+                                 storage,
+                                 "register-source-store-peer-lower-sequence-1"));
+        RegisterNodeOrAssert(&peer_registry,
+                             MakeRegisterRequest(
+                                 storage,
+                                 "register-peer-store-peer-lower-sequence-1"));
+
+        const std::string incarnation_id =
+            "store-peer-lower-sequence-1:boot:230000000:81:1";
+
+        auto current_live = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                 "store-peer-lower-sequence-1",
+                                                 9714,
+                                                 11,
+                                                 230);
+        current_live.incarnation_id = incarnation_id;
+        current_live.observation.health.health = ViewNodeHealth::kHealthy;
+        current_live.observation.health.disk_pressure = ViewNodeDiskPressure::kLow;
+        current_live.observation.load.active_reads = 9;
+        current_live.observation.load.active_writes = 6;
+        current_live.observation.load.queued_ops = 13;
+        const auto current_live_result = peer_registry.HeartbeatNode(current_live);
+        ASSERT_EQ(current_live_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(current_live_result.applied);
+
+        auto lower_sequence = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                   "store-peer-lower-sequence-1",
+                                                   9714,
+                                                   10,
+                                                   999);
+        lower_sequence.incarnation_id = incarnation_id;
+        lower_sequence.observation.health.health =
+            ViewNodeHealth::kUnavailable;
+        lower_sequence.observation.health.disk_pressure =
+            ViewNodeDiskPressure::kFull;
+        lower_sequence.observation.load.active_reads = 1;
+        lower_sequence.observation.load.active_writes = 1;
+        lower_sequence.observation.load.queued_ops = 1;
+        const auto lower_sequence_result =
+            source_registry.HeartbeatNode(lower_sequence);
+        ASSERT_EQ(lower_sequence_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lower_sequence_result.applied);
+
+        const auto export_result = ExportPeerSnapshotOrAssert(
+            source_registry,
+            "export-peer-lower-sequence-source",
+            999);
+        ASSERT_EQ(export_result.snapshot.storage_nodes.size(), 1U);
+        ExpectObservedStateFacts(export_result.snapshot.storage_nodes[0],
+                                 incarnation_id,
+                                 10U,
+                                 999U);
+        EXPECT_EQ(export_result.snapshot.storage_nodes[0].health.health,
+                  ViewNodeHealth::kUnavailable);
+
+        const auto import_result = peer_registry.ImportPeerSnapshot(
+            viewdemo::ImportPeerSnapshotRequest{
+                .request_id = "import-peer-lower-sequence",
+                .cluster_id = kClusterId,
+                .snapshot = export_result.snapshot});
+        ASSERT_EQ(import_result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(import_result.received_node_count, 1U);
+        EXPECT_EQ(import_result.accepted_node_count, 1U);
+        EXPECT_EQ(import_result.stale_ignored_node_count, 1U);
+        EXPECT_EQ(import_result.conflict_node_count, 0U);
+
+        const auto lookup = peer_registry.LookupNode(kClusterId,
+                                                     "store-peer-lower-sequence-1",
+                                                     999);
+        ASSERT_EQ(lookup.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_TRUE(lookup.snapshot.has_value());
+        ExpectObservedStateFacts(*lookup.snapshot, incarnation_id, 11U, 230U);
+        EXPECT_EQ(lookup.snapshot->health.health, ViewNodeHealth::kHealthy);
+        EXPECT_EQ(lookup.snapshot->health.disk_pressure,
+                  ViewNodeDiskPressure::kLow);
+        EXPECT_EQ(lookup.snapshot->load.active_reads, 9U);
+        EXPECT_EQ(lookup.snapshot->load.active_writes, 6U);
+        EXPECT_EQ(lookup.snapshot->load.queued_ops, 13U);
+        EXPECT_EQ(lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+    }
+
+    TEST(ViewNodeDiscoveryTest,
+         PeerSnapshotImportConflictPreservesStickyDiagnostics)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(1000);
+        config.suspect_timeout = std::chrono::milliseconds(2000);
+        config.dead_timeout = std::chrono::milliseconds(3000);
+        ViewNodeRegistry source_registry(config);
+        ViewNodeRegistry peer_registry(config);
+
+        auto peer_storage = MakeRegistration(ViewNodeType::kStorage,
+                                             "store-peer-conflict-1",
+                                             9715,
+                                             100);
+        peer_storage.capacity.total_capacity_bytes = 16'384;
+        peer_storage.capacity.used_capacity_bytes = 4'096;
+        peer_storage.capacity.available_capacity_bytes = 12'288;
+        RegisterNodeOrAssert(&peer_registry,
+                             MakeRegisterRequest(peer_storage,
+                                                "register-peer-store-peer-conflict-1"));
+
+        auto source_storage = peer_storage;
+        source_storage.endpoint = "127.0.0.1:9815";
+        source_storage.control_plane_endpoint = "127.0.0.1:10815";
+        source_storage.data_plane_endpoint = "127.0.0.1:11815";
+        source_storage.data_dir_fingerprint = "fingerprint-peer-conflict-source";
+        RegisterNodeOrAssert(&source_registry,
+                             MakeRegisterRequest(
+                                 source_storage,
+                                 "register-source-store-peer-conflict-1"));
+
+        const auto export_result = ExportPeerSnapshotOrAssert(
+            source_registry,
+            "export-peer-conflict-source",
+            100);
+        ASSERT_EQ(export_result.snapshot.storage_nodes.size(), 1U);
+
+        const auto import_result = peer_registry.ImportPeerSnapshot(
+            viewdemo::ImportPeerSnapshotRequest{
+                .request_id = "import-peer-conflict",
+                .cluster_id = kClusterId,
+                .snapshot = export_result.snapshot});
+        ASSERT_EQ(import_result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(import_result.received_node_count, 1U);
+        EXPECT_EQ(import_result.accepted_node_count, 0U);
+        EXPECT_EQ(import_result.conflict_node_count, 1U);
+        EXPECT_TRUE(ContainsDiagnosticCode(import_result.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "cluster-view-peer-conflict";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto cluster_view = peer_registry.GetClusterView(cluster_request, 100);
+        ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_view.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kEndpointConflict));
     }
 
     TEST(ViewNodeDiscoveryTest,
