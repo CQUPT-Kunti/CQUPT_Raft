@@ -285,11 +285,13 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
 
   add_dependencies(test_metadata_client_scenario
     raft_metadata_client
+    metadata_node_app
   )
 
   target_link_libraries(test_metadata_client_scenario
     PRIVATE
       metadata_proto
+      view_proto
       GTest::gtest_main
   )
 
@@ -301,6 +303,7 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
   target_compile_definitions(test_metadata_client_scenario
     PRIVATE
       RAFT_METADATA_CLIENT_PATH="$<TARGET_FILE:raft_metadata_client>"
+      METADATA_NODE_APP_PATH="$<TARGET_FILE:metadata_node_app>"
   )
 
   gtest_discover_tests(test_metadata_client_scenario

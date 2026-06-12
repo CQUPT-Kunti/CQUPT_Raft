@@ -1,5 +1,6 @@
 #include "cluster/cluster_config.h"
 #include "cluster/node_identity.h"
+#include "metadata.grpc.pb.h"
 #include "raft/common/config.h"
 #include "raft/node/raft_node.h"
 #include "view/view_client.h"
@@ -20,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -67,6 +69,27 @@ namespace
         bool registered{false};
         std::uint64_t next_sequence{1};
         std::string last_error_key;
+    };
+
+    struct DynamicJoinAttempt
+    {
+        std::string endpoint;
+        grpc::Status rpc_status;
+        raft::JoinMetadataClusterResponse response;
+    };
+
+    struct DynamicJoinTarget
+    {
+        std::string endpoint;
+        std::string source;
+        std::string observed_view_node_id;
+    };
+
+    struct DynamicJoinDiscoveryResult
+    {
+        std::vector<DynamicJoinTarget> targets;
+        std::vector<std::string> diagnostics;
+        bool used_view_discovery{false};
     };
 
     class IdentityStartupError final : public std::runtime_error
@@ -621,6 +644,400 @@ namespace
                "-" + std::to_string(nonce);
     }
 
+    [[nodiscard]] std::vector<ViewRegistrationTarget> BuildViewTargets(
+        const clusterdemo::ClusterConfig &config);
+
+    [[nodiscard]] std::vector<std::string> BuildDynamicJoinSeedEndpoints(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup)
+    {
+        std::vector<std::string> endpoints;
+        std::unordered_set<std::string> seen;
+        endpoints.reserve(config.metadata_nodes.size());
+
+        for (const auto &metadata_node : config.metadata_nodes)
+        {
+            if (metadata_node.node_id == startup.node_id)
+            {
+                continue;
+            }
+            if (metadata_node.initial_role ==
+                clusterdemo::MetadataNodeInitialRole::kCandidate)
+            {
+                continue;
+            }
+            if (metadata_node.endpoint.empty())
+            {
+                continue;
+            }
+            if (!seen.insert(metadata_node.endpoint).second)
+            {
+                continue;
+            }
+            endpoints.push_back(metadata_node.endpoint);
+        }
+        return endpoints;
+    }
+
+    [[nodiscard]] std::string ResolveMetadataJoinTargetEndpoint(
+        const viewdemo::ViewNodeSnapshot &snapshot)
+    {
+        if (!snapshot.control_plane_endpoint.empty())
+        {
+            return snapshot.control_plane_endpoint;
+        }
+        return snapshot.endpoint;
+    }
+
+    void AppendDynamicJoinTarget(
+        std::vector<DynamicJoinTarget> *targets,
+        std::unordered_set<std::string> *seen,
+        const MetadataNodeStartupConfig &startup,
+        std::string endpoint,
+        std::string source,
+        std::string observed_view_node_id)
+    {
+        if (targets == nullptr || seen == nullptr)
+        {
+            return;
+        }
+        if (endpoint.empty() || endpoint == startup.listen_endpoint)
+        {
+            return;
+        }
+        if (!seen->insert(endpoint).second)
+        {
+            return;
+        }
+        targets->push_back(DynamicJoinTarget{
+            .endpoint = std::move(endpoint),
+            .source = std::move(source),
+            .observed_view_node_id = std::move(observed_view_node_id),
+        });
+    }
+
+    [[nodiscard]] DynamicJoinDiscoveryResult DiscoverDynamicJoinTargets(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup)
+    {
+        DynamicJoinDiscoveryResult result;
+        std::unordered_set<std::string> seen;
+        const auto view_targets = BuildViewTargets(config);
+        std::uint64_t request_nonce = NowUnixMs();
+
+        for (const auto &view_target : view_targets)
+        {
+            const auto discovery = view_target.client->DiscoverMetadata(
+                viewdemo::DiscoverMetadataRequest{
+                    .request_id = MakeViewRequestId("discover-metadata",
+                                                   startup,
+                                                   request_nonce++),
+                    .cluster_id = startup.cluster_id,
+                    .prefer_leader = true,
+                    .live_only = true,
+                    .limit = static_cast<std::uint32_t>(
+                        std::max<std::size_t>(config.metadata_nodes.size(), 3U)),
+                });
+
+            std::ostringstream diagnostic;
+            diagnostic << "view_endpoint=" << view_target.endpoint;
+            if (!discovery.transport_ok())
+            {
+                diagnostic << " transport_status="
+                           << static_cast<int>(discovery.rpc.grpc_status_code)
+                           << " transport_message="
+                           << discovery.rpc.grpc_error_message;
+                result.diagnostics.push_back(diagnostic.str());
+                continue;
+            }
+
+            diagnostic << " status="
+                       << viewdemo::ToString(
+                              discovery.result.summary.status)
+                       << " metadata_candidates="
+                       << discovery.result.metadata_nodes.size()
+                       << " message="
+                       << discovery.result.summary.message;
+            if (discovery.result.leader_hint.has_value())
+            {
+                diagnostic << " leader_hint_endpoint="
+                           << discovery.result.leader_hint->endpoint;
+            }
+            result.diagnostics.push_back(diagnostic.str());
+
+            if (!discovery.result.ok())
+            {
+                continue;
+            }
+
+            const std::string observed_view_node_id =
+                !discovery.result.summary.node_id.empty()
+                    ? discovery.result.summary.node_id
+                    : view_target.endpoint;
+
+            if (discovery.result.leader_hint.has_value())
+            {
+                AppendDynamicJoinTarget(&result.targets,
+                                        &seen,
+                                        startup,
+                                        discovery.result.leader_hint->endpoint,
+                                        "view_leader_hint",
+                                        observed_view_node_id);
+            }
+
+            for (const auto &snapshot : discovery.result.metadata_nodes)
+            {
+                AppendDynamicJoinTarget(&result.targets,
+                                        &seen,
+                                        startup,
+                                        ResolveMetadataJoinTargetEndpoint(snapshot),
+                                        "view_metadata_candidate",
+                                        observed_view_node_id);
+            }
+        }
+
+        result.used_view_discovery = !result.targets.empty();
+        if (result.used_view_discovery)
+        {
+            return result;
+        }
+
+        for (const auto &endpoint : BuildDynamicJoinSeedEndpoints(config, startup))
+        {
+            AppendDynamicJoinTarget(&result.targets,
+                                    &seen,
+                                    startup,
+                                    endpoint,
+                                    "config_seed_fallback",
+                                    {});
+        }
+        return result;
+    }
+
+    [[nodiscard]] raft::JoinMetadataClusterRequest BuildJoinMetadataClusterRequest(
+        const MetadataNodeStartupConfig &startup,
+        const clusterdemo::NodeIdentity &identity,
+        const clusterdemo::ProcessIncarnation &incarnation,
+        const DynamicJoinTarget &target)
+    {
+        raft::JoinMetadataClusterRequest request;
+        const std::uint64_t now_unix_ms = NowUnixMs();
+        request.set_request_id("metadata-node-app-join-" + startup.node_id + "-" +
+                               std::to_string(now_unix_ms));
+        request.set_cluster_id(startup.cluster_id);
+        request.set_node_id(identity.node_id);
+        request.set_candidate_raft_id(startup.raft_id);
+        request.set_candidate_client_address(startup.listen_endpoint);
+        request.set_candidate_raft_address(startup.listen_endpoint);
+        request.set_candidate_incarnation_id(incarnation.incarnation_id);
+        request.set_candidate_sequence(incarnation.startup_sequence_base);
+        request.set_persistent_generation(identity.persistent_generation);
+        request.set_data_dir_fingerprint(NormalizePathKey(startup.data_dir));
+        request.set_local_state_hint(
+            raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+        request.set_observed_view_node_id(target.observed_view_node_id);
+        request.set_observed_time_unix_ms(now_unix_ms);
+        request.set_observed_metadata_endpoint(target.endpoint);
+        return request;
+    }
+
+    [[nodiscard]] DynamicJoinAttempt AttemptDynamicJoinValidation(
+        const std::string &endpoint,
+        const raft::JoinMetadataClusterRequest &request)
+    {
+        DynamicJoinAttempt attempt;
+        attempt.endpoint = endpoint;
+
+        auto channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
+        auto stub = raft::MetadataService::NewStub(channel);
+        grpc::ClientContext context;
+        attempt.rpc_status =
+            stub->JoinMetadataCluster(&context, request, &attempt.response);
+        return attempt;
+    }
+
+    [[nodiscard]] std::string DescribeJoinAttempt(
+        const DynamicJoinAttempt &attempt)
+    {
+        std::ostringstream oss;
+        oss << "endpoint=" << attempt.endpoint;
+        if (!attempt.rpc_status.ok())
+        {
+            oss << " transport_status="
+                << static_cast<int>(attempt.rpc_status.error_code())
+                << " transport_message=" << attempt.rpc_status.error_message();
+            return oss.str();
+        }
+
+        oss << " status="
+            << raft::MetadataStatusCode_Name(attempt.response.summary().code())
+            << " disposition="
+            << raft::JoinMetadataClusterDisposition_Name(
+                   attempt.response.disposition())
+            << " requested_membership="
+            << raft::JoinMetadataTargetMembership_Name(
+                   attempt.response.requested_membership())
+            << " committed_membership_changed="
+            << (attempt.response.committed_membership_changed() ? "true" : "false")
+            << " membership_epoch=" << attempt.response.membership_epoch()
+            << " message=" << attempt.response.summary().message();
+        if (attempt.response.summary().has_leader_hint())
+        {
+            oss << " leader_hint_id="
+                << attempt.response.summary().leader_hint().leader_id()
+                << " leader_hint_address="
+                << attempt.response.summary().leader_hint().leader_address();
+        }
+        return oss.str();
+    }
+
+    [[nodiscard]] int RunDynamicJoinCandidateMode(
+        const clusterdemo::ClusterConfig &config,
+        const MetadataNodeStartupConfig &startup,
+        const clusterdemo::NodeIdentity &identity,
+        const clusterdemo::ProcessIncarnation &incarnation)
+    {
+        const auto discovery = DiscoverDynamicJoinTargets(config, startup);
+        if (discovery.targets.empty())
+        {
+            std::cerr
+                << "metadata_node_app dynamic join error: no MetadataNode join targets were discovered"
+                << " configured for node_id=" << startup.node_id
+                << " cluster_id=" << startup.cluster_id;
+            if (!discovery.diagnostics.empty())
+            {
+                std::cerr << " discovery_attempts=[";
+                for (std::size_t index = 0; index < discovery.diagnostics.size(); ++index)
+                {
+                    if (index > 0)
+                    {
+                        std::cerr << " | ";
+                    }
+                    std::cerr << discovery.diagnostics[index];
+                }
+                std::cerr << "]";
+            }
+            std::cerr << '\n';
+            return static_cast<int>(ExitCode::kConfigError);
+        }
+
+        std::vector<std::string> diagnostics;
+        diagnostics.reserve(discovery.targets.size() + discovery.diagnostics.size());
+        diagnostics.insert(diagnostics.end(),
+                           discovery.diagnostics.begin(),
+                           discovery.diagnostics.end());
+        std::optional<DynamicJoinAttempt> last_not_leader;
+        std::vector<DynamicJoinTarget> pending_targets = discovery.targets;
+        std::unordered_set<std::string> queued_endpoints;
+        std::unordered_set<std::string> attempted_endpoints;
+        for (const auto &target : pending_targets)
+        {
+            queued_endpoints.insert(target.endpoint);
+        }
+
+        for (std::size_t index = 0; index < pending_targets.size(); ++index)
+        {
+            const auto &target = pending_targets[index];
+            if (!attempted_endpoints.insert(target.endpoint).second)
+            {
+                continue;
+            }
+
+            const auto request = BuildJoinMetadataClusterRequest(startup,
+                                                                 identity,
+                                                                 incarnation,
+                                                                 target);
+            const DynamicJoinAttempt attempt =
+                AttemptDynamicJoinValidation(target.endpoint, request);
+            diagnostics.push_back("source=" + target.source + " " +
+                                  DescribeJoinAttempt(attempt));
+
+            if (!attempt.rpc_status.ok())
+            {
+                continue;
+            }
+
+            switch (attempt.response.disposition())
+            {
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER:
+                last_not_leader = attempt;
+                if (attempt.response.summary().has_leader_hint() &&
+                    !attempt.response.summary().leader_hint().leader_address().empty())
+                {
+                    AppendDynamicJoinTarget(&pending_targets,
+                                            &queued_endpoints,
+                                            startup,
+                                            attempt.response.summary().leader_hint().leader_address(),
+                                            "metadata_not_leader_hint",
+                                            target.observed_view_node_id);
+                }
+                continue;
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT:
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE:
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE:
+                std::cout
+                    << "metadata_node_app candidate mode join validation reached"
+                    << " cluster_id=" << startup.cluster_id
+                    << " node_id=" << identity.node_id
+                    << " raft_id=" << startup.raft_id
+                    << " endpoint=" << startup.listen_endpoint
+                    << " identity_membership_state="
+                    << clusterdemo::ToString(identity.membership_state)
+                    << " identity_source="
+                    << clusterdemo::ToString(identity.source)
+                    << " persistent_generation=" << identity.persistent_generation
+                    << " incarnation_id=" << incarnation.incarnation_id
+                    << " discovery_source="
+                    << (discovery.used_view_discovery ? "view_candidates"
+                                                      : "config_seed_fallback")
+                    << " result=" << DescribeJoinAttempt(attempt)
+                    << "; AddLearner/catch-up/promote are not implemented, "
+                       "candidate will not start as local voter/learner"
+                    << '\n';
+                return static_cast<int>(ExitCode::kUnsupported);
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_INVALID_CANDIDATE:
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED:
+            case raft::JOIN_METADATA_CLUSTER_DISPOSITION_UNSPECIFIED:
+            default:
+                std::cerr
+                    << "metadata_node_app dynamic join rejected: "
+                    << DescribeJoinAttempt(attempt) << '\n';
+                return static_cast<int>(ExitCode::kStartupError);
+            }
+        }
+
+        std::cerr << "metadata_node_app dynamic join failed: no metadata leader accepted join validation"
+                  << " cluster_id=" << startup.cluster_id
+                  << " node_id=" << identity.node_id
+                  << " raft_id=" << startup.raft_id
+                  << " discovery_source="
+                  << (discovery.used_view_discovery ? "view_candidates"
+                                                    : "config_seed_fallback");
+        if (last_not_leader.has_value() &&
+            last_not_leader->response.summary().has_leader_hint())
+        {
+            std::cerr << " last_leader_hint_id="
+                      << last_not_leader->response.summary().leader_hint().leader_id()
+                      << " last_leader_hint_address="
+                      << last_not_leader->response.summary().leader_hint().leader_address();
+        }
+        if (!diagnostics.empty())
+        {
+            std::cerr << " attempts=[";
+            for (std::size_t index = 0; index < diagnostics.size(); ++index)
+            {
+                if (index > 0)
+                {
+                    std::cerr << " | ";
+                }
+                std::cerr << diagnostics[index];
+            }
+            std::cerr << "]";
+        }
+        std::cerr << '\n';
+        return static_cast<int>(ExitCode::kStartupError);
+    }
+
     [[nodiscard]] std::optional<std::string> FindMetadataNodeIdByRaftId(
         const clusterdemo::ClusterConfig &config,
         const std::int32_t raft_id)
@@ -1051,22 +1468,10 @@ namespace
 
         if (IsDynamicJoinCandidateMode(startup))
         {
-            std::cout
-                << "metadata_node_app candidate mode prepared durable identity and process incarnation"
-                << " cluster_id=" << startup.cluster_id
-                << " node_id=" << identity.node_id
-                << " raft_id=" << startup.raft_id
-                << " endpoint=" << startup.listen_endpoint
-                << " data_dir=" << startup.data_dir.generic_string()
-                << " identity_membership_state="
-                << clusterdemo::ToString(identity.membership_state)
-                << " identity_source="
-                << clusterdemo::ToString(identity.source)
-                << " incarnation_id=" << incarnation.incarnation_id
-                << "; JoinMetadataCluster/AddLearner is not implemented in T016,"
-                << " refusing to start candidate as a Raft voter/learner without committed membership authority"
-                << '\n';
-            return static_cast<int>(ExitCode::kUnsupported);
+            return RunDynamicJoinCandidateMode(*loaded_config.config,
+                                               startup,
+                                               identity,
+                                               incarnation);
         }
 
         const raftdemo::NodeConfig node_config =
