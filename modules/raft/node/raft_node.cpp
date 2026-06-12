@@ -207,6 +207,19 @@ namespace raftdemo
                          });
     }
 
+    RuntimeMembershipEntry MakeCommittedVoterRuntimeEntry(
+        const std::int32_t raft_id,
+        std::string address)
+    {
+      RuntimeMembershipEntry entry;
+      entry.raft_id = raft_id;
+      entry.address = std::move(address);
+      entry.role = RuntimeMembershipRole::kVoter;
+      entry.committed = true;
+      entry.pending = false;
+      return entry;
+    }
+
   } // namespace
 
   RaftNode::RaftNode(NodeConfig config)
@@ -577,6 +590,12 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return snapshot;
   }
 
+  RuntimeMembershipSummary RaftNode::GetRuntimeMembershipSummary() const
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    return BuildRuntimeMembershipSummaryLocked();
+  }
+
   CommittedMembershipQuorumSummary RaftNode::GetCommittedMembershipQuorumSummary() const
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -607,6 +626,79 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
                                             config_.node_id)
                              ? CommittedMembershipRole::kVoter
                              : CommittedMembershipRole::kNonMember;
+    return summary;
+  }
+
+  RuntimeMembershipSummary RaftNode::BuildRuntimeMembershipSummaryLocked() const
+  {
+    RuntimeMembershipSummary summary;
+    summary.committed_log_index = commit_index_;
+    summary.committed_term = TermAtIndexLocked(commit_index_);
+
+    std::map<std::int32_t, RuntimeMembershipEntry> voter_entries_by_id;
+    voter_entries_by_id.emplace(
+        config_.node_id,
+        MakeCommittedVoterRuntimeEntry(config_.node_id, config_.address));
+    for (const auto &peer : config_.peers)
+    {
+      voter_entries_by_id.try_emplace(
+          peer.node_id,
+          MakeCommittedVoterRuntimeEntry(peer.node_id, peer.address));
+    }
+
+    for (const auto &[raft_id, entry] : voter_entries_by_id)
+    {
+      summary.voter_ids.push_back(raft_id);
+      summary.voter_entries.push_back(entry);
+    }
+
+    if (pending_add_learner_proposal_.has_value())
+    {
+      RuntimeMembershipEntry learner_entry;
+      learner_entry.raft_id = pending_add_learner_proposal_->candidate_raft_id;
+      learner_entry.address = pending_add_learner_proposal_->candidate_raft_address;
+      learner_entry.role = RuntimeMembershipRole::kLearner;
+      learner_entry.committed = false;
+      learner_entry.pending = true;
+      learner_entry.canonical_node_id = pending_add_learner_proposal_->node_id;
+      learner_entry.candidate_incarnation_id =
+          pending_add_learner_proposal_->candidate_incarnation_id;
+      learner_entry.candidate_sequence =
+          pending_add_learner_proposal_->candidate_sequence;
+      learner_entry.persistent_generation =
+          pending_add_learner_proposal_->persistent_generation;
+      learner_entry.data_dir_fingerprint =
+          pending_add_learner_proposal_->data_dir_fingerprint;
+      if (voter_entries_by_id.find(learner_entry.raft_id) ==
+          voter_entries_by_id.end())
+      {
+        summary.learner_ids.push_back(learner_entry.raft_id);
+        summary.learner_entries.push_back(learner_entry);
+      }
+    }
+
+    summary.voter_count = summary.voter_entries.size();
+    summary.learner_count = summary.learner_entries.size();
+    summary.committed_voter_quorum_size =
+        ComputeCommittedVoterQuorumSize(summary.voter_count);
+
+    if (std::binary_search(summary.voter_ids.begin(),
+                           summary.voter_ids.end(),
+                           config_.node_id))
+    {
+      summary.local_role = RuntimeMembershipRole::kVoter;
+    }
+    else if (std::binary_search(summary.learner_ids.begin(),
+                                summary.learner_ids.end(),
+                                config_.node_id))
+    {
+      summary.local_role = RuntimeMembershipRole::kLearner;
+    }
+    else
+    {
+      summary.local_role = RuntimeMembershipRole::kNonMember;
+    }
+
     return summary;
   }
 

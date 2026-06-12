@@ -102,6 +102,42 @@ namespace raftdemo
     kNonMember,
   };
 
+  enum class RuntimeMembershipRole
+  {
+    kUnknown,
+    kVoter,
+    kLearner,
+    kNonMember,
+  };
+
+  struct RuntimeMembershipEntry
+  {
+    std::int32_t raft_id{0};
+    std::string address;
+    RuntimeMembershipRole role{RuntimeMembershipRole::kUnknown};
+    bool committed{false};
+    bool pending{false};
+    std::string canonical_node_id;
+    std::string candidate_incarnation_id;
+    std::uint64_t candidate_sequence{0};
+    std::uint64_t persistent_generation{0};
+    std::string data_dir_fingerprint;
+  };
+
+  struct RuntimeMembershipSummary
+  {
+    std::uint64_t committed_log_index{0};
+    std::uint64_t committed_term{0};
+    std::vector<int> voter_ids;
+    std::vector<int> learner_ids;
+    std::vector<RuntimeMembershipEntry> voter_entries;
+    std::vector<RuntimeMembershipEntry> learner_entries;
+    std::size_t voter_count{0};
+    std::size_t learner_count{0};
+    std::size_t committed_voter_quorum_size{0};
+    RuntimeMembershipRole local_role{RuntimeMembershipRole::kUnknown};
+  };
+
   struct CommittedMembershipQuorumSummary
   {
     // 仅用于诊断：必须基于已提交 membership 计算，不能按 live 节点或 ViewNode 观测降 quorum。
@@ -187,6 +223,10 @@ namespace raftdemo
     const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
     NodeStatusSnapshot GetStatusSnapshot() const;
     NodeMetricsSnapshot GetMetricsSnapshot() const;
+    // 运行时 membership 诊断接口：显式区分 committed voters 与 runtime learners。
+    // 当前阶段它不会改变 quorum/election/commit，只暴露运行时边界供后续
+    // learner catch-up / promote 安全实现复用。
+    RuntimeMembershipSummary GetRuntimeMembershipSummary() const;
     // 只读诊断接口：返回当前已提交 membership / quorum 摘要，不提供任何可变入口。
     CommittedMembershipQuorumSummary GetCommittedMembershipQuorumSummary() const;
     // AddLearner proposal path 目前只提供 leader admission / duplicate /
@@ -342,6 +382,7 @@ namespace raftdemo
     static const char *RpcKindName(RpcKind kind);
     static std::vector<RpcMetricState> BuildRpcMetricStateTemplate();
     RpcMetricState &RpcMetricLocked(RpcKind kind);
+    RuntimeMembershipSummary BuildRuntimeMembershipSummaryLocked() const;
     void ValidateNodeIdentity();
 
     void StartSnapshotWorker();

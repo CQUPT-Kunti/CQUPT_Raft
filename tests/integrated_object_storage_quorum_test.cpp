@@ -320,6 +320,37 @@ namespace raftdemo
             return oss.str();
         }
 
+        std::string DescribeRuntimeMembershipSummary(
+            const RuntimeMembershipSummary &summary)
+        {
+            std::ostringstream oss;
+            oss << "commit_index=" << summary.committed_log_index
+                << ", term=" << summary.committed_term
+                << ", voters=[";
+            for (std::size_t index = 0; index < summary.voter_ids.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    oss << ",";
+                }
+                oss << summary.voter_ids[index];
+            }
+            oss << "], learners=[";
+            for (std::size_t index = 0; index < summary.learner_ids.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    oss << ",";
+                }
+                oss << summary.learner_ids[index];
+            }
+            oss << "], voter_count=" << summary.voter_count
+                << ", learner_count=" << summary.learner_count
+                << ", committed_voter_quorum=" << summary.committed_voter_quorum_size
+                << ", local_role=" << static_cast<int>(summary.local_role);
+            return oss.str();
+        }
+
         std::filesystem::path TestBinaryDir()
         {
 #ifdef RAFT_TEST_BINARY_DIR
@@ -1815,11 +1846,38 @@ namespace raftdemo
                                  "committed membership log proposal"))
                 << accepted_result.message;
 
+            const auto runtime_summary = leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(runtime_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.learner_ids, std::vector<int>{61})
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.voter_count, 3U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.committed_voter_quorum_size, 2U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            ASSERT_EQ(runtime_summary.learner_entries.size(), 1U);
+            EXPECT_EQ(runtime_summary.learner_entries.front().role,
+                      RuntimeMembershipRole::kLearner);
+            EXPECT_FALSE(runtime_summary.learner_entries.front().committed);
+            EXPECT_TRUE(runtime_summary.learner_entries.front().pending);
+            EXPECT_EQ(runtime_summary.learner_entries.front().canonical_node_id,
+                      accepted_request.node_id);
+            EXPECT_EQ(runtime_summary.learner_entries.front().raft_id,
+                      accepted_request.candidate_raft_id);
+
             const auto duplicate_result = leader->ProposeAddLearner(accepted_request);
             EXPECT_EQ(duplicate_result.status,
                       AddLearnerProposalStatus::kDuplicate)
                 << duplicate_result.message;
             EXPECT_FALSE(duplicate_result.committed_membership_changed);
+
+            const auto duplicate_runtime_summary = leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(duplicate_runtime_summary.learner_ids, std::vector<int>{61})
+                << DescribeRuntimeMembershipSummary(duplicate_runtime_summary);
+            EXPECT_EQ(duplicate_runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(duplicate_runtime_summary);
 
             auto conflicting_request = accepted_request;
             conflicting_request.candidate_client_address =
@@ -1834,6 +1892,12 @@ namespace raftdemo
                 << conflicting_result.message;
             EXPECT_FALSE(conflicting_result.committed_membership_changed);
 
+            const auto conflicting_runtime_summary = leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(conflicting_runtime_summary.learner_ids, std::vector<int>{61})
+                << DescribeRuntimeMembershipSummary(conflicting_runtime_summary);
+            EXPECT_EQ(conflicting_runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(conflicting_runtime_summary);
+
             const auto pending_request = MakeAddLearnerProposalRequest(
                 MakeJoinMetadataClusterRequest("req-add-learner-pending",
                                                kClusterId,
@@ -1846,6 +1910,12 @@ namespace raftdemo
                       AddLearnerProposalStatus::kPendingMembershipChange)
                 << pending_result.message;
             EXPECT_FALSE(pending_result.committed_membership_changed);
+
+            const auto pending_runtime_summary = leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(pending_runtime_summary.learner_ids, std::vector<int>{61})
+                << DescribeRuntimeMembershipSummary(pending_runtime_summary);
+            EXPECT_EQ(pending_runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(pending_runtime_summary);
 
             const auto follower_result = follower->ProposeAddLearner(accepted_request);
             EXPECT_EQ(follower_result.status,

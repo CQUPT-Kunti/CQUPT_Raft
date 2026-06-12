@@ -154,7 +154,7 @@
 - [x] T068 [P] [US4] Add learner excluded from RequestVote and leader election test in `tests/test_raft_election.cpp` (验证: `test_raft_election`)
 - [x] T069 [P] [US4] Add 3 voters + 1 learner quorum remains 2 test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [x] T070 [P] [US4] Add single learner promote blocked by even voter count test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T071 [US4] Extend runtime membership representation for voters and learners in `modules/raft/node/raft_node.h` and `modules/raft/node/raft_node.cpp` (验证: `test_raft_election`, `integrated_object_storage_quorum`)
+- [x] T071 [US4] Extend runtime membership representation for voters and learners in `modules/raft/node/raft_node.h` and `modules/raft/node/raft_node.cpp` (验证: `test_raft_election`, `integrated_object_storage_quorum`)
 - [ ] T072 [US4] Update quorum calculation to use committed voters only in `modules/raft/node/raft_node.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T073 [US4] Exclude learners from RequestVote and candidacy paths in `modules/raft/node/raft_node.cpp` (验证: `test_raft_election`)
 - [ ] T074 [US4] Enable learner log replication progress tracking in `modules/raft/replication/replicator.cpp` and `modules/raft/replication/replicator.h` (验证: `test_raft_log_replication`)

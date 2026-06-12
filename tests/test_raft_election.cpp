@@ -157,6 +157,32 @@ std::string DescribeCommittedMembershipSummary(
   return oss.str();
 }
 
+std::string DescribeRuntimeMembershipSummary(
+    const RuntimeMembershipSummary& summary) {
+  std::ostringstream oss;
+  oss << "commit_index=" << summary.committed_log_index
+      << ", term=" << summary.committed_term
+      << ", voters=[";
+  for (std::size_t index = 0; index < summary.voter_ids.size(); ++index) {
+    if (index != 0) {
+      oss << ",";
+    }
+    oss << summary.voter_ids[index];
+  }
+  oss << "], learners=[";
+  for (std::size_t index = 0; index < summary.learner_ids.size(); ++index) {
+    if (index != 0) {
+      oss << ",";
+    }
+    oss << summary.learner_ids[index];
+  }
+  oss << "], voter_count=" << summary.voter_count
+      << ", learner_count=" << summary.learner_count
+      << ", committed_voter_quorum=" << summary.committed_voter_quorum_size
+      << ", local_role=" << static_cast<int>(summary.local_role);
+  return oss.str();
+}
+
 AddLearnerProposalRequest MakePendingLearnerProposalRequest(
     const std::string& cluster_id,
     const std::string& node_id,
@@ -498,6 +524,26 @@ TEST(RaftElectionTest,
   EXPECT_TRUE(ContainsAll(add_learner_result.message,
                           {"committed membership log proposal", "promote-to-voter"}))
       << add_learner_result.message;
+
+  const auto runtime_summary = leader->GetRuntimeMembershipSummary();
+  EXPECT_EQ(runtime_summary.voter_ids, kCommittedVoters)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.learner_ids, std::vector<int>{kLearnerRaftId})
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.voter_count, 3U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.learner_count, 1U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.committed_voter_quorum_size, 2U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  ASSERT_EQ(runtime_summary.learner_entries.size(), 1U);
+  EXPECT_EQ(runtime_summary.learner_entries.front().role,
+            RuntimeMembershipRole::kLearner);
+  EXPECT_FALSE(runtime_summary.learner_entries.front().committed);
+  EXPECT_TRUE(runtime_summary.learner_entries.front().pending);
+  EXPECT_EQ(runtime_summary.learner_entries.front().raft_id, kLearnerRaftId);
+  EXPECT_EQ(runtime_summary.learner_entries.front().canonical_node_id,
+            "meta-learner-pending");
 
   for (const auto& node : cluster.nodes()) {
     const auto summary = node->GetCommittedMembershipQuorumSummary();
