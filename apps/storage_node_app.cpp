@@ -630,19 +630,28 @@ namespace
         facts.health.health = storedemo::StorageNodeHealth::kHealthy;
         facts.health.disk_pressure = storedemo::StorageNodeDiskPressure::kLow;
         facts.health.io_error_count = 0;
+        facts.health.writable = true;
         facts.failure_domain.zone = startup.failure_domain.zone;
         facts.failure_domain.rack = startup.failure_domain.rack;
         return facts;
     }
 
     [[nodiscard]] viewdemo::ViewNodeHealth ToViewNodeHealth(
-        const storedemo::StorageNodeHealth health)
+        const storedemo::StorageNodeRegistryHealthFacts &health)
     {
-        switch (health)
+        switch (health.health)
         {
         case storedemo::StorageNodeHealth::kHealthy:
+            if (!health.writable)
+            {
+                return viewdemo::ViewNodeHealth::kReadOnly;
+            }
             return viewdemo::ViewNodeHealth::kHealthy;
         case storedemo::StorageNodeHealth::kDegraded:
+            if (!health.writable)
+            {
+                return viewdemo::ViewNodeHealth::kReadOnly;
+            }
             return viewdemo::ViewNodeHealth::kDegraded;
         case storedemo::StorageNodeHealth::kReadOnly:
             return viewdemo::ViewNodeHealth::kReadOnly;
@@ -716,11 +725,11 @@ namespace
         registration.data_dir_fingerprint =
             startup.data_dir.lexically_normal().generic_string();
         registration.observed_at_unix_ms = NowUnixMs();
-        // 当前 ViewNode registration/heartbeat 协议还没有显式 incarnation 字段。
-        // T014 只在 app 内生成并消费 process incarnation，协议扩展留给后续阶段。
+        // Register RPC 当前仍通过 request_id 绑定这次 process incarnation；
+        // Heartbeat RPC 则会显式携带 incarnation_id。
         registration.failure_domain.zone = facts.failure_domain.zone;
         registration.failure_domain.rack = facts.failure_domain.rack;
-        registration.health.health = ToViewNodeHealth(facts.health.health);
+        registration.health.health = ToViewNodeHealth(facts.health);
         registration.health.disk_pressure =
             ToViewNodeDiskPressure(facts.health.disk_pressure);
         registration.health.io_error_count = facts.health.io_error_count;
@@ -867,6 +876,8 @@ namespace
                 .cluster_id = startup.cluster_id,
                 .node_id = identity_state.identity.node_id,
                 .node_type = viewdemo::ViewNodeType::kStorage,
+                .incarnation_id =
+                    identity_state.process_incarnation.incarnation_id,
                 .sequence = sequence,
                 .observation = observation,
             });
@@ -947,6 +958,8 @@ namespace
             storedemo::RegisterStorageNodeRequest{
                 .node_id = identity_state.identity.node_id,
                 .endpoint = startup.listen_endpoint,
+                .incarnation_id =
+                    identity_state.process_incarnation.incarnation_id,
                 .observed_at_unix_ms = NowUnixMs(),
                 .facts = local_facts,
             });
