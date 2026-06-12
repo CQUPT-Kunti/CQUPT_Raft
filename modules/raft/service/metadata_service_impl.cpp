@@ -872,6 +872,43 @@ namespace raftdemo
       return std::nullopt;
     }
 
+    std::string DecorateJoinMetadataAuthorityBoundary(
+        const raft::JoinMetadataClusterRequest &request,
+        std::string message)
+    {
+      const std::string boundary =
+          "viewnode_observation=discovery_only; "
+          "join_authority=metadata_leader_committed_membership_only; "
+          "requested_membership=learner_not_voter";
+      if (message.find("viewnode_observation=discovery_only") !=
+          std::string::npos)
+      {
+        return message;
+      }
+
+      std::ostringstream oss;
+      oss << message;
+      if (!request.observed_view_node_id().empty())
+      {
+        oss << "; observed_view_node_id=" << request.observed_view_node_id();
+      }
+      if (!request.observed_metadata_endpoint().empty())
+      {
+        oss << "; observed_metadata_endpoint="
+            << request.observed_metadata_endpoint();
+      }
+      if (request.observed_time_unix_ms() != 0)
+      {
+        oss << "; observed_time_unix_ms=" << request.observed_time_unix_ms();
+      }
+      if (oss.tellp() > 0)
+      {
+        oss << "; ";
+      }
+      oss << boundary;
+      return oss.str();
+    }
+
     AddLearnerProposalRequest BuildAddLearnerProposalRequest(
         const raft::JoinMetadataClusterRequest &request)
     {
@@ -950,7 +987,7 @@ namespace raftdemo
       auto *reactor = context->DefaultReactor();
       FillSummary(status,
                   code,
-                  message,
+                  DecorateJoinMetadataAuthorityBoundary(request, message),
                   request.request_id(),
                   "",
                   "",

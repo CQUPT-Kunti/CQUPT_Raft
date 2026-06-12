@@ -38,6 +38,8 @@ namespace raftdemo
         using viewdemo::ViewNodeHealth;
         using viewdemo::ViewNodeRegistry;
         using viewdemo::ViewNodeType;
+        using viewdemo::ViewRegistryDiagnostic;
+        using viewdemo::ViewRegistryIssueCode;
         using viewdemo::ViewRegistryStatusCode;
 
         std::string ProposeStatusName(const ProposeStatus status)
@@ -92,6 +94,20 @@ namespace raftdemo
         bool Contains(const std::string &text, const std::string &needle)
         {
             return text.find(needle) != std::string::npos;
+        }
+
+        bool ContainsViewDiagnosticCode(
+            const std::vector<ViewRegistryDiagnostic> &diagnostics,
+            const ViewRegistryIssueCode code)
+        {
+            for (const auto &diagnostic : diagnostics)
+            {
+                if (diagnostic.code == code)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         bool IsLeaderNode(const std::shared_ptr<RaftNode> &node)
@@ -1263,6 +1279,9 @@ namespace raftdemo
             const auto cluster_view = registry.GetClusterView(cluster_view_request, 200);
             ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
             ASSERT_EQ(cluster_view.snapshot.metadata_nodes.size(), 4U);
+            EXPECT_TRUE(ContainsViewDiagnosticCode(
+                cluster_view.snapshot.diagnostics,
+                ViewRegistryIssueCode::kNonAuthorityBoundary));
 
             bool extra_observed_voter_found = false;
             for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
@@ -1455,6 +1474,9 @@ namespace raftdemo
 
             const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
             ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+            EXPECT_TRUE(ContainsViewDiagnosticCode(
+                cluster_view.snapshot.diagnostics,
+                ViewRegistryIssueCode::kNonAuthorityBoundary));
 
             std::size_t candidate_count = 0;
             for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
@@ -1648,6 +1670,9 @@ namespace raftdemo
             const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
             ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
             ASSERT_EQ(cluster_view.snapshot.metadata_nodes.size(), 5U);
+            EXPECT_TRUE(ContainsViewDiagnosticCode(
+                cluster_view.snapshot.diagnostics,
+                ViewRegistryIssueCode::kNonAuthorityBoundary));
 
             std::size_t joining_candidate_count = 0;
             for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
@@ -1881,6 +1906,12 @@ namespace raftdemo
             EXPECT_EQ(response.summary().leader_hint().leader_id(), leader_status.node_id);
             EXPECT_EQ(response.summary().leader_hint().leader_address(),
                       leader_status.address);
+            EXPECT_TRUE(Contains(response.summary().message(),
+                                 "viewnode_observation=discovery_only"))
+                << response.summary().message();
+            EXPECT_TRUE(Contains(response.summary().message(),
+                                 "join_authority=metadata_leader_committed_membership_only"))
+                << response.summary().message();
 
             ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
                                                             kCommittedVoters,
@@ -1946,6 +1977,12 @@ namespace raftdemo
                       accepted_request.node_id());
             EXPECT_EQ(accepted_response.assigned_raft_id(),
                       accepted_request.candidate_raft_id());
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "viewnode_observation=discovery_only"))
+                << accepted_response.summary().message();
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "requested_membership=learner_not_voter"))
+                << accepted_response.summary().message();
 
             raft::JoinMetadataClusterResponse duplicate_response;
             rpc_status = JoinMetadataClusterViaAddress(leader_status.address,

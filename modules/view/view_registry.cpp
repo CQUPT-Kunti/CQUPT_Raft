@@ -697,6 +697,11 @@ namespace viewdemo
             // ViewNode 只补 discovery / observation status，不推导 Raft authority。
             normalized.membership_state =
                 MapObservedMembershipState(normalized, liveness, health);
+            if (liveness != ViewNodeLivenessState::kLive ||
+                health.health == ViewNodeHealth::kUnavailable)
+            {
+                normalized.leader_hint.reset();
+            }
             return normalized;
         }
 
@@ -979,7 +984,8 @@ namespace viewdemo
 
         bool IsObservedLeader(const ViewNodeSnapshot &snapshot)
         {
-            return snapshot.metadata.has_value() &&
+            return snapshot.liveness == ViewNodeLivenessState::kLive &&
+                   snapshot.metadata.has_value() &&
                    snapshot.metadata->raft_role ==
                        MetadataRaftObservedRole::kLeader;
         }
@@ -997,6 +1003,10 @@ namespace viewdemo
         void MaybeUpdateLeaderHint(const ViewNodeSnapshot &snapshot,
                                    std::optional<MetadataLeaderHint> *leader_hint)
         {
+            if (snapshot.liveness != ViewNodeLivenessState::kLive)
+            {
+                return;
+            }
             if (!snapshot.metadata.has_value() ||
                 !snapshot.metadata->leader_hint.has_value())
             {
@@ -1009,6 +1019,52 @@ namespace viewdemo
             {
                 *leader_hint = candidate;
             }
+        }
+
+        std::string BuildMetadataNonAuthorityMessage(
+            const ViewNodeSnapshot &snapshot)
+        {
+            if (!snapshot.metadata.has_value())
+            {
+                return "metadata observation is discovery-only and cannot modify committed membership";
+            }
+
+            switch (snapshot.metadata->membership_state)
+            {
+            case MetadataMembershipObservedState::kVoter:
+                return "observed metadata voter state is discovery-only and does not enter committed voter membership";
+            case MetadataMembershipObservedState::kLearner:
+                return "observed metadata learner state is discovery-only and does not enter committed learner membership";
+            case MetadataMembershipObservedState::kJoining:
+                return "observed metadata joining state is discovery-only and does not bypass metadata leader validation";
+            case MetadataMembershipObservedState::kRegistered:
+            case MetadataMembershipObservedState::kDown:
+            case MetadataMembershipObservedState::kUnknown:
+                return "metadata observation is discovery-only and cannot modify committed membership";
+            }
+
+            return "metadata observation is discovery-only and cannot modify committed membership";
+        }
+
+        void AppendMetadataNonAuthorityDiagnostic(
+            const ViewNodeSnapshot &snapshot,
+            const RequestId &request_id,
+            std::vector<ViewRegistryDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr ||
+                snapshot.node_type != ViewNodeType::kMetadata)
+            {
+                return;
+            }
+
+            diagnostics->push_back(
+                MakeDiagnostic(ViewRegistryIssueCode::kNonAuthorityBoundary,
+                               BuildMetadataNonAuthorityMessage(snapshot),
+                               request_id,
+                               snapshot.cluster_id,
+                               snapshot.node_id,
+                               snapshot.endpoint,
+                               snapshot.last_sequence));
         }
 
         bool PassesMetadataFilters(const ViewNodeSnapshot &snapshot,
@@ -1573,6 +1629,12 @@ namespace viewdemo
                                        now_unix_ms,
                                        impl_->config);
         AppendStickyDiagnostics(existing->second, &result.diagnostics);
+        if (result.snapshot.has_value())
+        {
+            AppendMetadataNonAuthorityDiagnostic(*result.snapshot,
+                                                {},
+                                                &result.diagnostics);
+        }
         return result;
     }
 
@@ -1607,6 +1669,9 @@ namespace viewdemo
             {
                 continue;
             }
+            AppendMetadataNonAuthorityDiagnostic(snapshot,
+                                                request.request_id,
+                                                &result.diagnostics);
             if (!IsLiveForDiscovery(snapshot, request.live_only))
             {
                 AppendLivenessWarning(snapshot,
@@ -1615,7 +1680,8 @@ namespace viewdemo
                 continue;
             }
 
-            if (snapshot.metadata.has_value())
+            if (snapshot.liveness == ViewNodeLivenessState::kLive &&
+                snapshot.metadata.has_value())
             {
                 result.membership_epoch =
                     std::max(result.membership_epoch,
@@ -1781,6 +1847,9 @@ namespace viewdemo
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
             AppendStickyDiagnostics(record, &result.snapshot.diagnostics);
+            AppendMetadataNonAuthorityDiagnostic(snapshot,
+                                                request.request_id,
+                                                &result.snapshot.diagnostics);
             if (!request.include_dead_nodes &&
                 snapshot.liveness == ViewNodeLivenessState::kDead)
             {

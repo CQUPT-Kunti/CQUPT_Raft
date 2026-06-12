@@ -809,8 +809,10 @@ namespace
         EXPECT_EQ(result.leader_hint->observed_term, 12U);
         EXPECT_EQ(result.leader_hint->observed_at_unix_ms, 185U);
         ASSERT_FALSE(result.diagnostics.empty());
-        EXPECT_EQ(result.diagnostics[0].code,
-                  ViewRegistryIssueCode::kLivenessExcluded);
+        EXPECT_TRUE(ContainsDiagnosticCode(result.diagnostics,
+                                           ViewRegistryIssueCode::kLivenessExcluded));
+        EXPECT_TRUE(ContainsDiagnosticCode(result.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
     }
 
     TEST(ViewNodeDiscoveryTest,
@@ -846,6 +848,8 @@ namespace
                   MetadataMembershipObservedState::kJoining);
         EXPECT_EQ(initial_lookup.snapshot->metadata->raft_role,
                   MetadataRaftObservedRole::kFollower);
+        EXPECT_TRUE(ContainsDiagnosticCode(initial_lookup.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
         ExpectObservedStateFacts(*initial_lookup.snapshot, "", 0U, 100U);
 
         DiscoverMetadataRequest live_request;
@@ -863,6 +867,8 @@ namespace
                   MetadataMembershipObservedState::kJoining);
         EXPECT_EQ(live_result.membership_epoch, 1U);
         EXPECT_FALSE(live_result.leader_hint.has_value());
+        EXPECT_TRUE(ContainsDiagnosticCode(live_result.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
 
         const std::string current_incarnation =
             "meta-candidate-1:boot:300000000:1:1";
@@ -908,7 +914,7 @@ namespace
             registry.LookupNode(kClusterId, "meta-candidate-1", 200);
         ASSERT_EQ(merged_lookup.summary.status, ViewRegistryStatusCode::kOk);
         ASSERT_TRUE(merged_lookup.snapshot.has_value());
-        EXPECT_EQ(merged_lookup.snapshot->liveness, ViewNodeLivenessState::kLive);
+        EXPECT_EQ(merged_lookup.snapshot->liveness, ViewNodeLivenessState::kStale);
         ASSERT_TRUE(merged_lookup.snapshot->metadata.has_value());
         EXPECT_EQ(merged_lookup.snapshot->metadata->membership_state,
                   MetadataMembershipObservedState::kJoining);
@@ -932,14 +938,16 @@ namespace
             cluster_result.snapshot.metadata_nodes,
             "meta-candidate-1");
         ASSERT_NE(metadata_snapshot, nullptr);
-        EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kLive);
+        EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kStale);
         ASSERT_TRUE(metadata_snapshot->metadata.has_value());
         EXPECT_EQ(metadata_snapshot->metadata->membership_state,
                   MetadataMembershipObservedState::kJoining);
         EXPECT_EQ(metadata_snapshot->metadata->membership_epoch, 2U);
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_result.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
 
         live_result = registry.DiscoverMetadata(live_request, 260);
-        ASSERT_EQ(live_result.summary.status, ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(live_result.summary.status, ViewRegistryStatusCode::kNotFound);
         EXPECT_TRUE(live_result.metadata_nodes.empty());
         EXPECT_TRUE(ContainsDiagnosticCode(live_result.diagnostics,
                                            ViewRegistryIssueCode::kLivenessExcluded));
@@ -953,7 +961,10 @@ namespace
         EXPECT_EQ(metadata_snapshot->liveness, ViewNodeLivenessState::kDead);
         ASSERT_TRUE(metadata_snapshot->metadata.has_value());
         EXPECT_EQ(metadata_snapshot->metadata->membership_state,
-                  MetadataMembershipObservedState::kJoining);
+                  MetadataMembershipObservedState::kDown);
+        EXPECT_FALSE(metadata_snapshot->metadata->leader_hint.has_value());
+        EXPECT_TRUE(ContainsDiagnosticCode(cluster_result.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
     }
 
     TEST(ViewNodeDiscoveryTest,
@@ -1225,14 +1236,11 @@ namespace
         ASSERT_EQ(result.snapshot.view_nodes.size(), 1U);
         ASSERT_EQ(result.snapshot.metadata_nodes.size(), 1U);
         EXPECT_TRUE(result.snapshot.storage_nodes.empty());
-        ASSERT_TRUE(result.snapshot.leader_hint.has_value());
-        EXPECT_EQ(result.snapshot.leader_hint->node_id, "meta-1");
-
-        ASSERT_EQ(result.snapshot.diagnostics.size(), 2U);
-        EXPECT_EQ(result.snapshot.diagnostics[0].code,
-                  ViewRegistryIssueCode::kLivenessExcluded);
-        EXPECT_EQ(result.snapshot.diagnostics[1].code,
-                  ViewRegistryIssueCode::kLivenessExcluded);
+        EXPECT_FALSE(result.snapshot.leader_hint.has_value());
+        EXPECT_TRUE(ContainsDiagnosticCode(result.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kLivenessExcluded));
+        EXPECT_TRUE(ContainsDiagnosticCode(result.snapshot.diagnostics,
+                                           ViewRegistryIssueCode::kNonAuthorityBoundary));
     }
 
     TEST(ViewNodeDiscoveryTest, ViewNodeSelfRefreshKeepsSelfLiveBeyondDeadTtl)
