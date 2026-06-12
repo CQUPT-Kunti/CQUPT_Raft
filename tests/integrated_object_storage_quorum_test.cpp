@@ -155,11 +155,13 @@ namespace raftdemo
             const std::int32_t raft_id,
             const MetadataMembershipObservedState membership_state,
             const std::uint64_t observed_term,
-            const std::uint64_t membership_epoch)
+            const std::uint64_t membership_epoch,
+            const MetadataRaftObservedRole raft_role =
+                MetadataRaftObservedRole::kFollower)
         {
             MetadataNodeObservation observation;
             observation.raft_id = raft_id;
-            observation.raft_role = MetadataRaftObservedRole::kFollower;
+            observation.raft_role = raft_role;
             observation.membership_state = membership_state;
             observation.observed_term = observed_term;
             observation.commit_index = observed_term * 10;
@@ -173,7 +175,9 @@ namespace raftdemo
             const std::int32_t raft_id,
             const std::uint16_t port,
             const std::uint64_t observed_at_unix_ms,
-            const MetadataMembershipObservedState membership_state)
+            const MetadataMembershipObservedState membership_state,
+            const MetadataRaftObservedRole raft_role =
+                MetadataRaftObservedRole::kFollower)
         {
             NodeRegistration registration;
             registration.cluster_id = cluster_id;
@@ -197,7 +201,8 @@ namespace raftdemo
                 raft_id,
                 membership_state,
                 7,
-                3);
+                3,
+                raft_role);
             return registration;
         }
 
@@ -2034,6 +2039,527 @@ namespace raftdemo
             ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
                                                             kCommittedVoters,
                                                             2U);
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               ThreeVotersPlusObservedLearnerKeepsCommittedQuorumAtTwo)
+        {
+            constexpr const char *kBucket = "bucket-t069-learner-quorum";
+            constexpr const char *kObjectKeyMajority =
+                "objects/t069-majority-available.bin";
+            constexpr const char *kObjectIdMajority = "obj-t069-majority";
+            constexpr const char *kObjectKeyInsufficient =
+                "objects/t069-single-voter-insufficient.bin";
+            constexpr const char *kObjectIdInsufficient = "obj-t069-insufficient";
+            constexpr const char *kClusterId = "cluster-t069-learner-quorum";
+            constexpr const char *kLearnerNodeId = "meta-join-candidate-t069";
+            constexpr std::int32_t kLearnerRaftId = 69;
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before learner quorum "
+                   "boundary test; cluster="
+                << cluster.DescribeCluster();
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t069",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before learner quorum boundary test; status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const NodeStatusSnapshot leader_status = leader->GetStatusSnapshot();
+            raft::JoinMetadataClusterRequest learner_request =
+                MakeJoinMetadataClusterRequest("req-join-t069-learner",
+                                               kClusterId,
+                                               kLearnerNodeId,
+                                               kLearnerRaftId,
+                                               static_cast<std::uint16_t>(base_port_ + 1690),
+                                               static_cast<std::uint16_t>(base_port_ + 2690));
+            raft::JoinMetadataClusterResponse learner_response;
+            const grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(leader_status.address,
+                                             learner_request,
+                                             &learner_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(learner_response.summary().code(), raft::METADATA_STATUS_CODE_OK);
+            EXPECT_EQ(learner_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+            EXPECT_EQ(learner_response.requested_membership(),
+                      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+            EXPECT_FALSE(learner_response.committed_membership_changed());
+            EXPECT_EQ(learner_response.canonical_node_id(), kLearnerNodeId);
+            EXPECT_EQ(learner_response.assigned_raft_id(), kLearnerRaftId);
+            EXPECT_TRUE(Contains(learner_response.summary().message(),
+                                 "requested_membership=learner_not_voter"))
+                << learner_response.summary().message();
+            EXPECT_TRUE(Contains(learner_response.summary().message(),
+                                 "committed_quorum_size=2"))
+                << learner_response.summary().message();
+
+            ViewNodeRegistry registry;
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-1",
+                                         1,
+                                         static_cast<std::uint16_t>(base_port_ + 691),
+                                         100,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-1-t069");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-2",
+                                         2,
+                                         static_cast<std::uint16_t>(base_port_ + 692),
+                                         101,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-2-t069");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-3",
+                                         3,
+                                         static_cast<std::uint16_t>(base_port_ + 693),
+                                         102,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-3-t069");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         kLearnerNodeId,
+                                         kLearnerRaftId,
+                                         static_cast<std::uint16_t>(base_port_ + 694),
+                                         220,
+                                         MetadataMembershipObservedState::kLearner,
+                                         MetadataRaftObservedRole::kLearner),
+                "register-meta-learner-t069");
+
+            GetClusterViewRequest cluster_view_request;
+            cluster_view_request.request_id = "cluster-view-t069";
+            cluster_view_request.cluster_id = kClusterId;
+            cluster_view_request.include_dead_nodes = true;
+            cluster_view_request.include_warnings = true;
+
+            const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
+            ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+            ASSERT_EQ(cluster_view.snapshot.metadata_nodes.size(), 4U);
+            EXPECT_TRUE(ContainsViewDiagnosticCode(
+                cluster_view.snapshot.diagnostics,
+                ViewRegistryIssueCode::kNonAuthorityBoundary));
+
+            std::size_t observed_voter_count = 0;
+            std::size_t observed_learner_count = 0;
+            for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
+            {
+                ASSERT_TRUE(metadata_node.metadata.has_value());
+                if (metadata_node.metadata->membership_state ==
+                    MetadataMembershipObservedState::kVoter)
+                {
+                    ++observed_voter_count;
+                }
+                if (metadata_node.metadata->membership_state ==
+                    MetadataMembershipObservedState::kLearner)
+                {
+                    ++observed_learner_count;
+                    EXPECT_EQ(metadata_node.node_id, kLearnerNodeId);
+                    EXPECT_EQ(metadata_node.metadata->raft_role,
+                              MetadataRaftObservedRole::kLearner);
+                    EXPECT_EQ(metadata_node.metadata->raft_id, kLearnerRaftId);
+                }
+            }
+            EXPECT_EQ(observed_voter_count, 3U)
+                << "3 voters + 1 learner must still expose exactly 3 voters";
+            EXPECT_EQ(observed_learner_count, 1U)
+                << "learner should remain learner instead of joining voter set";
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_GE(follower_indexes.size(), 2U);
+
+            const std::size_t first_stopped_voter_index = follower_indexes.front();
+            cluster.StopNode(first_stopped_voter_index);
+
+            const auto surviving_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(surviving_leader, nullptr)
+                << "3 committed voters should keep legal leadership with 2 voters alive; "
+                   "learner must not affect committed election/quorum boundary. cluster="
+                << cluster.DescribeCluster();
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_majority_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(
+                                kBucket,
+                                kObjectKeyMajority,
+                                kObjectIdMajority,
+                                "create-object-t069-majority"),
+                            8s,
+                            &create_object_majority_result,
+                            {first_stopped_voter_index}))
+                << "3 committed voters plus 1 learner must still use quorum=2, so the "
+                   "surviving 2 real voters should create metadata. status="
+                << ProposeStatusName(create_object_majority_result.status)
+                << ", message=" << create_object_majority_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string pending_replication_diagnostics;
+            ASSERT_TRUE(WaitUntilPendingObjectReplicatedOnAllRunning(
+                            cluster,
+                            kBucket,
+                            kObjectKeyMajority,
+                            kObjectIdMajority,
+                            create_object_majority_result.log_index,
+                            5s,
+                            &pending_replication_diagnostics))
+                << "PENDING object did not replicate across surviving committed majority in "
+                   "3-voter + 1-learner boundary test; values="
+                << pending_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_majority_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(
+                                kBucket,
+                                kObjectKeyMajority,
+                                kObjectIdMajority,
+                                "commit-object-t069-majority"),
+                            8s,
+                            &commit_majority_result,
+                            {first_stopped_voter_index}))
+                << "learner must not be required for commit majority; surviving 2 committed "
+                   "voters should still commit. status="
+                << ProposeStatusName(commit_majority_result.status)
+                << ", message=" << commit_majority_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string committed_replication_diagnostics;
+            EXPECT_TRUE(WaitUntilCommittedObjectOnAllRunning(
+                cluster,
+                kBucket,
+                kObjectKeyMajority,
+                kObjectIdMajority,
+                commit_majority_result.log_index,
+                5s,
+                &committed_replication_diagnostics))
+                << "COMMITTED object did not converge across surviving committed majority in "
+                   "3-voter + 1-learner boundary test; values="
+                << committed_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            const std::size_t second_stopped_voter_index = follower_indexes.back();
+            cluster.StopNode(second_stopped_voter_index);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_insufficient_result;
+            EXPECT_FALSE(test::ProposeMetadataCommandWithRetry(
+                {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                test::MakeCreateObjectCommand(kBucket,
+                                              kObjectKeyInsufficient,
+                                              kObjectIdInsufficient,
+                                              "create-object-t069-insufficient"),
+                8s,
+                &create_object_insufficient_result,
+                {first_stopped_voter_index, second_stopped_voter_index}))
+                << "1 voter + 1 learner must not satisfy voter quorum; learner must remain "
+                   "outside committed majority. cluster="
+                << cluster.DescribeCluster();
+            EXPECT_TRUE(IsExpectedQuorumFailure(create_object_insufficient_result.status))
+                << "expected quorum failure once only one committed voter remains live. "
+                   "learner must not count toward commit/election majority. status="
+                << ProposeStatusName(create_object_insufficient_result.status)
+                << ", message=" << create_object_insufficient_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(
+            IntegratedObjectStorageQuorumTest,
+            SingleObservedLearnerDoesNotAutoPromoteToEvenCommittedVoterCount)
+        {
+            constexpr const char *kBucket = "bucket-t070-even-promote";
+            constexpr const char *kObjectKeyMajority =
+                "objects/t070-majority-available.bin";
+            constexpr const char *kObjectIdMajority = "obj-t070-majority";
+            constexpr const char *kObjectKeyInsufficient =
+                "objects/t070-single-voter-insufficient.bin";
+            constexpr const char *kObjectIdInsufficient = "obj-t070-insufficient";
+            constexpr const char *kClusterId = "cluster-t070-even-promote";
+            constexpr const char *kLearnerNodeId = "meta-ready-learner-even";
+            constexpr std::int32_t kLearnerRaftId = 71;
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before single learner "
+                   "promote boundary test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t070",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before single learner promote boundary "
+                   "validation; status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::size_t leader_index = 0;
+            while (leader_index < cluster.Size() &&
+                   cluster.Node(leader_index) != leader)
+            {
+                ++leader_index;
+            }
+            ASSERT_LT(leader_index, cluster.Size());
+
+            const auto follower_indexes = cluster.OtherIndexes(leader_index);
+            ASSERT_GE(follower_indexes.size(), 2U);
+
+            const auto accepted_request = MakeAddLearnerProposalRequest(
+                MakeJoinMetadataClusterRequest("req-add-learner-t070",
+                                               kClusterId,
+                                               kLearnerNodeId,
+                                               kLearnerRaftId,
+                                               static_cast<std::uint16_t>(base_port_ + 1710),
+                                               static_cast<std::uint16_t>(base_port_ + 2710)));
+            const auto accepted_result = leader->ProposeAddLearner(accepted_request);
+            EXPECT_EQ(accepted_result.status,
+                      AddLearnerProposalStatus::kAcceptedPendingCommit)
+                << accepted_result.message;
+            EXPECT_FALSE(accepted_result.committed_membership_changed);
+            EXPECT_EQ(accepted_result.canonical_node_id, kLearnerNodeId);
+            EXPECT_EQ(accepted_result.assigned_raft_id, kLearnerRaftId);
+            EXPECT_TRUE(Contains(accepted_result.message,
+                                 "promote-to-voter remain unimplemented"))
+                << accepted_result.message;
+
+            ViewNodeRegistry registry;
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-1",
+                                         1,
+                                         static_cast<std::uint16_t>(base_port_ + 171),
+                                         100,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-1-t070");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-2",
+                                         2,
+                                         static_cast<std::uint16_t>(base_port_ + 172),
+                                         101,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-2-t070");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         "meta-committed-3",
+                                         3,
+                                         static_cast<std::uint16_t>(base_port_ + 173),
+                                         102,
+                                         MetadataMembershipObservedState::kVoter),
+                "register-meta-committed-3-t070");
+            RegisterNodeOrAssert(
+                &registry,
+                MakeMetadataRegistration(kClusterId,
+                                         kLearnerNodeId,
+                                         kLearnerRaftId,
+                                         static_cast<std::uint16_t>(base_port_ + 174),
+                                         220,
+                                         MetadataMembershipObservedState::kLearner,
+                                         MetadataRaftObservedRole::kLearner),
+                "register-meta-ready-learner-t070");
+
+            GetClusterViewRequest cluster_view_request;
+            cluster_view_request.request_id = "cluster-view-t070";
+            cluster_view_request.cluster_id = kClusterId;
+            cluster_view_request.include_dead_nodes = true;
+            cluster_view_request.include_warnings = true;
+
+            const auto cluster_view = registry.GetClusterView(cluster_view_request, 300);
+            ASSERT_EQ(cluster_view.summary.status, ViewRegistryStatusCode::kOk);
+            ASSERT_EQ(cluster_view.snapshot.metadata_nodes.size(), 4U);
+            EXPECT_TRUE(ContainsViewDiagnosticCode(
+                cluster_view.snapshot.diagnostics,
+                ViewRegistryIssueCode::kNonAuthorityBoundary));
+
+            std::size_t observed_voter_count = 0;
+            bool observed_learner_found = false;
+            for (const auto &metadata_node : cluster_view.snapshot.metadata_nodes)
+            {
+                ASSERT_TRUE(metadata_node.metadata.has_value());
+                if (metadata_node.metadata->membership_state ==
+                    MetadataMembershipObservedState::kVoter)
+                {
+                    ++observed_voter_count;
+                }
+
+                if (metadata_node.node_id != kLearnerNodeId)
+                {
+                    continue;
+                }
+
+                observed_learner_found = true;
+                EXPECT_EQ(metadata_node.metadata->membership_state,
+                          MetadataMembershipObservedState::kLearner);
+                EXPECT_EQ(metadata_node.metadata->raft_role,
+                          MetadataRaftObservedRole::kLearner);
+                EXPECT_EQ(metadata_node.metadata->raft_id, kLearnerRaftId);
+            }
+            EXPECT_EQ(observed_voter_count, 3U)
+                << "single learner observation must not inflate observed voter count to 4";
+            ASSERT_TRUE(observed_learner_found)
+                << "ViewNode should expose exactly one observed learner for single promote "
+                   "boundary test";
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            const std::size_t first_stopped_voter_index = follower_indexes.front();
+            cluster.StopNode(first_stopped_voter_index);
+
+            const auto surviving_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(surviving_leader, nullptr)
+                << "3-voter membership should keep a leader with one stopped voter while "
+                   "single learner remains non-voting; cluster="
+                << cluster.DescribeCluster();
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_majority_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(
+                                kBucket,
+                                kObjectKeyMajority,
+                                kObjectIdMajority,
+                                "create-object-t070-majority"),
+                            8s,
+                            &create_object_majority_result,
+                            {first_stopped_voter_index}))
+                << "single learner must not silently promote committed membership to 4 "
+                   "voters or raise quorum to 3. surviving 2 committed voters should still "
+                   "form the real quorum. status="
+                << ProposeStatusName(create_object_majority_result.status)
+                << ", message=" << create_object_majority_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string pending_replication_diagnostics;
+            ASSERT_TRUE(WaitUntilPendingObjectReplicatedOnAllRunning(
+                            cluster,
+                            kBucket,
+                            kObjectKeyMajority,
+                            kObjectIdMajority,
+                            create_object_majority_result.log_index,
+                            5s,
+                            &pending_replication_diagnostics))
+                << "pending object did not replicate across the surviving committed 2-voter "
+                   "majority after single learner observation. values="
+                << pending_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_majority_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(
+                                kBucket,
+                                kObjectKeyMajority,
+                                kObjectIdMajority,
+                                "commit-object-t070-majority"),
+                            8s,
+                            &commit_majority_result,
+                            {first_stopped_voter_index}))
+                << "single learner must remain non-voting, so 2 real voters should still "
+                   "commit while committed membership stays at 3 voters. status="
+                << ProposeStatusName(commit_majority_result.status)
+                << ", message=" << commit_majority_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            std::string committed_replication_diagnostics;
+            EXPECT_TRUE(WaitUntilCommittedObjectOnAllRunning(
+                cluster,
+                kBucket,
+                kObjectKeyMajority,
+                kObjectIdMajority,
+                commit_majority_result.log_index,
+                5s,
+                &committed_replication_diagnostics))
+                << "committed object did not converge across the surviving committed "
+                   "majority after single learner observation. values="
+                << committed_replication_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+
+            const std::size_t second_stopped_voter_index = follower_indexes.back();
+            cluster.StopNode(second_stopped_voter_index);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ProposeResult create_object_insufficient_result;
+            EXPECT_FALSE(test::ProposeMetadataCommandWithRetry(
+                {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                test::MakeCreateObjectCommand(kBucket,
+                                              kObjectKeyInsufficient,
+                                              kObjectIdInsufficient,
+                                              "create-object-t070-insufficient"),
+                8s,
+                &create_object_insufficient_result,
+                {first_stopped_voter_index, second_stopped_voter_index}))
+                << "single learner must not be auto-promoted into an even 4-voter committed "
+                   "configuration. one real voter plus one observed/pending learner must not "
+                   "reach quorum. cluster="
+                << cluster.DescribeCluster();
+            EXPECT_TRUE(IsExpectedQuorumFailure(create_object_insufficient_result.status))
+                << "expected quorum failure once only one committed voter remains live, even "
+                   "with one learner observed. status="
+                << ProposeStatusName(create_object_insufficient_result.status)
+                << ", message=" << create_object_insufficient_result.message
+                << ", cluster=" << cluster.DescribeCluster();
         }
     } // namespace
 } // namespace raftdemo

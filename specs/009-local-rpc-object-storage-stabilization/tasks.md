@@ -149,11 +149,11 @@
 
 **Independent Test**: 3 voters + 1 learner quorum 仍为 2；learner 可接收 AppendEntries/InstallSnapshot；单独 promote 被明确阻止。
 
-- [ ] T066 [P] [US4] Add learner AppendEntries catch-up test in `tests/test_raft_log_replication.cpp` (验证: `test_raft_log_replication`)
-- [ ] T067 [P] [US4] Add learner InstallSnapshot catch-up test in `tests/test_raft_snapshot_catchup.cpp` (验证: `test_raft_snapshot_catchup`)
-- [ ] T068 [P] [US4] Add learner excluded from RequestVote and leader election test in `tests/test_raft_election.cpp` (验证: `test_raft_election`)
-- [ ] T069 [P] [US4] Add 3 voters + 1 learner quorum remains 2 test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T070 [P] [US4] Add single learner promote blocked by even voter count test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T066 [P] [US4] Add learner AppendEntries catch-up test in `tests/test_raft_log_replication.cpp` (验证: `test_raft_log_replication`)
+- [x] T067 [P] [US4] Add learner InstallSnapshot catch-up test in `tests/test_raft_snapshot_catchup.cpp` (验证: `test_raft_snapshot_catchup`)
+- [x] T068 [P] [US4] Add learner excluded from RequestVote and leader election test in `tests/test_raft_election.cpp` (验证: `test_raft_election`)
+- [x] T069 [P] [US4] Add 3 voters + 1 learner quorum remains 2 test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T070 [P] [US4] Add single learner promote blocked by even voter count test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T071 [US4] Extend runtime membership representation for voters and learners in `modules/raft/node/raft_node.h` and `modules/raft/node/raft_node.cpp` (验证: `test_raft_election`, `integrated_object_storage_quorum`)
 - [ ] T072 [US4] Update quorum calculation to use committed voters only in `modules/raft/node/raft_node.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T073 [US4] Exclude learners from RequestVote and candidacy paths in `modules/raft/node/raft_node.cpp` (验证: `test_raft_election`)

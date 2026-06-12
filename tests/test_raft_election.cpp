@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
+
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -74,6 +79,147 @@ bool ContainsAll(const std::string& snapshot, const std::vector<std::string>& pa
   }
   return true;
 }
+
+std::optional<std::size_t> FindLeaderIndex(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes) {
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    if (nodes[index] && IsLeaderSnapshot(nodes[index]->Describe())) {
+      return index;
+    }
+  }
+  return std::nullopt;
+}
+
+std::shared_ptr<RaftNode> WaitForSingleLeaderAmong(
+    const std::vector<std::shared_ptr<RaftNode>>& nodes,
+    const std::vector<std::size_t>& indexes,
+    std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::shared_ptr<RaftNode> leader;
+    int leader_count = 0;
+    for (const std::size_t index : indexes) {
+      if (index >= nodes.size() || !nodes[index]) {
+        continue;
+      }
+      if (IsLeaderSnapshot(nodes[index]->Describe())) {
+        leader = nodes[index];
+        ++leader_count;
+      }
+    }
+    if (leader_count == 1) {
+      return leader;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  return nullptr;
+}
+
+std::vector<int> ExtractNodeIds(const std::vector<std::shared_ptr<RaftNode>>& nodes,
+                                const std::vector<std::size_t>& indexes) {
+  std::vector<int> ids;
+  ids.reserve(indexes.size());
+  for (const auto index : indexes) {
+    if (index >= nodes.size() || !nodes[index]) {
+      continue;
+    }
+    const auto node_id = ExtractIntField(nodes[index]->Describe(), "node");
+    if (node_id.has_value()) {
+      ids.push_back(*node_id);
+    }
+  }
+  return ids;
+}
+
+std::string DescribeCommittedMembershipSummary(
+    const CommittedMembershipQuorumSummary& summary) {
+  std::ostringstream oss;
+  oss << "commit_index=" << summary.committed_log_index
+      << ", term=" << summary.committed_term
+      << ", voters=[";
+  for (std::size_t index = 0; index < summary.voter_ids.size(); ++index) {
+    if (index != 0) {
+      oss << ",";
+    }
+    oss << summary.voter_ids[index];
+  }
+  oss << "], learners=[";
+  for (std::size_t index = 0; index < summary.learner_ids.size(); ++index) {
+    if (index != 0) {
+      oss << ",";
+    }
+    oss << summary.learner_ids[index];
+  }
+  oss << "], voter_count=" << summary.voter_count
+      << ", learner_count=" << summary.learner_count
+      << ", quorum=" << summary.quorum_size
+      << ", local_role=" << static_cast<int>(summary.local_role);
+  return oss.str();
+}
+
+AddLearnerProposalRequest MakePendingLearnerProposalRequest(
+    const std::string& cluster_id,
+    const std::string& node_id,
+    std::int32_t candidate_raft_id,
+    std::uint16_t candidate_client_port,
+    std::uint16_t candidate_raft_port) {
+  AddLearnerProposalRequest request;
+  request.cluster_id = cluster_id;
+  request.node_id = node_id;
+  request.candidate_raft_id = candidate_raft_id;
+  request.candidate_client_address =
+      "127.0.0.1:" + std::to_string(candidate_client_port);
+  request.candidate_raft_address =
+      "127.0.0.1:" + std::to_string(candidate_raft_port);
+  request.candidate_incarnation_id = node_id + ":boot:1710000000";
+  request.candidate_sequence = 1;
+  request.persistent_generation = 1;
+  request.data_dir_fingerprint = "fingerprint-" + node_id;
+  return request;
+}
+
+class CountingVoteService final : public raft::RaftService::Service {
+ public:
+  grpc::Status RequestVote(grpc::ServerContext*,
+                           const raft::VoteRequest* request,
+                           raft::VoteResponse* response) override {
+    request_vote_count_.fetch_add(1);
+    last_candidate_id_.store(request->candidate_id());
+    response->set_term(request->term());
+    response->set_vote_granted(true);
+    return grpc::Status::OK;
+  }
+
+  int request_vote_count() const { return request_vote_count_.load(); }
+  int last_candidate_id() const { return last_candidate_id_.load(); }
+
+ private:
+  std::atomic<int> request_vote_count_{0};
+  std::atomic<int> last_candidate_id_{-1};
+};
+
+class FakeLearnerVoteEndpoint {
+ public:
+  explicit FakeLearnerVoteEndpoint(const std::string& address) {
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service_);
+    server_ = builder.BuildAndStart();
+  }
+
+  ~FakeLearnerVoteEndpoint() {
+    if (server_) {
+      server_->Shutdown();
+    }
+  }
+
+  int request_vote_count() const { return service_.request_vote_count(); }
+  int last_candidate_id() const { return service_.last_candidate_id(); }
+
+ private:
+  CountingVoteService service_;
+  std::unique_ptr<grpc::Server> server_;
+};
 
 std::vector<NodeConfig> BuildThreeNodeConfigs(const std::filesystem::path& data_root,
                                              int base_port) {
@@ -302,6 +448,108 @@ TEST(RaftElectionTest, FollowerRejectsClientProposeAfterLeaderIsElected) {
   const ProposeResult result = follower->Propose(cmd);
   EXPECT_EQ(result.status, ProposeStatus::kNotLeader);
   EXPECT_NE(result.leader_id, -1);
+}
+
+TEST(RaftElectionTest,
+     PendingLearnerCandidateIsExcludedFromRequestVoteAndLeaderElectionQuorum) {
+  constexpr const char* kClusterId = "cluster-t068-election";
+  constexpr std::int32_t kLearnerRaftId = 4;
+  constexpr std::uint16_t kLearnerClientPort = 54360;
+  constexpr std::uint16_t kLearnerRaftPort = 54361;
+  const std::vector<int> kCommittedVoters{1, 2, 3};
+
+  ClusterRunner cluster(54250);
+  cluster.Start();
+
+  auto leader = cluster.WaitForLeader(5s);
+  ASSERT_NE(leader, nullptr);
+  ASSERT_TRUE(cluster.WaitUntilSingleLeader(2s));
+
+  const auto leader_index = FindLeaderIndex(cluster.nodes());
+  ASSERT_TRUE(leader_index.has_value());
+
+  std::vector<std::size_t> follower_indexes;
+  follower_indexes.reserve(cluster.nodes().size() - 1);
+  for (std::size_t index = 0; index < cluster.nodes().size(); ++index) {
+    if (index != *leader_index) {
+      follower_indexes.push_back(index);
+    }
+  }
+  ASSERT_EQ(follower_indexes.size(), 2U);
+
+  const auto expected_successor_ids =
+      ExtractNodeIds(cluster.nodes(), follower_indexes);
+  ASSERT_EQ(expected_successor_ids.size(), 2U);
+
+  FakeLearnerVoteEndpoint fake_learner_endpoint(
+      "127.0.0.1:" + std::to_string(kLearnerRaftPort));
+
+  const auto add_learner_result = leader->ProposeAddLearner(
+      MakePendingLearnerProposalRequest(kClusterId,
+                                        "meta-learner-pending",
+                                        kLearnerRaftId,
+                                        kLearnerClientPort,
+                                        kLearnerRaftPort));
+  ASSERT_EQ(add_learner_result.status,
+            AddLearnerProposalStatus::kAcceptedPendingCommit)
+      << add_learner_result.message;
+  EXPECT_FALSE(add_learner_result.committed_membership_changed);
+  EXPECT_EQ(add_learner_result.assigned_raft_id, kLearnerRaftId);
+  EXPECT_TRUE(ContainsAll(add_learner_result.message,
+                          {"committed membership log proposal", "promote-to-voter"}))
+      << add_learner_result.message;
+
+  for (const auto& node : cluster.nodes()) {
+    const auto summary = node->GetCommittedMembershipQuorumSummary();
+    EXPECT_EQ(summary.voter_ids, kCommittedVoters)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_TRUE(summary.learner_ids.empty())
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.voter_count, 3U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.learner_count, 0U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.quorum_size, 2U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.local_role, CommittedMembershipRole::kVoter)
+        << DescribeCommittedMembershipSummary(summary);
+  }
+
+  leader->Stop();
+
+  const auto successor =
+      WaitForSingleLeaderAmong(cluster.nodes(), follower_indexes, 5s);
+  ASSERT_NE(successor, nullptr);
+
+  const auto successor_id = ExtractIntField(successor->Describe(), "node");
+  ASSERT_TRUE(successor_id.has_value());
+  EXPECT_TRUE(std::find(expected_successor_ids.begin(),
+                        expected_successor_ids.end(),
+                        *successor_id) != expected_successor_ids.end())
+      << "unexpected successor=" << successor->Describe();
+
+  std::this_thread::sleep_for(500ms);
+
+  EXPECT_EQ(fake_learner_endpoint.request_vote_count(), 0)
+      << "pending learner candidate unexpectedly received RequestVote RPCs"
+      << ", last_candidate_id=" << fake_learner_endpoint.last_candidate_id();
+
+  for (const auto index : follower_indexes) {
+    const auto& node = cluster.nodes()[index];
+    const auto summary = node->GetCommittedMembershipQuorumSummary();
+    EXPECT_EQ(summary.voter_ids, kCommittedVoters)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_TRUE(summary.learner_ids.empty())
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.voter_count, 3U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.learner_count, 0U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.quorum_size, 2U)
+        << DescribeCommittedMembershipSummary(summary);
+    EXPECT_EQ(summary.local_role, CommittedMembershipRole::kVoter)
+        << DescribeCommittedMembershipSummary(summary);
+  }
 }
 
 }  // namespace
