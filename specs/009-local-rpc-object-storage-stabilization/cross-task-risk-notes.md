@@ -77,3 +77,9 @@ Mitigation: Keep current US3 PASS scoped to `storage_heartbeat_registry` and `In
 Risk: T055-T065 now validate dynamic Metadata candidate identity/config, `JoinMetadataCluster` proto contract, metadata leader authority, ViewNode discovery fallback, and `AddLearner` admission boundary, but the runtime still stops before committed learner membership change, learner catch-up, InstallSnapshot catch-up, promote-to-voter, odd-voter-safe promotion, and local RPC dynamic metadata add-node smoke. Multi-ViewNode peer sync effects on metadata join discovery are also not fully exercised beyond targeted tests.
 
 Mitigation: Keep current US4 PASS scoped to validation/boundary semantics only. Treat T066-T098 as required follow-up for learner replication, snapshot catch-up, promotion safety, local RPC runtime smoke, and broader multi-ViewNode discovery validation before claiming full dynamic Metadata membership lifecycle support.
+
+## R14: Learner Catch-Up Phase Is Linux-Validated, But Promotion And Cross-Platform Runtime Validation Remain Pending
+
+Risk: T066-T076 now cover learner AppendEntries catch-up, InstallSnapshot catch-up, learner exclusion from election/quorum, committed-voters-only quorum safety, and waiting-for-pair diagnostics on Linux targeted tests, but the repository still lacks promote-to-voter, batch promote, joint consensus, and cross-platform runtime validation. Treating Phase 8 PASS as full learner lifecycle completion would overstate the current safety envelope.
+
+Mitigation: Keep learner Phase 8 closure scoped to Linux-targeted catch-up and non-voter safety semantics only. Record Windows/macOS as pending, require T078+ to validate batch promotion and no-committed-4-voter history, and do not claim end-to-end dynamic metadata learner lifecycle completion before those tasks and local RPC smoke are finished.

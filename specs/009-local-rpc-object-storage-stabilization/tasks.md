@@ -160,7 +160,7 @@
 - [x] T074 [US4] Enable learner log replication progress tracking in `modules/raft/replication/replicator.cpp` and `modules/raft/replication/replicator.h` (验证: `test_raft_log_replication`)
 - [x] T075 [US4] Enable learner snapshot install and applied progress tracking in `modules/raft/replication/replicator.cpp` and snapshot integration paths (验证: `test_raft_snapshot_catchup`, `test_raft_snapshot_restart`)
 - [x] T076 [US4] Add pending learner / ready-to-promote / waiting-for-pair status reporting in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T077 [US4] Record learner catch-up validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-08-learner-catchup.md` (验证: `test_raft_log_replication`, `test_raft_snapshot_catchup`, `integrated_object_storage_quorum`)
+- [ ] T077 [US4] Record learner catch-up validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/t077-record-learner-catch-up-validation.md` (验证: `test_raft_log_replication`, `test_raft_snapshot_catchup`, `integrated_object_storage_quorum`)
 
 ---
 

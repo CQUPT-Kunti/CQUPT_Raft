@@ -181,3 +181,65 @@
   - promote-to-voter / odd-voter-safe promotion
   - Windows validation
   - macOS validation
+
+## US4 Phase 8 Closure Snapshot
+
+- Historical Linux targeted validation:
+  - `test_raft_log_replication`
+    - result: PASS
+    - evidence:
+      - `tmp/test-logs/t074-build.log`
+      - `tmp/test-logs/t074-ctest.log`
+  - `test_raft_snapshot_catchup`
+    - result: PASS
+    - evidence:
+      - `tmp/test-logs/t067-build.log`
+      - `tmp/test-logs/t067-ctest.log`
+      - `tmp/test-logs/t075-snapshot-tests.log`
+  - `integrated_object_storage_quorum`
+    - result: PASS
+    - evidence:
+      - `tmp/test-logs/t076-build.log`
+      - `tmp/test-logs/t076-ctest.log`
+  - `test_raft_election`
+    - result: PASS
+    - evidence:
+      - `tmp/test-logs/t072-ctest.log`
+      - `tmp/test-logs/t072-ctest-rerun.log`
+  - `metadata_client_scenario`
+    - result: PASS
+    - evidence:
+      - `tmp/test-logs/t076-ctest.log`
+
+- Covered US4 learner areas:
+  - learner AppendEntries catch-up
+  - learner InstallSnapshot catch-up
+  - learner excluded from RequestVote / candidacy / leader election
+  - committed-voters-only quorum calculation
+  - `3 voters + 1 learner` quorum remains `2`
+  - single learner promote blocked by even voter count
+  - runtime voters / learners representation
+  - learner log replication progress tracking
+  - learner snapshot install / applied progress tracking
+  - pending learner / ready-to-promote / waiting-for-pair status reporting
+
+- Current Phase 8 semantics:
+  - learner can catch up through AppendEntries and InstallSnapshot
+  - learner progress is observable for diagnostics
+  - learner remains non-voter before future explicit promote work
+  - committed voter set remains the only authority for quorum / election / commit
+  - ready learner status reporting does not modify committed membership
+
+- T077 rerun status:
+  - attempted build command:
+    - `( flock -n 9 || exit 99; cmake --build --preset debug-ninja-low-parallel --target test_raft_log_replication test_raft_snapshot_catchup integrated_object_storage_quorum test_raft_election ) 9>/tmp/cqupt_raft_build.lock`
+  - result: SKIPPED
+  - reason: build lock not acquired
+
+- Skipped in Phase 8 closure:
+  - Windows validation
+  - macOS validation
+  - local RPC runtime dynamic metadata learner join smoke
+  - promote-to-voter
+  - batch promote
+  - joint consensus
