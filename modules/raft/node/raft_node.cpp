@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,7 @@ namespace raftdemo
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
     constexpr const char *kSnapshotMarkerCommand = "snapshot";
     constexpr const char *kIdentityFileName = "node_identity.txt";
+    constexpr const char *kStructuredIdentityFileName = "node.identity";
     constexpr std::size_t kMaxInflightMetadataProposals = 4;
     constexpr std::size_t kCompletedMetadataProposalCacheLimit = 64;
 
@@ -151,6 +153,69 @@ namespace raftdemo
       return voter_count / 2 + 1;
     }
 
+    std::vector<PeerConfig> BuildUniqueCommittedVoterPeers(
+        const NodeConfig &config)
+    {
+      std::vector<PeerConfig> peers;
+      peers.reserve(config.peers.size());
+
+      std::unordered_set<std::int32_t> seen_ids;
+      seen_ids.insert(config.node_id);
+
+      for (const auto &peer : config.peers)
+      {
+        if (!seen_ids.insert(peer.node_id).second)
+        {
+          continue;
+        }
+        peers.push_back(peer);
+      }
+
+      return peers;
+    }
+
+    std::vector<int> BuildCommittedVoterIds(const NodeConfig &config)
+    {
+      std::vector<int> voter_ids;
+      voter_ids.reserve(config.peers.size() + 1);
+      voter_ids.push_back(config.node_id);
+
+      for (const auto &peer : BuildUniqueCommittedVoterPeers(config))
+      {
+        voter_ids.push_back(peer.node_id);
+      }
+
+      std::sort(voter_ids.begin(), voter_ids.end());
+      return voter_ids;
+    }
+
+    std::size_t CountCommittedVoters(const NodeConfig &config)
+    {
+      return BuildCommittedVoterIds(config).size();
+    }
+
+    std::size_t ComputeCommittedVoterQuorumSize(const NodeConfig &config)
+    {
+      return ComputeCommittedVoterQuorumSize(CountCommittedVoters(config));
+    }
+
+    std::size_t CountReplicatedCommittedVoters(
+        const NodeConfig &config,
+        const std::unordered_map<int, std::uint64_t> &match_index_by_peer_id,
+        const std::uint64_t log_index)
+    {
+      std::size_t replicated_voter_count = 1;
+      for (const auto &peer : BuildUniqueCommittedVoterPeers(config))
+      {
+        const auto it = match_index_by_peer_id.find(peer.node_id);
+        if (it != match_index_by_peer_id.end() && it->second >= log_index)
+        {
+          ++replicated_voter_count;
+        }
+      }
+      return replicated_voter_count;
+    }
+
     std::optional<std::string> ValidateAddLearnerProposalRequest(
         const AddLearnerProposalRequest &request)
     {
@@ -218,6 +283,42 @@ namespace raftdemo
       entry.committed = true;
       entry.pending = false;
       return entry;
+    }
+
+    RuntimeMembershipRole ParseRuntimeMembershipRoleHint(
+        const std::string &membership_state)
+    {
+      if (membership_state == "voter")
+      {
+        return RuntimeMembershipRole::kVoter;
+      }
+      if (membership_state == "learner")
+      {
+        return RuntimeMembershipRole::kLearner;
+      }
+      if (membership_state == "joining" ||
+          membership_state == "candidate" ||
+          membership_state == "non_raft")
+      {
+        return RuntimeMembershipRole::kNonMember;
+      }
+      return RuntimeMembershipRole::kUnknown;
+    }
+
+    const char *RuntimeMembershipRoleName(const RuntimeMembershipRole role)
+    {
+      switch (role)
+      {
+      case RuntimeMembershipRole::kVoter:
+        return "voter";
+      case RuntimeMembershipRole::kLearner:
+        return "learner";
+      case RuntimeMembershipRole::kNonMember:
+        return "non_member";
+      case RuntimeMembershipRole::kUnknown:
+      default:
+        return "unknown";
+      }
     }
 
   } // namespace
@@ -373,8 +474,8 @@ namespace raftdemo
     }
 
     Log(NodeTag(config_.node_id), "started at ", config_.address, ", peers=", config_.peers.size(),
-        ", cluster_size=", config_.peers.size() + 1,
-        ", quorum=", ((config_.peers.size() + 1) / 2 + 1),
+        ", committed_voter_count=", CountCommittedVoters(config_),
+        ", quorum=", ComputeCommittedVoterQuorumSize(config_),
         ", data_dir=", config_.data_dir, ", snapshot_dir=", snapshot_config_.snapshot_dir);
   }
 
@@ -442,6 +543,8 @@ namespace raftdemo
 
     const std::filesystem::path identity_path =
         std::filesystem::path(config_.data_dir) / kIdentityFileName;
+    const std::filesystem::path structured_identity_path =
+        std::filesystem::path(config_.data_dir) / kStructuredIdentityFileName;
 
     if (std::filesystem::exists(identity_path, ec))
     {
@@ -459,21 +562,38 @@ namespace raftdemo
                                  ", expected node_id=" + std::to_string(config_.node_id) +
                                  ", found node_id=" + std::to_string(stored_node_id));
       }
-      return;
+    }
+    else
+    {
+      std::ofstream out(identity_path, std::ios::trunc);
+      if (!out.is_open())
+      {
+        throw std::runtime_error("failed to create identity file: " + identity_path.string());
+      }
+
+      out << "node_id=" << config_.node_id << '\n';
+      out << "address=" << config_.address << '\n';
+      out.flush();
+      if (!out)
+      {
+        throw std::runtime_error("failed to write identity file: " + identity_path.string());
+      }
     }
 
-    std::ofstream out(identity_path, std::ios::trunc);
-    if (!out.is_open())
+    local_runtime_membership_role_hint_ = RuntimeMembershipRole::kVoter;
+    if (std::filesystem::exists(structured_identity_path, ec))
     {
-      throw std::runtime_error("failed to create identity file: " + identity_path.string());
-    }
-
-    out << "node_id=" << config_.node_id << '\n';
-    out << "address=" << config_.address << '\n';
-    out.flush();
-    if (!out)
-    {
-      throw std::runtime_error("failed to write identity file: " + identity_path.string());
+      const auto values = ReadIdentityFile(structured_identity_path);
+      if (const auto membership_state_it = values.find("membership_state");
+          membership_state_it != values.end())
+      {
+        const auto parsed_role =
+            ParseRuntimeMembershipRoleHint(membership_state_it->second);
+        if (parsed_role != RuntimeMembershipRole::kUnknown)
+        {
+          local_runtime_membership_role_hint_ = parsed_role;
+        }
+      }
     }
   }
 
@@ -606,21 +726,13 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
     // 当前阶段 RaftNode 内部没有运行时 membership authority；诊断摘要必须只读取
     // 已提交配置边界下当前节点已知的成员集，不能根据 live 节点或 ViewNode 观测降 quorum。
-    summary.voter_ids.reserve(config_.peers.size() + 1);
-    summary.voter_ids.push_back(config_.node_id);
-    for (const auto &peer : config_.peers)
-    {
-      summary.voter_ids.push_back(peer.node_id);
-    }
-    std::sort(summary.voter_ids.begin(), summary.voter_ids.end());
-    summary.voter_ids.erase(std::unique(summary.voter_ids.begin(), summary.voter_ids.end()),
-                            summary.voter_ids.end());
+    summary.voter_ids = BuildCommittedVoterIds(config_);
 
     // 第一阶段暂未把 learner membership 下沉到 RaftNode 运行时，因此这里保持只读空集，
     // 避免把 registered-only 或观测节点误计入 committed voter quorum。
     summary.voter_count = summary.voter_ids.size();
     summary.learner_count = summary.learner_ids.size();
-    summary.quorum_size = ComputeCommittedVoterQuorumSize(summary.voter_count);
+    summary.quorum_size = ComputeCommittedVoterQuorumSize(config_);
     summary.local_role = std::binary_search(summary.voter_ids.begin(),
                                             summary.voter_ids.end(),
                                             config_.node_id)
@@ -636,10 +748,14 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     summary.committed_term = TermAtIndexLocked(commit_index_);
 
     std::map<std::int32_t, RuntimeMembershipEntry> voter_entries_by_id;
-    voter_entries_by_id.emplace(
-        config_.node_id,
-        MakeCommittedVoterRuntimeEntry(config_.node_id, config_.address));
-    for (const auto &peer : config_.peers)
+    if (local_runtime_membership_role_hint_ != RuntimeMembershipRole::kLearner &&
+        local_runtime_membership_role_hint_ != RuntimeMembershipRole::kNonMember)
+    {
+      voter_entries_by_id.emplace(
+          config_.node_id,
+          MakeCommittedVoterRuntimeEntry(config_.node_id, config_.address));
+    }
+    for (const auto &peer : BuildUniqueCommittedVoterPeers(config_))
     {
       voter_entries_by_id.try_emplace(
           peer.node_id,
@@ -650,6 +766,18 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     {
       summary.voter_ids.push_back(raft_id);
       summary.voter_entries.push_back(entry);
+    }
+
+    if (local_runtime_membership_role_hint_ == RuntimeMembershipRole::kLearner)
+    {
+      RuntimeMembershipEntry local_learner_entry;
+      local_learner_entry.raft_id = config_.node_id;
+      local_learner_entry.address = config_.address;
+      local_learner_entry.role = RuntimeMembershipRole::kLearner;
+      local_learner_entry.committed = false;
+      local_learner_entry.pending = false;
+      summary.learner_ids.push_back(local_learner_entry.raft_id);
+      summary.learner_entries.push_back(local_learner_entry);
     }
 
     if (pending_add_learner_proposal_.has_value())
@@ -670,7 +798,10 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       learner_entry.data_dir_fingerprint =
           pending_add_learner_proposal_->data_dir_fingerprint;
       if (voter_entries_by_id.find(learner_entry.raft_id) ==
-          voter_entries_by_id.end())
+              voter_entries_by_id.end() &&
+          std::find(summary.learner_ids.begin(),
+                    summary.learner_ids.end(),
+                    learner_entry.raft_id) == summary.learner_ids.end())
       {
         summary.learner_ids.push_back(learner_entry.raft_id);
         summary.learner_entries.push_back(learner_entry);
@@ -682,9 +813,17 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     summary.committed_voter_quorum_size =
         ComputeCommittedVoterQuorumSize(summary.voter_count);
 
-    if (std::binary_search(summary.voter_ids.begin(),
-                           summary.voter_ids.end(),
-                           config_.node_id))
+    if (local_runtime_membership_role_hint_ == RuntimeMembershipRole::kLearner)
+    {
+      summary.local_role = RuntimeMembershipRole::kLearner;
+    }
+    else if (local_runtime_membership_role_hint_ == RuntimeMembershipRole::kNonMember)
+    {
+      summary.local_role = RuntimeMembershipRole::kNonMember;
+    }
+    else if (std::binary_search(summary.voter_ids.begin(),
+                                summary.voter_ids.end(),
+                                config_.node_id))
     {
       summary.local_role = RuntimeMembershipRole::kVoter;
     }
@@ -1001,8 +1140,6 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
   void RaftNode::StartElection()
   {
-    RecordElectionStarted();
-
     std::uint64_t term = 0;
     std::uint64_t last_log_index = 0;
     std::uint64_t last_log_term = 0;
@@ -1015,6 +1152,19 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       {
         return;
       }
+
+      const RuntimeMembershipSummary runtime_membership =
+          BuildRuntimeMembershipSummaryLocked();
+      if (runtime_membership.local_role != RuntimeMembershipRole::kVoter)
+      {
+        ResetElectionTimerLocked();
+        Log(NodeTag(config_.node_id),
+            "skip election because local runtime membership is non-voter, role=",
+            RuntimeMembershipRoleName(runtime_membership.local_role));
+        return;
+      }
+
+      RecordElectionStarted();
 
       const auto old_role = role_;
       const auto old_term = current_term_;
@@ -1041,8 +1191,17 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       term = current_term_;
       last_log_index = LastLogIndexLocked();
       last_log_term = LastLogTermLocked();
-      peers = config_.peers;
-      quorum = static_cast<int>((peers.size() + 1) / 2) + 1;
+      peers.clear();
+      peers.reserve(runtime_membership.voter_entries.size());
+      for (const auto &entry : runtime_membership.voter_entries)
+      {
+        if (entry.raft_id == config_.node_id)
+        {
+          continue;
+        }
+        peers.push_back(PeerConfig{entry.raft_id, entry.address});
+      }
+      quorum = static_cast<int>(runtime_membership.committed_voter_quorum_size);
 
       ResetElectionTimerLocked();
       Log(NodeTag(config_.node_id), "start election, term=", term,
@@ -1116,6 +1275,16 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       }
       if (role_ != Role::kCandidate || current_term_ != term)
       {
+        return;
+      }
+
+      const RuntimeMembershipSummary runtime_membership =
+          BuildRuntimeMembershipSummaryLocked();
+      if (runtime_membership.local_role != RuntimeMembershipRole::kVoter)
+      {
+        Log(NodeTag(config_.node_id),
+            "reject leadership transition because local runtime membership is non-voter, role=",
+            RuntimeMembershipRoleName(runtime_membership.local_role));
         return;
       }
 
@@ -1641,6 +1810,19 @@ void RaftNode::SendHeartbeats()
         response->set_term(current_term_);
         return;
       }
+    }
+
+    const RuntimeMembershipSummary runtime_membership =
+        BuildRuntimeMembershipSummaryLocked();
+    if (runtime_membership.local_role != RuntimeMembershipRole::kVoter)
+    {
+      response->set_term(current_term_);
+      Log(NodeTag(config_.node_id),
+          "reject vote request because local runtime membership is non-voter, role=",
+          RuntimeMembershipRoleName(runtime_membership.local_role),
+          ", candidate=", request.candidate_id(),
+          ", term=", request.term());
+      return;
     }
 
     const bool up_to_date =
@@ -2710,7 +2892,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         return log_index <= last_snapshot_index_ ? ReplicationOutcome::kReplicated
                                                  : ReplicationOutcome::kLogUnavailable;
       }
-      peers = config_.peers;
+      peers = BuildUniqueCommittedVoterPeers(config_);
       term = current_term_;
 
       for (const auto &peer : peers)
@@ -2719,8 +2901,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
       }
     }
 
-    const std::size_t total_nodes = peers.size() + 1;
-    const std::size_t majority = total_nodes / 2 + 1;
+    const std::size_t majority = ComputeCommittedVoterQuorumSize(config_);
     if (majority <= 1)
     {
       return ReplicationOutcome::kReplicated;
@@ -2728,15 +2909,8 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
 
     {
       std::lock_guard<std::mutex> lk(mu_);
-      std::size_t replicated_count = 1;
-      for (const auto &peer : peers)
-      {
-        const auto it = match_index_.find(peer.node_id);
-        if (it != match_index_.end() && it->second >= log_index)
-        {
-          ++replicated_count;
-        }
-      }
+      const std::size_t replicated_count =
+          CountReplicatedCommittedVoters(config_, match_index_, log_index);
       if (replicated_count >= majority)
       {
         return ReplicationOutcome::kReplicated;
@@ -2787,15 +2961,8 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         {
           return ReplicationOutcome::kLostLeadership;
         }
-        std::size_t replicated_count = 1;
-        for (const auto &candidate : peers)
-        {
-          const auto it = match_index_.find(candidate.node_id);
-          if (it != match_index_.end() && it->second >= log_index)
-          {
-            ++replicated_count;
-          }
-        }
+        const std::size_t replicated_count =
+            CountReplicatedCommittedVoters(config_, match_index_, log_index);
         if (replicated_count >= majority)
         {
           return ReplicationOutcome::kReplicated;
@@ -2821,8 +2988,8 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
       return;
     }
 
-    const std::size_t total_nodes = config_.peers.size() + 1;
-    const std::size_t majority = total_nodes / 2 + 1;
+    const auto committed_voter_peers = BuildUniqueCommittedVoterPeers(config_);
+    const std::size_t majority = ComputeCommittedVoterQuorumSize(config_);
     const std::uint64_t last_index = LastLogIndexLocked();
 
     for (std::uint64_t index = last_index; index > commit_index_; --index)
@@ -2838,7 +3005,7 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
       }
 
       std::size_t replicated_count = 1;
-      for (const auto &peer : config_.peers)
+      for (const auto &peer : committed_voter_peers)
       {
         const auto it = match_index_.find(peer.node_id);
         if (it != match_index_.end() && it->second >= index)

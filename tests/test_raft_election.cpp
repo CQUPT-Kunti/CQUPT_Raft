@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <random>
@@ -202,6 +203,29 @@ AddLearnerProposalRequest MakePendingLearnerProposalRequest(
   request.persistent_generation = 1;
   request.data_dir_fingerprint = "fingerprint-" + node_id;
   return request;
+}
+
+void WriteLearnerMetadataIdentity(const std::filesystem::path& data_dir,
+                                  const int raft_id,
+                                  const std::string& cluster_node_id) {
+  std::error_code ec;
+  std::filesystem::create_directories(data_dir, ec);
+  ASSERT_FALSE(static_cast<bool>(ec)) << ec.message();
+
+  const auto identity_path = data_dir / "node.identity";
+  std::ofstream out(identity_path, std::ios::trunc);
+  ASSERT_TRUE(out.is_open()) << identity_path.string();
+  out << "identity_version=2\n";
+  out << "cluster_id=cluster-t073-election\n";
+  out << "node_id=" << cluster_node_id << "\n";
+  out << "node_type=metadata\n";
+  out << "raft_id=" << raft_id << "\n";
+  out << "membership_state=learner\n";
+  out << "persistent_generation=1\n";
+  out << "created_at_unix_ms=1710000000000\n";
+  out << "source=config_generator\n";
+  out.flush();
+  ASSERT_TRUE(static_cast<bool>(out)) << identity_path.string();
 }
 
 class CountingVoteService final : public raft::RaftService::Service {
@@ -596,6 +620,85 @@ TEST(RaftElectionTest,
     EXPECT_EQ(summary.local_role, CommittedMembershipRole::kVoter)
         << DescribeCommittedMembershipSummary(summary);
   }
+}
+
+TEST(RaftElectionTest,
+     LearnerIdentityNodeRejectsVoteRequestsAndCannotSelfElectLeader) {
+  std::random_device rd;
+  const auto root =
+      TestBinaryDir() / "raft_test_data" / "election" /
+      ("raft_election_learner_identity_" + std::to_string(NowForPath()) + "_" +
+       std::to_string(rd()));
+  const auto data_dir = root / "raft_data" / "learner_node";
+  const auto snapshot_dir = root / "raft_snapshots" / "learner_node";
+  WriteLearnerMetadataIdentity(data_dir, 41, "meta-learner-local-t073");
+
+  NodeConfig config;
+  config.node_id = 41;
+  config.address = "127.0.0.1:54391";
+  config.peers = {};
+  config.election_timeout_min = std::chrono::milliseconds(250);
+  config.election_timeout_max = std::chrono::milliseconds(350);
+  config.heartbeat_interval = std::chrono::milliseconds(80);
+  config.rpc_deadline = std::chrono::milliseconds(300);
+  config.data_dir = data_dir.string();
+
+  snapshotConfig snapshot_config;
+  snapshot_config.enabled = false;
+  snapshot_config.snapshot_dir = snapshot_dir.string();
+
+  auto learner = std::make_shared<RaftNode>(config, snapshot_config);
+  const auto runtime_summary = learner->GetRuntimeMembershipSummary();
+  EXPECT_EQ(runtime_summary.local_role, RuntimeMembershipRole::kLearner)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_TRUE(runtime_summary.voter_ids.empty())
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.learner_ids, std::vector<int>{41})
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.voter_count, 0U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.learner_count, 1U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+  EXPECT_EQ(runtime_summary.committed_voter_quorum_size, 0U)
+      << DescribeRuntimeMembershipSummary(runtime_summary);
+
+  std::thread thread([learner]() {
+    learner->Start();
+    learner->Wait();
+  });
+
+  std::this_thread::sleep_for(900ms);
+
+  const std::string before_vote_snapshot = learner->Describe();
+  EXPECT_FALSE(IsLeaderSnapshot(before_vote_snapshot)) << before_vote_snapshot;
+  EXPECT_EQ(ExtractIntField(before_vote_snapshot, "leader").value_or(-1), -1)
+      << before_vote_snapshot;
+
+  raft::VoteRequest request;
+  request.set_term(7);
+  request.set_candidate_id(1);
+  request.set_last_log_index(0);
+  request.set_last_log_term(0);
+
+  raft::VoteResponse response;
+  learner->OnRequestVote(request, &response);
+  EXPECT_FALSE(response.vote_granted());
+  EXPECT_EQ(response.term(), 7U);
+
+  std::this_thread::sleep_for(300ms);
+
+  const std::string after_vote_snapshot = learner->Describe();
+  EXPECT_FALSE(IsLeaderSnapshot(after_vote_snapshot)) << after_vote_snapshot;
+  EXPECT_FALSE(ContainsAll(after_vote_snapshot, {"role=Candidate"}))
+      << after_vote_snapshot;
+
+  learner->Stop();
+  if (thread.joinable()) {
+    thread.join();
+  }
+
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
 }
 
 }  // namespace

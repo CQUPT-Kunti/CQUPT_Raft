@@ -446,6 +446,8 @@ namespace raftdemo
     bool snapshot_in_progress_{false};
     std::uint64_t pending_snapshot_index_{0};
     std::uint64_t pending_snapshot_term_{0};
+    RuntimeMembershipRole local_runtime_membership_role_hint_{
+        RuntimeMembershipRole::kUnknown};
 
     mutable std::mutex metrics_mu_;
     std::uint64_t propose_success_count_{0};
