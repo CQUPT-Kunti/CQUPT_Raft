@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <random>
@@ -422,6 +423,37 @@ namespace raftdemo
             return configs;
         }
 
+        NodeConfig BuildDetachedLearnerLikeConfig(
+            const std::filesystem::path &data_root,
+            const std::int32_t learner_raft_id,
+            const std::uint16_t learner_raft_port)
+        {
+            NodeConfig learner;
+            learner.node_id = learner_raft_id;
+            learner.address = "127.0.0.1:" + std::to_string(learner_raft_port);
+            learner.election_timeout_min = 300ms;
+            learner.election_timeout_max = 600ms;
+            learner.heartbeat_interval = 80ms;
+            learner.rpc_deadline = 500ms;
+            learner.data_dir =
+                (data_root / ("learner_" + std::to_string(learner_raft_id))).string();
+            return learner;
+        }
+
+        void WriteStructuredLearnerIdentity(const NodeConfig &learner)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(learner.data_dir, ec);
+            ASSERT_FALSE(ec) << ec.message();
+
+            std::ofstream out(std::filesystem::path(learner.data_dir) / "node.identity",
+                              std::ios::trunc);
+            ASSERT_TRUE(out.is_open());
+            out << "membership_state=learner\n";
+            out.flush();
+            ASSERT_TRUE(static_cast<bool>(out));
+        }
+
         snapshotConfig MakeDisabledSnapshotConfig(
             const std::filesystem::path &snapshot_root)
         {
@@ -748,6 +780,54 @@ namespace raftdemo
             return false;
         }
 
+        bool WaitForLearnerReplicationProgress(
+            const std::shared_ptr<RaftNode> &leader,
+            const int learner_raft_id,
+            const std::uint64_t minimum_match_index,
+            const std::chrono::milliseconds timeout,
+            RuntimeMembershipEntry *learner_entry,
+            std::string *diagnostics)
+        {
+            const auto deadline = Clock::now() + timeout;
+            std::string last_snapshot;
+
+            while (Clock::now() < deadline)
+            {
+                const auto summary =
+                    leader != nullptr ? leader->GetRuntimeMembershipSummary()
+                                      : RuntimeMembershipSummary{};
+                last_snapshot = DescribeRuntimeMembershipSummary(summary);
+                for (const auto &entry : summary.learner_entries)
+                {
+                    if (entry.raft_id != learner_raft_id)
+                    {
+                        continue;
+                    }
+                    if (entry.match_index >= minimum_match_index &&
+                        entry.next_index >= entry.match_index)
+                    {
+                        if (learner_entry != nullptr)
+                        {
+                            *learner_entry = entry;
+                        }
+                        if (diagnostics != nullptr)
+                        {
+                            *diagnostics = last_snapshot;
+                        }
+                        return true;
+                    }
+                }
+
+                std::this_thread::sleep_for(50ms);
+            }
+
+            if (diagnostics != nullptr)
+            {
+                *diagnostics = last_snapshot;
+            }
+            return false;
+        }
+
         bool WaitForPendingObjectToRemainInvisible(
             const std::shared_ptr<RaftNode> &node,
             const std::string &bucket,
@@ -946,6 +1026,54 @@ namespace raftdemo
 
             std::filesystem::path root_;
             int base_port_{0};
+        };
+
+        class StandaloneNodeRunner
+        {
+        public:
+            explicit StandaloneNodeRunner(std::shared_ptr<RaftNode> node)
+                : node_(std::move(node))
+            {
+            }
+
+            ~StandaloneNodeRunner()
+            {
+                Stop();
+            }
+
+            void Start()
+            {
+                if (!node_ || thread_.joinable())
+                {
+                    return;
+                }
+                thread_ = std::thread([node = node_]()
+                                      {
+                                          node->Start();
+                                          node->Wait();
+                                      });
+            }
+
+            void Stop()
+            {
+                if (node_)
+                {
+                    node_->Stop();
+                }
+                if (thread_.joinable())
+                {
+                    thread_.join();
+                }
+            }
+
+            const std::shared_ptr<RaftNode> &Node() const
+            {
+                return node_;
+            }
+
+        private:
+            std::shared_ptr<RaftNode> node_;
+            std::thread thread_;
         };
 
         void ExpectCommittedMembershipUnchangedOnRunningNodes(
@@ -2630,6 +2758,186 @@ namespace raftdemo
                 << ProposeStatusName(create_object_insufficient_result.status)
                 << ", message=" << create_object_insufficient_result.message
                 << ", cluster=" << cluster.DescribeCluster();
+        }
+
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               JoinMetadataClusterReportsPendingThenReadyLearnerWaitingForPair)
+        {
+            constexpr const char *kBucket = "bucket-t076-learner-status";
+            constexpr const char *kObjectKey = "objects/t076-learner-status.bin";
+            constexpr const char *kObjectId = "obj-t076-learner-status";
+            constexpr const char *kClusterId = "cluster-t076-learner-status";
+            constexpr const char *kLearnerNodeId = "meta-learner-status-t076";
+            constexpr std::int32_t kLearnerRaftId = 76;
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before learner status "
+                   "reporting test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t076",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before learner status reporting test; "
+                   "status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult create_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(kBucket,
+                                                          kObjectKey,
+                                                          kObjectId,
+                                                          "create-object-t076"),
+                            8s,
+                            &create_object_result))
+                << "CreateObject should succeed before learner status reporting test; "
+                   "status="
+                << ProposeStatusName(create_object_result.status)
+                << ", message=" << create_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(kBucket,
+                                                          kObjectKey,
+                                                          kObjectId,
+                                                          "commit-object-t076"),
+                            8s,
+                            &commit_object_result))
+                << "CommitObject should succeed before learner status reporting test; "
+                   "status="
+                << ProposeStatusName(commit_object_result.status)
+                << ", message=" << commit_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+            ASSERT_GT(commit_object_result.log_index, 0U);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            const auto learner_data_root = root_ / "detached_learners";
+            const std::uint16_t learner_client_port =
+                static_cast<std::uint16_t>(base_port_ + 1760);
+            const std::uint16_t learner_raft_port =
+                static_cast<std::uint16_t>(base_port_ + 2760);
+            const NodeConfig learner_config = BuildDetachedLearnerLikeConfig(
+                learner_data_root,
+                kLearnerRaftId,
+                learner_raft_port);
+            WriteStructuredLearnerIdentity(learner_config);
+            const snapshotConfig learner_snapshot_config =
+                MakeDisabledSnapshotConfig(root_ / "learner_snapshots_t076");
+            StandaloneNodeRunner learner_runner(
+                std::make_shared<RaftNode>(learner_config, learner_snapshot_config));
+
+            raft::JoinMetadataClusterRequest join_request =
+                MakeJoinMetadataClusterRequest("req-join-t076-learner",
+                                               kClusterId,
+                                               kLearnerNodeId,
+                                               kLearnerRaftId,
+                                               learner_client_port,
+                                               learner_raft_port);
+            const NodeStatusSnapshot leader_status = leader->GetStatusSnapshot();
+            raft::JoinMetadataClusterResponse accepted_response;
+            grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(leader_status.address,
+                                             join_request,
+                                             &accepted_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(accepted_response.summary().code(), raft::METADATA_STATUS_CODE_OK);
+            EXPECT_EQ(accepted_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+            EXPECT_FALSE(accepted_response.committed_membership_changed());
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "learner_status=pending"))
+                << accepted_response.summary().message();
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "promotion_status=catching_up"))
+                << accepted_response.summary().message();
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "runtime_learner_count=1"))
+                << accepted_response.summary().message();
+            EXPECT_TRUE(Contains(accepted_response.summary().message(),
+                                 "promotion_policy=odd_committed_voter_count_only"))
+                << accepted_response.summary().message();
+
+            learner_runner.Start();
+
+            RuntimeMembershipEntry learner_progress;
+            std::string learner_progress_diagnostics;
+            ASSERT_TRUE(WaitForLearnerReplicationProgress(leader,
+                                                          kLearnerRaftId,
+                                                          commit_object_result.log_index,
+                                                          8s,
+                                                          &learner_progress,
+                                                          &learner_progress_diagnostics))
+                << "pending learner did not reach committed log boundary before "
+                   "status re-query; runtime="
+                << learner_progress_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+            EXPECT_TRUE(learner_progress.pending) << learner_progress_diagnostics;
+            EXPECT_FALSE(learner_progress.committed) << learner_progress_diagnostics;
+            EXPECT_GE(learner_progress.match_index, commit_object_result.log_index)
+                << learner_progress_diagnostics;
+
+            const auto current_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(current_leader, nullptr)
+                << "cluster lost leader before learner ready status re-query; cluster="
+                << cluster.DescribeCluster();
+            const NodeStatusSnapshot current_leader_status =
+                current_leader->GetStatusSnapshot();
+
+            raft::JoinMetadataClusterResponse duplicate_response;
+            rpc_status = JoinMetadataClusterViaAddress(current_leader_status.address,
+                                                       join_request,
+                                                       &duplicate_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(duplicate_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+            EXPECT_EQ(duplicate_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE);
+            EXPECT_FALSE(duplicate_response.committed_membership_changed());
+            EXPECT_TRUE(Contains(duplicate_response.summary().message(),
+                                 "learner_status=ready_to_promote"))
+                << duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(duplicate_response.summary().message(),
+                                 "promotion_status=waiting_for_pair"))
+                << duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(duplicate_response.summary().message(),
+                                 "promotion_block_reason=even_voter_count"))
+                << duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(duplicate_response.summary().message(),
+                                 "committed_quorum_size=2"))
+                << duplicate_response.summary().message();
+
+            const auto runtime_summary = current_leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(runtime_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.voter_count, 3U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.learner_ids, std::vector<int>{kLearnerRaftId})
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+            EXPECT_EQ(runtime_summary.committed_voter_quorum_size, 2U)
+                << DescribeRuntimeMembershipSummary(runtime_summary);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
         }
     } // namespace
 } // namespace raftdemo
