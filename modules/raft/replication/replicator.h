@@ -13,12 +13,19 @@ namespace raftdemo
 
   class RaftNode;
 
+  enum class ReplicationTargetRole : std::uint8_t
+  {
+    kCommittedVoter = 0,
+    kLearner = 1,
+  };
+
   class Replicator
   {
   public:
-    Replicator(RaftNode &node, PeerConfig peer);
+    Replicator(RaftNode &node, PeerConfig peer, ReplicationTargetRole target_role);
 
     int PeerId() const;
+    ReplicationTargetRole TargetRole() const;
 
     // Replicate at most one batch to this follower. target_index == 0 means a
     // heartbeat/probe replication. When target_index > 0, the return value tells
@@ -48,6 +55,7 @@ namespace raftdemo
 
     RaftNode &node_;
     PeerConfig peer_;
+    ReplicationTargetRole target_role_{ReplicationTargetRole::kCommittedVoter};
     mutable std::mutex mu_;
 
     bool append_inflight_{false};
@@ -58,7 +66,13 @@ namespace raftdemo
     std::uint64_t append_rpc_finished_{0};
     std::uint64_t snapshot_rpc_started_{0};
     std::uint64_t snapshot_rpc_finished_{0};
+    std::uint64_t snapshot_rpc_succeeded_{0};
+    std::uint64_t snapshot_rpc_failed_{0};
     std::uint64_t transport_failures_{0};
+    std::uint64_t last_snapshot_index_{0};
+    std::uint64_t last_snapshot_term_{0};
+    std::uint64_t last_snapshot_applied_index_{0};
+    std::uint64_t last_snapshot_peer_log_index_{0};
   };
 
 } // namespace raftdemo

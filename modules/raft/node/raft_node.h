@@ -117,6 +117,12 @@ namespace raftdemo
     RuntimeMembershipRole role{RuntimeMembershipRole::kUnknown};
     bool committed{false};
     bool pending{false};
+    std::uint64_t match_index{0};
+    std::uint64_t next_index{0};
+    std::uint64_t last_snapshot_index{0};
+    std::uint64_t last_snapshot_term{0};
+    std::uint64_t last_applied_index{0};
+    std::uint64_t observed_last_log_index{0};
     std::string canonical_node_id;
     std::string candidate_incarnation_id;
     std::uint64_t candidate_sequence{0};
@@ -302,6 +308,13 @@ namespace raftdemo
 
     friend class Replicator;
     friend class RaftServiceImpl;
+    struct SnapshotProgress
+    {
+      std::uint64_t last_snapshot_index{0};
+      std::uint64_t last_snapshot_term{0};
+      std::uint64_t last_applied_index{0};
+      std::uint64_t last_log_index{0};
+    };
     void InitServer();
     void InitClients();
     Replicator *GetOrCreateReplicatorLocked(const PeerConfig &peer);
@@ -344,7 +357,9 @@ namespace raftdemo
         int peer_id, const raft::AppendEntriesRequest &request);
     std::optional<raft::InstallSnapshotResponse> InstallSnapshotRpc(
         int peer_id, const raft::InstallSnapshotRequest &request);
-    bool SendInstallSnapshotToPeer(int peer_id, std::uint64_t term);
+    bool SendInstallSnapshotToPeer(int peer_id,
+                                   std::uint64_t term,
+                                   SnapshotProgress *progress);
 
     static const char *RoleName(Role role);
 
@@ -373,6 +388,11 @@ namespace raftdemo
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
     std::string AddressForNodeLocked(int node_id) const;
+    void EnsurePeerClientLocked(const PeerConfig &peer);
+    std::optional<PeerConfig> PendingLearnerPeerLocked() const;
+    std::vector<PeerConfig> LearnerReplicationPeersLocked() const;
+    void InitializePendingLearnerReplicationStateLocked();
+    void ResetPendingLearnerReplicationStateLocked();
     void MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id);
     void RecordProposeResult(bool success);
     void RecordElectionStarted();
@@ -409,6 +429,7 @@ namespace raftdemo
 
     std::unordered_map<int, std::uint64_t> next_index_;
     std::unordered_map<int, std::uint64_t> match_index_;
+    std::unordered_map<int, SnapshotProgress> peer_snapshot_progress_;
     std::unordered_map<int, std::unique_ptr<Replicator>> replicators_;
 
     std::unordered_map<int, std::unique_ptr<PeerClient>> clients_;

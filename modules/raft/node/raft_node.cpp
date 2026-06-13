@@ -619,12 +619,7 @@ namespace raftdemo
     clients_.clear();
     for (const auto &peer : config_.peers)
     {
-      auto client = std::make_unique<PeerClient>();
-      client->peer_id = peer.node_id;
-      client->address = peer.address;
-      client->channel = grpc::CreateChannel(peer.address, grpc::InsecureChannelCredentials());
-      client->stub = raft::RaftService::NewStub(client->channel);
-      clients_[peer.node_id] = std::move(client);
+      EnsurePeerClientLocked(peer);
     }
   }
 
@@ -637,7 +632,14 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return it->second.get();
   }
 
-  auto replicator = std::make_unique<Replicator>(*this, peer);
+  const auto pending_learner = PendingLearnerPeerLocked();
+  const auto target_role =
+      pending_learner.has_value() &&
+              pending_learner->node_id == peer.node_id &&
+              pending_learner->address == peer.address
+          ? ReplicationTargetRole::kLearner
+          : ReplicationTargetRole::kCommittedVoter;
+  auto replicator = std::make_unique<Replicator>(*this, peer, target_role);
   Replicator *raw = replicator.get();
   replicators_.emplace(peer.node_id, std::move(replicator));
   return raw;
@@ -764,8 +766,32 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
     for (const auto &[raft_id, entry] : voter_entries_by_id)
     {
+      auto voter_entry = entry;
+      if (const auto match_it = match_index_.find(raft_id); match_it != match_index_.end())
+      {
+        voter_entry.match_index = match_it->second;
+      }
+      if (const auto next_it = next_index_.find(raft_id); next_it != next_index_.end())
+      {
+        voter_entry.next_index = next_it->second;
+      }
+      if (raft_id == config_.node_id)
+      {
+        voter_entry.last_snapshot_index = last_snapshot_index_;
+        voter_entry.last_snapshot_term = last_snapshot_term_;
+        voter_entry.last_applied_index = last_applied_;
+        voter_entry.observed_last_log_index = LastLogIndexLocked();
+      }
+      else if (const auto snapshot_it = peer_snapshot_progress_.find(raft_id);
+               snapshot_it != peer_snapshot_progress_.end())
+      {
+        voter_entry.last_snapshot_index = snapshot_it->second.last_snapshot_index;
+        voter_entry.last_snapshot_term = snapshot_it->second.last_snapshot_term;
+        voter_entry.last_applied_index = snapshot_it->second.last_applied_index;
+        voter_entry.observed_last_log_index = snapshot_it->second.last_log_index;
+      }
       summary.voter_ids.push_back(raft_id);
-      summary.voter_entries.push_back(entry);
+      summary.voter_entries.push_back(std::move(voter_entry));
     }
 
     if (local_runtime_membership_role_hint_ == RuntimeMembershipRole::kLearner)
@@ -776,6 +802,20 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       local_learner_entry.role = RuntimeMembershipRole::kLearner;
       local_learner_entry.committed = false;
       local_learner_entry.pending = false;
+      if (const auto match_it = match_index_.find(local_learner_entry.raft_id);
+          match_it != match_index_.end())
+      {
+        local_learner_entry.match_index = match_it->second;
+      }
+      if (const auto next_it = next_index_.find(local_learner_entry.raft_id);
+          next_it != next_index_.end())
+      {
+        local_learner_entry.next_index = next_it->second;
+      }
+      local_learner_entry.last_snapshot_index = last_snapshot_index_;
+      local_learner_entry.last_snapshot_term = last_snapshot_term_;
+      local_learner_entry.last_applied_index = last_applied_;
+      local_learner_entry.observed_last_log_index = LastLogIndexLocked();
       summary.learner_ids.push_back(local_learner_entry.raft_id);
       summary.learner_entries.push_back(local_learner_entry);
     }
@@ -788,6 +828,24 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       learner_entry.role = RuntimeMembershipRole::kLearner;
       learner_entry.committed = false;
       learner_entry.pending = true;
+      if (const auto match_it = match_index_.find(learner_entry.raft_id);
+          match_it != match_index_.end())
+      {
+        learner_entry.match_index = match_it->second;
+      }
+      if (const auto next_it = next_index_.find(learner_entry.raft_id);
+          next_it != next_index_.end())
+      {
+        learner_entry.next_index = next_it->second;
+      }
+      if (const auto snapshot_it = peer_snapshot_progress_.find(learner_entry.raft_id);
+          snapshot_it != peer_snapshot_progress_.end())
+      {
+        learner_entry.last_snapshot_index = snapshot_it->second.last_snapshot_index;
+        learner_entry.last_snapshot_term = snapshot_it->second.last_snapshot_term;
+        learner_entry.last_applied_index = snapshot_it->second.last_applied_index;
+        learner_entry.observed_last_log_index = snapshot_it->second.last_log_index;
+      }
       learner_entry.canonical_node_id = pending_add_learner_proposal_->node_id;
       learner_entry.candidate_incarnation_id =
           pending_add_learner_proposal_->candidate_incarnation_id;
@@ -945,6 +1003,7 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
         .data_dir_fingerprint = request.data_dir_fingerprint,
         .accepted_membership_epoch = commit_index_,
     };
+    InitializePendingLearnerReplicationStateLocked();
     result.status = AddLearnerProposalStatus::kAcceptedPendingCommit;
     result.membership_epoch = commit_index_;
     result.message =
@@ -1314,7 +1373,9 @@ void RaftNode::SendHeartbeats()
     {
       return;
     }
-    peers = config_.peers;
+    peers = BuildUniqueCommittedVoterPeers(config_);
+    const auto learner_peers = LearnerReplicationPeersLocked();
+    peers.insert(peers.end(), learner_peers.begin(), learner_peers.end());
     term = current_term_;
 
     for (const auto &peer : peers)
@@ -1385,6 +1446,7 @@ void RaftNode::SendHeartbeats()
 
     if (role_ != Role::kLeader)
     {
+      ResetPendingLearnerReplicationStateLocked();
       pending_add_learner_proposal_.reset();
     }
 
@@ -1420,6 +1482,7 @@ void RaftNode::SendHeartbeats()
     CancelElectionTimerLocked();
 
     const auto last_log_index = LastLogIndexLocked();
+    ResetPendingLearnerReplicationStateLocked();
     pending_add_learner_proposal_.reset();
     next_index_.clear();
     match_index_.clear();
@@ -1429,6 +1492,7 @@ void RaftNode::SendHeartbeats()
     {
       next_index_[peer.node_id] = SafeAddOne(last_log_index);
       match_index_[peer.node_id] = 0;
+      EnsurePeerClientLocked(peer);
       GetOrCreateReplicatorLocked(peer);
     }
 
@@ -1690,8 +1754,15 @@ void RaftNode::SendHeartbeats()
     return response;
   }
 
-  bool RaftNode::SendInstallSnapshotToPeer(int peer_id, std::uint64_t term)
+  bool RaftNode::SendInstallSnapshotToPeer(int peer_id,
+                                           std::uint64_t term,
+                                           SnapshotProgress *progress)
   {
+    if (progress != nullptr)
+    {
+      *progress = SnapshotProgress{};
+    }
+
     SnapshotMeta meta;
     std::string error;
     {
@@ -1737,6 +1808,12 @@ void RaftNode::SendHeartbeats()
       return false;
     }
 
+    if (progress != nullptr)
+    {
+      progress->last_snapshot_index = meta.last_included_index;
+      progress->last_snapshot_term = meta.last_included_term;
+    }
+
     std::ifstream in(meta.snapshot_path, std::ios::binary);
     if (!in.is_open())
     {
@@ -1778,6 +1855,10 @@ void RaftNode::SendHeartbeats()
     {
       auto &next_index = next_index_[peer_id];
       const std::uint64_t hinted_next = SafeAddOne(response->last_log_index());
+      if (progress != nullptr)
+      {
+        progress->last_log_index = response->last_log_index();
+      }
       if (hinted_next > 0)
       {
         next_index = hinted_next;
@@ -1789,6 +1870,29 @@ void RaftNode::SendHeartbeats()
     auto &next_index = next_index_[peer_id];
     match_index = std::max<std::uint64_t>(match_index, meta.last_included_index);
     next_index = std::max<std::uint64_t>(next_index, SafeAddOne(meta.last_included_index));
+    auto &snapshot_progress = peer_snapshot_progress_[peer_id];
+    const std::uint64_t previous_snapshot_index = snapshot_progress.last_snapshot_index;
+    if (meta.last_included_index > previous_snapshot_index)
+    {
+      snapshot_progress.last_snapshot_index = meta.last_included_index;
+      snapshot_progress.last_snapshot_term = meta.last_included_term;
+    }
+    else if (meta.last_included_index == previous_snapshot_index)
+    {
+      snapshot_progress.last_snapshot_term =
+          std::max<std::uint64_t>(snapshot_progress.last_snapshot_term,
+                                  meta.last_included_term);
+    }
+    snapshot_progress.last_applied_index =
+        std::max<std::uint64_t>(snapshot_progress.last_applied_index,
+                                meta.last_included_index);
+    snapshot_progress.last_log_index =
+        std::max<std::uint64_t>(snapshot_progress.last_log_index,
+                                response->last_log_index());
+    if (progress != nullptr)
+    {
+      *progress = snapshot_progress;
+    }
     return true;
   }
 
@@ -2227,7 +2331,93 @@ void RaftNode::SendHeartbeats()
         return peer.address;
       }
     }
+    if (pending_add_learner_proposal_.has_value() &&
+        pending_add_learner_proposal_->candidate_raft_id == node_id)
+    {
+      return pending_add_learner_proposal_->candidate_raft_address;
+    }
     return "";
+  }
+
+  void RaftNode::EnsurePeerClientLocked(const PeerConfig &peer)
+  {
+    if (clients_.find(peer.node_id) != clients_.end())
+    {
+      return;
+    }
+
+    auto client = std::make_unique<PeerClient>();
+    client->peer_id = peer.node_id;
+    client->address = peer.address;
+    client->channel = grpc::CreateChannel(peer.address, grpc::InsecureChannelCredentials());
+    client->stub = raft::RaftService::NewStub(client->channel);
+    clients_[peer.node_id] = std::move(client);
+  }
+
+  std::optional<PeerConfig> RaftNode::PendingLearnerPeerLocked() const
+  {
+    if (!pending_add_learner_proposal_.has_value())
+    {
+      return std::nullopt;
+    }
+
+    const auto &pending = *pending_add_learner_proposal_;
+    if (pending.candidate_raft_id <= 0 || pending.candidate_raft_address.empty())
+    {
+      return std::nullopt;
+    }
+
+    if (pending.candidate_raft_id == config_.node_id ||
+        std::any_of(config_.peers.begin(),
+                    config_.peers.end(),
+                    [&pending](const PeerConfig &peer) {
+                      return peer.node_id == pending.candidate_raft_id;
+                    }))
+    {
+      return std::nullopt;
+    }
+
+    return PeerConfig{pending.candidate_raft_id, pending.candidate_raft_address};
+  }
+
+  std::vector<PeerConfig> RaftNode::LearnerReplicationPeersLocked() const
+  {
+    std::vector<PeerConfig> peers;
+    if (const auto pending_learner = PendingLearnerPeerLocked();
+        pending_learner.has_value())
+    {
+      peers.push_back(*pending_learner);
+    }
+    return peers;
+  }
+
+  void RaftNode::InitializePendingLearnerReplicationStateLocked()
+  {
+    const auto pending_learner = PendingLearnerPeerLocked();
+    if (!pending_learner.has_value())
+    {
+      return;
+    }
+
+    match_index_[pending_learner->node_id] = 0;
+    next_index_[pending_learner->node_id] = SafeAddOne(LastLogIndexLocked());
+    EnsurePeerClientLocked(*pending_learner);
+    GetOrCreateReplicatorLocked(*pending_learner);
+  }
+
+  void RaftNode::ResetPendingLearnerReplicationStateLocked()
+  {
+    const auto pending_learner = PendingLearnerPeerLocked();
+    if (!pending_learner.has_value())
+    {
+      return;
+    }
+
+    match_index_.erase(pending_learner->node_id);
+    next_index_.erase(pending_learner->node_id);
+    peer_snapshot_progress_.erase(pending_learner->node_id);
+    replicators_.erase(pending_learner->node_id);
+    clients_.erase(pending_learner->node_id);
   }
 
   void RaftNode::MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id)

@@ -23,16 +23,38 @@ namespace raftdemo
     {
       return value == std::numeric_limits<std::uint64_t>::max() ? value : value + 1;
     }
+
+    const char *ReplicationTargetRoleName(const ReplicationTargetRole role)
+    {
+      switch (role)
+      {
+      case ReplicationTargetRole::kCommittedVoter:
+        return "committed_voter";
+      case ReplicationTargetRole::kLearner:
+        return "learner";
+      }
+      return "unknown";
+    }
   } // namespace
 
-  Replicator::Replicator(RaftNode &node, PeerConfig peer)
-      : node_(node), peer_(std::move(peer)), retry_backoff_(kInitialRetryBackoff)
+  Replicator::Replicator(RaftNode &node,
+                         PeerConfig peer,
+                         ReplicationTargetRole target_role)
+      : node_(node),
+        peer_(std::move(peer)),
+        target_role_(target_role),
+        retry_backoff_(kInitialRetryBackoff)
   {
   }
 
   int Replicator::PeerId() const
   {
     return peer_.node_id;
+  }
+
+  ReplicationTargetRole Replicator::TargetRole() const
+  {
+    return target_role_;
   }
 
   bool Replicator::HasInflightRpc() const
@@ -46,6 +68,7 @@ namespace raftdemo
     std::lock_guard<std::mutex> lk(mu_);
     std::ostringstream oss;
     oss << "peer=" << peer_.node_id
+        << ", target_role=" << ReplicationTargetRoleName(target_role_)
         << ", append_inflight=" << append_inflight_
         << ", snapshot_inflight=" << snapshot_inflight_
         << ", backoff_ms=" << retry_backoff_.count()
@@ -53,7 +76,16 @@ namespace raftdemo
         << ", append_rpc_finished=" << append_rpc_finished_
         << ", snapshot_rpc_started=" << snapshot_rpc_started_
         << ", snapshot_rpc_finished=" << snapshot_rpc_finished_
+        << ", snapshot_rpc_succeeded=" << snapshot_rpc_succeeded_
+        << ", snapshot_rpc_failed=" << snapshot_rpc_failed_
         << ", transport_failures=" << transport_failures_;
+    if (last_snapshot_index_ > 0)
+    {
+      oss << ", last_snapshot_index=" << last_snapshot_index_
+          << ", last_snapshot_term=" << last_snapshot_term_
+          << ", last_snapshot_applied_index=" << last_snapshot_applied_index_
+          << ", last_snapshot_peer_log_index=" << last_snapshot_peer_log_index_;
+    }
     return oss.str();
   }
 
@@ -108,17 +140,37 @@ namespace raftdemo
 
     if (should_install_snapshot)
     {
-      const bool ok = node_.SendInstallSnapshotToPeer(peer_.node_id, leader_term);
+      RaftNode::SnapshotProgress progress;
+      const bool ok = node_.SendInstallSnapshotToPeer(peer_.node_id, leader_term, &progress);
 
       {
         std::lock_guard<std::mutex> replicator_lk(mu_);
         FinishSnapshotRpcLocked();
+        const std::uint64_t previous_snapshot_index = last_snapshot_index_;
+        if (progress.last_snapshot_index > previous_snapshot_index)
+        {
+          last_snapshot_index_ = progress.last_snapshot_index;
+          last_snapshot_term_ = progress.last_snapshot_term;
+        }
+        else if (progress.last_snapshot_index == previous_snapshot_index)
+        {
+          last_snapshot_term_ =
+              std::max<std::uint64_t>(last_snapshot_term_, progress.last_snapshot_term);
+        }
+        last_snapshot_applied_index_ =
+            std::max<std::uint64_t>(last_snapshot_applied_index_,
+                                    progress.last_applied_index);
+        last_snapshot_peer_log_index_ =
+            std::max<std::uint64_t>(last_snapshot_peer_log_index_,
+                                    progress.last_log_index);
         if (ok)
         {
+          ++snapshot_rpc_succeeded_;
           ResetBackoffLocked();
         }
         else
         {
+          ++snapshot_rpc_failed_;
           RecordTransportFailureLocked();
         }
       }
@@ -267,11 +319,14 @@ namespace raftdemo
       match_index = std::max<std::uint64_t>(match_index, response.match_index());
       next_index = std::max<std::uint64_t>(next_index, SafeAddOne(response.match_index()));
 
-      const std::uint64_t old_commit_index = node_.commit_index_;
-      node_.AdvanceCommitIndexUnlocked();
-      if (should_apply != nullptr && node_.commit_index_ > old_commit_index)
+      if (target_role_ == ReplicationTargetRole::kCommittedVoter)
       {
-        *should_apply = true;
+        const std::uint64_t old_commit_index = node_.commit_index_;
+        node_.AdvanceCommitIndexUnlocked();
+        if (should_apply != nullptr && node_.commit_index_ > old_commit_index)
+        {
+          *should_apply = true;
+        }
       }
 
       return target_index == 0 || match_index >= target_index;
