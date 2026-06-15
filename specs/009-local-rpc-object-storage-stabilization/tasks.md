@@ -171,10 +171,10 @@
 **Independent Test**: 两个 learners ready 后 committed voters 直接变为 5，quorum 从 2 变 3，中间没有 committed 4 voters。
 
 - [x] T078 [P] [US4] Add 3 voters + 2 ready learners batch promote test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T079 [P] [US4] Add no committed 4-voter history assertion in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T080 [P] [US4] Add leader failure during batch promote test in `tests/metadata_failover_test.cpp` (验证: `metadata_failover_test`)
-- [ ] T081 [P] [US4] Add restart recovery for committed batch membership in `tests/test_raft_snapshot_restart.cpp` (验证: `test_raft_snapshot_restart`)
-- [ ] T082 [US4] Design and implement batched membership change or joint consensus state in `modules/raft/node/raft_node.cpp` and `modules/raft/node/raft_node.h` (验证: `integrated_object_storage_quorum`)
+- [x] T079 [P] [US4] Add no committed 4-voter history assertion in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T080 [P] [US4] Add leader failure during batch promote test in `tests/metadata_failover_test.cpp` (验证: `metadata_failover_test`)
+- [x] T081 [P] [US4] Add restart recovery for committed batch membership in `tests/test_raft_snapshot_restart.cpp` (验证: `test_raft_snapshot_restart`)
+- [x] T082 [US4] Design and implement batched membership change or joint consensus state in `modules/raft/node/raft_node.cpp` and `modules/raft/node/raft_node.h` (验证: `integrated_object_storage_quorum`)
 - [ ] T083 [US4] Persist and apply batch membership changes through Raft log/config entry path in `modules/raft/storage` and `modules/raft/node/raft_node.cpp` (验证: `test_raft_snapshot_restart`, `integrated_object_storage_quorum`)
 - [ ] T084 [US4] Add target voter odd-count validation before membership proposal commit in `modules/raft/node/raft_node.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T085 [US4] Promote two ready learners together and update quorum summary in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)

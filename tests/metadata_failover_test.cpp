@@ -1737,6 +1737,8 @@ namespace raftdemo
           std::make_shared<RaftNode>(second_learner_config));
 
       std::vector<std::string> observed_diagnostics;
+      leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
 
       raft::JoinMetadataClusterRequest first_join_request =
           MakeJoinMetadataClusterRequest("req-join-t080-learner-a",

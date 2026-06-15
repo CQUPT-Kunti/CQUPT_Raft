@@ -72,38 +72,14 @@ Risk: T045-T053 now validate StorageNode dynamic join semantics through registry
 
 Mitigation: Keep current US3 PASS scoped to `storage_heartbeat_registry` and `IntegratedObjectStorageE2ETest.*`. Add real runtime add-node example commands and smoke validation in Phase 10/T089-T098 before claiming full local RPC dynamic-join workflow validation.
 
-## R13: Dynamic Metadata Join Still Stops At Validation And Admission Boundary
+## R13: Dynamic Metadata Join Has Batch-Promote Safety Coverage, But End-To-End Local RPC And Membership Traceability Still Lag
 
-Risk: T055-T065 now validate dynamic Metadata candidate identity/config, `JoinMetadataCluster` proto contract, metadata leader authority, ViewNode discovery fallback, and `AddLearner` admission boundary, but the runtime still stops before committed learner membership change, learner catch-up, InstallSnapshot catch-up, promote-to-voter, odd-voter-safe promotion, and local RPC dynamic metadata add-node smoke. Multi-ViewNode peer sync effects on metadata join discovery are also not fully exercised beyond targeted tests.
+Risk: T055-T082 now cover dynamic Metadata candidate identity/config, `JoinMetadataCluster` contract, learner catch-up, learner exclusion from election/quorum, no-committed-`4-voter` safety, leader failover during batch promote, restart recovery of committed `5-voter` membership, and the `RaftNode` atomic batch promotion boundary. However, the repository still lacks end-to-end local RPC dynamic metadata add-node smoke and a dedicated first-class committed membership transition trace. Without those pieces, later storage/replay/diagnostics work could drift from the current targeted-test safety envelope.
 
-Mitigation: Keep current US4 PASS scoped to validation/boundary semantics only. Treat T066-T098 as required follow-up for learner replication, snapshot catch-up, promotion safety, local RPC runtime smoke, and broader multi-ViewNode discovery validation before claiming full dynamic Metadata membership lifecycle support.
+Mitigation: Treat current US4 progress as targeted Linux validation of the core membership safety path. Keep Phase 10 local RPC workflow validation pending, and require later membership persistence / diagnostics work to preserve the same `3 voters -> 5 voters` atomicity and no-committed-`4-voter` guarantees already covered by the current tests.
 
-## R14: Learner Catch-Up Phase Is Linux-Validated, But Promotion And Cross-Platform Runtime Validation Remain Pending
+## R19: Atomic Batch Promotion Boundary Exists, But First-Class Membership Persistence And History Still Lag Behind
 
-Risk: T066-T076 now cover learner AppendEntries catch-up, InstallSnapshot catch-up, learner exclusion from election/quorum, committed-voters-only quorum safety, and waiting-for-pair diagnostics on Linux targeted tests, but the repository still lacks promote-to-voter, batch promote, joint consensus, and cross-platform runtime validation. Treating Phase 8 PASS as full learner lifecycle completion would overstate the current safety envelope.
+Risk: T082 now provides a working atomic batch learner promotion boundary by encoding the transition as an internal Raft log command inside `RaftNode`, and targeted failover / restart tests can reach and recover a committed `5-voter` membership. However, committed membership persistence, replay traceability, and diagnostics still do not have a dedicated first-class membership-change channel. Later work on storage/replay/history may drift from the current internal-command boundary if T083/T085 do not preserve the same `3 voters -> 5 voters` atomicity guarantees.
 
-Mitigation: Keep learner Phase 8 closure scoped to Linux-targeted catch-up and non-voter safety semantics only. Record Windows/macOS as pending, require T078+ to validate batch promotion and no-committed-4-voter history, and do not claim end-to-end dynamic metadata learner lifecycle completion before those tasks and local RPC smoke are finished.
-
-## R15: T078 Cannot Yet Reach Two Ready Learners Or Prove No-Committed-4-Voter History Through Real APIs
-
-Risk: Current runtime membership admission still stores only one `pending_add_learner_proposal_`, and the public path exposed by `JoinMetadataCluster` has no batch promote / promote-to-voter boundary. As a result, the T078 test can drive one learner to `ready_to_promote` and verify `waiting_for_pair`, but it cannot yet continue through a real `3 voters + 2 ready learners -> direct 5 voters` transition or prove the absence of committed 4-voter intermediate history with executable assertions.
-
-Mitigation: Keep T078 as an intentionally red test-first guard until production exposes a real second-learner admission path plus an explicit batch promote boundary. When that boundary exists, extend the test to verify: before promote both learners remain non-voters and quorum stays at 2; after batch promote committed voters become 5 with quorum 3; and no committed 4-voter membership is ever observable in diagnostics or state summaries.
-
-## R16: T079 Still Lacks A First-Class Committed Membership History Trace
-
-Risk: T079 can currently sample `CommittedMembershipQuorumSummary` on running nodes and inspect `JoinMetadataCluster` diagnostics such as `committed_voter_count` / `committed_voter_ids`, but the runtime still lacks a dedicated committed membership history or config-transition trace. That means the test can prove "no observable committed 4-voter state" only at sampled boundaries, not from a first-class persisted or replayable history stream.
-
-Mitigation: Treat the current T079 coverage as the strongest available observable-state guard for now. When batch promote / joint consensus work starts, add an explicit committed membership timeline or equivalent diagnostics trace so tests can assert end-to-end that `3 voters -> 5 voters` occurs without any committed `4 voters` intermediate state, including failed or interrupted transitions across leader failover and restart.
-
-## R17: T080 Cannot Yet Exercise Real Batch-Promote-In-Progress Failover
-
-Risk: T080 can already verify that a leader failure during the currently observable learner-promotion boundary does not leave committed `4 voters`, does not shrink quorum, and does not restore learners as voters. However, because runtime admission still blocks the second learner while the first learner is only `waiting_for_pair`, the failover harness cannot yet reach a real `2 ready learners + batch promote in progress` state. As a result, failover coverage is currently limited to blocked / partial / interrupted promote boundaries rather than a true batch promote transition.
-
-Mitigation: Keep T080 as a test-first guard for the current failover safety envelope. Once batch promote or joint consensus exposes a real promote-in-progress boundary, extend the test to cover: leader failure after both learners are ready, incomplete promote recovery on the new leader, direct recovery to `5 voters / quorum 3`, no duplicate membership entries, and no committed `4 voters` in any replayable history or diagnostics trace.
-
-## R18: T081 Cannot Yet Prove Restart Recovery Of A Real Committed Five-Voter Batch Membership
-
-Risk: T081 can validate that snapshot/restart does not resurrect blocked or partial learner promotion as committed membership, and that restart does not create committed `4 voters` or restore learners as voters. But because runtime membership never reaches a real committed `5-voter` batch membership and there is no explicit durable membership history/config trace, the restart harness cannot yet verify the intended final state `5 voters / quorum 3` after recovery.
-
-Mitigation: Keep T081 as a test-first guard for the current restart safety envelope. Once batch promote persistence is implemented, extend the test to construct a real committed `3 voters + 2 ready learners -> 5 voters` result, force a snapshot or equivalent durable recovery point after commit, restart the affected nodes, and assert that recovery preserves the promoted voters, restores quorum `3`, never replays a `4-voter` state, and does not re-apply the promote step.
+Mitigation: Treat the T082 implementation as the current production safety boundary, not the final persistence model. T083 should preserve the same no-committed-`4-voter` invariant through storage/replay paths, and later diagnostics work should expose an explicit committed membership transition trace so failover/restart/history assertions do not depend only on sampled summaries and message strings.

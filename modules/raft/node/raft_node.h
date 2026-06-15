@@ -306,6 +306,12 @@ namespace raftdemo
       std::uint64_t accepted_membership_epoch{0};
     };
 
+    struct AtomicBatchPromotionTarget
+    {
+      std::int32_t raft_id{0};
+      std::string address;
+    };
+
     friend class Replicator;
     friend class RaftServiceImpl;
     struct SnapshotProgress
@@ -387,12 +393,27 @@ namespace raftdemo
     void PruneCompletedMetadataProposalsLocked();
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
+    bool IsAtomicBatchPromotionCommand(const std::string &command_data) const;
+    ApplyResult ApplyAtomicBatchPromotionCommand(std::uint64_t apply_index,
+                                                 const std::string &command_data);
+    std::string BuildAtomicBatchPromotionCommandLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets) const;
+    bool ParseAtomicBatchPromotionCommand(
+        const std::string &command_data,
+        std::vector<AtomicBatchPromotionTarget> *targets,
+        std::string *reason) const;
+    std::optional<std::uint64_t> PrepareAtomicBatchPromotionLogIndexLocked();
+    bool IsPendingLearnerReadyForPromotionLocked(
+        const PendingAddLearnerProposal &proposal) const;
+    std::vector<AtomicBatchPromotionTarget>
+    CollectAtomicBatchPromotionTargetsLocked() const;
     std::string AddressForNodeLocked(int node_id) const;
     void EnsurePeerClientLocked(const PeerConfig &peer);
-    std::optional<PeerConfig> PendingLearnerPeerLocked() const;
     std::vector<PeerConfig> LearnerReplicationPeersLocked() const;
-    void InitializePendingLearnerReplicationStateLocked();
-    void ResetPendingLearnerReplicationStateLocked();
+    void InitializePendingLearnerReplicationStateLocked(
+        const PendingAddLearnerProposal &proposal);
+    void ResetPendingLearnerReplicationStateLocked(std::int32_t learner_raft_id);
+    void ResetAllPendingLearnerReplicationStateLocked();
     void MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id);
     void RecordProposeResult(bool success);
     void RecordElectionStarted();
@@ -449,7 +470,8 @@ namespace raftdemo
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
-    std::optional<PendingAddLearnerProposal> pending_add_learner_proposal_;
+    std::vector<PendingAddLearnerProposal> pending_add_learner_proposals_;
+    std::optional<std::uint64_t> inflight_atomic_batch_promotion_log_index_;
     std::unordered_map<std::string, std::shared_ptr<MetadataProposalTracker>>
         metadata_inflight_proposals_;
     std::unordered_map<std::string, CompletedMetadataProposal>

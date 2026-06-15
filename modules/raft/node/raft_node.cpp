@@ -1,6 +1,7 @@
 #include "raft/node/raft_node.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,8 @@ namespace raftdemo
     };
 
     constexpr const char *kInternalNoOpCommand = "__raft_internal_noop__";
+    constexpr const char *kInternalAtomicBatchPromotionCommandPrefix =
+        "__raft_internal_atomic_batch_promote_v1__";
     constexpr const char *kSnapshotMarkerCommand = "snapshot";
     constexpr const char *kIdentityFileName = "node_identity.txt";
     constexpr const char *kStructuredIdentityFileName = "node.identity";
@@ -62,6 +65,58 @@ namespace raftdemo
     }
 
     std::string NodeTag(int node_id) { return "node-" + std::to_string(node_id); }
+
+    std::string HexEncode(std::string_view value)
+    {
+      static constexpr char kHexDigits[] = "0123456789abcdef";
+      std::string encoded;
+      encoded.reserve(value.size() * 2U);
+      for (const unsigned char ch : value)
+      {
+        encoded.push_back(kHexDigits[(ch >> 4U) & 0x0FU]);
+        encoded.push_back(kHexDigits[ch & 0x0FU]);
+      }
+      return encoded;
+    }
+
+    bool HexDecode(std::string_view encoded, std::string *value)
+    {
+      if (value == nullptr || encoded.size() % 2U != 0U)
+      {
+        return false;
+      }
+
+      auto decode_nibble = [](const char ch) -> int {
+        if (ch >= '0' && ch <= '9')
+        {
+          return ch - '0';
+        }
+        if (ch >= 'a' && ch <= 'f')
+        {
+          return 10 + ch - 'a';
+        }
+        if (ch >= 'A' && ch <= 'F')
+        {
+          return 10 + ch - 'A';
+        }
+        return -1;
+      };
+
+      std::string decoded;
+      decoded.reserve(encoded.size() / 2U);
+      for (std::size_t index = 0; index < encoded.size(); index += 2U)
+      {
+        const int high = decode_nibble(encoded[index]);
+        const int low = decode_nibble(encoded[index + 1U]);
+        if (high < 0 || low < 0)
+        {
+          return false;
+        }
+        decoded.push_back(static_cast<char>((high << 4U) | low));
+      }
+      *value = std::move(decoded);
+      return true;
+    }
 
     std::string DefaultDataDir(int node_id)
     {
@@ -632,13 +687,16 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return it->second.get();
   }
 
-  const auto pending_learner = PendingLearnerPeerLocked();
-  const auto target_role =
-      pending_learner.has_value() &&
-              pending_learner->node_id == peer.node_id &&
-              pending_learner->address == peer.address
-          ? ReplicationTargetRole::kLearner
-          : ReplicationTargetRole::kCommittedVoter;
+  const bool is_pending_learner =
+      std::any_of(pending_add_learner_proposals_.begin(),
+                  pending_add_learner_proposals_.end(),
+                  [&peer](const PendingAddLearnerProposal &proposal) {
+                    return proposal.candidate_raft_id == peer.node_id &&
+                           proposal.candidate_raft_address == peer.address;
+                  });
+  const auto target_role = is_pending_learner
+                               ? ReplicationTargetRole::kLearner
+                               : ReplicationTargetRole::kCommittedVoter;
   auto replicator = std::make_unique<Replicator>(*this, peer, target_role);
   Replicator *raw = replicator.get();
   replicators_.emplace(peer.node_id, std::move(replicator));
@@ -820,11 +878,11 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       summary.learner_entries.push_back(local_learner_entry);
     }
 
-    if (pending_add_learner_proposal_.has_value())
+    for (const auto &pending_proposal : pending_add_learner_proposals_)
     {
       RuntimeMembershipEntry learner_entry;
-      learner_entry.raft_id = pending_add_learner_proposal_->candidate_raft_id;
-      learner_entry.address = pending_add_learner_proposal_->candidate_raft_address;
+      learner_entry.raft_id = pending_proposal.candidate_raft_id;
+      learner_entry.address = pending_proposal.candidate_raft_address;
       learner_entry.role = RuntimeMembershipRole::kLearner;
       learner_entry.committed = false;
       learner_entry.pending = true;
@@ -846,15 +904,15 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
         learner_entry.last_applied_index = snapshot_it->second.last_applied_index;
         learner_entry.observed_last_log_index = snapshot_it->second.last_log_index;
       }
-      learner_entry.canonical_node_id = pending_add_learner_proposal_->node_id;
+      learner_entry.canonical_node_id = pending_proposal.node_id;
       learner_entry.candidate_incarnation_id =
-          pending_add_learner_proposal_->candidate_incarnation_id;
+          pending_proposal.candidate_incarnation_id;
       learner_entry.candidate_sequence =
-          pending_add_learner_proposal_->candidate_sequence;
+          pending_proposal.candidate_sequence;
       learner_entry.persistent_generation =
-          pending_add_learner_proposal_->persistent_generation;
+          pending_proposal.persistent_generation;
       learner_entry.data_dir_fingerprint =
-          pending_add_learner_proposal_->data_dir_fingerprint;
+          pending_proposal.data_dir_fingerprint;
       if (voter_entries_by_id.find(learner_entry.raft_id) ==
               voter_entries_by_id.end() &&
           std::find(summary.learner_ids.begin(),
@@ -966,9 +1024,8 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
              pending.data_dir_fingerprint == request.data_dir_fingerprint;
     };
 
-    if (pending_add_learner_proposal_.has_value())
+    for (const auto &pending : pending_add_learner_proposals_)
     {
-      const auto &pending = *pending_add_learner_proposal_;
       result.membership_epoch = pending.accepted_membership_epoch;
       if (is_same_pending(pending))
       {
@@ -985,13 +1042,16 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
             "conflicting AddLearner proposal for learner candidate already pending";
         return result;
       }
+    }
 
+    if (pending_add_learner_proposals_.size() >= 2U)
+    {
       result.status = AddLearnerProposalStatus::kPendingMembershipChange;
-      result.message = "pending AddLearner proposal already exists";
+      result.message = "pending AddLearner proposal set already reached atomic batch boundary";
       return result;
     }
 
-    pending_add_learner_proposal_ = PendingAddLearnerProposal{
+    const PendingAddLearnerProposal pending_proposal{
         .cluster_id = request.cluster_id,
         .node_id = request.node_id,
         .candidate_raft_id = request.candidate_raft_id,
@@ -1003,11 +1063,19 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
         .data_dir_fingerprint = request.data_dir_fingerprint,
         .accepted_membership_epoch = commit_index_,
     };
-    InitializePendingLearnerReplicationStateLocked();
+    pending_add_learner_proposals_.push_back(pending_proposal);
+    std::sort(pending_add_learner_proposals_.begin(),
+              pending_add_learner_proposals_.end(),
+              [](const PendingAddLearnerProposal &lhs,
+                 const PendingAddLearnerProposal &rhs) {
+                return lhs.candidate_raft_id < rhs.candidate_raft_id;
+              });
+    InitializePendingLearnerReplicationStateLocked(pending_proposal);
     result.status = AddLearnerProposalStatus::kAcceptedPendingCommit;
     result.membership_epoch = commit_index_;
-    result.message =
-        "AddLearner proposal path admitted on leader; committed membership log proposal, learner catch-up and promote-to-voter remain unimplemented";
+    result.message = pending_add_learner_proposals_.size() >= 2U
+                         ? "AddLearner proposal admitted into atomic batch learner set"
+                         : "AddLearner proposal admitted on leader; learner catch-up remains pending until atomic batch promote is safe";
     return result;
   }
 
@@ -1366,6 +1434,7 @@ void RaftNode::SendHeartbeats()
 {
   std::vector<PeerConfig> peers;
   std::uint64_t term = 0;
+  std::optional<std::uint64_t> atomic_batch_log_index;
 
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1373,6 +1442,7 @@ void RaftNode::SendHeartbeats()
     {
       return;
     }
+    atomic_batch_log_index = PrepareAtomicBatchPromotionLogIndexLocked();
     peers = BuildUniqueCommittedVoterPeers(config_);
     const auto learner_peers = LearnerReplicationPeersLocked();
     peers.insert(peers.end(), learner_peers.begin(), learner_peers.end());
@@ -1417,6 +1487,30 @@ void RaftNode::SendHeartbeats()
       }
     } });
   }
+
+  if (!atomic_batch_log_index.has_value())
+  {
+    return;
+  }
+
+  if (ReplicateLogEntryToMajority(*atomic_batch_log_index) !=
+      ReplicationOutcome::kReplicated)
+  {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    AdvanceCommitIndexUnlocked();
+  }
+
+  ApplyResult apply_result = ApplyCommittedEntries();
+  if (!apply_result.Ok)
+  {
+    Log(NodeTag(config_.node_id),
+        "atomic batch promotion apply failed after replication, reason=",
+        apply_result.message);
+  }
 }
 
   bool RaftNode::BecomeFollowerLocked(std::uint64_t new_term, int new_leader,
@@ -1446,8 +1540,9 @@ void RaftNode::SendHeartbeats()
 
     if (role_ != Role::kLeader)
     {
-      ResetPendingLearnerReplicationStateLocked();
-      pending_add_learner_proposal_.reset();
+      ResetAllPendingLearnerReplicationStateLocked();
+      pending_add_learner_proposals_.clear();
+      inflight_atomic_batch_promotion_log_index_.reset();
     }
 
     ResetElectionTimerLocked();
@@ -1482,8 +1577,9 @@ void RaftNode::SendHeartbeats()
     CancelElectionTimerLocked();
 
     const auto last_log_index = LastLogIndexLocked();
-    ResetPendingLearnerReplicationStateLocked();
-    pending_add_learner_proposal_.reset();
+    ResetAllPendingLearnerReplicationStateLocked();
+    pending_add_learner_proposals_.clear();
+    inflight_atomic_batch_promotion_log_index_.reset();
     next_index_.clear();
     match_index_.clear();
     match_index_[config_.node_id] = last_log_index;
@@ -2331,10 +2427,12 @@ void RaftNode::SendHeartbeats()
         return peer.address;
       }
     }
-    if (pending_add_learner_proposal_.has_value() &&
-        pending_add_learner_proposal_->candidate_raft_id == node_id)
+    for (const auto &pending_proposal : pending_add_learner_proposals_)
     {
-      return pending_add_learner_proposal_->candidate_raft_address;
+      if (pending_proposal.candidate_raft_id == node_id)
+      {
+        return pending_proposal.candidate_raft_address;
+      }
     }
     return "";
   }
@@ -2354,70 +2452,68 @@ void RaftNode::SendHeartbeats()
     clients_[peer.node_id] = std::move(client);
   }
 
-  std::optional<PeerConfig> RaftNode::PendingLearnerPeerLocked() const
-  {
-    if (!pending_add_learner_proposal_.has_value())
-    {
-      return std::nullopt;
-    }
-
-    const auto &pending = *pending_add_learner_proposal_;
-    if (pending.candidate_raft_id <= 0 || pending.candidate_raft_address.empty())
-    {
-      return std::nullopt;
-    }
-
-    if (pending.candidate_raft_id == config_.node_id ||
-        std::any_of(config_.peers.begin(),
-                    config_.peers.end(),
-                    [&pending](const PeerConfig &peer) {
-                      return peer.node_id == pending.candidate_raft_id;
-                    }))
-    {
-      return std::nullopt;
-    }
-
-    return PeerConfig{pending.candidate_raft_id, pending.candidate_raft_address};
-  }
-
   std::vector<PeerConfig> RaftNode::LearnerReplicationPeersLocked() const
   {
     std::vector<PeerConfig> peers;
-    if (const auto pending_learner = PendingLearnerPeerLocked();
-        pending_learner.has_value())
+    peers.reserve(pending_add_learner_proposals_.size());
+    for (const auto &pending : pending_add_learner_proposals_)
     {
-      peers.push_back(*pending_learner);
+      if (pending.candidate_raft_id <= 0 || pending.candidate_raft_address.empty())
+      {
+        continue;
+      }
+      if (pending.candidate_raft_id == config_.node_id ||
+          std::any_of(config_.peers.begin(),
+                      config_.peers.end(),
+                      [&pending](const PeerConfig &peer) {
+                        return peer.node_id == pending.candidate_raft_id;
+                      }))
+      {
+        continue;
+      }
+      peers.push_back(
+          PeerConfig{pending.candidate_raft_id, pending.candidate_raft_address});
     }
     return peers;
   }
 
-  void RaftNode::InitializePendingLearnerReplicationStateLocked()
+  void RaftNode::InitializePendingLearnerReplicationStateLocked(
+      const PendingAddLearnerProposal &proposal)
   {
-    const auto pending_learner = PendingLearnerPeerLocked();
-    if (!pending_learner.has_value())
+    if (proposal.candidate_raft_id <= 0 || proposal.candidate_raft_address.empty())
     {
       return;
     }
 
-    match_index_[pending_learner->node_id] = 0;
-    next_index_[pending_learner->node_id] = SafeAddOne(LastLogIndexLocked());
-    EnsurePeerClientLocked(*pending_learner);
-    GetOrCreateReplicatorLocked(*pending_learner);
+    const PeerConfig pending_learner{proposal.candidate_raft_id,
+                                     proposal.candidate_raft_address};
+    match_index_[pending_learner.node_id] = 0;
+    next_index_[pending_learner.node_id] = SafeAddOne(LastLogIndexLocked());
+    EnsurePeerClientLocked(pending_learner);
+    GetOrCreateReplicatorLocked(pending_learner);
   }
 
-  void RaftNode::ResetPendingLearnerReplicationStateLocked()
+  void RaftNode::ResetPendingLearnerReplicationStateLocked(
+      const std::int32_t learner_raft_id)
   {
-    const auto pending_learner = PendingLearnerPeerLocked();
-    if (!pending_learner.has_value())
+    if (learner_raft_id <= 0)
     {
       return;
     }
 
-    match_index_.erase(pending_learner->node_id);
-    next_index_.erase(pending_learner->node_id);
-    peer_snapshot_progress_.erase(pending_learner->node_id);
-    replicators_.erase(pending_learner->node_id);
-    clients_.erase(pending_learner->node_id);
+    match_index_.erase(learner_raft_id);
+    next_index_.erase(learner_raft_id);
+    peer_snapshot_progress_.erase(learner_raft_id);
+    replicators_.erase(learner_raft_id);
+    clients_.erase(learner_raft_id);
+  }
+
+  void RaftNode::ResetAllPendingLearnerReplicationStateLocked()
+  {
+    for (const auto &pending : pending_add_learner_proposals_)
+    {
+      ResetPendingLearnerReplicationStateLocked(pending.candidate_raft_id);
+    }
   }
 
   void RaftNode::MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id)
@@ -3273,12 +3369,19 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
         state_machine = state_machine_.get();
       }
 
-      if (state_machine == nullptr)
+      ApplyResult result;
+      if (IsAtomicBatchPromotionCommand(command_data))
       {
-        return {false, "state machine is null"};
+        result = ApplyAtomicBatchPromotionCommand(apply_index, command_data);
       }
-
-      ApplyResult result = state_machine->Apply(apply_index, apply_term, command_data);
+      else
+      {
+        if (state_machine == nullptr)
+        {
+          return {false, "state machine is null"};
+        }
+        result = state_machine->Apply(apply_index, apply_term, command_data);
+      }
       if (!result.Ok)
       {
         Log(NodeTag(config_.node_id),
@@ -3610,6 +3713,322 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
     }
 
     return true;
+  }
+
+  bool RaftNode::IsAtomicBatchPromotionCommand(
+      const std::string &command_data) const
+  {
+    return command_data.rfind(kInternalAtomicBatchPromotionCommandPrefix, 0) == 0;
+  }
+
+  ApplyResult RaftNode::ApplyAtomicBatchPromotionCommand(
+      const std::uint64_t apply_index,
+      const std::string &command_data)
+  {
+    std::vector<AtomicBatchPromotionTarget> targets;
+    std::string reason;
+    if (!ParseAtomicBatchPromotionCommand(command_data, &targets, &reason))
+    {
+      return {false, "invalid atomic batch promotion command: " + reason};
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    std::map<std::int32_t, std::string> target_voters;
+    for (const auto &target : targets)
+    {
+      if (target.raft_id <= 0 || target.address.empty())
+      {
+        return {false, "atomic batch promotion target is incomplete"};
+      }
+      target_voters[target.raft_id] = target.address;
+    }
+
+    if (target_voters.size() < 3U || target_voters.size() % 2U == 0U)
+    {
+      return {false, "atomic batch promotion target voter count must stay odd"};
+    }
+    if (target_voters.find(config_.node_id) == target_voters.end())
+    {
+      return {false, "atomic batch promotion would remove local node"};
+    }
+
+    std::unordered_set<std::int32_t> previous_peer_ids;
+    for (const auto &peer : config_.peers)
+    {
+      previous_peer_ids.insert(peer.node_id);
+    }
+
+    std::vector<PeerConfig> new_peers;
+    new_peers.reserve(target_voters.size() - 1U);
+    for (const auto &[raft_id, address] : target_voters)
+    {
+      if (raft_id == config_.node_id)
+      {
+        continue;
+      }
+      new_peers.push_back(PeerConfig{raft_id, address});
+    }
+
+    config_.peers = std::move(new_peers);
+    inflight_atomic_batch_promotion_log_index_.reset();
+    pending_add_learner_proposals_.erase(
+        std::remove_if(pending_add_learner_proposals_.begin(),
+                       pending_add_learner_proposals_.end(),
+                       [&target_voters](const PendingAddLearnerProposal &proposal) {
+                         return target_voters.find(proposal.candidate_raft_id) !=
+                                target_voters.end();
+                       }),
+        pending_add_learner_proposals_.end());
+    local_runtime_membership_role_hint_ = RuntimeMembershipRole::kVoter;
+
+    for (const auto &peer : config_.peers)
+    {
+      const bool was_new_peer =
+          previous_peer_ids.find(peer.node_id) == previous_peer_ids.end();
+      if (was_new_peer)
+      {
+        replicators_.erase(peer.node_id);
+      }
+      EnsurePeerClientLocked(peer);
+      if (role_ == Role::kLeader)
+      {
+        GetOrCreateReplicatorLocked(peer);
+      }
+    }
+
+    match_index_[config_.node_id] =
+        std::max<std::uint64_t>(match_index_[config_.node_id], LastLogIndexLocked());
+    next_index_[config_.node_id] = SafeAddOne(LastLogIndexLocked());
+
+    return {true,
+            "atomic batch learner promotion committed at index " +
+                std::to_string(apply_index)};
+  }
+
+  std::string RaftNode::BuildAtomicBatchPromotionCommandLocked(
+      const std::vector<AtomicBatchPromotionTarget> &targets) const
+  {
+    std::ostringstream oss;
+    oss << kInternalAtomicBatchPromotionCommandPrefix;
+    bool first = true;
+    for (const auto &target : targets)
+    {
+      if (!first)
+      {
+        oss << ';';
+      }
+      first = false;
+      oss << target.raft_id << ',' << HexEncode(target.address);
+    }
+    return oss.str();
+  }
+
+  bool RaftNode::ParseAtomicBatchPromotionCommand(
+      const std::string &command_data,
+      std::vector<AtomicBatchPromotionTarget> *targets,
+      std::string *reason) const
+  {
+    if (targets == nullptr)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "targets output is null";
+      }
+      return false;
+    }
+    targets->clear();
+
+    if (!IsAtomicBatchPromotionCommand(command_data))
+    {
+      if (reason != nullptr)
+      {
+        *reason = "missing internal command prefix";
+      }
+      return false;
+    }
+
+    const std::string payload =
+        command_data.substr(std::char_traits<char>::length(
+            kInternalAtomicBatchPromotionCommandPrefix));
+    std::size_t begin = 0U;
+    while (begin < payload.size())
+    {
+      const std::size_t end = payload.find(';', begin);
+      const std::string token =
+          payload.substr(begin,
+                         end == std::string::npos ? std::string::npos : end - begin);
+      if (token.empty())
+      {
+        if (reason != nullptr)
+        {
+          *reason = "empty promotion target token";
+        }
+        return false;
+      }
+
+      const std::size_t comma = token.find(',');
+      if (comma == std::string::npos)
+      {
+        if (reason != nullptr)
+        {
+          *reason = "promotion target is missing delimiter";
+        }
+        return false;
+      }
+
+      AtomicBatchPromotionTarget target;
+      try
+      {
+        target.raft_id = std::stoi(token.substr(0, comma));
+      }
+      catch (const std::exception &)
+      {
+        if (reason != nullptr)
+        {
+          *reason = "promotion target raft_id is invalid";
+        }
+        return false;
+      }
+      if (!HexDecode(std::string_view(token).substr(comma + 1U), &target.address) ||
+          target.address.empty())
+      {
+        if (reason != nullptr)
+        {
+          *reason = "promotion target address is invalid";
+        }
+        return false;
+      }
+      targets->push_back(std::move(target));
+
+      if (end == std::string::npos)
+      {
+        break;
+      }
+      begin = end + 1U;
+    }
+
+    if (targets->size() < 3U)
+    {
+      if (reason != nullptr)
+      {
+        *reason = "promotion target voter count is too small";
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool RaftNode::IsPendingLearnerReadyForPromotionLocked(
+      const PendingAddLearnerProposal &proposal) const
+  {
+    const auto match_it = match_index_.find(proposal.candidate_raft_id);
+    const auto snapshot_it =
+        peer_snapshot_progress_.find(proposal.candidate_raft_id);
+    std::uint64_t highest_observed = 0;
+    if (match_it != match_index_.end())
+    {
+      highest_observed = std::max(highest_observed, match_it->second);
+    }
+    if (snapshot_it != peer_snapshot_progress_.end())
+    {
+      highest_observed =
+          std::max(highest_observed, snapshot_it->second.last_snapshot_index);
+      highest_observed =
+          std::max(highest_observed, snapshot_it->second.last_applied_index);
+      highest_observed =
+          std::max(highest_observed, snapshot_it->second.last_log_index);
+    }
+    return highest_observed > 0 && highest_observed >= commit_index_;
+  }
+
+  std::vector<RaftNode::AtomicBatchPromotionTarget>
+  RaftNode::CollectAtomicBatchPromotionTargetsLocked() const
+  {
+    std::vector<AtomicBatchPromotionTarget> ready_promotions;
+    for (const auto &pending : pending_add_learner_proposals_)
+    {
+      if (!IsPendingLearnerReadyForPromotionLocked(pending))
+      {
+        continue;
+      }
+      ready_promotions.push_back(
+          AtomicBatchPromotionTarget{pending.candidate_raft_id,
+                                     pending.candidate_raft_address});
+    }
+
+    if (ready_promotions.size() < 2U)
+    {
+      return {};
+    }
+
+    std::sort(ready_promotions.begin(),
+              ready_promotions.end(),
+              [](const AtomicBatchPromotionTarget &lhs,
+                 const AtomicBatchPromotionTarget &rhs) {
+                return lhs.raft_id < rhs.raft_id;
+              });
+    ready_promotions.resize(2U);
+
+    std::map<std::int32_t, std::string> target_voters;
+    target_voters[config_.node_id] = config_.address;
+    for (const auto &peer : BuildUniqueCommittedVoterPeers(config_))
+    {
+      target_voters[peer.node_id] = peer.address;
+    }
+    for (const auto &promoted : ready_promotions)
+    {
+      target_voters[promoted.raft_id] = promoted.address;
+    }
+
+    if (target_voters.size() % 2U == 0U)
+    {
+      return {};
+    }
+
+    std::vector<AtomicBatchPromotionTarget> targets;
+    targets.reserve(target_voters.size());
+    for (const auto &[raft_id, address] : target_voters)
+    {
+      targets.push_back(AtomicBatchPromotionTarget{raft_id, address});
+    }
+    return targets;
+  }
+
+  std::optional<std::uint64_t> RaftNode::PrepareAtomicBatchPromotionLogIndexLocked()
+  {
+    if (!running_.load() || role_ != Role::kLeader)
+    {
+      return std::nullopt;
+    }
+
+    if (inflight_atomic_batch_promotion_log_index_.has_value())
+    {
+      if (*inflight_atomic_batch_promotion_log_index_ <= commit_index_)
+      {
+        inflight_atomic_batch_promotion_log_index_.reset();
+        return std::nullopt;
+      }
+      if (HasLogAtIndexLocked(*inflight_atomic_batch_promotion_log_index_))
+      {
+        return inflight_atomic_batch_promotion_log_index_;
+      }
+      inflight_atomic_batch_promotion_log_index_.reset();
+    }
+
+    const auto targets = CollectAtomicBatchPromotionTargetsLocked();
+    if (targets.empty())
+    {
+      return std::nullopt;
+    }
+
+    const std::uint64_t log_index =
+        AppendLocalLogUnlocked(BuildAtomicBatchPromotionCommandLocked(targets));
+    if (log_index == 0)
+    {
+      return std::nullopt;
+    }
+    inflight_atomic_batch_promotion_log_index_ = log_index;
+    return inflight_atomic_batch_promotion_log_index_;
   }
 
 } // namespace raftdemo
