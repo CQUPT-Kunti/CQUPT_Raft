@@ -89,3 +89,9 @@ Mitigation: Keep learner Phase 8 closure scoped to Linux-targeted catch-up and n
 Risk: Current runtime membership admission still stores only one `pending_add_learner_proposal_`, and the public path exposed by `JoinMetadataCluster` has no batch promote / promote-to-voter boundary. As a result, the T078 test can drive one learner to `ready_to_promote` and verify `waiting_for_pair`, but it cannot yet continue through a real `3 voters + 2 ready learners -> direct 5 voters` transition or prove the absence of committed 4-voter intermediate history with executable assertions.
 
 Mitigation: Keep T078 as an intentionally red test-first guard until production exposes a real second-learner admission path plus an explicit batch promote boundary. When that boundary exists, extend the test to verify: before promote both learners remain non-voters and quorum stays at 2; after batch promote committed voters become 5 with quorum 3; and no committed 4-voter membership is ever observable in diagnostics or state summaries.
+
+## R16: T079 Still Lacks A First-Class Committed Membership History Trace
+
+Risk: T079 can currently sample `CommittedMembershipQuorumSummary` on running nodes and inspect `JoinMetadataCluster` diagnostics such as `committed_voter_count` / `committed_voter_ids`, but the runtime still lacks a dedicated committed membership history or config-transition trace. That means the test can prove "no observable committed 4-voter state" only at sampled boundaries, not from a first-class persisted or replayable history stream.
+
+Mitigation: Treat the current T079 coverage as the strongest available observable-state guard for now. When batch promote / joint consensus work starts, add an explicit committed membership timeline or equivalent diagnostics trace so tests can assert end-to-end that `3 voters -> 5 voters` occurs without any committed `4 voters` intermediate state, including failed or interrupted transitions across leader failover and restart.
