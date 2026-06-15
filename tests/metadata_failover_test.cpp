@@ -1,11 +1,15 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,6 +48,71 @@ namespace raftdemo
       return 43000 + jitter + tick;
     }
 
+    std::optional<std::uint64_t> ExtractUnsignedDiagnosticValue(
+        const std::string &text,
+        const std::string &key)
+    {
+      const std::size_t begin = text.find(key);
+      if (begin == std::string::npos)
+      {
+        return std::nullopt;
+      }
+
+      const std::size_t value_begin = begin + key.size();
+      std::size_t value_end = value_begin;
+      while (value_end < text.size() &&
+             std::isdigit(static_cast<unsigned char>(text[value_end])) != 0)
+      {
+        ++value_end;
+      }
+      if (value_end == value_begin)
+      {
+        return std::nullopt;
+      }
+
+      try
+      {
+        return static_cast<std::uint64_t>(
+            std::stoull(text.substr(value_begin, value_end - value_begin)));
+      }
+      catch (...)
+      {
+        return std::nullopt;
+      }
+    }
+
+    std::optional<std::size_t> ExtractBracketListEntryCount(
+        const std::string &text,
+        const std::string &key)
+    {
+      const std::size_t begin = text.find(key);
+      if (begin == std::string::npos)
+      {
+        return std::nullopt;
+      }
+
+      const std::size_t list_begin = begin + key.size();
+      const std::size_t list_end = text.find(']', list_begin);
+      if (list_end == std::string::npos)
+      {
+        return std::nullopt;
+      }
+      if (list_end == list_begin)
+      {
+        return 0U;
+      }
+
+      std::size_t count = 1U;
+      for (std::size_t index = list_begin; index < list_end; ++index)
+      {
+        if (text[index] == ',')
+        {
+          ++count;
+        }
+      }
+      return count;
+    }
+
     std::vector<NodeConfig> BuildThreeNodeConfigs(const std::filesystem::path &root,
                                                   const int base_port)
     {
@@ -79,6 +148,207 @@ namespace raftdemo
       n3.data_dir = (root / "node_3_data").string();
 
       return {n1, n2, n3};
+    }
+
+    NodeConfig BuildDetachedLearnerLikeConfig(const std::filesystem::path &root,
+                                              const int learner_id,
+                                              const int learner_port)
+    {
+      NodeConfig learner;
+      learner.node_id = learner_id;
+      learner.address = "127.0.0.1:" + std::to_string(learner_port);
+      learner.election_timeout_min = 300ms;
+      learner.election_timeout_max = 600ms;
+      learner.heartbeat_interval = 80ms;
+      learner.rpc_deadline = 500ms;
+      learner.data_dir = (root / ("learner_" + std::to_string(learner_id))).string();
+      return learner;
+    }
+
+    void WriteStructuredLearnerIdentity(const NodeConfig &learner)
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(learner.data_dir, ec);
+      ASSERT_FALSE(ec) << ec.message();
+
+      std::ofstream out(std::filesystem::path(learner.data_dir) / "node.identity",
+                        std::ios::trunc);
+      ASSERT_TRUE(out.is_open());
+      out << "membership_state=learner\n";
+      out.flush();
+      ASSERT_TRUE(static_cast<bool>(out));
+    }
+
+    std::string DescribeCommittedMembershipSummary(
+        const CommittedMembershipQuorumSummary &summary)
+    {
+      std::ostringstream oss;
+      oss << "commit_index=" << summary.committed_log_index
+          << ", term=" << summary.committed_term
+          << ", voters=[";
+      for (std::size_t index = 0; index < summary.voter_ids.size(); ++index)
+      {
+        if (index != 0)
+        {
+          oss << ",";
+        }
+        oss << summary.voter_ids[index];
+      }
+      oss << "], learners=[";
+      for (std::size_t index = 0; index < summary.learner_ids.size(); ++index)
+      {
+        if (index != 0)
+        {
+          oss << ",";
+        }
+        oss << summary.learner_ids[index];
+      }
+      oss << "], voter_count=" << summary.voter_count
+          << ", learner_count=" << summary.learner_count
+          << ", quorum=" << summary.quorum_size
+          << ", local_role=" << static_cast<int>(summary.local_role);
+      return oss.str();
+    }
+
+    std::string DescribeRuntimeMembershipSummary(const RuntimeMembershipSummary &summary)
+    {
+      std::ostringstream oss;
+      oss << "commit_index=" << summary.committed_log_index
+          << ", term=" << summary.committed_term
+          << ", voters=[";
+      for (std::size_t index = 0; index < summary.voter_ids.size(); ++index)
+      {
+        if (index != 0)
+        {
+          oss << ",";
+        }
+        oss << summary.voter_ids[index];
+      }
+      oss << "], learners=[";
+      for (std::size_t index = 0; index < summary.learner_ids.size(); ++index)
+      {
+        if (index != 0)
+        {
+          oss << ",";
+        }
+        oss << summary.learner_ids[index];
+      }
+      oss << "], voter_count=" << summary.voter_count
+          << ", learner_count=" << summary.learner_count
+          << ", committed_voter_quorum=" << summary.committed_voter_quorum_size
+          << ", local_role=" << static_cast<int>(summary.local_role);
+      return oss.str();
+    }
+
+    void ExpectNoCommittedFourVoterDiagnostic(const std::string &diagnostic,
+                                              const std::string &context)
+    {
+      if (diagnostic.empty())
+      {
+        return;
+      }
+
+      if (const auto voter_count = ExtractUnsignedDiagnosticValue(
+              diagnostic,
+              "committed_voter_count=");
+          voter_count.has_value())
+      {
+        EXPECT_NE(*voter_count, 4U)
+            << context << "; diagnostic=" << diagnostic;
+      }
+
+      if (const auto voter_ids = ExtractBracketListEntryCount(
+              diagnostic,
+              "committed_voter_ids=[");
+          voter_ids.has_value())
+      {
+        EXPECT_NE(*voter_ids, 4U)
+            << context << "; diagnostic=" << diagnostic;
+      }
+    }
+
+    void ExpectCommittedThreeVoterBoundary(const std::shared_ptr<RaftNode> &node,
+                                           const std::string &context)
+    {
+      ASSERT_NE(node, nullptr);
+      const auto summary = node->GetCommittedMembershipQuorumSummary();
+      EXPECT_EQ(summary.voter_ids, std::vector<int>({1, 2, 3}))
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+      EXPECT_TRUE(summary.learner_ids.empty())
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+      EXPECT_EQ(summary.voter_count, 3U)
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+      EXPECT_EQ(summary.learner_count, 0U)
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+      EXPECT_EQ(summary.quorum_size, 2U)
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+      EXPECT_NE(summary.voter_count, 4U)
+          << context << "; summary=" << DescribeCommittedMembershipSummary(summary);
+    }
+
+    void ExpectRuntimeStillTreatsLearnersAsNonVoters(
+        const RuntimeMembershipSummary &summary,
+        const std::vector<int> &candidate_learner_ids,
+        const std::string &context)
+    {
+      EXPECT_EQ(summary.voter_ids, std::vector<int>({1, 2, 3}))
+          << context << "; runtime=" << DescribeRuntimeMembershipSummary(summary);
+      EXPECT_EQ(summary.voter_count, 3U)
+          << context << "; runtime=" << DescribeRuntimeMembershipSummary(summary);
+      EXPECT_EQ(summary.committed_voter_quorum_size, 2U)
+          << context << "; runtime=" << DescribeRuntimeMembershipSummary(summary);
+      EXPECT_NE(summary.voter_count, 4U)
+          << context << "; runtime=" << DescribeRuntimeMembershipSummary(summary);
+      for (const int learner_id : candidate_learner_ids)
+      {
+        EXPECT_TRUE(std::find(summary.voter_ids.begin(),
+                              summary.voter_ids.end(),
+                              learner_id) == summary.voter_ids.end())
+            << context << "; learner_id=" << learner_id
+            << " must not be restored as voter; runtime="
+            << DescribeRuntimeMembershipSummary(summary);
+      }
+    }
+
+    raft::JoinMetadataClusterRequest MakeJoinMetadataClusterRequest(
+        const std::string &request_id,
+        const std::string &cluster_id,
+        const std::string &node_id,
+        const std::int32_t candidate_raft_id,
+        const std::uint16_t candidate_client_port,
+        const std::uint16_t candidate_raft_port)
+    {
+      raft::JoinMetadataClusterRequest request;
+      request.set_request_id(request_id);
+      request.set_cluster_id(cluster_id);
+      request.set_node_id(node_id);
+      request.set_candidate_raft_id(candidate_raft_id);
+      request.set_candidate_client_address("127.0.0.1:" +
+                                           std::to_string(candidate_client_port));
+      request.set_candidate_raft_address("127.0.0.1:" +
+                                         std::to_string(candidate_raft_port));
+      request.set_candidate_incarnation_id(node_id + ":boot:1710000000");
+      request.set_candidate_sequence(1);
+      request.set_persistent_generation(1);
+      request.set_data_dir_fingerprint("fingerprint-" + node_id);
+      request.set_local_state_hint(
+          raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+      request.set_observed_view_node_id("view-1");
+      request.set_observed_time_unix_ms(1710000000123ULL);
+      request.set_observed_metadata_endpoint("127.0.0.1:" +
+                                             std::to_string(candidate_client_port));
+      return request;
+    }
+
+    grpc::Status JoinMetadataClusterViaAddress(
+        const std::string &address,
+        const raft::JoinMetadataClusterRequest &request,
+        raft::JoinMetadataClusterResponse *response)
+    {
+      auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+      auto stub = raft::MetadataService::NewStub(channel);
+      grpc::ClientContext context;
+      return stub->JoinMetadataCluster(&context, request, response);
     }
 
     class MetadataCluster
@@ -181,6 +451,54 @@ namespace raftdemo
       std::vector<std::thread> wait_threads_;
     };
 
+    class StandaloneNodeRunner
+    {
+    public:
+      explicit StandaloneNodeRunner(std::shared_ptr<RaftNode> node)
+          : node_(std::move(node))
+      {
+      }
+
+      ~StandaloneNodeRunner()
+      {
+        Stop();
+      }
+
+      void Start()
+      {
+        if (!node_ || thread_.joinable())
+        {
+          return;
+        }
+        thread_ = std::thread([node = node_]()
+                              {
+                                node->Start();
+                                node->Wait();
+                              });
+      }
+
+      void Stop()
+      {
+        if (node_ != nullptr)
+        {
+          node_->Stop();
+        }
+        if (thread_.joinable())
+        {
+          thread_.join();
+        }
+      }
+
+      const std::shared_ptr<RaftNode> &Node() const
+      {
+        return node_;
+      }
+
+    private:
+      std::shared_ptr<RaftNode> node_;
+      std::thread thread_;
+    };
+
     bool IsExcluded(const std::size_t index,
                     const std::vector<std::size_t> &excluded)
     {
@@ -226,6 +544,53 @@ namespace raftdemo
         std::this_thread::sleep_for(50ms);
       }
       return nullptr;
+    }
+
+    bool WaitForLearnerReplicationProgress(const std::shared_ptr<RaftNode> &leader,
+                                           const int learner_raft_id,
+                                           const std::uint64_t minimum_match_index,
+                                           const std::chrono::milliseconds timeout,
+                                           RuntimeMembershipEntry *learner_entry,
+                                           std::string *diagnostics)
+    {
+      const auto deadline = Clock::now() + timeout;
+      std::string last_snapshot;
+
+      while (Clock::now() < deadline)
+      {
+        const auto summary =
+            leader != nullptr ? leader->GetRuntimeMembershipSummary()
+                              : RuntimeMembershipSummary{};
+        last_snapshot = DescribeRuntimeMembershipSummary(summary);
+        for (const auto &entry : summary.learner_entries)
+        {
+          if (entry.raft_id != learner_raft_id)
+          {
+            continue;
+          }
+          if (entry.match_index >= minimum_match_index &&
+              entry.next_index >= entry.match_index)
+          {
+            if (learner_entry != nullptr)
+            {
+              *learner_entry = entry;
+            }
+            if (diagnostics != nullptr)
+            {
+              *diagnostics = last_snapshot;
+            }
+            return true;
+          }
+        }
+
+        std::this_thread::sleep_for(50ms);
+      }
+
+      if (diagnostics != nullptr)
+      {
+        *diagnostics = last_snapshot;
+      }
+      return false;
     }
 
     std::size_t FindNodeIndex(const std::vector<std::shared_ptr<RaftNode>> &nodes,
@@ -1273,6 +1638,331 @@ namespace raftdemo
       EXPECT_EQ(second_response.summary().code(), raft::METADATA_STATUS_CODE_IDEMPOTENCY_CONFLICT)
           << second_response.summary().message();
       EXPECT_EQ(second_response.summary().request_id(), "fingerprint-create");
+    }
+
+    TEST_F(MetadataFailoverTest,
+           LeaderFailureDuringIncompleteBatchPromoteDoesNotLeavePartialCommittedMembership)
+    {
+      constexpr const char *kBucket = "failover-batch-promote-bucket";
+      constexpr const char *kObjectKey = "object/failover-batch-promote";
+      constexpr const char *kObjectId = "obj-failover-batch-promote";
+      constexpr const char *kClusterId = "cluster-t080-batch-promote-failover";
+      constexpr const char *kFirstLearnerNodeId = "meta-failover-learner-a-t080";
+      constexpr const char *kSecondLearnerNodeId = "meta-failover-learner-b-t080";
+      constexpr std::int32_t kFirstLearnerRaftId = 280;
+      constexpr std::int32_t kSecondLearnerRaftId = 281;
+
+      const auto configs = BuildThreeNodeConfigs(root_, base_port_);
+      MetadataCluster cluster(configs);
+      cluster.Start();
+
+      auto leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      const auto bucket_response = InvokeWriteViaCurrentLeader<
+          raft::CreateBucketRequest, raft::CreateBucketResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateBucketRequest("t080-create-bucket", kBucket),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateBucketRequest &request,
+             raft::CreateBucketResponse *response)
+          {
+            return stub->CreateBucket(context, request, response);
+          });
+      ASSERT_EQ(bucket_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << bucket_response.summary().message();
+
+      const auto create_response = InvokeWriteViaCurrentLeader<
+          raft::CreateObjectRequest, raft::CreateObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCreateObjectRequest("t080-create-object",
+                                  kBucket,
+                                  kObjectKey,
+                                  kObjectId),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CreateObjectRequest &request,
+             raft::CreateObjectResponse *response)
+          {
+            return stub->CreateObject(context, request, response);
+          });
+      ASSERT_EQ(create_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << create_response.summary().message();
+
+      const auto commit_response = InvokeWriteViaCurrentLeader<
+          raft::CommitObjectRequest, raft::CommitObjectResponse>(
+          cluster.Nodes(),
+          configs,
+          MakeCommitObjectRequest("t080-commit-object",
+                                  kBucket,
+                                  kObjectKey,
+                                  kObjectId),
+          5s,
+          [](raft::MetadataService::Stub *stub,
+             grpc::ClientContext *context,
+             const raft::CommitObjectRequest &request,
+             raft::CommitObjectResponse *response)
+          {
+            return stub->CommitObject(context, request, response);
+          });
+      ASSERT_EQ(commit_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << commit_response.summary().message();
+      ASSERT_GT(commit_response.summary().log_index(), 0U);
+
+      for (const auto &node : cluster.Nodes())
+      {
+        ExpectCommittedThreeVoterBoundary(node, "initial 3-voter committed state");
+      }
+
+      const auto learners_root = root_ / "t080_detached_learners";
+      const auto first_learner_config = BuildDetachedLearnerLikeConfig(
+          learners_root,
+          kFirstLearnerRaftId,
+          base_port_ + 280);
+      const auto second_learner_config = BuildDetachedLearnerLikeConfig(
+          learners_root,
+          kSecondLearnerRaftId,
+          base_port_ + 281);
+      WriteStructuredLearnerIdentity(first_learner_config);
+      WriteStructuredLearnerIdentity(second_learner_config);
+
+      StandaloneNodeRunner first_learner_runner(
+          std::make_shared<RaftNode>(first_learner_config));
+      StandaloneNodeRunner second_learner_runner(
+          std::make_shared<RaftNode>(second_learner_config));
+
+      std::vector<std::string> observed_diagnostics;
+
+      raft::JoinMetadataClusterRequest first_join_request =
+          MakeJoinMetadataClusterRequest("req-join-t080-learner-a",
+                                         kClusterId,
+                                         kFirstLearnerNodeId,
+                                         kFirstLearnerRaftId,
+                                         static_cast<std::uint16_t>(base_port_ + 1280),
+                                         static_cast<std::uint16_t>(base_port_ + 280));
+      raft::JoinMetadataClusterResponse first_join_response;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(leader->GetStatusSnapshot().address,
+                                                first_join_request,
+                                                &first_join_response)
+                      .ok());
+      ASSERT_EQ(first_join_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << first_join_response.summary().message();
+      ASSERT_EQ(first_join_response.disposition(),
+                raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+          << first_join_response.summary().message();
+      ASSERT_FALSE(first_join_response.committed_membership_changed());
+      EXPECT_TRUE(first_join_response.requested_membership() ==
+                  raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      EXPECT_TRUE(first_join_response.summary().message().find("learner_status=pending") !=
+                  std::string::npos)
+          << first_join_response.summary().message();
+      EXPECT_TRUE(first_join_response.summary().message().find("committed_quorum_size=2") !=
+                  std::string::npos)
+          << first_join_response.summary().message();
+      observed_diagnostics.push_back(first_join_response.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(first_join_response.summary().message(),
+                                           "first learner accepted pending commit");
+
+      first_learner_runner.Start();
+
+      RuntimeMembershipEntry first_learner_progress;
+      std::string first_learner_progress_diagnostics;
+      ASSERT_TRUE(WaitForLearnerReplicationProgress(leader,
+                                                    kFirstLearnerRaftId,
+                                                    commit_response.summary().log_index(),
+                                                    8s,
+                                                    &first_learner_progress,
+                                                    &first_learner_progress_diagnostics))
+          << first_learner_progress_diagnostics << "\n"
+          << DescribeCluster(cluster.Nodes());
+
+      auto current_leader = WaitForSingleLeader(cluster.Nodes(), 8s);
+      ASSERT_NE(current_leader, nullptr) << DescribeCluster(cluster.Nodes());
+
+      raft::JoinMetadataClusterResponse first_ready_response;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(current_leader->GetStatusSnapshot().address,
+                                                first_join_request,
+                                                &first_ready_response)
+                      .ok());
+      EXPECT_EQ(first_ready_response.summary().code(),
+                raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
+          << first_ready_response.summary().message();
+      EXPECT_EQ(first_ready_response.disposition(),
+                raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE)
+          << first_ready_response.summary().message();
+      EXPECT_FALSE(first_ready_response.committed_membership_changed());
+      EXPECT_TRUE(first_ready_response.summary().message().find(
+                      "learner_status=ready_to_promote") != std::string::npos)
+          << first_ready_response.summary().message();
+      EXPECT_TRUE(first_ready_response.summary().message().find(
+                      "promotion_status=waiting_for_pair") != std::string::npos)
+          << first_ready_response.summary().message();
+      EXPECT_TRUE(first_ready_response.summary().message().find(
+                      "promotion_block_reason=even_voter_count") != std::string::npos)
+          << first_ready_response.summary().message();
+      observed_diagnostics.push_back(first_ready_response.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(first_ready_response.summary().message(),
+                                           "first learner ready waiting_for_pair");
+
+      const auto ready_runtime = current_leader->GetRuntimeMembershipSummary();
+      ExpectRuntimeStillTreatsLearnersAsNonVoters(
+          ready_runtime,
+          {kFirstLearnerRaftId, kSecondLearnerRaftId},
+          "single ready learner before failover");
+      EXPECT_EQ(ready_runtime.learner_ids, std::vector<int>({kFirstLearnerRaftId}))
+          << DescribeRuntimeMembershipSummary(ready_runtime);
+      EXPECT_EQ(ready_runtime.learner_count, 1U)
+          << DescribeRuntimeMembershipSummary(ready_runtime);
+
+      raft::JoinMetadataClusterRequest second_join_request =
+          MakeJoinMetadataClusterRequest("req-join-t080-learner-b",
+                                         kClusterId,
+                                         kSecondLearnerNodeId,
+                                         kSecondLearnerRaftId,
+                                         static_cast<std::uint16_t>(base_port_ + 1281),
+                                         static_cast<std::uint16_t>(base_port_ + 281));
+      raft::JoinMetadataClusterResponse second_join_response;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(current_leader->GetStatusSnapshot().address,
+                                                second_join_request,
+                                                &second_join_response)
+                      .ok());
+      EXPECT_FALSE(second_join_response.committed_membership_changed());
+      EXPECT_EQ(second_join_response.requested_membership(),
+                raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      observed_diagnostics.push_back(second_join_response.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(second_join_response.summary().message(),
+                                           "second learner join attempt before failover");
+
+      const auto leader_index = FindNodeIndex(cluster.Nodes(), current_leader);
+      ASSERT_LT(leader_index, cluster.Nodes().size());
+      cluster.StopNode(leader_index);
+
+      const std::vector<std::size_t> excluded{leader_index};
+      auto new_leader = WaitForSingleLeader(cluster.Nodes(), 10s, excluded);
+      ASSERT_NE(new_leader, nullptr)
+          << "no new leader after stopping old leader during incomplete batch promote\n"
+          << DescribeCluster(cluster.Nodes());
+
+      for (std::size_t index = 0; index < cluster.Nodes().size(); ++index)
+      {
+        if (std::find(excluded.begin(), excluded.end(), index) != excluded.end())
+        {
+          continue;
+        }
+        ExpectCommittedThreeVoterBoundary(
+            cluster.Nodes()[index],
+            "committed membership after leader failure during incomplete promote");
+      }
+
+      const auto failover_runtime = new_leader->GetRuntimeMembershipSummary();
+      ExpectRuntimeStillTreatsLearnersAsNonVoters(
+          failover_runtime,
+          {kFirstLearnerRaftId, kSecondLearnerRaftId},
+          "new leader after incomplete batch promote failover");
+      EXPECT_LE(failover_runtime.learner_count, 1U)
+          << DescribeRuntimeMembershipSummary(failover_runtime);
+
+      raft::JoinMetadataClusterResponse retry_first_on_new_leader;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(new_leader->GetStatusSnapshot().address,
+                                                first_join_request,
+                                                &retry_first_on_new_leader)
+                      .ok());
+      EXPECT_FALSE(retry_first_on_new_leader.committed_membership_changed());
+      EXPECT_TRUE(retry_first_on_new_leader.summary().code() ==
+                      raft::METADATA_STATUS_CODE_OK ||
+                  retry_first_on_new_leader.summary().code() ==
+                      raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY)
+          << retry_first_on_new_leader.summary().message();
+      EXPECT_EQ(retry_first_on_new_leader.requested_membership(),
+                raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      observed_diagnostics.push_back(retry_first_on_new_leader.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(
+          retry_first_on_new_leader.summary().message(),
+          "retry first learner on new leader after failover");
+
+      const auto retry_runtime = new_leader->GetRuntimeMembershipSummary();
+      ExpectRuntimeStillTreatsLearnersAsNonVoters(
+          retry_runtime,
+          {kFirstLearnerRaftId, kSecondLearnerRaftId},
+          "runtime after retrying first learner on new leader");
+      EXPECT_LE(retry_runtime.learner_count, 1U)
+          << DescribeRuntimeMembershipSummary(retry_runtime);
+      if (!retry_runtime.learner_ids.empty())
+      {
+        EXPECT_EQ(retry_runtime.learner_ids.front(), kFirstLearnerRaftId)
+            << DescribeRuntimeMembershipSummary(retry_runtime);
+      }
+
+      raft::JoinMetadataClusterResponse duplicate_first_on_new_leader;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(new_leader->GetStatusSnapshot().address,
+                                                first_join_request,
+                                                &duplicate_first_on_new_leader)
+                      .ok());
+      EXPECT_FALSE(duplicate_first_on_new_leader.committed_membership_changed());
+      observed_diagnostics.push_back(duplicate_first_on_new_leader.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(
+          duplicate_first_on_new_leader.summary().message(),
+          "duplicate first learner retry on new leader");
+
+      const auto duplicate_runtime = new_leader->GetRuntimeMembershipSummary();
+      ExpectRuntimeStillTreatsLearnersAsNonVoters(
+          duplicate_runtime,
+          {kFirstLearnerRaftId, kSecondLearnerRaftId},
+          "runtime after duplicate retry on new leader");
+      EXPECT_LE(duplicate_runtime.learner_count, 1U)
+          << DescribeRuntimeMembershipSummary(duplicate_runtime);
+
+      raft::JoinMetadataClusterResponse retry_second_on_new_leader;
+      ASSERT_TRUE(JoinMetadataClusterViaAddress(new_leader->GetStatusSnapshot().address,
+                                                second_join_request,
+                                                &retry_second_on_new_leader)
+                      .ok());
+      EXPECT_FALSE(retry_second_on_new_leader.committed_membership_changed());
+      EXPECT_EQ(retry_second_on_new_leader.requested_membership(),
+                raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      observed_diagnostics.push_back(retry_second_on_new_leader.summary().message());
+      ExpectNoCommittedFourVoterDiagnostic(
+          retry_second_on_new_leader.summary().message(),
+          "retry second learner on new leader after failover");
+
+      for (std::size_t index = 0; index < cluster.Nodes().size(); ++index)
+      {
+        if (std::find(excluded.begin(), excluded.end(), index) != excluded.end())
+        {
+          continue;
+        }
+        ExpectCommittedThreeVoterBoundary(
+            cluster.Nodes()[index],
+            "final committed boundary after failover retries");
+      }
+
+      EXPECT_EQ(second_join_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+          << second_join_response.summary().message();
+      EXPECT_EQ(second_join_response.disposition(),
+                raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+          << second_join_response.summary().message();
+      if (second_join_response.summary().code() != raft::METADATA_STATUS_CODE_OK ||
+          second_join_response.disposition() !=
+              raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+      {
+        ADD_FAILURE()
+            << "T080 requires a real promote-in-progress boundary with 3 committed voters "
+               "+ 2 ready learners before leader failure. current runtime still blocks the "
+               "second learner while the first learner waits_for_pair, so this test can "
+               "only lock failover safety for the incomplete/blocked path: no partial "
+               "committed membership, no committed 4-voter state, no learner restored as "
+               "voter, and no quorum shrink. actual_code="
+            << second_join_response.summary().code()
+            << ", actual_disposition=" << second_join_response.disposition()
+            << ", actual_message=" << second_join_response.summary().message()
+            << "\ncluster:\n"
+            << DescribeCluster(cluster.Nodes());
+      }
     }
 
   } // namespace
