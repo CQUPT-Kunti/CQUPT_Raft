@@ -160,7 +160,7 @@
 - [x] T074 [US4] Enable learner log replication progress tracking in `modules/raft/replication/replicator.cpp` and `modules/raft/replication/replicator.h` (验证: `test_raft_log_replication`)
 - [x] T075 [US4] Enable learner snapshot install and applied progress tracking in `modules/raft/replication/replicator.cpp` and snapshot integration paths (验证: `test_raft_snapshot_catchup`, `test_raft_snapshot_restart`)
 - [x] T076 [US4] Add pending learner / ready-to-promote / waiting-for-pair status reporting in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T077 [US4] Record learner catch-up validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/t077-record-learner-catch-up-validation.md` (验证: `test_raft_log_replication`, `test_raft_snapshot_catchup`, `integrated_object_storage_quorum`)
+- [x] T077 [US4] Record learner catch-up validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/t077-record-learner-catch-up-validation.md` (验证: `test_raft_log_replication`, `test_raft_snapshot_catchup`, `integrated_object_storage_quorum`)
 
 ---
 
@@ -170,7 +170,7 @@
 
 **Independent Test**: 两个 learners ready 后 committed voters 直接变为 5，quorum 从 2 变 3，中间没有 committed 4 voters。
 
-- [ ] T078 [P] [US4] Add 3 voters + 2 ready learners batch promote test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T078 [P] [US4] Add 3 voters + 2 ready learners batch promote test in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T079 [P] [US4] Add no committed 4-voter history assertion in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T080 [P] [US4] Add leader failure during batch promote test in `tests/metadata_failover_test.cpp` (验证: `metadata_failover_test`)
 - [ ] T081 [P] [US4] Add restart recovery for committed batch membership in `tests/test_raft_snapshot_restart.cpp` (验证: `test_raft_snapshot_restart`)

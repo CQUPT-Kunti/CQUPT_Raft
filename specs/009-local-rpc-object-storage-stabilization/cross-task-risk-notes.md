@@ -83,3 +83,9 @@ Mitigation: Keep current US4 PASS scoped to validation/boundary semantics only. 
 Risk: T066-T076 now cover learner AppendEntries catch-up, InstallSnapshot catch-up, learner exclusion from election/quorum, committed-voters-only quorum safety, and waiting-for-pair diagnostics on Linux targeted tests, but the repository still lacks promote-to-voter, batch promote, joint consensus, and cross-platform runtime validation. Treating Phase 8 PASS as full learner lifecycle completion would overstate the current safety envelope.
 
 Mitigation: Keep learner Phase 8 closure scoped to Linux-targeted catch-up and non-voter safety semantics only. Record Windows/macOS as pending, require T078+ to validate batch promotion and no-committed-4-voter history, and do not claim end-to-end dynamic metadata learner lifecycle completion before those tasks and local RPC smoke are finished.
+
+## R15: T078 Cannot Yet Reach Two Ready Learners Or Prove No-Committed-4-Voter History Through Real APIs
+
+Risk: Current runtime membership admission still stores only one `pending_add_learner_proposal_`, and the public path exposed by `JoinMetadataCluster` has no batch promote / promote-to-voter boundary. As a result, the T078 test can drive one learner to `ready_to_promote` and verify `waiting_for_pair`, but it cannot yet continue through a real `3 voters + 2 ready learners -> direct 5 voters` transition or prove the absence of committed 4-voter intermediate history with executable assertions.
+
+Mitigation: Keep T078 as an intentionally red test-first guard until production exposes a real second-learner admission path plus an explicit batch promote boundary. When that boundary exists, extend the test to verify: before promote both learners remain non-voters and quorum stays at 2; after batch promote committed voters become 5 with quorum 3; and no committed 4-voter membership is ever observable in diagnostics or state summaries.

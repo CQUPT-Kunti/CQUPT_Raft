@@ -2939,5 +2939,332 @@ namespace raftdemo
                                                             kCommittedVoters,
                                                             2U);
         }
+
+        TEST_F(
+            IntegratedObjectStorageQuorumTest,
+            TwoReadyLearnersMustBatchPromoteDirectlyToFiveCommittedVotersWithoutCommittedFourVoterHistory)
+        {
+            constexpr const char *kBucket = "bucket-t078-batch-promote";
+            constexpr const char *kObjectKey = "objects/t078-batch-promote.bin";
+            constexpr const char *kObjectId = "obj-t078-batch-promote";
+            constexpr const char *kClusterId = "cluster-t078-batch-promote";
+            constexpr const char *kFirstLearnerNodeId = "meta-batch-learner-a-t078";
+            constexpr const char *kSecondLearnerNodeId = "meta-batch-learner-b-t078";
+            constexpr std::int32_t kFirstLearnerRaftId = 78;
+            constexpr std::int32_t kSecondLearnerRaftId = 79;
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before batch promote "
+                   "boundary test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t078",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before batch promote boundary test; "
+                   "status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult create_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCreateObjectCommand(kBucket,
+                                                          kObjectKey,
+                                                          kObjectId,
+                                                          "create-object-t078"),
+                            8s,
+                            &create_object_result))
+                << "CreateObject should succeed before batch promote boundary test; "
+                   "status="
+                << ProposeStatusName(create_object_result.status)
+                << ", message=" << create_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            ProposeResult commit_object_result;
+            ASSERT_TRUE(test::ProposeMetadataCommandWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            test::MakeCommitObjectCommand(kBucket,
+                                                          kObjectKey,
+                                                          kObjectId,
+                                                          "commit-object-t078"),
+                            8s,
+                            &commit_object_result))
+                << "CommitObject should succeed before batch promote boundary test; "
+                   "status="
+                << ProposeStatusName(commit_object_result.status)
+                << ", message=" << commit_object_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+            ASSERT_GT(commit_object_result.log_index, 0U);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            const auto learner_data_root = root_ / "detached_learners_t078";
+            const std::uint16_t first_learner_client_port =
+                static_cast<std::uint16_t>(base_port_ + 1780);
+            const std::uint16_t first_learner_raft_port =
+                static_cast<std::uint16_t>(base_port_ + 2780);
+            const NodeConfig first_learner_config = BuildDetachedLearnerLikeConfig(
+                learner_data_root,
+                kFirstLearnerRaftId,
+                first_learner_raft_port);
+            WriteStructuredLearnerIdentity(first_learner_config);
+            const snapshotConfig first_learner_snapshot_config =
+                MakeDisabledSnapshotConfig(root_ / "learner_snapshots_t078_a");
+            StandaloneNodeRunner first_learner_runner(std::make_shared<RaftNode>(
+                first_learner_config,
+                first_learner_snapshot_config));
+
+            const std::uint16_t second_learner_client_port =
+                static_cast<std::uint16_t>(base_port_ + 1790);
+            const std::uint16_t second_learner_raft_port =
+                static_cast<std::uint16_t>(base_port_ + 2790);
+            const NodeConfig second_learner_config = BuildDetachedLearnerLikeConfig(
+                learner_data_root,
+                kSecondLearnerRaftId,
+                second_learner_raft_port);
+            WriteStructuredLearnerIdentity(second_learner_config);
+            const snapshotConfig second_learner_snapshot_config =
+                MakeDisabledSnapshotConfig(root_ / "learner_snapshots_t078_b");
+            StandaloneNodeRunner second_learner_runner(std::make_shared<RaftNode>(
+                second_learner_config,
+                second_learner_snapshot_config));
+
+            raft::JoinMetadataClusterRequest first_join_request =
+                MakeJoinMetadataClusterRequest("req-join-t078-learner-a",
+                                               kClusterId,
+                                               kFirstLearnerNodeId,
+                                               kFirstLearnerRaftId,
+                                               first_learner_client_port,
+                                               first_learner_raft_port);
+            const NodeStatusSnapshot leader_status = leader->GetStatusSnapshot();
+            raft::JoinMetadataClusterResponse first_accepted_response;
+            grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(leader_status.address,
+                                             first_join_request,
+                                             &first_accepted_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(first_accepted_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_OK);
+            EXPECT_EQ(first_accepted_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+            EXPECT_FALSE(first_accepted_response.committed_membership_changed());
+            EXPECT_TRUE(Contains(first_accepted_response.summary().message(),
+                                 "learner_status=pending"))
+                << first_accepted_response.summary().message();
+            EXPECT_TRUE(Contains(first_accepted_response.summary().message(),
+                                 "promotion_status=catching_up"))
+                << first_accepted_response.summary().message();
+            EXPECT_TRUE(Contains(first_accepted_response.summary().message(),
+                                 "runtime_learner_count=1"))
+                << first_accepted_response.summary().message();
+            EXPECT_TRUE(Contains(first_accepted_response.summary().message(),
+                                 "promotion_policy=odd_committed_voter_count_only"))
+                << first_accepted_response.summary().message();
+
+            first_learner_runner.Start();
+
+            RuntimeMembershipEntry first_learner_progress;
+            std::string first_learner_progress_diagnostics;
+            ASSERT_TRUE(WaitForLearnerReplicationProgress(leader,
+                                                          kFirstLearnerRaftId,
+                                                          commit_object_result.log_index,
+                                                          8s,
+                                                          &first_learner_progress,
+                                                          &first_learner_progress_diagnostics))
+                << "first pending learner did not reach ready-to-promote boundary before "
+                   "second learner admission attempt; runtime="
+                << first_learner_progress_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+            EXPECT_TRUE(first_learner_progress.pending)
+                << first_learner_progress_diagnostics;
+            EXPECT_FALSE(first_learner_progress.committed)
+                << first_learner_progress_diagnostics;
+            EXPECT_GE(first_learner_progress.match_index, commit_object_result.log_index)
+                << first_learner_progress_diagnostics;
+
+            const auto current_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(current_leader, nullptr)
+                << "cluster lost leader before ready learner re-query in batch promote "
+                   "boundary test; cluster="
+                << cluster.DescribeCluster();
+            const NodeStatusSnapshot current_leader_status =
+                current_leader->GetStatusSnapshot();
+
+            raft::JoinMetadataClusterResponse first_duplicate_response;
+            rpc_status = JoinMetadataClusterViaAddress(current_leader_status.address,
+                                                       first_join_request,
+                                                       &first_duplicate_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(first_duplicate_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_IDEMPOTENT_REPLAY);
+            EXPECT_EQ(first_duplicate_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE);
+            EXPECT_FALSE(first_duplicate_response.committed_membership_changed());
+            EXPECT_TRUE(Contains(first_duplicate_response.summary().message(),
+                                 "learner_status=ready_to_promote"))
+                << first_duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(first_duplicate_response.summary().message(),
+                                 "promotion_status=waiting_for_pair"))
+                << first_duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(first_duplicate_response.summary().message(),
+                                 "promotion_block_reason=even_voter_count"))
+                << first_duplicate_response.summary().message();
+            EXPECT_TRUE(Contains(first_duplicate_response.summary().message(),
+                                 "committed_quorum_size=2"))
+                << first_duplicate_response.summary().message();
+
+            const auto first_ready_summary =
+                current_leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(first_ready_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(first_ready_summary);
+            EXPECT_EQ(first_ready_summary.voter_count, 3U)
+                << DescribeRuntimeMembershipSummary(first_ready_summary);
+            EXPECT_EQ(first_ready_summary.learner_ids,
+                      std::vector<int>{kFirstLearnerRaftId})
+                << DescribeRuntimeMembershipSummary(first_ready_summary);
+            EXPECT_EQ(first_ready_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(first_ready_summary);
+            EXPECT_EQ(first_ready_summary.committed_voter_quorum_size, 2U)
+                << DescribeRuntimeMembershipSummary(first_ready_summary);
+            ASSERT_EQ(first_ready_summary.learner_entries.size(), 1U);
+            EXPECT_EQ(first_ready_summary.learner_entries.front().role,
+                      RuntimeMembershipRole::kLearner);
+            EXPECT_FALSE(first_ready_summary.learner_entries.front().committed);
+            EXPECT_TRUE(first_ready_summary.learner_entries.front().pending);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            raft::JoinMetadataClusterRequest second_join_request =
+                MakeJoinMetadataClusterRequest("req-join-t078-learner-b",
+                                               kClusterId,
+                                               kSecondLearnerNodeId,
+                                               kSecondLearnerRaftId,
+                                               second_learner_client_port,
+                                               second_learner_raft_port);
+            raft::JoinMetadataClusterResponse second_join_response;
+            rpc_status = JoinMetadataClusterViaAddress(current_leader_status.address,
+                                                       second_join_request,
+                                                       &second_join_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(second_join_response.requested_membership(),
+                      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+            EXPECT_FALSE(second_join_response.committed_membership_changed());
+            EXPECT_EQ(second_join_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_OK)
+                << second_join_response.summary().message();
+            EXPECT_EQ(second_join_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+                << second_join_response.summary().message();
+            if (second_join_response.summary().code() != raft::METADATA_STATUS_CODE_OK ||
+                second_join_response.disposition() !=
+                    raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+            {
+                ADD_FAILURE()
+                    << "T078 requires a real path to 3 committed voters + 2 ready learners "
+                       "before any batch promote. current runtime still blocks the second "
+                       "learner while the first learner is only waiting_for_pair, so the "
+                       "test cannot continue to the required direct 5-voter promote / "
+                       "quorum=3 / no committed 4-voter history boundary. actual_code="
+                    << second_join_response.summary().code()
+                    << ", actual_disposition=" << second_join_response.disposition()
+                    << ", actual_message=" << second_join_response.summary().message()
+                    << ", runtime="
+                    << DescribeRuntimeMembershipSummary(
+                           current_leader->GetRuntimeMembershipSummary())
+                    << ", cluster=" << cluster.DescribeCluster();
+                ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                                kCommittedVoters,
+                                                                2U);
+                return;
+            }
+
+            second_learner_runner.Start();
+
+            RuntimeMembershipEntry second_learner_progress;
+            std::string second_learner_progress_diagnostics;
+            ASSERT_TRUE(WaitForLearnerReplicationProgress(
+                            current_leader,
+                            kSecondLearnerRaftId,
+                            commit_object_result.log_index,
+                            8s,
+                            &second_learner_progress,
+                            &second_learner_progress_diagnostics))
+                << "second learner did not reach ready-to-promote boundary before explicit "
+                   "batch promote step; runtime="
+                << second_learner_progress_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+            EXPECT_TRUE(second_learner_progress.pending)
+                << second_learner_progress_diagnostics;
+            EXPECT_FALSE(second_learner_progress.committed)
+                << second_learner_progress_diagnostics;
+
+            const auto leader_after_second_ready = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader_after_second_ready, nullptr)
+                << "cluster lost leader before two-ready-learner summary check; cluster="
+                << cluster.DescribeCluster();
+
+            const auto two_ready_summary =
+                leader_after_second_ready->GetRuntimeMembershipSummary();
+            EXPECT_EQ(two_ready_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+            EXPECT_EQ(two_ready_summary.voter_count, 3U)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+            EXPECT_EQ(two_ready_summary.learner_count, 2U)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+            EXPECT_EQ(two_ready_summary.committed_voter_quorum_size, 2U)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+            EXPECT_EQ(two_ready_summary.learner_entries.size(), 2U)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+
+            bool found_first_ready_learner = false;
+            bool found_second_ready_learner = false;
+            for (const auto &entry : two_ready_summary.learner_entries)
+            {
+                if (entry.raft_id == kFirstLearnerRaftId)
+                {
+                    found_first_ready_learner = true;
+                }
+                if (entry.raft_id == kSecondLearnerRaftId)
+                {
+                    found_second_ready_learner = true;
+                }
+                EXPECT_EQ(entry.role, RuntimeMembershipRole::kLearner)
+                    << DescribeRuntimeMembershipSummary(two_ready_summary);
+                EXPECT_FALSE(entry.committed)
+                    << DescribeRuntimeMembershipSummary(two_ready_summary);
+            }
+            EXPECT_TRUE(found_first_ready_learner)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+            EXPECT_TRUE(found_second_ready_learner)
+                << DescribeRuntimeMembershipSummary(two_ready_summary);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+
+            ADD_FAILURE()
+                << "T078 intentionally remains red until production exposes a non-faked "
+                   "batch promote path. after reaching 3 committed voters + 2 ready "
+                   "learners, the next step must directly commit 5 voters with quorum=3 "
+                   "and must not expose any committed 4-voter intermediate membership. "
+                   "runtime="
+                << DescribeRuntimeMembershipSummary(two_ready_summary)
+                << ", cluster=" << cluster.DescribeCluster();
+        }
     } // namespace
 } // namespace raftdemo
