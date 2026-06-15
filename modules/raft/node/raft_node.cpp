@@ -1079,6 +1079,175 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
     return result;
   }
 
+  AddLearnerProposalResult RaftNode::PromoteReadyLearnerBatch(
+      const AddLearnerProposalRequest &request)
+  {
+    AddLearnerProposalResult result;
+    result.canonical_node_id = request.node_id;
+    result.assigned_raft_id = request.candidate_raft_id;
+
+    if (const auto validation_error = ValidateAddLearnerProposalRequest(request);
+        validation_error.has_value())
+    {
+      result.status = AddLearnerProposalStatus::kInvalidArgument;
+      result.message = *validation_error;
+      return result;
+    }
+
+    std::optional<std::uint64_t> atomic_batch_log_index;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      result.membership_epoch = commit_index_;
+
+      if (!running_.load())
+      {
+        result.status = AddLearnerProposalStatus::kNodeStopping;
+        result.message = "node is stopping";
+        return result;
+      }
+
+      if (role_ != Role::kLeader)
+      {
+        result.status = AddLearnerProposalStatus::kNotLeader;
+        result.message = "batch learner promotion authority belongs to the current leader";
+        return result;
+      }
+
+      result.leader_id = config_.node_id;
+
+      auto pending_it = std::find_if(
+          pending_add_learner_proposals_.begin(),
+          pending_add_learner_proposals_.end(),
+          [&request](const PendingAddLearnerProposal &pending) {
+            return pending.cluster_id == request.cluster_id &&
+                   pending.node_id == request.node_id &&
+                   pending.candidate_raft_id == request.candidate_raft_id &&
+                   pending.candidate_client_address == request.candidate_client_address &&
+                   pending.candidate_raft_address == request.candidate_raft_address &&
+                   pending.candidate_incarnation_id ==
+                       request.candidate_incarnation_id &&
+                   pending.candidate_sequence == request.candidate_sequence &&
+                   pending.persistent_generation ==
+                       request.persistent_generation &&
+                   pending.data_dir_fingerprint ==
+                       request.data_dir_fingerprint;
+          });
+      if (pending_it == pending_add_learner_proposals_.end())
+      {
+        if (HasCommittedVoterRaftId(config_, request.candidate_raft_id))
+        {
+          result.status = AddLearnerProposalStatus::kRejected;
+          result.message =
+              "candidate_raft_id already exists in committed voter set";
+          return result;
+        }
+        result.status = AddLearnerProposalStatus::kRejected;
+        result.message =
+            "batch learner promotion requires an existing pending learner";
+        return result;
+      }
+
+      if (!IsPendingLearnerReadyForPromotionLocked(*pending_it))
+      {
+        result.status = AddLearnerProposalStatus::kPendingMembershipChange;
+        result.message =
+            "batch learner promotion blocked because learner is still catching up";
+        return result;
+      }
+
+      const auto targets = CollectAtomicBatchPromotionTargetsLocked();
+      if (targets.empty())
+      {
+        result.status = AddLearnerProposalStatus::kPendingMembershipChange;
+        result.message =
+            "batch learner promotion waiting for another ready learner";
+        return result;
+      }
+
+      atomic_batch_log_index = PrepareAtomicBatchPromotionLogIndexLocked();
+      if (!atomic_batch_log_index.has_value())
+      {
+        result.status = AddLearnerProposalStatus::kPendingMembershipChange;
+        result.message =
+            "batch learner promotion boundary is not ready to append committed membership change";
+        return result;
+      }
+    }
+
+    const ReplicationOutcome replication_outcome =
+        ReplicateLogEntryToMajority(*atomic_batch_log_index);
+    if (replication_outcome != ReplicationOutcome::kReplicated)
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      result.membership_epoch = commit_index_;
+      if (!running_.load())
+      {
+        result.status = AddLearnerProposalStatus::kNodeStopping;
+        result.message = "node is stopping";
+        return result;
+      }
+      if (role_ != Role::kLeader)
+      {
+        result.status = AddLearnerProposalStatus::kNotLeader;
+        result.message =
+            "batch learner promotion lost leader before membership commit";
+        return result;
+      }
+      result.leader_id = config_.node_id;
+      result.status = AddLearnerProposalStatus::kPendingMembershipChange;
+      result.message =
+          "batch learner promotion did not reach committed membership";
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      AdvanceCommitIndexUnlocked();
+    }
+
+    const ApplyResult apply_result = ApplyCommittedEntries();
+    if (!apply_result.Ok)
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      result.membership_epoch = commit_index_;
+      if (!running_.load())
+      {
+        result.status = AddLearnerProposalStatus::kNodeStopping;
+        result.message = "node is stopping";
+        return result;
+      }
+      if (role_ != Role::kLeader)
+      {
+        result.status = AddLearnerProposalStatus::kNotLeader;
+        result.message =
+            "batch learner promotion lost leader before membership apply";
+        return result;
+      }
+      result.leader_id = config_.node_id;
+      result.status = AddLearnerProposalStatus::kRejected;
+      result.message = apply_result.message;
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      result.leader_id = leader_id_;
+      result.term = current_term_;
+      result.membership_epoch = commit_index_;
+      result.committed_membership_changed =
+          HasCommittedVoterRaftId(config_, request.candidate_raft_id);
+    }
+    result.status = AddLearnerProposalStatus::kAcceptedPendingCommit;
+    result.message = apply_result.message;
+    return result;
+  }
+
   std::string RaftNode::Describe() const
   {
     const NodeStatusSnapshot status = GetStatusSnapshot();
@@ -1434,7 +1603,6 @@ void RaftNode::SendHeartbeats()
 {
   std::vector<PeerConfig> peers;
   std::uint64_t term = 0;
-  std::optional<std::uint64_t> atomic_batch_log_index;
 
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1442,7 +1610,6 @@ void RaftNode::SendHeartbeats()
     {
       return;
     }
-    atomic_batch_log_index = PrepareAtomicBatchPromotionLogIndexLocked();
     peers = BuildUniqueCommittedVoterPeers(config_);
     const auto learner_peers = LearnerReplicationPeersLocked();
     peers.insert(peers.end(), learner_peers.begin(), learner_peers.end());
@@ -1486,30 +1653,6 @@ void RaftNode::SendHeartbeats()
             result.message);
       }
     } });
-  }
-
-  if (!atomic_batch_log_index.has_value())
-  {
-    return;
-  }
-
-  if (ReplicateLogEntryToMajority(*atomic_batch_log_index) !=
-      ReplicationOutcome::kReplicated)
-  {
-    return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    AdvanceCommitIndexUnlocked();
-  }
-
-  ApplyResult apply_result = ApplyCommittedEntries();
-  if (!apply_result.Ok)
-  {
-    Log(NodeTag(config_.node_id),
-        "atomic batch promotion apply failed after replication, reason=",
-        apply_result.message);
   }
 }
 

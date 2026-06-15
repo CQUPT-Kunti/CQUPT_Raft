@@ -241,6 +241,10 @@ namespace raftdemo
     // 需要在此边界之上继续实现。
     AddLearnerProposalResult ProposeAddLearner(
         const AddLearnerProposalRequest &request);
+    // 显式 batch promote 路由边界：只允许 leader 在现有 pending learners 上
+    // 触发原子 batch promote；真实 committed membership 仍只来自内部原子日志。
+    AddLearnerProposalResult PromoteReadyLearnerBatch(
+        const AddLearnerProposalRequest &request);
     bool IsRunning() const;
 
   private:

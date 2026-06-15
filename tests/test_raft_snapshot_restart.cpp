@@ -922,6 +922,34 @@ TEST_F(RaftSnapshotRestartTest,
       << second_learner_progress_diagnostics
       << ", cluster=" << DescribeCluster(cluster.Nodes());
 
+  stable_leader = WaitForStableLeader(cluster.Nodes(), std::chrono::seconds(8));
+  ASSERT_TRUE(stable_leader.has_value())
+      << "leader did not stabilize before explicit batch promote through metadata service, cluster="
+      << DescribeCluster(cluster.Nodes());
+  leader = stable_leader->leader;
+
+  raft::JoinMetadataClusterResponse promote_response;
+  ASSERT_TRUE(JoinMetadataClusterViaAddress(leader->GetStatusSnapshot().address,
+                                            first_join_request,
+                                            &promote_response)
+                  .ok());
+  EXPECT_EQ(promote_response.summary().code(), raft::METADATA_STATUS_CODE_OK)
+      << promote_response.summary().message();
+  EXPECT_EQ(promote_response.disposition(),
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+      << promote_response.summary().message();
+  EXPECT_TRUE(promote_response.committed_membership_changed())
+      << promote_response.summary().message();
+  EXPECT_TRUE(promote_response.summary().message().find("committed_voter_count=5") !=
+              std::string::npos)
+      << promote_response.summary().message();
+  EXPECT_TRUE(promote_response.summary().message().find("committed_quorum_size=3") !=
+              std::string::npos)
+      << promote_response.summary().message();
+  observed_diagnostics.push_back(promote_response.summary().message());
+  ExpectNoCommittedFourVoterDiagnostic(promote_response.summary().message(),
+                                       "explicit batch promote before restart");
+
   std::string committed_five_diagnostics;
   ASSERT_TRUE(WaitForCommittedMembershipOnNodes(cluster.Nodes(),
                                                 promoted_voters,

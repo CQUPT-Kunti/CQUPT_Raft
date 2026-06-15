@@ -3466,6 +3466,38 @@ namespace raftdemo
             EXPECT_FALSE(second_learner_progress.committed)
                 << second_learner_progress_diagnostics;
 
+            const auto leader_before_batch_promote = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader_before_batch_promote, nullptr)
+                << "cluster lost leader before explicit batch promote routing through "
+                   "metadata service; cluster="
+                << cluster.DescribeCluster();
+            raft::JoinMetadataClusterResponse promote_response;
+            rpc_status = JoinMetadataClusterViaAddress(
+                leader_before_batch_promote->GetStatusSnapshot().address,
+                first_join_request,
+                &promote_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(promote_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_OK)
+                << promote_response.summary().message();
+            EXPECT_EQ(promote_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+                << promote_response.summary().message();
+            EXPECT_TRUE(promote_response.committed_membership_changed())
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "committed_voter_count=5"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "committed_quorum_size=3"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "runtime_voter_count=5"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "runtime_learner_count=0"))
+                << promote_response.summary().message();
+
             std::string committed_five_diagnostics;
             ASSERT_TRUE(WaitForCommittedMembershipOnRunningNodes(cluster,
                                                                  kFiveCommittedVoters,
@@ -3496,7 +3528,8 @@ namespace raftdemo
                 cluster,
                 {first_accepted_response.summary().message(),
                  first_duplicate_response.summary().message(),
-                 second_join_response.summary().message()},
+                 second_join_response.summary().message(),
+                 promote_response.summary().message()},
                 "atomic batch promote committed directly to 5 voters");
         }
 
@@ -3763,6 +3796,27 @@ namespace raftdemo
                    "history completion step; runtime="
                 << second_learner_progress_diagnostics
                 << ", cluster=" << cluster.DescribeCluster();
+
+            const auto leader_before_batch_promote = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader_before_batch_promote, nullptr)
+                << "cluster lost leader before explicit batch promote in no-4-voter "
+                   "history test; cluster="
+                << cluster.DescribeCluster();
+            raft::JoinMetadataClusterResponse promote_response;
+            rpc_status = JoinMetadataClusterViaAddress(
+                leader_before_batch_promote->GetStatusSnapshot().address,
+                first_join_request,
+                &promote_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(promote_response.summary().code(),
+                      raft::METADATA_STATUS_CODE_OK)
+                << promote_response.summary().message();
+            EXPECT_EQ(promote_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
+                << promote_response.summary().message();
+            EXPECT_TRUE(promote_response.committed_membership_changed())
+                << promote_response.summary().message();
+            observed_diagnostics.push_back(promote_response.summary().message());
 
             std::string committed_five_diagnostics;
             ASSERT_TRUE(WaitForCommittedMembershipOnRunningNodes(cluster,
