@@ -243,3 +243,43 @@
   - promote-to-voter
   - batch promote
   - joint consensus
+
+## US4 Phase 9 Batch Promote Closure Snapshot
+
+- Linux targeted validation:
+  - build targets:
+    - `integrated_object_storage_quorum`
+    - `test_metadata_failover`
+    - `test_raft_snapshot_restart`
+  - ctest regex:
+    - `IntegratedObjectStorageQuorum|MetadataFailover|RaftSnapshotRestart|RaftSnapshotRecovery|SnapshotRestart`
+  - result: PASS (`36/36`)
+  - logs:
+    - `tmp/test-logs/t086-build.log`
+    - `tmp/test-logs/t086-ctest.log`
+
+- Covered US4 batch promote areas:
+  - `3 voters + 2 ready learners -> committed 5 voters`
+  - quorum stays committed-voters-only before promote
+  - single learner promote blocked by even voter count
+  - no committed `4-voter` history
+  - leader failure during batch promote does not leave partial committed membership
+  - snapshot / restart recovery restores committed `5-voter` membership with quorum `3`
+  - ViewNode observation remains non-authoritative for membership change
+
+- Covered key CTest entries:
+  - `IntegratedObjectStorageQuorumTest.ThreeVotersPlusObservedLearnerKeepsCommittedQuorumAtTwo`
+  - `IntegratedObjectStorageQuorumTest.SingleObservedLearnerDoesNotAutoPromoteToEvenCommittedVoterCount`
+  - `IntegratedObjectStorageQuorumTest.SingleReadyLearnerDirectPromotionIsRejectedBeforeEvenCommittedMembershipProposal`
+  - `IntegratedObjectStorageQuorumTest.TwoReadyLearnersMustBatchPromoteDirectlyToFiveCommittedVotersWithoutCommittedFourVoterHistory`
+  - `IntegratedObjectStorageQuorumTest.BlockedOrInterruptedBatchPromotePathNeverExposesCommittedFourVoterHistory`
+  - `MetadataFailoverTest.LeaderFailureDuringIncompleteBatchPromoteDoesNotLeavePartialCommittedMembership`
+  - `RaftSnapshotRestartTest.RestartRecoveryDoesNotTreatBlockedBatchPromoteAsCommittedFiveVoterMembership`
+
+- Skipped in Phase 9 closure:
+  - Windows validation
+  - macOS validation
+  - local RPC dynamic metadata join + batch promote smoke
+  - long-running failover / soak
+  - multi-ViewNode discovery interaction with promote target selection runtime smoke
+  - joint consensus implementation / protocol-level validation
