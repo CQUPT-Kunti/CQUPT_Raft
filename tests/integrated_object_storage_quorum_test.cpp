@@ -3185,6 +3185,159 @@ namespace raftdemo
                                                             2U);
         }
 
+        TEST_F(IntegratedObjectStorageQuorumTest,
+               SingleReadyLearnerDirectPromotionIsRejectedBeforeEvenCommittedMembershipProposal)
+        {
+            constexpr const char *kBucket = "bucket-t084-odd-count";
+            constexpr const char *kObjectKey = "objects/t084-odd-count.bin";
+            constexpr const char *kObjectId = "obj-t084-odd-count";
+            constexpr const char *kClusterId = "cluster-t084-odd-count";
+            constexpr const char *kLearnerNodeId = "meta-odd-count-learner-t084";
+            constexpr std::int32_t kLearnerRaftId = 84;
+            const std::vector<int> kCommittedVoters{1, 2, 3};
+
+            auto cluster = MakeCluster(3);
+            cluster.StartAll();
+
+            const auto leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader, nullptr)
+                << "3-voter cluster failed to elect leader before odd-count "
+                   "validation test; cluster="
+                << cluster.DescribeCluster();
+
+            ProposeResult create_bucket_result;
+            ASSERT_TRUE(test::ProposeCreateBucketWithRetry(
+                            {cluster.Node(0), cluster.Node(1), cluster.Node(2)},
+                            kBucket,
+                            "create-bucket-t084",
+                            8s,
+                            &create_bucket_result))
+                << "CreateBucket should succeed before odd-count promotion validation; "
+                   "status="
+                << ProposeStatusName(create_bucket_result.status)
+                << ", message=" << create_bucket_result.message
+                << ", cluster=" << cluster.DescribeCluster();
+
+            const auto learner_data_root = root_ / "detached_learners_t084";
+            const auto learner_client_port =
+                static_cast<std::uint16_t>(base_port_ + 1840);
+            const auto learner_raft_port =
+                static_cast<std::uint16_t>(base_port_ + 2840);
+            const NodeConfig learner_config = BuildDetachedLearnerLikeConfig(
+                learner_data_root,
+                kLearnerRaftId,
+                learner_raft_port);
+            WriteStructuredLearnerIdentity(learner_config);
+            const snapshotConfig learner_snapshot_config =
+                MakeDisabledSnapshotConfig(root_ / "learner_snapshots_t084");
+            StandaloneNodeRunner learner_runner(
+                std::make_shared<RaftNode>(learner_config, learner_snapshot_config));
+
+            raft::JoinMetadataClusterRequest join_request =
+                MakeJoinMetadataClusterRequest("req-join-t084-learner",
+                                               kClusterId,
+                                               kLearnerNodeId,
+                                               kLearnerRaftId,
+                                               learner_client_port,
+                                               learner_raft_port);
+            const auto leader_before_join = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(leader_before_join, nullptr)
+                << "cluster lost leader before learner admission in odd-count "
+                   "validation test; cluster="
+                << cluster.DescribeCluster();
+            const NodeStatusSnapshot leader_status =
+                leader_before_join->GetStatusSnapshot();
+
+            raft::JoinMetadataClusterResponse accepted_response;
+            grpc::Status rpc_status =
+                JoinMetadataClusterViaAddress(leader_status.address,
+                                             join_request,
+                                             &accepted_response);
+            ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
+            EXPECT_EQ(accepted_response.summary().code(), raft::METADATA_STATUS_CODE_OK);
+            EXPECT_EQ(accepted_response.disposition(),
+                      raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+            EXPECT_FALSE(accepted_response.committed_membership_changed());
+
+            learner_runner.Start();
+
+            RuntimeMembershipEntry learner_progress;
+            std::string learner_progress_diagnostics;
+            ASSERT_TRUE(WaitForLearnerReplicationProgress(leader_before_join,
+                                                          kLearnerRaftId,
+                                                          create_bucket_result.log_index,
+                                                          8s,
+                                                          &learner_progress,
+                                                          &learner_progress_diagnostics))
+                << "pending learner did not reach ready boundary before direct "
+                   "odd-count validation; runtime="
+                << learner_progress_diagnostics
+                << ", cluster=" << cluster.DescribeCluster();
+            EXPECT_TRUE(learner_progress.pending) << learner_progress_diagnostics;
+            EXPECT_FALSE(learner_progress.committed) << learner_progress_diagnostics;
+
+            const auto current_leader = cluster.WaitForSingleLeader(8s);
+            ASSERT_NE(current_leader, nullptr)
+                << "cluster lost leader before direct odd-count promotion attempt; "
+                   "cluster="
+                << cluster.DescribeCluster();
+            const NodeStatusSnapshot before_promote_status =
+                current_leader->GetStatusSnapshot();
+            const auto before_runtime_summary =
+                current_leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(before_runtime_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(before_runtime_summary);
+            EXPECT_EQ(before_runtime_summary.learner_ids,
+                      std::vector<int>{kLearnerRaftId})
+                << DescribeRuntimeMembershipSummary(before_runtime_summary);
+
+            const auto promote_result = current_leader->PromoteReadyLearnerBatch(
+                MakeAddLearnerProposalRequest(join_request));
+            EXPECT_EQ(promote_result.status, AddLearnerProposalStatus::kRejected)
+                << AddLearnerProposalStatusName(promote_result.status) << ": "
+                << promote_result.message;
+            EXPECT_FALSE(promote_result.committed_membership_changed);
+            EXPECT_TRUE(Contains(promote_result.message,
+                                 "target committed voter count 4 must stay odd before "
+                                 "membership commit"))
+                << promote_result.message;
+            EXPECT_TRUE(Contains(promote_result.message,
+                                 "waiting for another ready learner before membership "
+                                 "commit"))
+                << promote_result.message;
+
+            const NodeStatusSnapshot after_promote_status =
+                current_leader->GetStatusSnapshot();
+            EXPECT_EQ(after_promote_status.last_log_index,
+                      before_promote_status.last_log_index)
+                << "rejected even-target promotion must not append partial committed "
+                   "membership log; cluster="
+                << cluster.DescribeCluster();
+            EXPECT_EQ(after_promote_status.commit_index,
+                      before_promote_status.commit_index)
+                << "rejected even-target promotion must not advance committed "
+                   "membership; cluster="
+                << cluster.DescribeCluster();
+
+            const auto after_runtime_summary =
+                current_leader->GetRuntimeMembershipSummary();
+            EXPECT_EQ(after_runtime_summary.voter_ids, kCommittedVoters)
+                << DescribeRuntimeMembershipSummary(after_runtime_summary);
+            EXPECT_EQ(after_runtime_summary.voter_count, 3U)
+                << DescribeRuntimeMembershipSummary(after_runtime_summary);
+            EXPECT_EQ(after_runtime_summary.learner_ids,
+                      std::vector<int>{kLearnerRaftId})
+                << DescribeRuntimeMembershipSummary(after_runtime_summary);
+            EXPECT_EQ(after_runtime_summary.learner_count, 1U)
+                << DescribeRuntimeMembershipSummary(after_runtime_summary);
+            EXPECT_EQ(after_runtime_summary.committed_voter_quorum_size, 2U)
+                << DescribeRuntimeMembershipSummary(after_runtime_summary);
+
+            ExpectCommittedMembershipUnchangedOnRunningNodes(cluster,
+                                                            kCommittedVoters,
+                                                            2U);
+        }
+
         TEST_F(
             IntegratedObjectStorageQuorumTest,
             TwoReadyLearnersMustBatchPromoteDirectlyToFiveCommittedVotersWithoutCommittedFourVoterHistory)

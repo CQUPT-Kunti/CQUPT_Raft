@@ -406,7 +406,13 @@ namespace raftdemo
         const std::string &command_data,
         std::vector<AtomicBatchPromotionTarget> *targets,
         std::string *reason) const;
-    std::optional<std::uint64_t> PrepareAtomicBatchPromotionLogIndexLocked();
+    std::size_t CommittedVoterCountLocked() const;
+    std::optional<std::string> ValidateTargetCommittedVoterCountLocked(
+        std::size_t target_voter_count) const;
+    std::optional<std::string> ValidateAtomicBatchPromotionTargetsLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets) const;
+    std::optional<std::uint64_t> PrepareAtomicBatchPromotionLogIndexLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets);
     bool IsPendingLearnerReadyForPromotionLocked(
         const PendingAddLearnerProposal &proposal) const;
     std::vector<AtomicBatchPromotionTarget>

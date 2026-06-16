@@ -1160,13 +1160,34 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
       const auto targets = CollectAtomicBatchPromotionTargetsLocked();
       if (targets.empty())
       {
+        const std::size_t single_target_voter_count =
+            CommittedVoterCountLocked() + 1U;
+        if (const auto validation_error =
+                ValidateTargetCommittedVoterCountLocked(single_target_voter_count);
+            validation_error.has_value())
+        {
+          result.status = AddLearnerProposalStatus::kRejected;
+          result.message =
+              *validation_error +
+              "; waiting for another ready learner before membership commit";
+          return result;
+        }
         result.status = AddLearnerProposalStatus::kPendingMembershipChange;
         result.message =
             "batch learner promotion waiting for another ready learner";
         return result;
       }
 
-      atomic_batch_log_index = PrepareAtomicBatchPromotionLogIndexLocked();
+      if (const auto validation_error =
+              ValidateAtomicBatchPromotionTargetsLocked(targets);
+          validation_error.has_value())
+      {
+        result.status = AddLearnerProposalStatus::kRejected;
+        result.message = *validation_error;
+        return result;
+      }
+
+      atomic_batch_log_index = PrepareAtomicBatchPromotionLogIndexLocked(targets);
       if (!atomic_batch_log_index.has_value())
       {
         result.status = AddLearnerProposalStatus::kPendingMembershipChange;
@@ -3876,23 +3897,16 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
     }
 
     std::lock_guard<std::mutex> lk(mu_);
+    if (const auto validation_error =
+            ValidateAtomicBatchPromotionTargetsLocked(targets);
+        validation_error.has_value())
+    {
+      return {false, *validation_error};
+    }
     std::map<std::int32_t, std::string> target_voters;
     for (const auto &target : targets)
     {
-      if (target.raft_id <= 0 || target.address.empty())
-      {
-        return {false, "atomic batch promotion target is incomplete"};
-      }
       target_voters[target.raft_id] = target.address;
-    }
-
-    if (target_voters.size() < 3U || target_voters.size() % 2U == 0U)
-    {
-      return {false, "atomic batch promotion target voter count must stay odd"};
-    }
-    if (target_voters.find(config_.node_id) == target_voters.end())
-    {
-      return {false, "atomic batch promotion would remove local node"};
     }
 
     std::unordered_set<std::int32_t> previous_peer_ids;
@@ -4061,6 +4075,53 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
     return true;
   }
 
+  std::size_t RaftNode::CommittedVoterCountLocked() const
+  {
+    return BuildUniqueCommittedVoterPeers(config_).size() + 1U;
+  }
+
+  std::optional<std::string> RaftNode::ValidateTargetCommittedVoterCountLocked(
+      const std::size_t target_voter_count) const
+  {
+    if (target_voter_count < 3U)
+    {
+      return "target committed voter count must be at least 3 before membership commit";
+    }
+    if (target_voter_count % 2U == 0U)
+    {
+      return "target committed voter count " +
+             std::to_string(target_voter_count) +
+             " must stay odd before membership commit";
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> RaftNode::ValidateAtomicBatchPromotionTargetsLocked(
+      const std::vector<AtomicBatchPromotionTarget> &targets) const
+  {
+    std::map<std::int32_t, std::string> target_voters;
+    for (const auto &target : targets)
+    {
+      if (target.raft_id <= 0 || target.address.empty())
+      {
+        return "atomic batch promotion target is incomplete";
+      }
+      target_voters[target.raft_id] = target.address;
+    }
+
+    if (const auto validation_error =
+            ValidateTargetCommittedVoterCountLocked(target_voters.size());
+        validation_error.has_value())
+    {
+      return validation_error;
+    }
+    if (target_voters.find(config_.node_id) == target_voters.end())
+    {
+      return "atomic batch promotion would remove local node";
+    }
+    return std::nullopt;
+  }
+
   bool RaftNode::IsPendingLearnerReadyForPromotionLocked(
       const PendingAddLearnerProposal &proposal) const
   {
@@ -4137,7 +4198,8 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
     return targets;
   }
 
-  std::optional<std::uint64_t> RaftNode::PrepareAtomicBatchPromotionLogIndexLocked()
+  std::optional<std::uint64_t> RaftNode::PrepareAtomicBatchPromotionLogIndexLocked(
+      const std::vector<AtomicBatchPromotionTarget> &targets)
   {
     if (!running_.load() || role_ != Role::kLeader)
     {
@@ -4158,8 +4220,11 @@ RaftNode::ReplicationOutcome RaftNode::ReplicateLogEntryToMajority(
       inflight_atomic_batch_promotion_log_index_.reset();
     }
 
-    const auto targets = CollectAtomicBatchPromotionTargetsLocked();
     if (targets.empty())
+    {
+      return std::nullopt;
+    }
+    if (ValidateAtomicBatchPromotionTargetsLocked(targets).has_value())
     {
       return std::nullopt;
     }
