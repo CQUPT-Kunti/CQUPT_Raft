@@ -306,7 +306,8 @@ namespace raftdemo
     std::string BuildJoinLearnerStatusMessage(
         const std::string &base_message,
         const RuntimeMembershipSummary &runtime_summary,
-        const raft::JoinMetadataClusterRequest &request)
+        const raft::JoinMetadataClusterRequest &request,
+        const bool committed_membership_changed)
     {
       std::ostringstream oss;
       oss << base_message
@@ -316,9 +317,21 @@ namespace raftdemo
       const auto *entry = FindRuntimeLearnerEntry(runtime_summary, request);
       if (entry == nullptr)
       {
+        if (committed_membership_changed &&
+            std::find(runtime_summary.voter_ids.begin(),
+                      runtime_summary.voter_ids.end(),
+                      request.candidate_raft_id()) != runtime_summary.voter_ids.end())
+        {
+          oss << "; learner_status=promoted"
+              << "; promotion_status=batch_promoted"
+              << "; promotion_batch_size=2"
+              << "; promotion_policy=odd_committed_voter_count_only";
+        }
         return oss.str();
       }
 
+      const std::size_t ready_learner_count =
+          CountReadyRuntimeLearners(runtime_summary);
       const bool ready_to_promote =
           IsRuntimeLearnerReadyToPromote(runtime_summary, *entry);
       const bool waiting_for_pair =
@@ -336,6 +349,10 @@ namespace raftdemo
         oss << "waiting_for_pair"
             << "; promotion_block_reason=even_voter_count";
       }
+      else if (ready_to_promote && ready_learner_count == 2U)
+      {
+        oss << "ready_pair";
+      }
       else if (ready_to_promote)
       {
         oss << "ready_to_promote";
@@ -351,6 +368,7 @@ namespace raftdemo
     void DecorateJoinSummaryWithLearnerStatus(
         const RuntimeMembershipSummary &runtime_summary,
         const raft::JoinMetadataClusterRequest &request,
+        const bool committed_membership_changed,
         raft::MetadataResponseSummary *summary)
     {
       if (summary == nullptr)
@@ -359,7 +377,8 @@ namespace raftdemo
       }
       summary->set_message(BuildJoinLearnerStatusMessage(summary->message(),
                                                          runtime_summary,
-                                                         request));
+                                                         request,
+                                                         committed_membership_changed));
     }
 
     void FillLeaderHint(const NodeStatusSnapshot &status,
@@ -1063,7 +1082,7 @@ namespace raftdemo
       {
         return false;
       }
-      return CountReadyRuntimeLearners(runtime_summary) >= 2U;
+      return CountReadyRuntimeLearners(runtime_summary) == 2U;
     }
 
     raft::MetadataStatusCode ToJoinMetadataStatusCode(
@@ -1144,6 +1163,7 @@ namespace raftdemo
                                      response->mutable_summary());
       DecorateJoinSummaryWithLearnerStatus(runtime_summary,
                                            request,
+                                           committed_membership_changed,
                                            response->mutable_summary());
       response->set_disposition(disposition);
       response->set_requested_membership(

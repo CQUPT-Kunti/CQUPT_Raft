@@ -177,7 +177,7 @@
 - [x] T082 [US4] Design and implement batched membership change or joint consensus state in `modules/raft/node/raft_node.cpp` and `modules/raft/node/raft_node.h` (验证: `integrated_object_storage_quorum`)
 - [x] T083 [US4] Persist and apply batch membership changes through Raft log/config entry path in `modules/raft/storage` and `modules/raft/node/raft_node.cpp` (验证: `test_raft_snapshot_restart`, `integrated_object_storage_quorum`)
 - [x] T084 [US4] Add target voter odd-count validation before membership proposal commit in `modules/raft/node/raft_node.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T085 [US4] Promote two ready learners together and update quorum summary in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)
+- [x] T085 [US4] Promote two ready learners together and update quorum summary in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T086 [US4] Ensure batch promote handles concurrent or duplicate pending changes in `modules/raft/node/raft_node.cpp` (验证: `metadata_failover_test`, `integrated_object_storage_quorum`)
 - [ ] T087 [US4] If safe batch promote cannot be finished in this milestone, document learner-only completion and blocked promote status in `specs/009-local-rpc-object-storage-stabilization/cross-task-risk-notes.md` (验证: `integrated_object_storage_quorum`)
 - [ ] T088 [US4] Record batch promote validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-09-batch-promote.md` (验证: `integrated_object_storage_quorum`, `metadata_failover_test`, `test_raft_snapshot_restart`)

@@ -3650,6 +3650,15 @@ namespace raftdemo
             EXPECT_TRUE(Contains(promote_response.summary().message(),
                                  "runtime_learner_count=0"))
                 << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "learner_status=promoted"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "promotion_status=batch_promoted"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "promotion_batch_size=2"))
+                << promote_response.summary().message();
 
             std::string committed_five_diagnostics;
             ASSERT_TRUE(WaitForCommittedMembershipOnRunningNodes(cluster,
@@ -3968,6 +3977,12 @@ namespace raftdemo
                       raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT)
                 << promote_response.summary().message();
             EXPECT_TRUE(promote_response.committed_membership_changed())
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "learner_status=promoted"))
+                << promote_response.summary().message();
+            EXPECT_TRUE(Contains(promote_response.summary().message(),
+                                 "promotion_status=batch_promoted"))
                 << promote_response.summary().message();
             observed_diagnostics.push_back(promote_response.summary().message());
 
