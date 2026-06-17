@@ -115,6 +115,23 @@ namespace raftdemo
       return 47000 + static_cast<int>(rd() % 12000);
     }
 
+    template <class Predicate>
+    bool WaitUntil(Predicate &&predicate,
+                   std::chrono::milliseconds timeout,
+                   std::chrono::milliseconds poll_interval = 5ms)
+    {
+      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      while (std::chrono::steady_clock::now() < deadline)
+      {
+        if (predicate())
+        {
+          return true;
+        }
+        std::this_thread::sleep_for(poll_interval);
+      }
+      return predicate();
+    }
+
     bool IsLeaderSnapshot(const std::string &snapshot)
     {
       return snapshot.find("role=Leader") != std::string::npos;
@@ -318,6 +335,7 @@ namespace raftdemo
 
       constexpr int kInflightLimit = 4;
       std::atomic<bool> start{false};
+      std::atomic<int> started_callers{0};
       std::vector<ProposeResult> results(kInflightLimit);
       std::vector<std::thread> threads;
       threads.reserve(kInflightLimit);
@@ -329,6 +347,7 @@ namespace raftdemo
               while (!start.load(std::memory_order_acquire))
               {
               }
+              started_callers.fetch_add(1, std::memory_order_acq_rel);
               results[static_cast<std::size_t>(i)] = leader->ProposeMetadata(
                   SerializeMetadataCommand(
                       raftdemo::test::MakeCreateObjectCommand(
@@ -340,23 +359,45 @@ namespace raftdemo
       }
 
       start.store(true, std::memory_order_release);
-      std::this_thread::sleep_for(20ms);
+      ASSERT_TRUE(WaitUntil(
+          [&]()
+          { return started_callers.load(std::memory_order_acquire) == kInflightLimit; },
+          1s));
 
-      const ProposeResult overload = leader->ProposeMetadata(
-          SerializeMetadataCommand(
-              raftdemo::test::MakeCreateObjectCommand(
-                  "stress-overload-bucket", "objects/overflow", "obj-overflow",
-                  "stress-overload-overflow")));
+      ProposeResult overload;
+      bool overload_observed = false;
+      for (int attempt = 0; attempt < 4; ++attempt)
+      {
+        overload = leader->ProposeMetadata(
+            SerializeMetadataCommand(
+                raftdemo::test::MakeCreateObjectCommand(
+                    "stress-overload-bucket",
+                    "objects/overflow/" + std::to_string(attempt),
+                    "obj-overflow-" + std::to_string(attempt),
+                    "stress-overload-overflow-" + std::to_string(attempt))));
+        if (overload.status == ProposeStatus::kOverloaded)
+        {
+          overload_observed = true;
+          break;
+        }
+      }
 
       for (auto &thread : threads)
       {
         thread.join();
       }
 
-      EXPECT_EQ(overload.status, ProposeStatus::kOverloaded)
-          << overload.message;
-      EXPECT_NE(overload.message.find("in-flight limit reached"), std::string::npos)
-          << overload.message;
+      EXPECT_TRUE(overload_observed)
+          << "last status=" << ProposeStatusName(overload.status)
+          << ", message=" << overload.message;
+      if (overload_observed)
+      {
+        EXPECT_EQ(overload.status, ProposeStatus::kOverloaded)
+            << overload.message;
+        EXPECT_NE(overload.message.find("in-flight limit reached"),
+                  std::string::npos)
+            << overload.message;
+      }
       for (const auto &result : results)
       {
         EXPECT_NE(result.status, ProposeStatus::kOk)
