@@ -194,7 +194,7 @@
 - [x] T090 [P] [US6] Add 2-ViewNode startup support in `examples/object-storage-local-3meta-6store/qidong.sh` or a sibling 009 startup script (验证: local RPC startup)
 - [x] T091 [P] [US6] Add matching shutdown support in `examples/object-storage-local-3meta-6store/tingzhi.sh` or a sibling 009 shutdown script (验证: local RPC shutdown)
 - [x] T092 [US6] Add run-time StorageNode join command to `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a sibling 009 script (验证: local RPC dynamic storage join)
-- [ ] T093 [US6] Add run-time Metadata learner join command for one learner and blocked promote observation in example scripts (验证: local RPC metadata join)
+- [x] T093 [US6] Add run-time Metadata learner join command for one learner and blocked promote observation in example scripts (验证: local RPC metadata join)
 - [ ] T094 [US6] Add second learner join and batch promote observation in example scripts (验证: local RPC metadata join, quorum status)
 - [ ] T095 [US6] Add ViewNode failover status and roundtrip path to example scripts (验证: local RPC status, roundtrip)
 - [ ] T096 [US6] Ensure example logs are written under an ignored/local log path and summarized in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-10-local-rpc-example.md` (验证: project test-log rules)

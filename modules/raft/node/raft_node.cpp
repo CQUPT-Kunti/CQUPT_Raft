@@ -244,6 +244,36 @@ namespace raftdemo
       return voter_ids;
     }
 
+    bool LocalRoleCountsAsCommittedVoter(
+        const RuntimeMembershipRole local_role_hint)
+    {
+      return local_role_hint != RuntimeMembershipRole::kLearner &&
+             local_role_hint != RuntimeMembershipRole::kNonMember;
+    }
+
+    std::vector<int> BuildCommittedVoterIdsForLocalRole(
+        const NodeConfig &config,
+        const RuntimeMembershipRole local_role_hint)
+    {
+      std::vector<int> voter_ids;
+      voter_ids.reserve(config.peers.size() + 1);
+
+      if (LocalRoleCountsAsCommittedVoter(local_role_hint))
+      {
+        voter_ids.push_back(config.node_id);
+      }
+
+      for (const auto &peer : BuildUniqueCommittedVoterPeers(config))
+      {
+        voter_ids.push_back(peer.node_id);
+      }
+
+      std::sort(voter_ids.begin(), voter_ids.end());
+      voter_ids.erase(std::unique(voter_ids.begin(), voter_ids.end()),
+                      voter_ids.end());
+      return voter_ids;
+    }
+
     std::size_t CountCommittedVoters(const NodeConfig &config)
     {
       return BuildCommittedVoterIds(config).size();
@@ -252,6 +282,21 @@ namespace raftdemo
     std::size_t ComputeCommittedVoterQuorumSize(const NodeConfig &config)
     {
       return ComputeCommittedVoterQuorumSize(CountCommittedVoters(config));
+    }
+
+    std::size_t CountCommittedVotersForLocalRole(
+        const NodeConfig &config,
+        const RuntimeMembershipRole local_role_hint)
+    {
+      return BuildCommittedVoterIdsForLocalRole(config, local_role_hint).size();
+    }
+
+    std::size_t ComputeCommittedVoterQuorumSizeForLocalRole(
+        const NodeConfig &config,
+        const RuntimeMembershipRole local_role_hint)
+    {
+      return ComputeCommittedVoterQuorumSize(
+          CountCommittedVotersForLocalRole(config, local_role_hint));
     }
 
     std::size_t CountReplicatedCommittedVoters(
@@ -528,9 +573,13 @@ namespace raftdemo
       ResetSnapshotTimerLocked();
     }
 
+    const RuntimeMembershipRole local_role_hint =
+        local_runtime_membership_role_hint_;
     Log(NodeTag(config_.node_id), "started at ", config_.address, ", peers=", config_.peers.size(),
-        ", committed_voter_count=", CountCommittedVoters(config_),
-        ", quorum=", ComputeCommittedVoterQuorumSize(config_),
+        ", committed_voter_count=",
+        CountCommittedVotersForLocalRole(config_, local_role_hint),
+        ", quorum=",
+        ComputeCommittedVoterQuorumSizeForLocalRole(config_, local_role_hint),
         ", data_dir=", config_.data_dir, ", snapshot_dir=", snapshot_config_.snapshot_dir);
   }
 
@@ -786,13 +835,14 @@ Replicator *RaftNode::GetOrCreateReplicatorLocked(const PeerConfig &peer)
 
     // 当前阶段 RaftNode 内部没有运行时 membership authority；诊断摘要必须只读取
     // 已提交配置边界下当前节点已知的成员集，不能根据 live 节点或 ViewNode 观测降 quorum。
-    summary.voter_ids = BuildCommittedVoterIds(config_);
+    summary.voter_ids = BuildCommittedVoterIdsForLocalRole(
+        config_, local_runtime_membership_role_hint_);
 
     // 第一阶段暂未把 learner membership 下沉到 RaftNode 运行时，因此这里保持只读空集，
     // 避免把 registered-only 或观测节点误计入 committed voter quorum。
     summary.voter_count = summary.voter_ids.size();
     summary.learner_count = summary.learner_ids.size();
-    summary.quorum_size = ComputeCommittedVoterQuorumSize(config_);
+    summary.quorum_size = ComputeCommittedVoterQuorumSize(summary.voter_count);
     summary.local_role = std::binary_search(summary.voter_ids.begin(),
                                             summary.voter_ids.end(),
                                             config_.node_id)
