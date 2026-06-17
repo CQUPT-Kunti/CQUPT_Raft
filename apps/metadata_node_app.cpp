@@ -1119,7 +1119,9 @@ namespace
         const bool runtime_observes_learner =
             RuntimeSummaryContainsLearner(runtime_summary, startup.raft_id);
         const bool admitted_dynamic_learner =
-            IsDynamicJoinCandidateMode(startup);
+            IsDynamicJoinCandidateMode(startup) &&
+            quorum_summary.local_role !=
+                raftdemo::CommittedMembershipRole::kVoter;
         observation.raft_role = (runtime_observes_learner ||
                                  admitted_dynamic_learner)
                                     ? viewdemo::MetadataRaftObservedRole::kLearner
@@ -1600,10 +1602,27 @@ namespace
         std::thread candidate_join_thread;
         if (dynamic_join_candidate_mode)
         {
-            candidate_join_thread = std::thread([&loaded_config, &startup, &identity, &incarnation, heartbeat_interval]() {
+            candidate_join_thread = std::thread([&loaded_config, &startup, &identity, &incarnation, &node, heartbeat_interval]() {
                 std::string last_join_state;
                 while (!g_stop_requested.load())
                 {
+                    const auto committed_summary =
+                        node->GetCommittedMembershipQuorumSummary();
+                    if (committed_summary.local_role ==
+                        raftdemo::CommittedMembershipRole::kVoter)
+                    {
+                        std::cout << "metadata_node_app candidate join settled"
+                                  << " cluster_id=" << startup.cluster_id
+                                  << " node_id=" << identity.node_id
+                                  << " raft_id=" << startup.raft_id
+                                  << " committed_voter_count="
+                                  << committed_summary.voter_count
+                                  << " committed_quorum_size="
+                                  << committed_summary.quorum_size
+                                  << '\n';
+                        break;
+                    }
+
                     const auto join_round = ExecuteDynamicJoinRound(*loaded_config.config,
                                                                     startup,
                                                                     identity,
