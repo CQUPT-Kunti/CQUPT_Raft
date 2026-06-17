@@ -193,7 +193,7 @@
 - [x] T089 [P] [US6] Add or extend 009 local RPC topology config under `examples/object-storage-local-3meta-6store/cluster.json` or a sibling 009 example config (验证: app targets build, local RPC startup)
 - [x] T090 [P] [US6] Add 2-ViewNode startup support in `examples/object-storage-local-3meta-6store/qidong.sh` or a sibling 009 startup script (验证: local RPC startup)
 - [x] T091 [P] [US6] Add matching shutdown support in `examples/object-storage-local-3meta-6store/tingzhi.sh` or a sibling 009 shutdown script (验证: local RPC shutdown)
-- [ ] T092 [US6] Add run-time StorageNode join command to `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a sibling 009 script (验证: local RPC dynamic storage join)
+- [x] T092 [US6] Add run-time StorageNode join command to `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a sibling 009 script (验证: local RPC dynamic storage join)
 - [ ] T093 [US6] Add run-time Metadata learner join command for one learner and blocked promote observation in example scripts (验证: local RPC metadata join)
 - [ ] T094 [US6] Add second learner join and batch promote observation in example scripts (验证: local RPC metadata join, quorum status)
 - [ ] T095 [US6] Add ViewNode failover status and roundtrip path to example scripts (验证: local RPC status, roundtrip)
