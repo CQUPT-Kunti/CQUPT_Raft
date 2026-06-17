@@ -210,7 +210,7 @@
 **Independent Test**: validation matrix 中的每个故障/重启/重复/TTL/odd-voter 场景都有 CTest 或 local RPC example 入口。
 
 - [x] T099 [P] [US6] Fix View failover surviving node incorrectly reported as unavailable in `examples/object-storage-local-009-dynamic/rpc_demo.sh` and related failover validation (验证: `ViewFailoverScriptValidation`, `test_view_node_discovery`, local RPC `failover-view`)
-- [ ] T100 [P] [US6] Add StorageNode duplicate registration and stale heartbeat test in `tests/storage_heartbeat_registry_test.cpp` (验证: `storage_heartbeat_registry`)
+- [x] T100 [P] [US6] Add surviving ViewNode failover regression coverage in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `ctest --preset debug-tests -R "ViewFailover|FailoverView|ViewNode" --output-on-failure`)
 - [ ] T101 [P] [US6] Add identity damaged-file, type mismatch, and cluster mismatch coverage in `tests/node_identity_test.cpp` (验证: `test_node_identity`)
 - [ ] T102 [P] [US6] Add Metadata duplicate join request and idempotency/conflict test in `tests/metadata_client_scenario_test.cpp` (验证: `metadata_client_scenario_test`)
 - [ ] T103 [P] [US6] Add leader change during learner catch-up scenario in `tests/metadata_failover_test.cpp` (验证: `metadata_failover_test`)

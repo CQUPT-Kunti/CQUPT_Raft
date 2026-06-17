@@ -982,6 +982,15 @@ if(TARGET test_view_node_discovery)
       view_proto
   )
 endif()
+add_raft_gtest(view_failover_test
+  view_failover_test.cpp
+  "${RAFT_008_LABELS_VIEW_NODE}")
+if(TARGET view_failover_test)
+  target_link_libraries(view_failover_test
+    PRIVATE
+      view_proto
+  )
+endif()
 set(VIEW_FAILOVER_SCRIPT_TEST
   "${CMAKE_CURRENT_SOURCE_DIR}/view_failover_script_test.sh")
 if (EXISTS "${VIEW_FAILOVER_SCRIPT_TEST}")
