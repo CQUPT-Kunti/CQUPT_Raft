@@ -180,7 +180,7 @@
 - [x] T085 [US4] Promote two ready learners together and update quorum summary in `modules/raft/service/metadata_service_impl.cpp` (验证: `integrated_object_storage_quorum`)
 - [x] T086 [US4] Ensure batch promote handles concurrent or duplicate pending changes in `modules/raft/node/raft_node.cpp` (验证: `metadata_failover_test`, `integrated_object_storage_quorum`)
 - [x] T087 [US4] If safe batch promote cannot be finished in this milestone, document learner-only completion and blocked promote status in `specs/009-local-rpc-object-storage-stabilization/cross-task-risk-notes.md` (验证: `integrated_object_storage_quorum`)
-- [ ] T088 [US4] Record batch promote validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-09-batch-promote.md` (验证: `integrated_object_storage_quorum`, `metadata_failover_test`, `test_raft_snapshot_restart`)
+- [x] T088 [US4] Record batch promote validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-09-batch-promote.md` (验证: `integrated_object_storage_quorum`, `metadata_failover_test`, `test_raft_snapshot_restart`)
 
 ---
 
