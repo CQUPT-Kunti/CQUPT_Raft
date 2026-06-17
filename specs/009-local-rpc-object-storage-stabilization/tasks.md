@@ -190,7 +190,7 @@
 
 **Independent Test**: 用 example 脚本完成动态加入和真实 upload/download，不是静态配置后一键启动。
 
-- [ ] T089 [P] [US6] Add or extend 009 local RPC topology config under `examples/object-storage-local-3meta-6store/cluster.json` or a sibling 009 example config (验证: app targets build, local RPC startup)
+- [x] T089 [P] [US6] Add or extend 009 local RPC topology config under `examples/object-storage-local-3meta-6store/cluster.json` or a sibling 009 example config (验证: app targets build, local RPC startup)
 - [ ] T090 [P] [US6] Add 2-ViewNode startup support in `examples/object-storage-local-3meta-6store/qidong.sh` or a sibling 009 startup script (验证: local RPC startup)
 - [ ] T091 [P] [US6] Add matching shutdown support in `examples/object-storage-local-3meta-6store/tingzhi.sh` or a sibling 009 shutdown script (验证: local RPC shutdown)
 - [ ] T092 [US6] Add run-time StorageNode join command to `examples/object-storage-local-3meta-6store/rpc_demo.sh` or a sibling 009 script (验证: local RPC dynamic storage join)
