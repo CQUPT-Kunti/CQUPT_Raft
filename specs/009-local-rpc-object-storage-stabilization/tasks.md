@@ -226,7 +226,7 @@
 
 **Purpose**: 收口 009 交付状态、风险、验证矩阵和模块说明。
 
-- [ ] T109 [P] Update `specs/009-local-rpc-object-storage-stabilization/module-notes.md` with final responsibilities, state transitions, and misuse warnings (验证: module-notes reviewed against touched modules)
+- [x] T109 [P] Validate MetadataNode identity lifecycle boundary and failure scenarios in `tests/node_identity_test.cpp`, `tests/metadata_client_scenario_test.cpp`, and `specs/009-local-rpc-object-storage-stabilization/task-reports/t109-validate-metadatanode-identity-lifecycle-boundary-and-failure-scenarios.md` (验证: `test_node_identity`, `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure`)
 - [x] T110 [P] Validate MetadataNode identity restart and recovery lifecycle in `tests/node_identity_test.cpp` and `tests/metadata_client_scenario_test.cpp` (验证: `test_node_identity`, `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure`)
 - [x] T111 [P] Add end-to-end dynamic metadata node join validation in `tests/node_identity_test.cpp` and `tests/metadata_client_scenario_test.cpp` (验证: `test_node_identity`, `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure`)
 - [ ] T112 Add final task summary in `specs/009-local-rpc-object-storage-stabilization/task-reports/final-summary.md` (验证: all phase task reports referenced)

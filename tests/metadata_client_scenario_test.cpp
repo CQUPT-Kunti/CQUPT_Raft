@@ -434,6 +434,17 @@ namespace
     return buffer.str();
   }
 
+  void WriteRequiredTextFile(const std::filesystem::path &path,
+                             const std::string &content)
+  {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output.is_open()) << path.string();
+    output << content;
+    output.close();
+    ASSERT_TRUE(output.good()) << path.string();
+  }
+
   std::optional<std::string> ReadIdentityField(
       const std::filesystem::path &path,
       const std::string &field_name)
@@ -3069,6 +3080,178 @@ TEST_F(MetadataClientScenarioTest,
   EXPECT_EQ(snapshot_it->metadata().raft_id(), 1);
   EXPECT_EQ(snapshot_it->metadata().membership_state(),
             view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsCorruptPersistedIdentityWithoutSilentRewrite)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-corrupt";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7816";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_corrupt");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string corrupt_identity =
+      "not-a-valid-node-identity\nmissing-equals-line\n";
+  WriteRequiredTextFile(identity_path, corrupt_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_corrupt");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), corrupt_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedStorageIdentityRoleMismatch)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-node-type";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7815";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_node_type");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string wrong_role_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-node-type\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=storage\n"
+      "raft_id=\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=non_raft\n"
+      "persistent_generation=1\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, wrong_role_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_node_type");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "node_type mismatch")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), wrong_role_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedInvalidMembershipState)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-membership";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7814";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_membership");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string invalid_membership_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-membership\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=metadata\n"
+      "raft_id=1\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=not-a-valid-state\n"
+      "persistent_generation=1\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, invalid_membership_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_membership");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "membership_state")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), invalid_membership_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedInvalidPersistentGeneration)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-generation";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7817";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_generation");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string invalid_generation_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-generation\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=metadata\n"
+      "raft_id=1\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=voter\n"
+      "persistent_generation=0\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, invalid_generation_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_generation");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "persistent_generation")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), invalid_generation_identity);
 #endif
 }
 
