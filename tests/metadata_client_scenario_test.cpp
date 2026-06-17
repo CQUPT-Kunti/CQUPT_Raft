@@ -2959,6 +2959,120 @@ TEST_F(MetadataClientScenarioTest,
 }
 
 TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapConsistencyRepeatStartReusesPersistedIdentity)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app bootstrap consistency is only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t108-bootstrap-consistency";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7818";
+
+  const auto scenario_dir = MakeScenarioDirectory("t108_bootstrap_consistency");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+
+  const TimedProcessRunResult first_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t108_bootstrap_first_start",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGTERM);
+
+  ASSERT_EQ(first_run.exit_code, 0) << first_run.output;
+  ASSERT_TRUE(first_run.matched_required_output) << first_run.output;
+  EXPECT_TRUE(first_run.terminated_by_test);
+  ASSERT_TRUE(std::filesystem::exists(identity_path)) << identity_path.string();
+
+  const auto first_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto first_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto first_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto first_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto first_source = ReadIdentityField(identity_path, "source");
+  const auto first_raft_id = ReadIdentityField(identity_path, "raft_id");
+  const std::string first_identity_content =
+      ReadRequiredTextFile(identity_path);
+  ASSERT_TRUE(first_node_id.has_value());
+  ASSERT_TRUE(first_node_type.has_value());
+  ASSERT_TRUE(first_membership_state.has_value());
+  ASSERT_TRUE(first_generation.has_value());
+  ASSERT_TRUE(first_source.has_value());
+  ASSERT_TRUE(first_raft_id.has_value());
+  EXPECT_EQ(*first_node_id, kBootstrapNodeId);
+  EXPECT_EQ(*first_node_type, "metadata");
+  EXPECT_EQ(*first_membership_state, "voter");
+  EXPECT_EQ(*first_generation, "1");
+  EXPECT_EQ(*first_source, "config_generator");
+  EXPECT_EQ(*first_raft_id, "1");
+
+  const TimedProcessRunResult second_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t108_bootstrap_second_start",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGTERM);
+
+  ASSERT_EQ(second_run.exit_code, 0) << second_run.output;
+  ASSERT_TRUE(second_run.matched_required_output) << second_run.output;
+  EXPECT_TRUE(second_run.terminated_by_test);
+
+  const auto second_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto second_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto second_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto second_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto second_source = ReadIdentityField(identity_path, "source");
+  const auto second_raft_id = ReadIdentityField(identity_path, "raft_id");
+  ASSERT_TRUE(second_node_id.has_value());
+  ASSERT_TRUE(second_node_type.has_value());
+  ASSERT_TRUE(second_membership_state.has_value());
+  ASSERT_TRUE(second_generation.has_value());
+  ASSERT_TRUE(second_source.has_value());
+  ASSERT_TRUE(second_raft_id.has_value());
+  EXPECT_EQ(*second_node_id, *first_node_id);
+  EXPECT_EQ(*second_node_type, *first_node_type);
+  EXPECT_EQ(*second_membership_state, *first_membership_state);
+  EXPECT_EQ(*second_generation, *first_generation);
+  EXPECT_EQ(*second_source, *first_source);
+  EXPECT_EQ(*second_raft_id, *first_raft_id);
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), first_identity_content);
+
+  const auto cluster_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(cluster_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << cluster_view.summary().message();
+  const auto snapshot_it =
+      std::find_if(cluster_view.metadata_nodes().begin(),
+                   cluster_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-bootstrap-1";
+                   });
+  ASSERT_NE(snapshot_it, cluster_view.metadata_nodes().end());
+  ASSERT_TRUE(snapshot_it->has_metadata());
+  EXPECT_EQ(snapshot_it->endpoint(), kBootstrapEndpoint);
+  EXPECT_EQ(snapshot_it->metadata().raft_id(), 1);
+  EXPECT_EQ(snapshot_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
        MetadataNodeBootstrapRestartRecoveryReusesIdentityAfterForcedExit)
 {
 #ifdef _WIN32

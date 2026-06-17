@@ -218,7 +218,7 @@
 - [x] T105 [P] [US6] Final ViewNode self-refresh and peer-sync contract validation in `contracts/view-node-self-refresh-and-peer-sync.md`, `tests/view_node_discovery_test.cpp`, `tests/view_failover_test.cpp`, `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md`, and `specs/009-local-rpc-object-storage-stabilization/module-notes.md` (验证: `test_view_node_discovery`, `view_failover_test`, `ctest --preset debug-tests -R "ViewNode|ViewFailover" --output-on-failure`)
 - [x] T106 [US6] Final phase validation and stabilization report for `009-local-rpc-object-storage-stabilization` in `specs/009-local-rpc-object-storage-stabilization/task-reports/t106-final-phase-validation-and-stabilization-report.md` (验证: existing task reports, `validation-matrix.md`, `module-notes.md`, `contracts/*`, `tasks.md`)
 - [x] T107 [US6] Update `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` with actual test names and skipped platform items (验证: validation matrix complete)
-- [ ] T108 [US6] Record stability matrix validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-11-stability-matrix.md` (验证: relevant CTest names and local RPC scripts)
+- [x] T108 [US6] Validate MetadataNode identity persistence and bootstrap consistency in `tests/node_identity_test.cpp`, `tests/metadata_client_scenario_test.cpp`, and `specs/009-local-rpc-object-storage-stabilization/task-reports/t108-validate-metadatanode-identity-persistence-and-bootstrap-consistency.md` (验证: `test_node_identity`, `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure`)
 
 ---
 
