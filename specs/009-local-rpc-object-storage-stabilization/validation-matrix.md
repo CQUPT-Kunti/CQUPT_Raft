@@ -283,3 +283,40 @@
   - long-running failover / soak
   - multi-ViewNode discovery interaction with promote target selection runtime smoke
   - joint consensus implementation / protocol-level validation
+
+## US6 Phase 10 Local RPC Example Log Path Snapshot
+
+- Linux minimal smoke:
+  - script entry:
+    - `examples/object-storage-local-009-dynamic/qidong.sh`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/tingzhi.sh`
+  - result: PASS
+  - logs:
+    - `tmp/test-logs/t096-check-ignore.log`
+    - `tmp/test-logs/t096-git-status-ignored.log`
+    - `tmp/test-logs/t096-status.log`
+    - `tmp/test-logs/t096-cleanup.log`
+    - `tmp/test-logs/t096-summary.log`
+
+- Confirmed local ignored paths:
+  - process logs: `examples/object-storage-local-009-dynamic/logs/`
+  - pid files: `examples/object-storage-local-009-dynamic/pids/`
+  - validation command outputs: `tmp/test-logs/`
+
+- Covered Phase 10 log/output areas:
+  - `view-1` / `view-2` / `meta-1..3` / `store-1..6` process logs are split into dedicated files
+  - dynamic `store-7` / `meta-4` / `meta-5` keep the same per-node log naming convention when started
+  - failover temporary client config stays under local ignored path:
+    - `examples/object-storage-local-009-dynamic/logs/failover-view-2-client.json`
+  - command outputs for startup / shutdown / status / join / promote / failover remain traceable through `tmp/test-logs/t09x-*.log`
+  - task reports can summarize these outputs without embedding full node logs
+
+- Current boundary:
+  - runtime `data_dir` / identity / snapshot / chunk data remain local runtime artifacts and are not copied into task reports
+  - no production code changes were required for T096
+
+- Skipped in T096:
+  - Windows validation
+  - macOS validation
+  - extended roundtrip / failover rerun beyond minimal smoke
