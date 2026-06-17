@@ -33,7 +33,7 @@
 | 009 Area | Test File | Build Target | 真实 CTest 入口 | Custom Target | 已确认 Label | 后续任务建议入口 |
 |----------|-----------|--------------|-----------------|---------------|---------------|------------------|
 | ViewNode registry / self refresh / peer sync | `tests/view_node_discovery_test.cpp` | `test_view_node_discovery` | `ViewNodeDiscoveryTest.*` | 未确认到 | `integrated-object-storage`, `view-node`, `platform-neutral` | T018-T044、T099：build 用 `test_view_node_discovery`；CTest 用 `-L view-node` 或 `-R '^ViewNodeDiscoveryTest\\.'` |
-| ViewNode failover survivor availability regression | `tests/view_failover_test.cpp` | `view_failover_test` | `ViewFailoverTest.*` | 未确认到 | `integrated-object-storage`, `view-node`, `platform-neutral` | T100-T101：build 用 `view_failover_test`；CTest 用 `-R '^ViewFailoverTest\\.'` 或 `-R 'ViewFailover|FailoverView|ViewNode'` |
+| ViewNode failover survivor availability regression | `tests/view_failover_test.cpp` | `view_failover_test` | `ViewFailoverTest.*` | 未确认到 | `integrated-object-storage`, `view-node`, `platform-neutral` | T100-T102：build 用 `view_failover_test`；CTest 用 `-R '^ViewFailoverTest\\.'` 或 `-R 'ViewFailover|FailoverView|ViewNode'` |
 | Identity lifecycle | `tests/node_identity_test.cpp` | `test_node_identity` | `NodeIdentityTest.*` | 未确认到 | `integrated-object-storage`, `node-identity`, `platform-neutral`, `durability-boundary`, `windows-adaptation` | T006-T017、T029：build 用 `test_node_identity`；CTest 用 `-L node-identity` 或 `-R '^NodeIdentityTest\\.'` |
 | Cluster config | `tests/cluster_config_test.cpp` | `cluster_config_test` | `cluster_config_generation_test.*`, `cluster_config_validation_test.*`, `cluster_config_endpoint_allocation_test.*`, `cluster_config_resolution_test.*`, `cluster_config_quorum_helper_test.*` | 未确认到 | `integrated-object-storage`, `platform-neutral` | T008、T016、T038：build 用 `cluster_config_test`；CTest 用 `-R '^cluster_config_'` |
 | StorageNode heartbeat / registry | `tests/storage_heartbeat_registry_test.cpp` | `test_storage_heartbeat_registry` | `storage_heartbeat_registry` | 未确认到 | `storage-node`, `platform-neutral` | T045-T047、T049-T050：build 用 `test_storage_heartbeat_registry`；CTest 可直接用 `-R '^storage_heartbeat_registry$'` |
@@ -46,7 +46,7 @@
 | Raft snapshot catch-up | `tests/test_raft_snapshot_catchup.cpp` | `test_raft_snapshot_catchup` | `RaftSnapshotCatchupTest.*` | 未确认到 | `platform-neutral` | T067、T075、T077：build 用 `test_raft_snapshot_catchup`；CTest 用 `-R '^RaftSnapshotCatchupTest\\.'` |
 | Raft restart / snapshot recovery | `tests/test_raft_snapshot_restart.cpp` | `test_raft_snapshot_restart` | `RaftSnapshotRestartTest.*`, `RaftSnapshotRecoveryTest.*` | 未确认到 | `platform-neutral`, `durability-boundary`, `linux-specific-failure-injection` | T075、T081、T083、T088：build 用 `test_raft_snapshot_restart`；CTest 用 `-R '^(RaftSnapshotRestartTest|RaftSnapshotRecoveryTest)\\.'` |
 | Metadata failover | `tests/metadata_failover_test.cpp` | `test_metadata_failover` | `MetadataFailoverTest.*` | 未确认到 | `platform-neutral` | T080、T086、T103：build 用 `test_metadata_failover`；CTest 用 `-R '^MetadataFailoverTest\\.'` |
-| Metadata client scenario | `tests/metadata_client_scenario_test.cpp` | `test_metadata_client_scenario` | `MetadataClientScenarioTest.*` | 未确认到 | `platform-neutral` | T102：build 用 `test_metadata_client_scenario`；CTest 用 `-R '^MetadataClientScenarioTest\\.'` |
+| Metadata client scenario | `tests/metadata_client_scenario_test.cpp` | `test_metadata_client_scenario` | `MetadataClientScenarioTest.*` | 未确认到 | `platform-neutral` | 后续元数据客户端冲突/幂等回归：build 用 `test_metadata_client_scenario`；CTest 用 `-R '^MetadataClientScenarioTest\\.'` |
 
 ## Label Confirmation
 
@@ -86,7 +86,7 @@
 | Single-View incarnation-aware merge ordering | `tests/view_node_discovery_test.cpp` | Higher incarnation wins, same-incarnation higher sequence wins, `observed_time` alone cannot override newer live state; service/client adapter still exposes incarnation/sequence facts |
 | Dual ViewNode sync | ViewNode discovery/peer sync test | State registered on one ViewNode appears on peer after sync |
 | Old incarnation rejected | ViewNode discovery/peer sync test | Older incarnation cannot override newer incarnation even with newer observed_time |
-| ViewNode failover | `tests/view_node_discovery_test.cpp`, `tests/view_failover_test.cpp`, `ViewFailoverScriptValidation`, `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` | surviving ViewNode stays available even if peer sync continues failing; `GetClusterView()` remains `OK`; discovery/status remain usable; cluster degraded or partial must not be interpreted as node unavailable |
+| ViewNode failover | `tests/view_node_discovery_test.cpp`, `tests/view_failover_test.cpp`, `ViewFailoverScriptValidation`, `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` | surviving ViewNode stays available even if peer sync continues failing; self refresh and peer sync must not overwrite live observed state; recovered ViewNode must re-converge through peer sync; `GetClusterView()` remains `OK`; discovery/status remain usable; cluster degraded or partial must not be interpreted as node unavailable |
 | ViewNode registry restart recovery boundary | `modules/view/module-notes.md`, feature `module-notes.md` | Current phase explicitly documents memory-only restart recovery; registry persistence remains future work and Windows/macOS restart validation stays pending |
 | StorageNode first start | `tests/node_identity_test.cpp`, storage dynamic join test | identity_file created, node_id persisted |
 | StorageNode restart | `tests/storage_heartbeat_registry_test.cpp` | Same node_id, new incarnation, stale old updates rejected |
@@ -430,3 +430,33 @@
   - macOS runtime validation
   - long-running peer sync disconnect/retry soak
   - restart-after-failover registry rehydration beyond the current memory-only boundary
+
+## T102 Multi-View Self-Refresh / Peer-Sync / Failover Closure Snapshot
+
+- Linux targeted validation:
+  - build targets:
+    - `view_failover_test`
+    - `test_view_node_discovery`
+  - ctest regex:
+    - `ViewFailover|ViewNode`
+  - result: PASS (`39/39`)
+  - logs:
+    - `tmp/test-logs/t102-view-build.log`
+    - `tmp/test-logs/t102-view-ctest.log`
+
+- New regression coverage added in T102:
+  - `ViewFailoverTest.MultiViewSelfRefreshAndPeerSyncPreserveAvailabilityAcrossFailover`
+  - `ViewFailoverTest.RecoveredViewNodePeerSyncReconvergesWithoutOverwritingLiveState`
+
+- Covered multi-View semantics:
+  - self refresh state is not overwritten by stale peer-synced view records
+  - peer sync does not propagate `unavailable` to a live surviving ViewNode
+  - failover after peer sync still keeps surviving ViewNode available
+  - registry metadata/storage facts continue to synchronize through peer snapshots
+  - recovered ViewNode re-joins and converges back to `live` through peer sync
+  - `GetClusterView()`, `DiscoverMetadata()`, and `DiscoverStorage()` remain usable during failover and after re-convergence
+
+- Still not covered by T102:
+  - Windows runtime validation
+  - macOS runtime validation
+  - long-running multi-View soak / repeated disconnect-retry cycles
