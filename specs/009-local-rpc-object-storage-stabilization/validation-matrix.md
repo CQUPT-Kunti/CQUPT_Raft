@@ -320,3 +320,70 @@
   - Windows validation
   - macOS validation
   - extended roundtrip / failover rerun beyond minimal smoke
+
+## US6 Phase 10 Local RPC Dynamic Validation Snapshot
+
+- Linux full dynamic example:
+  - script entry:
+    - `examples/object-storage-local-009-dynamic/qidong.sh`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh roundtrip`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh join-storage`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh roundtrip`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh join-metadata-learner`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh promote-metadata-learner`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh join-metadata-learner-2`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh promote-metadata-learners`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh status`
+    - `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view`
+  - result: FAIL
+  - logs:
+    - `tmp/test-logs/t098-startup.log`
+    - `tmp/test-logs/t098-status-01.log`
+    - `tmp/test-logs/t098-roundtrip-01.log`
+    - `tmp/test-logs/t098-join-storage.log`
+    - `tmp/test-logs/t098-status-02.log`
+    - `tmp/test-logs/t098-roundtrip-02.log`
+    - `tmp/test-logs/t098-join-metadata-learner.log`
+    - `tmp/test-logs/t098-status-03.log`
+    - `tmp/test-logs/t098-promote-metadata-learner.log`
+    - `tmp/test-logs/t098-status-04.log`
+    - `tmp/test-logs/t098-join-metadata-learner-2.log`
+    - `tmp/test-logs/t098-status-05.log`
+    - `tmp/test-logs/t098-promote-metadata-learners.log`
+    - `tmp/test-logs/t098-status-06.log`
+    - `tmp/test-logs/t098-failover-view.log`
+    - `tmp/test-logs/t098-cleanup.log`
+
+- Passed Phase 10 runtime areas:
+  - `2 ViewNodes + 3 Metadata voters + 6 StorageNodes` startup
+  - initial `status`
+  - initial real `roundtrip`
+  - runtime `store-7` join and `storage_nodes=7` observation
+  - post-join `status`
+  - post-join real `roundtrip`
+  - runtime `meta-4` learner join
+  - single learner blocked promote with committed voters `3` and quorum `2`
+  - runtime `meta-5` learner join
+  - batch promote observation with committed voters `5`, quorum `3`, and no observed committed `4-voter` state
+
+- Failed Phase 10 runtime area:
+  - `rpc_demo.sh failover-view`
+    - failure summary:
+      - `surviving_view_status_unavailable`
+      - `wait_seconds=30`
+    - consequence:
+      - failover 之后的独立 `status` / `roundtrip` 步骤未进入 PASS 结论
+
+- Current boundary:
+  - batch promote runtime path is now observed in the local RPC example
+  - ViewNode failover runtime path is not yet stable enough to close Phase 10
+
+- Pending in T098:
+  - Windows validation
+  - macOS validation
+  - failover-after-batch-promote runtime stabilization

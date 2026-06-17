@@ -95,3 +95,15 @@ Mitigation: Keep `JoinMetadataCluster` as the current minimal routing boundary f
 Risk: T086 now confirms the current `3 voters + 2 ready learners -> committed 5 voters` boundary on Linux targeted CTest, including no committed `4-voter` history, blocked single-learner promote, failover safety, restart recovery, and committed-voters-only quorum. However, the evidence is still scoped to targeted tests. The repository still lacks joint consensus, long-running failover / duplicate-request soak, Phase 10 local RPC dynamic metadata join + batch promote smoke, multi-ViewNode runtime observation/promote interaction coverage, and Windows/macOS real-machine validation.
 
 Mitigation: Treat the current PASS as closure of the targeted US4 safety boundary, not as full runtime or cross-platform completion. Preserve the rule that ViewNode observation is never membership authority and that committed membership only changes through the Raft log / committed config path. Track local RPC workflow validation, broader failover soak, and Windows/macOS runs as separate follow-up work.
+
+## R22: ViewNode Failover Can Be Falsely Marked Unavailable By Baseline-Count Script Logic
+
+Risk: `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` previously equated “surviving view ready” with the baseline topology counts `metadata_nodes=3` and `storage_nodes=6`. After dynamic `store-7` join and `meta-4/meta-5` promotion, the real survivor-side `status OK` snapshot already showed `target_endpoint=127.0.0.1:8302`, `view-2 liveness=live`, `view-2 health=healthy`, `metadata_nodes=5`, and `storage_nodes=7`, but the hard-coded `3/6` check still returned failure and produced `surviving_view_status_unavailable`.
+
+Mitigation: Validate failover readiness by survivor endpoint + survivor self live/not-unavailable status + current summary-consistent metadata/storage live counts, instead of fixed baseline counts. Keep `peer sync` connection-refused/backoff diagnostics visible, but do not let them imply self unavailable. Guard this with `ViewFailoverScriptValidation`.
+
+## R23: Example Runtime State Leakage Can Pollute Dynamic Join Reruns
+
+Risk: Re-running the 009 local RPC example without resetting runtime state can leave previously promoted committed membership in example data directories. A later “fresh” rerun may then fail at `join-metadata-learner` with diagnostics such as `candidate_raft_id already exists in committed voter set`, even though the current fix is unrelated to metadata join logic. This can block clean full-sequence validation and confuse Phase 10/T098 follow-up work.
+
+Mitigation: Treat example-node data directories as runtime state, not source truth. Before claiming a clean full-sequence rerun, reset the example runtime state or use a fresh data root so learner-join and batch-promote validation start from the intended initial `3`-voter membership.

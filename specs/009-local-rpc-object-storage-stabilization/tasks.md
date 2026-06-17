@@ -198,7 +198,7 @@
 - [x] T094 [US6] Add second learner join and batch promote observation in example scripts (验证: local RPC metadata join, quorum status)
 - [x] T095 [US6] Add ViewNode failover status and roundtrip path to example scripts (验证: local RPC status, roundtrip)
 - [x] T096 [US6] Ensure example logs are written under an ignored/local log path and summarized in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-10-local-rpc-example.md` (验证: project test-log rules)
-- [ ] T097 [US6] Run targeted app build for `view_node_app metadata_node_app storage_node_app storage_client raft_metadata_client` before local RPC validation (验证: targeted CMake build)
+- [x] T097 [US6] Run targeted app build for `view_node_app metadata_node_app storage_node_app storage_client raft_metadata_client` before local RPC validation (验证: targeted CMake build)
 - [ ] T098 [US6] Record local RPC dynamic validation results in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-10-local-rpc-example.md` (验证: `qidong.sh`, `rpc_demo.sh status`, `rpc_demo.sh roundtrip`, `tingzhi.sh`)
 
 ---

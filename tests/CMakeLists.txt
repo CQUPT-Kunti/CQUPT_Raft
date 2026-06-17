@@ -982,6 +982,18 @@ if(TARGET test_view_node_discovery)
       view_proto
   )
 endif()
+set(VIEW_FAILOVER_SCRIPT_TEST
+  "${CMAKE_CURRENT_SOURCE_DIR}/view_failover_script_test.sh")
+if (EXISTS "${VIEW_FAILOVER_SCRIPT_TEST}")
+  add_test(NAME ViewFailoverScriptValidation
+    COMMAND bash "${VIEW_FAILOVER_SCRIPT_TEST}"
+      "${CMAKE_SOURCE_DIR}/examples/object-storage-local-009-dynamic/rpc_demo.sh"
+  )
+  set_tests_properties(ViewFailoverScriptValidation PROPERTIES
+    LABELS "view-node;linux-primary-diagnosis")
+else()
+  message(STATUS "Skip ViewFailoverScriptValidation: view_failover_script_test.sh not found")
+endif()
 add_raft_gtest(test_node_identity
   node_identity_test.cpp
   "${RAFT_008_LABELS_NODE_IDENTITY}")
