@@ -33,9 +33,10 @@
 | 009 Area | Test File | Build Target | 真实 CTest 入口 | Custom Target | 已确认 Label | 后续任务建议入口 |
 |----------|-----------|--------------|-----------------|---------------|---------------|------------------|
 | ViewNode registry / self refresh / peer sync | `tests/view_node_discovery_test.cpp` | `test_view_node_discovery` | `ViewNodeDiscoveryTest.*` | 未确认到 | `integrated-object-storage`, `view-node`, `platform-neutral` | T018-T044、T099：build 用 `test_view_node_discovery`；CTest 用 `-L view-node` 或 `-R '^ViewNodeDiscoveryTest\\.'` |
-| Identity lifecycle | `tests/node_identity_test.cpp` | `test_node_identity` | `NodeIdentityTest.*` | 未确认到 | `integrated-object-storage`, `node-identity`, `platform-neutral`, `durability-boundary`, `windows-adaptation` | T006-T017、T029、T101：build 用 `test_node_identity`；CTest 用 `-L node-identity` 或 `-R '^NodeIdentityTest\\.'` |
+| ViewNode failover survivor availability regression | `tests/view_failover_test.cpp` | `view_failover_test` | `ViewFailoverTest.*` | 未确认到 | `integrated-object-storage`, `view-node`, `platform-neutral` | T100-T101：build 用 `view_failover_test`；CTest 用 `-R '^ViewFailoverTest\\.'` 或 `-R 'ViewFailover|FailoverView|ViewNode'` |
+| Identity lifecycle | `tests/node_identity_test.cpp` | `test_node_identity` | `NodeIdentityTest.*` | 未确认到 | `integrated-object-storage`, `node-identity`, `platform-neutral`, `durability-boundary`, `windows-adaptation` | T006-T017、T029：build 用 `test_node_identity`；CTest 用 `-L node-identity` 或 `-R '^NodeIdentityTest\\.'` |
 | Cluster config | `tests/cluster_config_test.cpp` | `cluster_config_test` | `cluster_config_generation_test.*`, `cluster_config_validation_test.*`, `cluster_config_endpoint_allocation_test.*`, `cluster_config_resolution_test.*`, `cluster_config_quorum_helper_test.*` | 未确认到 | `integrated-object-storage`, `platform-neutral` | T008、T016、T038：build 用 `cluster_config_test`；CTest 用 `-R '^cluster_config_'` |
-| StorageNode heartbeat / registry | `tests/storage_heartbeat_registry_test.cpp` | `test_storage_heartbeat_registry` | `storage_heartbeat_registry` | 未确认到 | `storage-node`, `platform-neutral` | T045-T047、T049-T050、T100：build 用 `test_storage_heartbeat_registry`；CTest 可直接用 `-R '^storage_heartbeat_registry$'` |
+| StorageNode heartbeat / registry | `tests/storage_heartbeat_registry_test.cpp` | `test_storage_heartbeat_registry` | `storage_heartbeat_registry` | 未确认到 | `storage-node`, `platform-neutral` | T045-T047、T049-T050：build 用 `test_storage_heartbeat_registry`；CTest 可直接用 `-R '^storage_heartbeat_registry$'` |
 | Integrated object storage e2e | `tests/integrated_object_storage_e2e_test.cpp` | `test_integrated_object_storage_e2e` | `IntegratedObjectStorageE2ETest.*` | `integrated_object_storage_e2e` | `integrated-object-storage`, `integrated-object-storage-e2e`, `storage-transfer`, `platform-neutral`, `linux-primary-diagnosis` | T048、T051、T089-T098：build 可用 `test_integrated_object_storage_e2e` 或 `integrated_object_storage_e2e`；CTest 用 `-L integrated-object-storage-e2e` 或 `-R '^IntegratedObjectStorageE2ETest\\.'` |
 | Integrated object storage quorum | `tests/integrated_object_storage_quorum_test.cpp` | `test_integrated_object_storage_quorum` | `IntegratedObjectStorageQuorumTest.*` | `integrated_object_storage_quorum` | `integrated-object-storage`, `integrated-object-storage-quorum`, `platform-neutral` | T069-T070、T078-T086、T104-T105、T114：build 可用 `test_integrated_object_storage_quorum` 或 `integrated_object_storage_quorum`；CTest 用 `-L integrated-object-storage-quorum` 或 `-R '^IntegratedObjectStorageQuorumTest\\.'` |
 | Integrated object storage recovery | `tests/integrated_object_storage_recovery_test.cpp` | `test_integrated_object_storage_recovery` | `integrated_object_storage_recovery.IntegratedObjectStorageRecoveryTest.*` | `integrated_object_storage_recovery` | `integrated-object-storage`, `integrated-object-storage-recovery`, `storage-transfer`, `storage-node`, `storage-node-recovery`, `durability-boundary`, `linux-primary-diagnosis` | 009 recovery / cleanup 相关回归：build 可用 `test_integrated_object_storage_recovery` 或 `integrated_object_storage_recovery`；CTest 用 `-L integrated-object-storage-recovery` 或 `-R '^integrated_object_storage_recovery\\.'` |
@@ -85,7 +86,7 @@
 | Single-View incarnation-aware merge ordering | `tests/view_node_discovery_test.cpp` | Higher incarnation wins, same-incarnation higher sequence wins, `observed_time` alone cannot override newer live state; service/client adapter still exposes incarnation/sequence facts |
 | Dual ViewNode sync | ViewNode discovery/peer sync test | State registered on one ViewNode appears on peer after sync |
 | Old incarnation rejected | ViewNode discovery/peer sync test | Older incarnation cannot override newer incarnation even with newer observed_time |
-| ViewNode failover | local RPC example or integration test | Client discovers metadata/storage through surviving ViewNode |
+| ViewNode failover | `tests/view_node_discovery_test.cpp`, `tests/view_failover_test.cpp`, `ViewFailoverScriptValidation`, `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` | surviving ViewNode stays available even if peer sync continues failing; `GetClusterView()` remains `OK`; discovery/status remain usable; cluster degraded or partial must not be interpreted as node unavailable |
 | ViewNode registry restart recovery boundary | `modules/view/module-notes.md`, feature `module-notes.md` | Current phase explicitly documents memory-only restart recovery; registry persistence remains future work and Windows/macOS restart validation stays pending |
 | StorageNode first start | `tests/node_identity_test.cpp`, storage dynamic join test | identity_file created, node_id persisted |
 | StorageNode restart | `tests/storage_heartbeat_registry_test.cpp` | Same node_id, new incarnation, stale old updates rejected |
@@ -387,3 +388,45 @@
   - Windows validation
   - macOS validation
   - failover-after-batch-promote runtime stabilization
+
+## T099-T101 ViewNode Failover Stabilization Closure Snapshot
+
+- Historical context:
+  - T098 captured a real local RPC failover-view failure with `reason=surviving_view_status_unavailable`
+  - T099 confirmed the false negative came from over-strict script readiness gates rather than `modules/view/*` propagating `peer sync failure -> self unavailable`
+  - T100 added dedicated regression coverage so this boundary is no longer protected only by script assertions
+
+- Linux validation evidence reused by T101:
+  - T099:
+    - targeted build: PASS
+    - targeted CTest `ViewFailover|FailoverView|ViewNode`: PASS
+    - `ViewFailoverScriptValidation`: PASS
+    - local RPC `rpc_demo.sh failover-view`: PASS
+    - logs:
+      - `tmp/test-logs/t099-build.log`
+      - `tmp/test-logs/t099-ctest.log`
+      - `tmp/test-logs/t099-view-failover-script.log`
+      - `tmp/test-logs/t099-failover-view.log`
+  - T100:
+    - build target: `view_failover_test`
+    - targeted CTest `ViewFailover|FailoverView|ViewNode`: PASS (`37/37`)
+    - logs:
+      - `tmp/test-logs/t100-view-failover-build.log`
+      - `tmp/test-logs/t100-view-failover-ctest.log`
+
+- Covered stabilization semantics:
+  - `peer sync` connection-refused / backoff diagnostics remain visible
+  - `peer sync failure` does not imply self unavailable
+  - surviving ViewNode remains `liveness=live`
+  - surviving ViewNode may be `healthy` or `degraded`, but not misclassified as `unavailable`
+  - `GetClusterView()` remains `kOk`
+  - `DiscoverMetadata()` remains available through the surviving ViewNode
+  - partial storage registry may legitimately yield `kNotFound`
+  - `cluster degraded` / `partial` must not propagate into `node unavailable`
+  - ViewNode remains observation/discovery only and is not membership authority
+
+- Still not covered by this closure:
+  - Windows runtime validation
+  - macOS runtime validation
+  - long-running peer sync disconnect/retry soak
+  - restart-after-failover registry rehydration beyond the current memory-only boundary
