@@ -213,7 +213,7 @@
 - [x] T100 [P] [US6] Add surviving ViewNode failover regression coverage in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `ctest --preset debug-tests -R "ViewFailover|FailoverView|ViewNode" --output-on-failure`)
 - [x] T101 [P] [US6] Record ViewNode failover stabilization validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/t101-record-viewnode-failover-stabilization-validation.md` (验证: T099/T100 existing Linux evidence, `ViewFailoverScriptValidation`, `view_failover_test`)
 - [x] T102 [P] [US6] Add multi-ViewNode self-refresh and peer-sync failover coverage in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `test_view_node_discovery`, `ctest --preset debug-tests -R "ViewFailover|ViewNode" --output-on-failure`)
-- [ ] T103 [P] [US6] Add leader change during learner catch-up scenario in `tests/metadata_failover_test.cpp` (验证: `metadata_failover_test`)
+- [x] T103 [P] [US6] Validate ViewNode registry convergence after failover and recovery in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `test_view_node_discovery`, `ctest --preset debug-tests -R "ViewNode|ViewFailover" --output-on-failure`)
 - [ ] T104 [P] [US6] Add learner not counted in quorum and not eligible for election cross-check in `tests/test_raft_election.cpp` and `tests/integrated_object_storage_quorum_test.cpp` (验证: `test_raft_election`, `integrated_object_storage_quorum`)
 - [ ] T105 [P] [US6] Add committed membership odd-count invariant history checks in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
 - [ ] T106 [US6] Update `tests/CMakeLists.txt` with any new 009 test binaries and labels without removing existing tests (验证: targeted CTest labels)

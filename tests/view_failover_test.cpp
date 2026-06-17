@@ -329,34 +329,56 @@ namespace
         ASSERT_TRUE(result.result.applied);
     }
 
-    void SyncPeerSnapshotOrAssert(RunningViewNodeDiscoveryService &source,
-                                  RunningViewNodeDiscoveryService &peer,
-                                  const std::string &request_prefix)
+    auto PullPeerSnapshotOrAssert(RunningViewNodeDiscoveryService &source,
+                                  const std::string &request_id)
+        -> viewdemo::ViewNodeClientPullPeerViewSnapshotResult
     {
         PullPeerViewSnapshotRequest pull_request;
-        pull_request.request_id = request_prefix + "-pull";
+        pull_request.request_id = request_id;
         pull_request.cluster_id = kClusterId;
         pull_request.include_dead_nodes = true;
         pull_request.include_warnings = true;
 
         const auto pull_result = source.client().PullPeerViewSnapshot(pull_request);
-        ASSERT_TRUE(pull_result.transport_ok());
-        ASSERT_EQ(pull_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(pull_result.transport_ok());
+        EXPECT_EQ(pull_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        return pull_result;
+    }
 
+    auto PushPeerSnapshotOrAssert(RunningViewNodeDiscoveryService &peer,
+                                  viewdemo::ViewPeerSyncSnapshot snapshot,
+                                  const std::string &request_id)
+        -> viewdemo::ViewNodeClientPushPeerViewSnapshotResult
+    {
         PushPeerViewSnapshotRequest push_request;
-        push_request.request_id = request_prefix + "-push";
+        push_request.request_id = request_id;
         push_request.cluster_id = kClusterId;
-        push_request.snapshot = pull_result.result.snapshot;
+        push_request.snapshot = std::move(snapshot);
 
         const auto push_result = peer.client().PushPeerViewSnapshot(push_request);
-        ASSERT_TRUE(push_result.transport_ok());
-        ASSERT_EQ(push_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_TRUE(push_result.transport_ok());
+        EXPECT_EQ(push_result.result.summary.status, ViewRegistryStatusCode::kOk);
+        return push_result;
+    }
+
+    auto SyncPeerSnapshotOrAssert(RunningViewNodeDiscoveryService &source,
+                                  RunningViewNodeDiscoveryService &peer,
+                                  const std::string &request_prefix)
+        -> viewdemo::ViewNodeClientPushPeerViewSnapshotResult
+    {
+        const auto pull_result =
+            PullPeerSnapshotOrAssert(source, request_prefix + "-pull");
+        const auto push_result =
+            PushPeerSnapshotOrAssert(peer,
+                                     pull_result.result.snapshot,
+                                     request_prefix + "-push");
         EXPECT_EQ(push_result.result.received_node_count,
                   pull_result.result.snapshot.view_nodes.size() +
                       pull_result.result.snapshot.metadata_nodes.size() +
                       pull_result.result.snapshot.storage_nodes.size());
         EXPECT_TRUE(ContainsDiagnosticCode(push_result.result.diagnostics,
                                            ViewRegistryIssueCode::kNonAuthorityBoundary));
+        return push_result;
     }
 
     TEST(ViewFailoverTest,
@@ -1059,5 +1081,288 @@ namespace
         EXPECT_EQ(storage_result.result.storage_nodes[0].capacity
                       .available_capacity_bytes,
                   40'960U);
+    }
+
+    TEST(ViewFailoverTest,
+         RegistryConvergesAcrossViewNodesAfterFailoverRecoveryAndPeerSync)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+
+        RunningViewNodeDiscoveryService primary(config, 180);
+        RunningViewNodeDiscoveryService survivor(config, 180);
+
+        auto primary_view =
+            MakeRegistration(ViewNodeType::kView, "view-converge-primary-1", 9771, 180);
+        auto survivor_view_stale =
+            MakeRegistration(ViewNodeType::kView, "view-converge-survivor-1", 9772, 100);
+        auto survivor_view_live =
+            MakeRegistration(ViewNodeType::kView, "view-converge-survivor-1", 9772, 180);
+        auto metadata =
+            MakeRegistration(ViewNodeType::kMetadata, "meta-converge-1", 9773, 180);
+        metadata.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            21,
+            41,
+            MetadataLeaderHint{.node_id = "meta-converge-1",
+                               .raft_id = std::optional<std::int32_t>{8},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 41,
+                               .observed_at_unix_ms = 180});
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-converge-1", 9774, 181);
+        storage.failure_domain.zone = "zone-converge";
+        storage.failure_domain.rack = "rack-converge";
+        storage.capacity.total_capacity_bytes = 81'920;
+        storage.capacity.used_capacity_bytes = 28'672;
+        storage.capacity.available_capacity_bytes = 53'248;
+
+        RegisterNodeOrAssert(primary,
+                             primary_view,
+                             "converge-register-primary-view-on-primary");
+        RegisterNodeOrAssert(primary,
+                             survivor_view_stale,
+                             "converge-register-stale-survivor-view-on-primary");
+        RegisterNodeOrAssert(primary,
+                             metadata,
+                             "converge-register-meta-on-primary");
+        RegisterNodeOrAssert(primary,
+                             storage,
+                             "converge-register-store-on-primary");
+
+        RegisterNodeOrAssert(survivor,
+                             survivor_view_live,
+                             "converge-register-survivor-view-on-survivor");
+        RefreshSelfNodeOrAssert(
+            primary,
+            "view-converge-primary-1",
+            9771,
+            "view-converge-primary-1:boot:180000000:101:1",
+            4,
+            180);
+        RefreshSelfNodeOrAssert(
+            survivor,
+            "view-converge-survivor-1",
+            9772,
+            "view-converge-survivor-1:boot:180000000:102:1",
+            6,
+            180);
+
+        const auto old_primary_snapshot = PullPeerSnapshotOrAssert(
+            primary, "converge-old-primary-snapshot");
+        EXPECT_EQ(old_primary_snapshot.result.snapshot.view_nodes.size(), 2U);
+        EXPECT_EQ(old_primary_snapshot.result.snapshot.metadata_nodes.size(), 1U);
+        EXPECT_EQ(old_primary_snapshot.result.snapshot.storage_nodes.size(), 1U);
+
+        const auto first_sync = SyncPeerSnapshotOrAssert(primary,
+                                                         survivor,
+                                                         "converge-primary-to-survivor");
+        EXPECT_EQ(first_sync.result.conflict_node_count, 0U);
+
+        primary.Stop();
+        survivor.set_now_unix_ms(271);
+        RefreshSelfNodeOrAssert(
+            survivor,
+            "view-converge-survivor-1",
+            9772,
+            "view-converge-survivor-1:boot:180000000:102:1",
+            7,
+            271);
+
+        auto metadata_heartbeat = MakeHeartbeatRequest(ViewNodeType::kMetadata,
+                                                       "meta-converge-1",
+                                                       9773,
+                                                       12,
+                                                       271);
+        metadata_heartbeat.incarnation_id =
+            "meta-converge-1:boot:271000000:111:1";
+        metadata_heartbeat.observation.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            22,
+            42,
+            MetadataLeaderHint{.node_id = "meta-converge-1",
+                               .raft_id = std::optional<std::int32_t>{8},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 42,
+                               .observed_at_unix_ms = 271});
+        HeartbeatNodeOrAssert(survivor, std::move(metadata_heartbeat));
+
+        auto storage_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                      "store-converge-1",
+                                                      9774,
+                                                      13,
+                                                      271);
+        storage_heartbeat.incarnation_id =
+            "store-converge-1:boot:271000000:112:1";
+        storage_heartbeat.observation.failure_domain.zone = "zone-converge";
+        storage_heartbeat.observation.failure_domain.rack = "rack-converge";
+        storage_heartbeat.observation.capacity.total_capacity_bytes = 81'920;
+        storage_heartbeat.observation.capacity.used_capacity_bytes = 32'768;
+        storage_heartbeat.observation.capacity.available_capacity_bytes = 49'152;
+        storage_heartbeat.observation.load.active_reads = 5;
+        storage_heartbeat.observation.load.active_writes = 4;
+        storage_heartbeat.observation.load.queued_ops = 6;
+        HeartbeatNodeOrAssert(survivor, std::move(storage_heartbeat));
+
+        RunningViewNodeDiscoveryService recovered_primary(config, 280);
+        auto recovered_primary_view =
+            MakeRegistration(ViewNodeType::kView, "view-converge-primary-1", 9771, 280);
+        RegisterNodeOrAssert(recovered_primary,
+                             recovered_primary_view,
+                             "converge-register-primary-view-on-recovered-primary");
+        RefreshSelfNodeOrAssert(
+            recovered_primary,
+            "view-converge-primary-1",
+            9771,
+            "view-converge-primary-1:boot:280000000:121:1",
+            1,
+            280);
+
+        const auto survivor_to_recovered = SyncPeerSnapshotOrAssert(
+            survivor,
+            recovered_primary,
+            "converge-survivor-to-recovered-primary");
+        EXPECT_EQ(survivor_to_recovered.result.conflict_node_count, 0U);
+
+        recovered_primary.set_now_unix_ms(285);
+        RefreshSelfNodeOrAssert(
+            recovered_primary,
+            "view-converge-primary-1",
+            9771,
+            "view-converge-primary-1:boot:280000000:121:1",
+            2,
+            285);
+
+        const auto stale_push = PushPeerSnapshotOrAssert(
+            recovered_primary,
+            old_primary_snapshot.result.snapshot,
+            "converge-push-old-primary-snapshot-to-recovered-primary");
+        EXPECT_EQ(stale_push.result.conflict_node_count, 0U);
+        EXPECT_GE(stale_push.result.stale_ignored_node_count, 1U);
+
+        survivor.set_now_unix_ms(285);
+        const auto sync_primary_to_survivor = SyncPeerSnapshotOrAssert(
+            recovered_primary,
+            survivor,
+            "converge-recovered-primary-to-survivor");
+        EXPECT_EQ(sync_primary_to_survivor.result.conflict_node_count, 0U);
+
+        const auto sync_survivor_to_primary = SyncPeerSnapshotOrAssert(
+            survivor,
+            recovered_primary,
+            "converge-survivor-back-to-recovered-primary");
+        EXPECT_EQ(sync_survivor_to_primary.result.conflict_node_count, 0U);
+
+        GetClusterViewRequest cluster_request;
+        cluster_request.request_id = "converge-final-cluster";
+        cluster_request.cluster_id = kClusterId;
+        cluster_request.include_dead_nodes = true;
+        cluster_request.include_warnings = true;
+
+        const auto survivor_cluster =
+            survivor.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(survivor_cluster.transport_ok());
+        ASSERT_EQ(survivor_cluster.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        const auto recovered_cluster =
+            recovered_primary.client().GetClusterView(cluster_request);
+        ASSERT_TRUE(recovered_cluster.transport_ok());
+        ASSERT_EQ(recovered_cluster.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        ASSERT_EQ(survivor_cluster.result.snapshot.view_nodes.size(), 2U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.view_nodes.size(), 2U);
+        ASSERT_EQ(survivor_cluster.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(survivor_cluster.result.snapshot.storage_nodes.size(), 1U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.storage_nodes.size(), 1U);
+
+        EXPECT_FALSE(ContainsDiagnosticCode(survivor_cluster.result.snapshot.diagnostics,
+                                            ViewRegistryIssueCode::kEndpointConflict));
+        EXPECT_FALSE(ContainsDiagnosticCode(survivor_cluster.result.snapshot.diagnostics,
+                                            ViewRegistryIssueCode::kDataDirFingerprintConflict));
+        EXPECT_FALSE(ContainsDiagnosticCode(recovered_cluster.result.snapshot.diagnostics,
+                                            ViewRegistryIssueCode::kEndpointConflict));
+        EXPECT_FALSE(ContainsDiagnosticCode(recovered_cluster.result.snapshot.diagnostics,
+                                            ViewRegistryIssueCode::kDataDirFingerprintConflict));
+
+        const auto *survivor_primary_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.view_nodes,
+            "view-converge-primary-1");
+        const auto *recovered_primary_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.view_nodes,
+            "view-converge-primary-1");
+        ASSERT_NE(survivor_primary_snapshot, nullptr);
+        ASSERT_NE(recovered_primary_snapshot, nullptr);
+        EXPECT_EQ(survivor_primary_snapshot->liveness, ViewNodeLivenessState::kLive);
+        EXPECT_EQ(recovered_primary_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        ExpectObservedStateFacts(*survivor_primary_snapshot,
+                                 "view-converge-primary-1:boot:280000000:121:1",
+                                 2U,
+                                 285U);
+        ExpectObservedStateFacts(*recovered_primary_snapshot,
+                                 "view-converge-primary-1:boot:280000000:121:1",
+                                 2U,
+                                 285U);
+
+        const auto *survivor_survivor_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.view_nodes,
+            "view-converge-survivor-1");
+        const auto *recovered_survivor_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.view_nodes,
+            "view-converge-survivor-1");
+        ASSERT_NE(survivor_survivor_snapshot, nullptr);
+        ASSERT_NE(recovered_survivor_snapshot, nullptr);
+        EXPECT_EQ(survivor_survivor_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        EXPECT_EQ(recovered_survivor_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        ExpectObservedStateFacts(*survivor_survivor_snapshot,
+                                 "view-converge-survivor-1:boot:180000000:102:1",
+                                 7U,
+                                 271U);
+        ExpectObservedStateFacts(*recovered_survivor_snapshot,
+                                 "view-converge-survivor-1:boot:180000000:102:1",
+                                 7U,
+                                 271U);
+
+        const auto *survivor_metadata_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.metadata_nodes,
+            "meta-converge-1");
+        const auto *recovered_metadata_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.metadata_nodes,
+            "meta-converge-1");
+        ASSERT_NE(survivor_metadata_snapshot, nullptr);
+        ASSERT_NE(recovered_metadata_snapshot, nullptr);
+        ASSERT_TRUE(survivor_metadata_snapshot->metadata.has_value());
+        ASSERT_TRUE(recovered_metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(survivor_metadata_snapshot->metadata->membership_epoch, 22U);
+        EXPECT_EQ(recovered_metadata_snapshot->metadata->membership_epoch, 22U);
+        EXPECT_EQ(survivor_metadata_snapshot->metadata->observed_term, 42U);
+        EXPECT_EQ(recovered_metadata_snapshot->metadata->observed_term, 42U);
+
+        const auto *survivor_storage_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.storage_nodes,
+            "store-converge-1");
+        const auto *recovered_storage_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.storage_nodes,
+            "store-converge-1");
+        ASSERT_NE(survivor_storage_snapshot, nullptr);
+        ASSERT_NE(recovered_storage_snapshot, nullptr);
+        EXPECT_EQ(survivor_storage_snapshot->capacity.available_capacity_bytes,
+                  49'152U);
+        EXPECT_EQ(recovered_storage_snapshot->capacity.available_capacity_bytes,
+                  49'152U);
+        EXPECT_EQ(survivor_storage_snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(recovered_storage_snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
     }
 } // namespace
