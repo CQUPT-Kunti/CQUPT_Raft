@@ -199,7 +199,7 @@
 - [x] T095 [US6] Add ViewNode failover status and roundtrip path to example scripts (验证: local RPC status, roundtrip)
 - [x] T096 [US6] Ensure example logs are written under an ignored/local log path and summarized in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-10-local-rpc-example.md` (验证: project test-log rules)
 - [x] T097 [US6] Run targeted app build for `view_node_app metadata_node_app storage_node_app storage_client raft_metadata_client` before local RPC validation (验证: targeted CMake build)
-- [ ] T098 [US6] Record local RPC dynamic validation results in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-10-local-rpc-example.md` (验证: `qidong.sh`, `rpc_demo.sh status`, `rpc_demo.sh roundtrip`, `tingzhi.sh`)
+- [x] T098 [US6] Record local RPC dynamic validation results in `specs/009-local-rpc-object-storage-stabilization/task-reports/t098-record-local-rpc-dynamic-validation-results.md` (验证: `qidong.sh`, `rpc_demo.sh status`, `rpc_demo.sh roundtrip`, `tingzhi.sh`)
 
 ---
 
@@ -216,8 +216,8 @@
 - [x] T103 [P] [US6] Validate ViewNode registry convergence after failover and recovery in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `test_view_node_discovery`, `ctest --preset debug-tests -R "ViewNode|ViewFailover" --output-on-failure`)
 - [x] T104 [P] [US6] Validate persisted registry recovery and convergence after ViewNode restart in `tests/view_failover_test.cpp` (验证: `view_failover_test`, `ctest --preset debug-tests -R "ViewNode|ViewFailover" --output-on-failure`)
 - [x] T105 [P] [US6] Final ViewNode self-refresh and peer-sync contract validation in `contracts/view-node-self-refresh-and-peer-sync.md`, `tests/view_node_discovery_test.cpp`, `tests/view_failover_test.cpp`, `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md`, and `specs/009-local-rpc-object-storage-stabilization/module-notes.md` (验证: `test_view_node_discovery`, `view_failover_test`, `ctest --preset debug-tests -R "ViewNode|ViewFailover" --output-on-failure`)
-- [ ] T106 [US6] Update `tests/CMakeLists.txt` with any new 009 test binaries and labels without removing existing tests (验证: targeted CTest labels)
-- [ ] T107 [US6] Update `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` with actual test names and skipped platform items (验证: validation matrix complete)
+- [x] T106 [US6] Final phase validation and stabilization report for `009-local-rpc-object-storage-stabilization` in `specs/009-local-rpc-object-storage-stabilization/task-reports/t106-final-phase-validation-and-stabilization-report.md` (验证: existing task reports, `validation-matrix.md`, `module-notes.md`, `contracts/*`, `tasks.md`)
+- [x] T107 [US6] Update `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` with actual test names and skipped platform items (验证: validation matrix complete)
 - [ ] T108 [US6] Record stability matrix validation in `specs/009-local-rpc-object-storage-stabilization/task-reports/phase-11-stability-matrix.md` (验证: relevant CTest names and local RPC scripts)
 
 ---
@@ -228,7 +228,7 @@
 
 - [ ] T109 [P] Update `specs/009-local-rpc-object-storage-stabilization/module-notes.md` with final responsibilities, state transitions, and misuse warnings (验证: module-notes reviewed against touched modules)
 - [ ] T110 [P] Update `specs/009-local-rpc-object-storage-stabilization/cross-task-risk-notes.md` with resolved and residual risks (验证: risk notes reviewed against failed/skipped tests)
-- [ ] T111 [P] Update `specs/009-local-rpc-object-storage-stabilization/validation-matrix.md` with PASS/SKIP/PENDING status and log paths (验证: task reports)
+- [ ] T111 [P] Add end-to-end dynamic metadata node join validation in `tests/node_identity_test.cpp` and `tests/metadata_client_scenario_test.cpp` (验证: `test_node_identity`, `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure`)
 - [ ] T112 Add final task summary in `specs/009-local-rpc-object-storage-stabilization/task-reports/final-summary.md` (验证: all phase task reports referenced)
 - [ ] T113 Confirm `specs/009-local-rpc-object-storage-stabilization/spec.md`, `plan.md`, and `tasks.md` do not contain execution logs (验证: document review)
 - [ ] T114 Confirm no committed voter membership test allows even voter count in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)

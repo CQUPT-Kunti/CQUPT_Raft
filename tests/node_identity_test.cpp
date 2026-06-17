@@ -1257,6 +1257,105 @@ namespace clusterdemo
             EXPECT_EQ(persisted.find("voter"), std::string::npos);
         }
 
+        TEST_F(
+            NodeIdentityTest,
+            T111MetadataDynamicJoinJoiningIdentityRestartKeepsMembershipStateAndGenerationStable)
+        {
+            const auto data_dir = MakeDataDir("t111-dynamic-join-joining-restart");
+            auto joining_identity =
+                MakeMetadataDynamicJoinCandidateIdentity(
+                    "meta-join-joining-restart",
+                    451);
+            joining_identity.membership_state =
+                NodeIdentityMembershipState::kJoining;
+
+            const auto first_start = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = joining_identity.cluster_id,
+                            .node_id = joining_identity.node_id,
+                            .node_type = ClusterNodeType::kMetadata,
+                            .raft_id = joining_identity.raft_id,
+                            .membership_state =
+                                NodeIdentityMembershipState::kJoining,
+                            .source = joining_identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create = joining_identity,
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(first_start.ok()) << first_start.diagnostic;
+            ASSERT_TRUE(first_start.identity.has_value());
+            EXPECT_TRUE(first_start.created_new);
+            EXPECT_FALSE(first_start.loaded_existing);
+            EXPECT_EQ(first_start.identity->node_id, joining_identity.node_id);
+            EXPECT_EQ(first_start.identity->membership_state,
+                      NodeIdentityMembershipState::kJoining);
+            EXPECT_EQ(first_start.identity->persistent_generation, 1U);
+            EXPECT_EQ(first_start.identity->source,
+                      NodeIdentitySource::kExplicitOverride);
+
+            const auto restart = LoadOrCreateNodeIdentity(
+                NodeIdentityLoadOrCreateRequest{
+                    .load_options = NodeIdentityLoadOptions{
+                        .data_dir = data_dir,
+                        .expected = ExpectedNodeIdentity{
+                            .cluster_id = joining_identity.cluster_id,
+                            .node_id = joining_identity.node_id,
+                            .node_type = ClusterNodeType::kMetadata,
+                            .raft_id = joining_identity.raft_id,
+                            .membership_state =
+                                NodeIdentityMembershipState::kJoining,
+                            .source = joining_identity.source,
+                            .require_raft_id_for_metadata = true,
+                            .forbid_raft_id_for_non_metadata = true},
+                        .require_existing = false},
+                    .identity_to_create =
+                        MakeMetadataDynamicJoinCandidateIdentity(
+                            "meta-join-should-not-replace",
+                            999),
+                    .store_options = NodeIdentityStoreOptions{
+                        .data_dir = data_dir,
+                        .durability_mode =
+                            NodeIdentityDurabilityMode::kBestEffortForTests,
+                        .store_mode = NodeIdentityStoreMode::kCreateNewOnly,
+                        .expected_existing = {}}});
+
+            ASSERT_TRUE(restart.ok()) << restart.diagnostic;
+            ASSERT_TRUE(restart.identity.has_value());
+            EXPECT_TRUE(restart.loaded_existing);
+            EXPECT_FALSE(restart.created_new);
+            EXPECT_EQ(restart.identity->node_id, first_start.identity->node_id);
+            EXPECT_EQ(restart.identity->raft_id, first_start.identity->raft_id);
+            EXPECT_EQ(restart.identity->membership_state,
+                      first_start.identity->membership_state);
+            EXPECT_EQ(restart.identity->persistent_generation,
+                      first_start.identity->persistent_generation);
+            EXPECT_EQ(restart.identity->source, first_start.identity->source);
+
+            const auto persisted =
+                ReadTextFile(ResolveNodeIdentityPath(data_dir));
+            EXPECT_NE(persisted.find("node_id=meta-join-joining-restart"),
+                      std::string::npos);
+            EXPECT_NE(persisted.find("raft_id=451"), std::string::npos);
+            EXPECT_NE(persisted.find("membership_state=joining"),
+                      std::string::npos);
+            EXPECT_NE(persisted.find("persistent_generation=1"),
+                      std::string::npos);
+            EXPECT_NE(persisted.find("source=explicit_override"),
+                      std::string::npos);
+            EXPECT_EQ(persisted.find("meta-join-should-not-replace"),
+                      std::string::npos);
+        }
+
         TEST_F(NodeIdentityTest,
                T067StorageNodeFirstStartCreatesStableIdentityAndReloadsIt)
         {
