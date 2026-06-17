@@ -39,6 +39,7 @@ namespace
     using viewdemo::ViewNodeServiceImplConfig;
     using viewdemo::ViewNodeSnapshot;
     using viewdemo::ViewNodeType;
+    using viewdemo::ViewRegistryPeerSnapshot;
     using viewdemo::ViewRegistryConfig;
     using viewdemo::ViewRegistryDiagnostic;
     using viewdemo::ViewRegistryIssueCode;
@@ -188,6 +189,31 @@ namespace
             const HeartbeatNodeRequest &request) const
         {
             return registry_->RefreshSelfNode(request);
+        }
+
+        [[nodiscard]] viewdemo::ExportPeerSnapshotResult ExportPeerSnapshot(
+            const std::string &request_id,
+            const bool include_dead_nodes = true,
+            const bool include_warnings = true) const
+        {
+            return registry_->ExportPeerSnapshot(
+                viewdemo::ExportPeerSnapshotRequest{
+                    .request_id = request_id,
+                    .cluster_id = kClusterId,
+                    .include_dead_nodes = include_dead_nodes,
+                    .include_warnings = include_warnings},
+                now_unix_ms_);
+        }
+
+        [[nodiscard]] viewdemo::ImportPeerSnapshotResult ImportPeerSnapshot(
+            ViewRegistryPeerSnapshot snapshot,
+            const std::string &request_id)
+        {
+            return registry_->ImportPeerSnapshot(
+                viewdemo::ImportPeerSnapshotRequest{
+                    .request_id = request_id,
+                    .cluster_id = kClusterId,
+                    .snapshot = std::move(snapshot)});
         }
 
         void Stop()
@@ -1360,6 +1386,394 @@ namespace
                   49'152U);
         EXPECT_EQ(recovered_storage_snapshot->capacity.available_capacity_bytes,
                   49'152U);
+        EXPECT_EQ(survivor_storage_snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+        EXPECT_EQ(recovered_storage_snapshot->health.health,
+                  ViewNodeHealth::kHealthy);
+    }
+
+    TEST(ViewFailoverTest,
+         PersistedRegistryRecoveryReconvergesAfterViewNodeRestart)
+    {
+        ViewRegistryConfig config;
+        config.stale_timeout = std::chrono::milliseconds(30);
+        config.suspect_timeout = std::chrono::milliseconds(60);
+        config.dead_timeout = std::chrono::milliseconds(90);
+
+        RunningViewNodeDiscoveryService primary(config, 180);
+        RunningViewNodeDiscoveryService survivor(config, 180);
+
+        auto primary_view =
+            MakeRegistration(ViewNodeType::kView, "view-persist-primary-1", 9781, 180);
+        auto survivor_view =
+            MakeRegistration(ViewNodeType::kView, "view-persist-survivor-1", 9782, 180);
+        auto metadata =
+            MakeRegistration(ViewNodeType::kMetadata, "meta-persist-1", 9783, 180);
+        metadata.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            24,
+            51,
+            MetadataLeaderHint{.node_id = "meta-persist-1",
+                               .raft_id = std::optional<std::int32_t>{9},
+                               .endpoint = metadata.endpoint,
+                               .observed_term = 51,
+                               .observed_at_unix_ms = 180});
+
+        auto storage =
+            MakeRegistration(ViewNodeType::kStorage, "store-persist-1", 9784, 181);
+        storage.failure_domain.zone = "zone-persist";
+        storage.failure_domain.rack = "rack-persist";
+        storage.capacity.total_capacity_bytes = 98'304;
+        storage.capacity.used_capacity_bytes = 36'864;
+        storage.capacity.available_capacity_bytes = 61'440;
+
+        RegisterNodeOrAssert(primary,
+                             primary_view,
+                             "persist-register-primary-view-on-primary");
+        RegisterNodeOrAssert(primary,
+                             survivor_view,
+                             "persist-register-survivor-view-on-primary");
+        RegisterNodeOrAssert(primary,
+                             metadata,
+                             "persist-register-meta-on-primary");
+        RegisterNodeOrAssert(primary,
+                             storage,
+                             "persist-register-store-on-primary");
+
+        RegisterNodeOrAssert(survivor,
+                             primary_view,
+                             "persist-register-primary-view-on-survivor");
+        RegisterNodeOrAssert(survivor,
+                             survivor_view,
+                             "persist-register-survivor-view-on-survivor");
+
+        RefreshSelfNodeOrAssert(
+            primary,
+            "view-persist-primary-1",
+            9781,
+            "view-persist-primary-1:boot:180000000:131:1",
+            4,
+            180);
+        RefreshSelfNodeOrAssert(
+            survivor,
+            "view-persist-survivor-1",
+            9782,
+            "view-persist-survivor-1:boot:180000000:132:1",
+            6,
+            180);
+
+        auto initial_metadata_heartbeat = MakeHeartbeatRequest(ViewNodeType::kMetadata,
+                                                               "meta-persist-1",
+                                                               9783,
+                                                               8,
+                                                               180);
+        initial_metadata_heartbeat.incarnation_id =
+            "meta-persist-1:boot:180000000:141:1";
+        initial_metadata_heartbeat.observation.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            24,
+            51,
+            MetadataLeaderHint{.node_id = "meta-persist-1",
+                               .raft_id = std::optional<std::int32_t>{9},
+                               .endpoint =
+                                   initial_metadata_heartbeat.observation.endpoint,
+                               .observed_term = 51,
+                               .observed_at_unix_ms = 180});
+        HeartbeatNodeOrAssert(primary, std::move(initial_metadata_heartbeat));
+
+        auto initial_storage_heartbeat = MakeHeartbeatRequest(ViewNodeType::kStorage,
+                                                              "store-persist-1",
+                                                              9784,
+                                                              9,
+                                                              181);
+        initial_storage_heartbeat.incarnation_id =
+            "store-persist-1:boot:181000000:142:1";
+        initial_storage_heartbeat.observation.failure_domain.zone = "zone-persist";
+        initial_storage_heartbeat.observation.failure_domain.rack = "rack-persist";
+        initial_storage_heartbeat.observation.capacity.total_capacity_bytes =
+            98'304;
+        initial_storage_heartbeat.observation.capacity.used_capacity_bytes =
+            40'960;
+        initial_storage_heartbeat.observation.capacity.available_capacity_bytes =
+            57'344;
+        HeartbeatNodeOrAssert(primary, std::move(initial_storage_heartbeat));
+
+        const auto primary_to_survivor = SyncPeerSnapshotOrAssert(
+            primary,
+            survivor,
+            "persist-primary-to-survivor-initial");
+        EXPECT_EQ(primary_to_survivor.result.conflict_node_count, 0U);
+
+        const auto survivor_to_primary = SyncPeerSnapshotOrAssert(
+            survivor,
+            primary,
+            "persist-survivor-to-primary-initial");
+        EXPECT_EQ(survivor_to_primary.result.conflict_node_count, 0U);
+
+        const auto persisted_registry_snapshot =
+            primary.ExportPeerSnapshot("persist-export-primary-registry");
+        ASSERT_EQ(persisted_registry_snapshot.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(persisted_registry_snapshot.snapshot.view_nodes.size(), 2U);
+        EXPECT_EQ(persisted_registry_snapshot.snapshot.metadata_nodes.size(), 1U);
+        EXPECT_EQ(persisted_registry_snapshot.snapshot.storage_nodes.size(), 1U);
+
+        primary.Stop();
+        survivor.set_now_unix_ms(271);
+        RefreshSelfNodeOrAssert(
+            survivor,
+            "view-persist-survivor-1",
+            9782,
+            "view-persist-survivor-1:boot:180000000:132:1",
+            7,
+            271);
+
+        auto recovered_metadata_heartbeat = MakeHeartbeatRequest(
+            ViewNodeType::kMetadata,
+            "meta-persist-1",
+            9783,
+            11,
+            271);
+        recovered_metadata_heartbeat.incarnation_id =
+            "meta-persist-1:boot:271000000:151:1";
+        recovered_metadata_heartbeat.observation.metadata = MakeMetadataObservation(
+            MetadataRaftObservedRole::kLeader,
+            MetadataMembershipObservedState::kVoter,
+            25,
+            52,
+            MetadataLeaderHint{.node_id = "meta-persist-1",
+                               .raft_id = std::optional<std::int32_t>{9},
+                               .endpoint =
+                                   recovered_metadata_heartbeat.observation.endpoint,
+                               .observed_term = 52,
+                               .observed_at_unix_ms = 271});
+        HeartbeatNodeOrAssert(survivor, std::move(recovered_metadata_heartbeat));
+
+        auto recovered_storage_heartbeat = MakeHeartbeatRequest(
+            ViewNodeType::kStorage,
+            "store-persist-1",
+            9784,
+            12,
+            271);
+        recovered_storage_heartbeat.incarnation_id =
+            "store-persist-1:boot:271000000:152:1";
+        recovered_storage_heartbeat.observation.failure_domain.zone =
+            "zone-persist";
+        recovered_storage_heartbeat.observation.failure_domain.rack =
+            "rack-persist";
+        recovered_storage_heartbeat.observation.capacity.total_capacity_bytes =
+            98'304;
+        recovered_storage_heartbeat.observation.capacity.used_capacity_bytes =
+            43'008;
+        recovered_storage_heartbeat.observation.capacity.available_capacity_bytes =
+            55'296;
+        recovered_storage_heartbeat.observation.load.active_reads = 8;
+        recovered_storage_heartbeat.observation.load.active_writes = 5;
+        recovered_storage_heartbeat.observation.load.queued_ops = 10;
+        HeartbeatNodeOrAssert(survivor, std::move(recovered_storage_heartbeat));
+
+        RunningViewNodeDiscoveryService recovered_primary(config, 280);
+        auto recovered_primary_view =
+            MakeRegistration(ViewNodeType::kView, "view-persist-primary-1", 9781, 280);
+        RegisterNodeOrAssert(recovered_primary,
+                             recovered_primary_view,
+                             "persist-register-primary-view-on-recovered-primary");
+        RefreshSelfNodeOrAssert(
+            recovered_primary,
+            "view-persist-primary-1",
+            9781,
+            "view-persist-primary-1:boot:280000000:161:1",
+            1,
+            280);
+
+        const auto persisted_recovery = recovered_primary.ImportPeerSnapshot(
+            persisted_registry_snapshot.snapshot,
+            "persist-import-persisted-registry");
+        EXPECT_EQ(persisted_recovery.summary.status, ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(persisted_recovery.received_node_count, 4U);
+        EXPECT_EQ(persisted_recovery.accepted_node_count, 4U);
+        EXPECT_EQ(persisted_recovery.conflict_node_count, 0U);
+        EXPECT_GE(persisted_recovery.stale_ignored_node_count, 1U);
+
+        GetClusterViewRequest recovered_from_persisted_request;
+        recovered_from_persisted_request.request_id =
+            "persist-cluster-after-persisted-recovery";
+        recovered_from_persisted_request.cluster_id = kClusterId;
+        recovered_from_persisted_request.include_dead_nodes = true;
+        recovered_from_persisted_request.include_warnings = true;
+
+        const auto recovered_from_persisted_cluster =
+            recovered_primary.client().GetClusterView(
+                recovered_from_persisted_request);
+        ASSERT_TRUE(recovered_from_persisted_cluster.transport_ok());
+        ASSERT_EQ(recovered_from_persisted_cluster.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        ASSERT_EQ(recovered_from_persisted_cluster.result.snapshot.view_nodes.size(),
+                  2U);
+        ASSERT_EQ(recovered_from_persisted_cluster.result.snapshot.metadata_nodes.size(),
+                  1U);
+        ASSERT_EQ(recovered_from_persisted_cluster.result.snapshot.storage_nodes.size(),
+                  1U);
+
+        const auto *persisted_primary_snapshot = FindSnapshotByNodeId(
+            recovered_from_persisted_cluster.result.snapshot.view_nodes,
+            "view-persist-primary-1");
+        ASSERT_NE(persisted_primary_snapshot, nullptr);
+        EXPECT_EQ(persisted_primary_snapshot->liveness, ViewNodeLivenessState::kLive);
+        ExpectObservedStateFacts(*persisted_primary_snapshot,
+                                 "view-persist-primary-1:boot:280000000:161:1",
+                                 1U,
+                                 280U);
+
+        const auto *persisted_metadata_snapshot = FindSnapshotByNodeId(
+            recovered_from_persisted_cluster.result.snapshot.metadata_nodes,
+            "meta-persist-1");
+        ASSERT_NE(persisted_metadata_snapshot, nullptr);
+        ASSERT_TRUE(persisted_metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(persisted_metadata_snapshot->metadata->membership_epoch, 24U);
+        EXPECT_EQ(persisted_metadata_snapshot->metadata->observed_term, 51U);
+
+        const auto *persisted_storage_snapshot = FindSnapshotByNodeId(
+            recovered_from_persisted_cluster.result.snapshot.storage_nodes,
+            "store-persist-1");
+        ASSERT_NE(persisted_storage_snapshot, nullptr);
+        EXPECT_EQ(persisted_storage_snapshot->capacity.available_capacity_bytes,
+                  57'344U);
+
+        const auto survivor_to_recovered_after_restart =
+            SyncPeerSnapshotOrAssert(survivor,
+                                     recovered_primary,
+                                     "persist-survivor-to-recovered-primary");
+        EXPECT_EQ(survivor_to_recovered_after_restart.result.conflict_node_count,
+                  0U);
+
+        recovered_primary.set_now_unix_ms(285);
+        RefreshSelfNodeOrAssert(
+            recovered_primary,
+            "view-persist-primary-1",
+            9781,
+            "view-persist-primary-1:boot:280000000:161:1",
+            2,
+            285);
+
+        const auto replay_persisted_registry = recovered_primary.ImportPeerSnapshot(
+            persisted_registry_snapshot.snapshot,
+            "persist-replay-old-persisted-registry");
+        EXPECT_EQ(replay_persisted_registry.summary.status,
+                  ViewRegistryStatusCode::kOk);
+        EXPECT_EQ(replay_persisted_registry.received_node_count, 4U);
+        EXPECT_EQ(replay_persisted_registry.accepted_node_count, 4U);
+        EXPECT_EQ(replay_persisted_registry.conflict_node_count, 0U);
+        EXPECT_EQ(replay_persisted_registry.stale_ignored_node_count, 4U);
+
+        survivor.set_now_unix_ms(285);
+        const auto recovered_to_survivor = SyncPeerSnapshotOrAssert(
+            recovered_primary,
+            survivor,
+            "persist-recovered-primary-to-survivor");
+        EXPECT_EQ(recovered_to_survivor.result.conflict_node_count, 0U);
+
+        const auto survivor_back_to_recovered = SyncPeerSnapshotOrAssert(
+            survivor,
+            recovered_primary,
+            "persist-survivor-back-to-recovered-primary");
+        EXPECT_EQ(survivor_back_to_recovered.result.conflict_node_count, 0U);
+
+        GetClusterViewRequest final_cluster_request;
+        final_cluster_request.request_id = "persist-final-cluster";
+        final_cluster_request.cluster_id = kClusterId;
+        final_cluster_request.include_dead_nodes = true;
+        final_cluster_request.include_warnings = true;
+
+        const auto survivor_cluster = survivor.client().GetClusterView(
+            final_cluster_request);
+        ASSERT_TRUE(survivor_cluster.transport_ok());
+        ASSERT_EQ(survivor_cluster.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        const auto recovered_cluster = recovered_primary.client().GetClusterView(
+            final_cluster_request);
+        ASSERT_TRUE(recovered_cluster.transport_ok());
+        ASSERT_EQ(recovered_cluster.result.summary.status,
+                  ViewRegistryStatusCode::kOk);
+
+        ASSERT_EQ(survivor_cluster.result.snapshot.view_nodes.size(), 2U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.view_nodes.size(), 2U);
+        ASSERT_EQ(survivor_cluster.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.metadata_nodes.size(), 1U);
+        ASSERT_EQ(survivor_cluster.result.snapshot.storage_nodes.size(), 1U);
+        ASSERT_EQ(recovered_cluster.result.snapshot.storage_nodes.size(), 1U);
+
+        const auto *survivor_primary_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.view_nodes,
+            "view-persist-primary-1");
+        const auto *recovered_primary_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.view_nodes,
+            "view-persist-primary-1");
+        ASSERT_NE(survivor_primary_snapshot, nullptr);
+        ASSERT_NE(recovered_primary_snapshot, nullptr);
+        EXPECT_EQ(survivor_primary_snapshot->liveness, ViewNodeLivenessState::kLive);
+        EXPECT_EQ(recovered_primary_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        ExpectObservedStateFacts(*survivor_primary_snapshot,
+                                 "view-persist-primary-1:boot:280000000:161:1",
+                                 2U,
+                                 285U);
+        ExpectObservedStateFacts(*recovered_primary_snapshot,
+                                 "view-persist-primary-1:boot:280000000:161:1",
+                                 2U,
+                                 285U);
+
+        const auto *survivor_survivor_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.view_nodes,
+            "view-persist-survivor-1");
+        const auto *recovered_survivor_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.view_nodes,
+            "view-persist-survivor-1");
+        ASSERT_NE(survivor_survivor_snapshot, nullptr);
+        ASSERT_NE(recovered_survivor_snapshot, nullptr);
+        EXPECT_EQ(survivor_survivor_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        EXPECT_EQ(recovered_survivor_snapshot->liveness,
+                  ViewNodeLivenessState::kLive);
+        ExpectObservedStateFacts(*survivor_survivor_snapshot,
+                                 "view-persist-survivor-1:boot:180000000:132:1",
+                                 7U,
+                                 271U);
+        ExpectObservedStateFacts(*recovered_survivor_snapshot,
+                                 "view-persist-survivor-1:boot:180000000:132:1",
+                                 7U,
+                                 271U);
+
+        const auto *survivor_metadata_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.metadata_nodes,
+            "meta-persist-1");
+        const auto *recovered_metadata_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.metadata_nodes,
+            "meta-persist-1");
+        ASSERT_NE(survivor_metadata_snapshot, nullptr);
+        ASSERT_NE(recovered_metadata_snapshot, nullptr);
+        ASSERT_TRUE(survivor_metadata_snapshot->metadata.has_value());
+        ASSERT_TRUE(recovered_metadata_snapshot->metadata.has_value());
+        EXPECT_EQ(survivor_metadata_snapshot->metadata->membership_epoch, 25U);
+        EXPECT_EQ(recovered_metadata_snapshot->metadata->membership_epoch, 25U);
+        EXPECT_EQ(survivor_metadata_snapshot->metadata->observed_term, 52U);
+        EXPECT_EQ(recovered_metadata_snapshot->metadata->observed_term, 52U);
+
+        const auto *survivor_storage_snapshot = FindSnapshotByNodeId(
+            survivor_cluster.result.snapshot.storage_nodes,
+            "store-persist-1");
+        const auto *recovered_storage_snapshot = FindSnapshotByNodeId(
+            recovered_cluster.result.snapshot.storage_nodes,
+            "store-persist-1");
+        ASSERT_NE(survivor_storage_snapshot, nullptr);
+        ASSERT_NE(recovered_storage_snapshot, nullptr);
+        EXPECT_EQ(survivor_storage_snapshot->capacity.available_capacity_bytes,
+                  55'296U);
+        EXPECT_EQ(recovered_storage_snapshot->capacity.available_capacity_bytes,
+                  55'296U);
         EXPECT_EQ(survivor_storage_snapshot->health.health,
                   ViewNodeHealth::kHealthy);
         EXPECT_EQ(recovered_storage_snapshot->health.health,

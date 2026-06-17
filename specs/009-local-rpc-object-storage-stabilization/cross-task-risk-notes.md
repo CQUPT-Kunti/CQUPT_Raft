@@ -107,3 +107,9 @@ Mitigation: Validate failover readiness by survivor endpoint + survivor self liv
 Risk: Re-running the 009 local RPC example without resetting runtime state can leave previously promoted committed membership in example data directories. A later “fresh” rerun may then fail at `join-metadata-learner` with diagnostics such as `candidate_raft_id already exists in committed voter set`, even though the current fix is unrelated to metadata join logic. This can block clean full-sequence validation and confuse Phase 10/T098 follow-up work.
 
 Mitigation: Treat example-node data directories as runtime state, not source truth. Before claiming a clean full-sequence rerun, reset the example runtime state or use a fresh data root so learner-join and batch-promote validation start from the intended initial `3`-voter membership.
+
+## R24: Persisted Registry Recovery Test Now Covers Merge Semantics, But Runtime Durable Load Must Reuse The Same Boundary
+
+Risk: T104 now validates the restart path by restoring an exported ViewNode registry snapshot and then reconverging through peer sync. This proves the incarnation-aware merge and eventual-convergence semantics, but it does not by itself guarantee that a future file-backed or app-startup durable load path will apply the exact same snapshot shape, restore order, and stale-state rejection rules. A later runtime persistence implementation could still drift and reintroduce rollback or long-lived divergence bugs even though the current targeted test passes.
+
+Mitigation: Any future runtime registry persistence/load path should reuse the same observed-state snapshot model and import ordering already covered by T104: restore local snapshot first, preserve restarted self state by incarnation/sequence ordering, then reconverge through peer sync. Do not introduce a second “authoritative” recovery path or a different merge contract for persisted registry data.
