@@ -9,7 +9,7 @@
 - 当前 ViewNode registry：`modules/view/view_registry.h`、`modules/view/view_registry.cpp`
 - 当前 ViewNode RPC adapter/client：`modules/view/view_service_impl.*`、`modules/view/view_client.*`
 - 当前 ViewNode app：`apps/view_node_app.cpp`
-- 当前 ViewNode 测试：`tests/view_node_discovery_test.cpp`
+- 当前 ViewNode 测试：`tests/view_node_discovery_test.cpp`、`tests/view_failover_test.cpp`
 - 当前报告确认问题：`view-1` 自身 registry 记录只注册一次，可能因无 self-heartbeat 变为 stale/dead。
 
 ## Self Refresh Requirements
@@ -26,6 +26,7 @@
 - ViewNode 配置包含自身 endpoint、registry data dir、peer seed、self refresh interval、peer sync interval、liveness/suspect/dead timeout。
 - ViewNode 之间可用 PushViewSnapshot、PullViewSnapshot、MergeObservedState 或等价 RPC 同步 observed registry。
 - peer sync 是最终一致，不提供线性一致和 Raft membership 权威。
+- peer sync transport failure、retry、backoff 只能影响 peer convergence 速度，不能把本地 ViewNode 自身状态解释成 unavailable。
 - 任一 ViewNode 故障时，客户端仍应能从另一个 ViewNode 获取 Metadata leader hint 与 LIVE StorageNode 候选。
 
 ## Merge Ordering
@@ -43,11 +44,15 @@
 - 009 必须在实现前明确 ViewNode registry 是否持久化，以及重启后如何恢复。
 - 如果引入 registry snapshot，格式必须版本化并支持旧 incarnation 防护。
 - 如果某阶段保留内存型 registry，必须在计划和任务报告中明确重启后由 self refresh、node heartbeat、peer sync 重新收敛的边界。
+- 当前 009 收口边界是：
+  - runtime ViewNode registry 仍是 memory-only
+  - app 启动后依靠 startup register + self refresh + peer sync background loop 重新收敛
+  - `tests/view_failover_test.cpp` 额外验证“如果恢复了旧 registry snapshot，其 merge 语义仍不会覆盖新 incarnation，且最终能重新收敛”；这不等于已经引入新的 runtime durable registry 功能
 
 ## Validation Requirements
 
 - `tests/view_node_discovery_test.cpp` 覆盖单 ViewNode self refresh 超过 TTL 后仍 `LIVE`。
 - 同一测试或新增 ViewNode peer sync 测试覆盖停 self refresh 后 TTL 转换。
-- 双 ViewNode 测试覆盖 registry 同步、ViewNode failover、重启后新 incarnation 覆盖旧状态。
+- `tests/view_node_discovery_test.cpp` 覆盖 Pull/Push peer snapshot、old-incarnation snapshot rejection、discovery/status RPC 语义。
+- `tests/view_failover_test.cpp` 覆盖 registry 同步、ViewNode failover、surviving ViewNode availability、重启后新 incarnation 覆盖旧状态、最终 convergence，以及恢复旧 registry snapshot 后重新收敛。
 - 旧 incarnation heartbeat / snapshot 的 observed_time 即使更新，也不能覆盖新 incarnation。
-
