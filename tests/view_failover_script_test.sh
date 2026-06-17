@@ -33,13 +33,30 @@ storage_node node_id=store-7 endpoint=127.0.0.1:8507 liveness=live health=health
 EOF
 }
 
+write_partial_storage_fixture() {
+  local output_file="$1"
+  cat > "$output_file" <<EOF
+status OK request_id=test-status cluster_id=example-local-009-dynamic target_endpoint=127.0.0.1:8302 observed_at_unix_ms=1781674528123 view_nodes=2 metadata_nodes=3 storage_nodes=0
+leader_hint leader_hint.node_id=meta-1 leader_hint.raft_id=1 leader_hint.endpoint=127.0.0.1:8401 leader_hint.term=8 leader_hint.observed_at_unix_ms=1781674527705
+non_authority_boundary membership_observation_source=view_node raft_membership_authority=false object_manifest_authority=false
+view_node node_id=view-1 node_type=view endpoint=127.0.0.1:8301 liveness=dead health=healthy disk_pressure=low last_seen_unix_ms=1781674498966 last_sequence=174 control_plane_endpoint=127.0.0.1:8301
+view_node node_id=view-2 node_type=view endpoint=127.0.0.1:8302 liveness=live health=healthy disk_pressure=low last_seen_unix_ms=1781674527299 last_sequence=202 control_plane_endpoint=127.0.0.1:8302
+metadata_node node_id=meta-1 endpoint=127.0.0.1:8401 liveness=live health=healthy disk_pressure=low last_seen_unix_ms=1781674527664 last_sequence=201 raft_id=1 raft_role=leader membership_observation=voter observed_term=8 commit_index=40 membership_epoch=1
+metadata_node node_id=meta-2 endpoint=127.0.0.1:8402 liveness=live health=healthy disk_pressure=low last_seen_unix_ms=1781674527441 last_sequence=200 raft_id=2 raft_role=follower membership_observation=voter observed_term=8 commit_index=40 membership_epoch=1
+metadata_node node_id=meta-3 endpoint=127.0.0.1:8403 liveness=live health=healthy disk_pressure=low last_seen_unix_ms=1781674527696 last_sequence=200 raft_id=3 raft_role=follower membership_observation=voter observed_term=8 commit_index=40 membership_epoch=1
+EOF
+}
+
 expanded_degraded="$TMP_DIR/expanded-degraded.log"
+expanded_partial_storage="$TMP_DIR/expanded-partial-storage.log"
 expanded_unavailable="$TMP_DIR/expanded-unavailable.log"
 
 write_status_fixture "$expanded_degraded" "degraded"
+write_partial_storage_fixture "$expanded_partial_storage"
 write_status_fixture "$expanded_unavailable" "unavailable"
 
 status_reports_surviving_view_ready "$expanded_degraded"
+status_reports_surviving_view_ready "$expanded_partial_storage"
 
 if status_reports_surviving_view_ready "$expanded_unavailable"; then
   echo "expected unavailable survivor status to fail validation" >&2

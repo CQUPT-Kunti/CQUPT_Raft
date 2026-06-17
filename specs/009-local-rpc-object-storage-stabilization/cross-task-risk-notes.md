@@ -96,11 +96,11 @@ Risk: T086 now confirms the current `3 voters + 2 ready learners -> committed 5 
 
 Mitigation: Treat the current PASS as closure of the targeted US4 safety boundary, not as full runtime or cross-platform completion. Preserve the rule that ViewNode observation is never membership authority and that committed membership only changes through the Raft log / committed config path. Track local RPC workflow validation, broader failover soak, and Windows/macOS runs as separate follow-up work.
 
-## R22: ViewNode Failover Can Be Falsely Marked Unavailable By Baseline-Count Script Logic
+## R22: ViewNode Failover Can Be Falsely Marked Unavailable By Over-Strict Script Readiness Rules
 
-Risk: `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` previously equated “surviving view ready” with the baseline topology counts `metadata_nodes=3` and `storage_nodes=6`. After dynamic `store-7` join and `meta-4/meta-5` promotion, the real survivor-side `status OK` snapshot already showed `target_endpoint=127.0.0.1:8302`, `view-2 liveness=live`, `view-2 health=healthy`, `metadata_nodes=5`, and `storage_nodes=7`, but the hard-coded `3/6` check still returned failure and produced `surviving_view_status_unavailable`.
+Risk: `examples/object-storage-local-009-dynamic/rpc_demo.sh failover-view` previously equated “surviving view ready” with strict cluster-shape checks. The first false negative was the fixed baseline counts `metadata_nodes=3` and `storage_nodes=6`, which broke after dynamic `store-7` join and `meta-4/meta-5` promotion even when the survivor-side snapshot already showed `target_endpoint=127.0.0.1:8302`, `view-2 liveness=live`, and `view-2 health=healthy`. A second false negative remained when failover happened during partial registry convergence: `status OK` could still show `metadata_nodes=3` but `storage_nodes=0`, and the script still returned `surviving_view_status_unavailable` even though the surviving ViewNode itself was alive and serving status/discovery.
 
-Mitigation: Validate failover readiness by survivor endpoint + survivor self live/not-unavailable status + current summary-consistent metadata/storage live counts, instead of fixed baseline counts. Keep `peer sync` connection-refused/backoff diagnostics visible, but do not let them imply self unavailable. Guard this with `ViewFailoverScriptValidation`.
+Mitigation: Validate failover readiness by survivor endpoint + survivor self live/not-unavailable status + non-authority boundary + surviving metadata discovery, while explicitly allowing degraded / partial storage observations. Keep `peer sync` connection-refused/backoff diagnostics visible, but do not let them imply self unavailable. Guard this with `ViewFailoverScriptValidation`.
 
 ## R23: Example Runtime State Leakage Can Pollute Dynamic Join Reruns
 
