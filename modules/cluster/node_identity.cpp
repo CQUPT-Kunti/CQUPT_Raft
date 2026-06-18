@@ -1,6 +1,7 @@
 #include "cluster/node_identity.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -34,6 +35,8 @@ namespace clusterdemo
         {
             NodeIdentity identity;
             bool saw_raft_id{false};
+            bool saw_membership_state{false};
+            bool saw_persistent_generation{false};
         };
 
         std::string PathToDiagnosticString(const std::filesystem::path &path)
@@ -124,6 +127,234 @@ namespace clusterdemo
             return "'" + std::to_string(*raft_id) + "'";
         }
 
+        bool IsSupportedIdentityVersion(const std::uint32_t identity_version)
+        {
+            return identity_version == kNodeIdentityCurrentVersion;
+        }
+
+        std::uint64_t NextIncarnationOrdinal()
+        {
+            static std::atomic<std::uint64_t> next_ordinal{1};
+            return next_ordinal.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        std::string BuildProcessIncarnationId(const NodeIdentity &identity,
+                                              const std::int64_t started_at_unix_ns)
+        {
+#ifdef _WIN32
+            const auto pid = static_cast<unsigned long>(_getpid());
+#else
+            const auto pid = static_cast<unsigned long>(::getpid());
+#endif
+            const auto ordinal = NextIncarnationOrdinal();
+
+            std::ostringstream oss;
+            oss << identity.node_id
+                << ":boot:" << started_at_unix_ns
+                << ":" << pid
+                << ":" << ordinal;
+            return oss.str();
+        }
+
+        NodeIdentityMembershipState InferDefaultMembershipState(
+            const NodeIdentity &identity)
+        {
+            if (identity.node_type != ClusterNodeType::kMetadata)
+            {
+                return NodeIdentityMembershipState::kNonRaft;
+            }
+
+            if (identity.source == NodeIdentitySource::kConfigGenerator &&
+                identity.raft_id.has_value() && *identity.raft_id > 0)
+            {
+                return NodeIdentityMembershipState::kVoter;
+            }
+
+            if (identity.source == NodeIdentitySource::kExplicitOverride)
+            {
+                return NodeIdentityMembershipState::kCandidate;
+            }
+
+            if (identity.raft_id.has_value() && *identity.raft_id > 0)
+            {
+                return NodeIdentityMembershipState::kCandidate;
+            }
+
+            return NodeIdentityMembershipState::kJoining;
+        }
+
+        NodeIdentity NormalizeNodeIdentity(NodeIdentity identity)
+        {
+            if (identity.membership_state ==
+                NodeIdentityMembershipState::kUnknown)
+            {
+                identity.membership_state =
+                    InferDefaultMembershipState(identity);
+            }
+            return identity;
+        }
+
+        NodeIdentityValidationResult ValidateNodeIdentityImpl(
+            const NodeIdentity &identity,
+            const bool allow_membership_inference)
+        {
+            NodeIdentityValidationResult result;
+            const auto normalized_identity = allow_membership_inference
+                                                 ? NormalizeNodeIdentity(identity)
+                                                 : identity;
+
+            if (normalized_identity.cluster_id.empty())
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kMissingClusterId,
+                         "cluster_id",
+                         "cluster_id must not be empty",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+
+            if (normalized_identity.node_id.empty())
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kMissingNodeId,
+                         "node_id",
+                         "node_id must not be empty",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+
+            if (normalized_identity.node_type == ClusterNodeType::kUnknown)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kInvalidNodeType,
+                         "node_type",
+                         "node_type must be view, metadata or storage",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+
+            if (normalized_identity.identity_version == 0)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kInvalidIdentityVersion,
+                         "identity_version",
+                         "identity_version must be greater than zero",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+            else if (!IsSupportedIdentityVersion(normalized_identity.identity_version))
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kUnsupportedIdentityVersion,
+                         "identity_version",
+                         "identity_version is not supported by current binary; 009 only accepts the current node.identity schema",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+
+            if (normalized_identity.persistent_generation == 0)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kInvalidPersistentGeneration,
+                         "persistent_generation",
+                         "persistent_generation must be greater than zero",
+                         normalized_identity.node_type,
+                         normalized_identity.node_id,
+                         normalized_identity.raft_id);
+            }
+
+            if (normalized_identity.node_type == ClusterNodeType::kMetadata)
+            {
+                switch (normalized_identity.membership_state)
+                {
+                case NodeIdentityMembershipState::kJoining:
+                case NodeIdentityMembershipState::kCandidate:
+                    if (normalized_identity.raft_id.has_value() &&
+                        *normalized_identity.raft_id <= 0)
+                    {
+                        AddIssue(
+                            &result,
+                            NodeIdentityIssueCode::kMissingRaftId,
+                            "raft_id",
+                            "metadata joining/candidate identity may omit raft_id, but any provided raft_id must be positive",
+                            normalized_identity.node_type,
+                            normalized_identity.node_id,
+                            normalized_identity.raft_id);
+                    }
+                    break;
+                case NodeIdentityMembershipState::kLearner:
+                case NodeIdentityMembershipState::kVoter:
+                    if (!normalized_identity.raft_id.has_value() ||
+                        *normalized_identity.raft_id <= 0)
+                    {
+                        AddIssue(&result,
+                                 NodeIdentityIssueCode::kMissingRaftId,
+                                 "raft_id",
+                                 "metadata learner/voter identity requires positive raft_id",
+                                 normalized_identity.node_type,
+                                 normalized_identity.node_id,
+                                 normalized_identity.raft_id);
+                    }
+                    break;
+                case NodeIdentityMembershipState::kUnknown:
+                case NodeIdentityMembershipState::kNonRaft:
+                    AddIssue(&result,
+                             NodeIdentityIssueCode::kInvalidMembershipState,
+                             "membership_state",
+                             "metadata identity must use joining, candidate, learner or voter membership_state",
+                             normalized_identity.node_type,
+                             normalized_identity.node_id,
+                             normalized_identity.raft_id);
+                    break;
+                }
+
+                if (normalized_identity.membership_state ==
+                        NodeIdentityMembershipState::kVoter &&
+                    normalized_identity.source == NodeIdentitySource::kExplicitOverride)
+                {
+                    AddIssue(&result,
+                             NodeIdentityIssueCode::kInvalidMembershipState,
+                             "membership_state",
+                             "metadata dynamic join/local override identity must not persist voter membership_state without bootstrap or committed membership authority",
+                             normalized_identity.node_type,
+                             normalized_identity.node_id,
+                             normalized_identity.raft_id);
+                }
+            }
+            else
+            {
+                if (normalized_identity.raft_id.has_value())
+                {
+                    AddIssue(&result,
+                             NodeIdentityIssueCode::kUnexpectedRaftId,
+                             "raft_id",
+                             "non-metadata node identity must not carry raft_id",
+                             normalized_identity.node_type,
+                             normalized_identity.node_id,
+                             normalized_identity.raft_id);
+                }
+
+                if (normalized_identity.membership_state !=
+                    NodeIdentityMembershipState::kNonRaft)
+                {
+                    AddIssue(&result,
+                             NodeIdentityIssueCode::kInvalidMembershipState,
+                             "membership_state",
+                             "view/storage identity must persist non_raft membership_state",
+                             normalized_identity.node_type,
+                             normalized_identity.node_id,
+                             normalized_identity.raft_id);
+                }
+            }
+
+            return result;
+        }
+
         std::string BuildIdentitySummary(const NodeIdentity &identity)
         {
             std::ostringstream oss;
@@ -131,6 +362,10 @@ namespace clusterdemo
                 << ", node_id=" << QuoteDiagnosticValue(identity.node_id)
                 << ", node_type=" << QuoteDiagnosticValue(ToString(identity.node_type))
                 << ", raft_id=" << QuoteDiagnosticOptionalRaftId(identity.raft_id)
+                << ", membership_state="
+                << QuoteDiagnosticValue(ToString(identity.membership_state))
+                << ", persistent_generation='"
+                << identity.persistent_generation << "'"
                 << ", source=" << QuoteDiagnosticValue(ToString(identity.source));
             return oss.str();
         }
@@ -225,6 +460,25 @@ namespace clusterdemo
                          identity_path);
             }
 
+            if (expected.membership_state.has_value() &&
+                identity.membership_state != *expected.membership_state)
+            {
+                AddIssue(&result,
+                         NodeIdentityIssueCode::kMembershipStateMismatch,
+                         "membership_state",
+                         make_message("membership_state mismatch: expected=" +
+                                      QuoteDiagnosticValue(ToString(
+                                          *expected.membership_state)) +
+                                      ", actual=" +
+                                      QuoteDiagnosticValue(ToString(
+                                          identity.membership_state)) +
+                                      "; refusing to reinterpret durable metadata authority state"),
+                         identity.node_type,
+                         identity.node_id,
+                         identity.raft_id,
+                         identity_path);
+            }
+
             if (expected.source.has_value() &&
                 identity.source != *expected.source)
             {
@@ -244,8 +498,16 @@ namespace clusterdemo
                          identity_path);
             }
 
-            if (expected.require_raft_id_for_metadata &&
+            const auto expected_membership_state =
+                expected.membership_state.value_or(identity.membership_state);
+            const bool expected_metadata_needs_positive_raft_id =
+                expected.require_raft_id_for_metadata &&
                 identity.node_type == ClusterNodeType::kMetadata &&
+                expected_membership_state !=
+                    NodeIdentityMembershipState::kJoining &&
+                expected_membership_state !=
+                    NodeIdentityMembershipState::kCandidate;
+            if (expected_metadata_needs_positive_raft_id &&
                 (!identity.raft_id.has_value() || *identity.raft_id <= 0))
             {
                 AddIssue(&result,
@@ -330,6 +592,32 @@ namespace clusterdemo
             return true;
         }
 
+        bool ParseUInt64(std::string_view text, std::uint64_t *out)
+        {
+            if (out == nullptr)
+            {
+                return false;
+            }
+
+            const auto trimmed = TrimAscii(text);
+            if (trimmed.empty())
+            {
+                return false;
+            }
+
+            const char *begin = trimmed.data();
+            const char *end = trimmed.data() + trimmed.size();
+            std::uint64_t value = 0;
+            const auto parsed = std::from_chars(begin, end, value);
+            if (parsed.ec != std::errc{} || parsed.ptr != end)
+            {
+                return false;
+            }
+
+            *out = value;
+            return true;
+        }
+
         bool ParseInt32(std::string_view text, std::int32_t *out)
         {
             if (out == nullptr)
@@ -394,12 +682,45 @@ namespace clusterdemo
             return std::nullopt;
         }
 
+        std::optional<NodeIdentityMembershipState> ParseMembershipState(
+            std::string_view text)
+        {
+            const auto trimmed = TrimAscii(text);
+            if (trimmed == "unknown")
+            {
+                return NodeIdentityMembershipState::kUnknown;
+            }
+            if (trimmed == "non_raft")
+            {
+                return NodeIdentityMembershipState::kNonRaft;
+            }
+            if (trimmed == "joining")
+            {
+                return NodeIdentityMembershipState::kJoining;
+            }
+            if (trimmed == "candidate")
+            {
+                return NodeIdentityMembershipState::kCandidate;
+            }
+            if (trimmed == "learner")
+            {
+                return NodeIdentityMembershipState::kLearner;
+            }
+            if (trimmed == "voter")
+            {
+                return NodeIdentityMembershipState::kVoter;
+            }
+            return std::nullopt;
+        }
+
         bool NodeIdentityEquals(const NodeIdentity &lhs, const NodeIdentity &rhs)
         {
             return lhs.cluster_id == rhs.cluster_id &&
                    lhs.node_id == rhs.node_id &&
                    lhs.node_type == rhs.node_type &&
                    lhs.raft_id == rhs.raft_id &&
+                   lhs.membership_state == rhs.membership_state &&
+                   lhs.persistent_generation == rhs.persistent_generation &&
                    lhs.identity_version == rhs.identity_version &&
                    lhs.created_at_unix_ms == rhs.created_at_unix_ms &&
                    lhs.source == rhs.source;
@@ -500,8 +821,8 @@ namespace clusterdemo
             std::string *diagnostic)
         {
             ParsedIdentityFile parsed;
-            std::array<bool, 7> seen_fields{
-                false, false, false, false, false, false, false};
+            std::array<bool, 9> seen_fields{
+                false, false, false, false, false, false, false, false, false};
 
             auto add_corrupt_issue = [&](std::string field_path, std::string message)
             {
@@ -652,9 +973,52 @@ namespace clusterdemo
                     continue;
                 }
 
-                if (key == "source")
+                if (key == "membership_state")
                 {
                     if (!mark_seen(6))
+                    {
+                        continue;
+                    }
+
+                    parsed.saw_membership_state = true;
+                    const auto parsed_membership_state =
+                        ParseMembershipState(value);
+                    if (!parsed_membership_state.has_value())
+                    {
+                        add_corrupt_issue(
+                            key,
+                            "membership_state must be unknown, non_raft, joining, candidate, learner or voter");
+                        continue;
+                    }
+                    parsed.identity.membership_state =
+                        *parsed_membership_state;
+                    continue;
+                }
+
+                if (key == "persistent_generation")
+                {
+                    if (!mark_seen(7))
+                    {
+                        continue;
+                    }
+
+                    parsed.saw_persistent_generation = true;
+                    std::uint64_t persistent_generation = 0;
+                    if (!ParseUInt64(value, &persistent_generation))
+                    {
+                        add_corrupt_issue(
+                            key,
+                            "persistent_generation must be uint64");
+                        continue;
+                    }
+                    parsed.identity.persistent_generation =
+                        persistent_generation;
+                    continue;
+                }
+
+                if (key == "source")
+                {
+                    if (!mark_seen(8))
                     {
                         continue;
                     }
@@ -693,7 +1057,7 @@ namespace clusterdemo
             if (!seen_fields[4])
             {
                 add_corrupt_issue("raft_id",
-                                  "missing raft_id field; use empty value for non-metadata nodes");
+                                  "missing raft_id field; use empty value when raft_id is intentionally unset");
             }
             if (!seen_fields[5])
             {
@@ -701,6 +1065,16 @@ namespace clusterdemo
                                   "missing created_at_unix_ms field");
             }
             if (!seen_fields[6])
+            {
+                add_corrupt_issue("membership_state",
+                                  "missing membership_state field in node.identity");
+            }
+            if (!seen_fields[7])
+            {
+                add_corrupt_issue("persistent_generation",
+                                  "missing persistent_generation field in node.identity");
+            }
+            if (!seen_fields[8])
             {
                 add_corrupt_issue("source", "missing source field");
             }
@@ -731,6 +1105,10 @@ namespace clusterdemo
             }
             oss << '\n'
                 << "created_at_unix_ms=" << identity.created_at_unix_ms << '\n'
+                << "membership_state=" << ToString(identity.membership_state)
+                << '\n'
+                << "persistent_generation=" << identity.persistent_generation
+                << '\n'
                 << "source=" << ToString(identity.source) << '\n';
             return oss.str();
         }
@@ -768,6 +1146,17 @@ namespace clusterdemo
                 return NodeIdentityStatusCode::kUnsupported;
             }
             return NodeIdentityStatusCode::kConflict;
+        }
+
+        NodeIdentityStatusCode ProcessIncarnationStatusFromValidation(
+            const NodeIdentityValidationResult &validation)
+        {
+            if (HasIssueCode(validation,
+                             NodeIdentityIssueCode::kUnsupportedIdentityVersion))
+            {
+                return NodeIdentityStatusCode::kUnsupported;
+            }
+            return NodeIdentityStatusCode::kInvalidArgument;
         }
 
         void CleanupStagingFile(const std::filesystem::path &staging_path)
@@ -985,6 +1374,7 @@ namespace clusterdemo
             }
 
             result.status = NodeIdentityStatusCode::kOk;
+            result.identity = identity;
             result.created =
                 options.store_mode == NodeIdentityStoreMode::kCreateNewOnly;
             result.replaced =
@@ -992,7 +1382,7 @@ namespace clusterdemo
                 NodeIdentityStoreMode::kReplaceOnlyIfMatchesExpected;
             result.durable = false;
             result.diagnostic =
-                "best-effort node.identity publish completed on Windows; "
+                "best-effort atomic node.identity publish completed on Windows; "
                 "file flush and MoveFileExW succeeded, directory durability not claimed";
             return result;
 #else
@@ -1075,13 +1465,14 @@ namespace clusterdemo
             }
 
             result.status = NodeIdentityStatusCode::kOk;
+            result.identity = identity;
             result.created =
                 options.store_mode == NodeIdentityStoreMode::kCreateNewOnly;
             result.replaced =
                 options.store_mode ==
                 NodeIdentityStoreMode::kReplaceOnlyIfMatchesExpected;
             result.durable = true;
-            result.diagnostic = "node.identity durable publish completed";
+            result.diagnostic = "node.identity atomic durable publish completed";
             return result;
 #endif
         }
@@ -1096,87 +1487,7 @@ namespace clusterdemo
     NodeIdentityValidationResult ValidateNodeIdentity(
         const NodeIdentity &identity)
     {
-        NodeIdentityValidationResult result;
-
-        if (identity.cluster_id.empty())
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kMissingClusterId,
-                     "cluster_id",
-                     "cluster_id must not be empty",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (identity.node_id.empty())
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kMissingNodeId,
-                     "node_id",
-                     "node_id must not be empty",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (identity.node_type == ClusterNodeType::kUnknown)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kInvalidNodeType,
-                     "node_type",
-                     "node_type must be view, metadata or storage",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (identity.identity_version == 0)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kInvalidIdentityVersion,
-                     "identity_version",
-                     "identity_version must be greater than zero",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-        else if (identity.identity_version != kNodeIdentityCurrentVersion)
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kUnsupportedIdentityVersion,
-                     "identity_version",
-                     "identity_version is not supported by current binary",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        if (identity.node_type == ClusterNodeType::kMetadata)
-        {
-            if (!identity.raft_id.has_value() || *identity.raft_id <= 0)
-            {
-                AddIssue(&result,
-                         NodeIdentityIssueCode::kMissingRaftId,
-                         "raft_id",
-                         "metadata node identity requires positive raft_id",
-                         identity.node_type,
-                         identity.node_id,
-                         identity.raft_id);
-            }
-        }
-        else if (identity.raft_id.has_value())
-        {
-            AddIssue(&result,
-                     NodeIdentityIssueCode::kUnexpectedRaftId,
-                     "raft_id",
-                     "non-metadata node identity must not carry raft_id",
-                     identity.node_type,
-                     identity.node_id,
-                     identity.raft_id);
-        }
-
-        return result;
+        return ValidateNodeIdentityImpl(identity, true);
     }
 
     NodeIdentityValidationResult ValidateNodeIdentityMatches(
@@ -1298,7 +1609,9 @@ namespace clusterdemo
             return result;
         }
 
-        auto identity_validation = ValidateNodeIdentity(parsed->identity);
+        const auto loaded_identity = parsed->identity;
+        auto identity_validation =
+            ValidateNodeIdentityImpl(loaded_identity, false);
         if (!identity_validation.ok())
         {
             for (const auto &issue : identity_validation.issues)
@@ -1313,7 +1626,7 @@ namespace clusterdemo
         // load 阶段要把 durable identity 的路径和 expected/actual 差异一起返回，
         // 避免调用方只看到 conflict 却无法定位是哪份 node.identity 被错误复用。
         auto match_validation = ValidateNodeIdentityMatchesDetailed(
-            parsed->identity,
+            loaded_identity,
             options.expected,
             result.identity_path,
             "existing node.identity");
@@ -1326,7 +1639,7 @@ namespace clusterdemo
         }
 
         result.status = NodeIdentityStatusCode::kOk;
-        result.identity = parsed->identity;
+        result.identity = loaded_identity;
         result.diagnostic = "node.identity loaded successfully";
         return result;
     }
@@ -1344,7 +1657,8 @@ namespace clusterdemo
             return result;
         }
 
-        auto identity_validation = ValidateNodeIdentity(identity);
+        const auto normalized_identity = NormalizeNodeIdentity(identity);
+        auto identity_validation = ValidateNodeIdentity(normalized_identity);
         if (!identity_validation.ok())
         {
             result.validation = std::move(identity_validation);
@@ -1384,10 +1698,11 @@ namespace clusterdemo
                 result.status = NodeIdentityStatusCode::kConflict;
                 const ExpectedNodeIdentity requested_identity{
                     .cluster_id = identity.cluster_id,
-                    .node_id = identity.node_id,
-                    .node_type = identity.node_type,
-                    .raft_id = identity.raft_id,
-                    .source = identity.source,
+                    .node_id = normalized_identity.node_id,
+                    .node_type = normalized_identity.node_type,
+                    .raft_id = normalized_identity.raft_id,
+                    .membership_state = normalized_identity.membership_state,
+                    .source = normalized_identity.source,
                     .require_raft_id_for_metadata = true,
                     .forbid_raft_id_for_non_metadata = true};
                 // create-only 冲突不能只报“已存在”，还要返回请求身份和现存身份
@@ -1402,8 +1717,8 @@ namespace clusterdemo
                          NodeIdentityIssueCode::kExistingIdentityConflict,
                          "node.identity",
                          "refusing to overwrite existing node.identity in create-only mode; "
-                         "requested identity=" +
-                             BuildIdentitySummary(identity) +
+                             "requested identity=" +
+                             BuildIdentitySummary(normalized_identity) +
                              ", existing identity=" +
                              BuildIdentitySummary(*loaded.identity),
                          loaded.identity->node_type,
@@ -1427,15 +1742,16 @@ namespace clusterdemo
                 return result;
             }
 
-            if (!NodeIdentityEquals(*loaded.identity, identity))
+            if (!NodeIdentityEquals(*loaded.identity, normalized_identity))
             {
                 result.status = NodeIdentityStatusCode::kConflict;
                 const ExpectedNodeIdentity requested_identity{
-                    .cluster_id = identity.cluster_id,
-                    .node_id = identity.node_id,
-                    .node_type = identity.node_type,
-                    .raft_id = identity.raft_id,
-                    .source = identity.source,
+                    .cluster_id = normalized_identity.cluster_id,
+                    .node_id = normalized_identity.node_id,
+                    .node_type = normalized_identity.node_type,
+                    .raft_id = normalized_identity.raft_id,
+                    .membership_state = normalized_identity.membership_state,
+                    .source = normalized_identity.source,
                     .require_raft_id_for_metadata = true,
                     .forbid_raft_id_for_non_metadata = true};
                 // replace-only 只允许重写同一身份文件；如果请求身份不同，必须显式
@@ -1450,8 +1766,8 @@ namespace clusterdemo
                          NodeIdentityIssueCode::kExistingIdentityConflict,
                          "node.identity",
                          "replace mode only permits rewriting the same identity; "
-                         "requested identity=" +
-                             BuildIdentitySummary(identity) +
+                             "requested identity=" +
+                             BuildIdentitySummary(normalized_identity) +
                              ", existing identity=" +
                              BuildIdentitySummary(*loaded.identity),
                          loaded.identity->node_type,
@@ -1478,7 +1794,7 @@ namespace clusterdemo
             return result;
         }
 
-        result = PublishIdentityFile(identity, options);
+        result = PublishIdentityFile(normalized_identity, options);
         return result;
     }
 
@@ -1514,7 +1830,7 @@ namespace clusterdemo
         if (stored.ok())
         {
             result.status = NodeIdentityStatusCode::kOk;
-            result.identity = request.identity_to_create;
+            result.identity = stored.identity;
             result.validation = stored.validation;
             result.created_new = true;
             result.durable = stored.durable;
@@ -1544,6 +1860,44 @@ namespace clusterdemo
         return result;
     }
 
+    ProcessIncarnationResult CreateProcessIncarnation(const NodeIdentity &identity)
+    {
+        ProcessIncarnationResult result;
+
+        auto identity_validation = ValidateNodeIdentity(identity);
+        if (!identity_validation.ok())
+        {
+            result.validation = std::move(identity_validation);
+            result.status =
+                ProcessIncarnationStatusFromValidation(result.validation);
+            result.diagnostic = JoinIssues(result.validation);
+            return result;
+        }
+
+        const auto now = std::chrono::system_clock::now();
+        const auto started_at_unix_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch())
+                .count();
+        const auto started_at_unix_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch())
+                .count();
+
+        result.status = NodeIdentityStatusCode::kOk;
+        result.incarnation = ProcessIncarnation{
+            .cluster_id = identity.cluster_id,
+            .node_id = identity.node_id,
+            .node_type = identity.node_type,
+            .incarnation_id =
+                BuildProcessIncarnationId(identity, started_at_unix_ns),
+            .started_at_unix_ms = started_at_unix_ms,
+            .startup_sequence_base = kProcessIncarnationInitialSequence};
+        result.diagnostic =
+            "process incarnation created successfully from durable node identity";
+        return result;
+    }
+
     const char *ToString(const NodeIdentitySource source)
     {
         switch (source)
@@ -1555,6 +1909,27 @@ namespace clusterdemo
         case NodeIdentitySource::kExplicitOverride:
             return "explicit_override";
         case NodeIdentitySource::kUnknown:
+        default:
+            return "unknown";
+        }
+    }
+
+    const char *ToString(const NodeIdentityMembershipState state)
+    {
+        switch (state)
+        {
+        case NodeIdentityMembershipState::kUnknown:
+            return "unknown";
+        case NodeIdentityMembershipState::kNonRaft:
+            return "non_raft";
+        case NodeIdentityMembershipState::kJoining:
+            return "joining";
+        case NodeIdentityMembershipState::kCandidate:
+            return "candidate";
+        case NodeIdentityMembershipState::kLearner:
+            return "learner";
+        case NodeIdentityMembershipState::kVoter:
+            return "voter";
         default:
             return "unknown";
         }
@@ -1627,6 +2002,12 @@ namespace clusterdemo
             return "durability_publish_failed";
         case NodeIdentityIssueCode::kIoFailure:
             return "io_failure";
+        case NodeIdentityIssueCode::kInvalidMembershipState:
+            return "invalid_membership_state";
+        case NodeIdentityIssueCode::kMembershipStateMismatch:
+            return "membership_state_mismatch";
+        case NodeIdentityIssueCode::kInvalidPersistentGeneration:
+            return "invalid_persistent_generation";
         case NodeIdentityIssueCode::kUnknown:
         default:
             return "unknown";

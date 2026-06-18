@@ -35,12 +35,20 @@ namespace viewdemo
         struct Record
         {
             NodeRegistration registration;
+            ViewNodeObservedState observed_state;
             std::uint64_t registered_at_unix_ms{0};
-            std::uint64_t last_seen_unix_ms{0};
-            std::uint64_t last_sequence{0};
+            std::vector<ViewRegistryDiagnostic> sticky_diagnostics;
         };
 
         using Records = std::map<RecordKey, Record>;
+
+        struct ParsedProcessIncarnationId
+        {
+            NodeId node_id;
+            std::uint64_t started_at_unix_ns{0};
+            std::uint64_t pid{0};
+            std::uint64_t ordinal{0};
+        };
 
         bool IsValidNodeId(const std::string_view node_id)
         {
@@ -99,6 +107,181 @@ namespace viewdemo
         bool IsValidOptionalEndpoint(const std::string_view endpoint)
         {
             return endpoint.empty() || IsValidEndpoint(endpoint);
+        }
+
+        bool TryParseUnsignedU64(const std::string_view text,
+                                 std::uint64_t *value_out)
+        {
+            if (text.empty() ||
+                !std::all_of(text.begin(),
+                             text.end(),
+                             [](const unsigned char ch)
+                             { return std::isdigit(ch) != 0; }))
+            {
+                return false;
+            }
+
+            try
+            {
+                *value_out = std::stoull(std::string(text));
+                return true;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+        }
+
+        bool TryParseProcessIncarnationId(
+            const std::string_view incarnation_id,
+            ParsedProcessIncarnationId *parsed_out)
+        {
+            constexpr std::string_view kBootMarker = ":boot:";
+            const auto marker = incarnation_id.find(kBootMarker);
+            if (marker == std::string_view::npos || marker == 0 ||
+                marker + kBootMarker.size() >= incarnation_id.size())
+            {
+                return false;
+            }
+
+            ParsedProcessIncarnationId parsed;
+            parsed.node_id = std::string(incarnation_id.substr(0, marker));
+            if (!IsValidNodeId(parsed.node_id))
+            {
+                return false;
+            }
+
+            const auto remainder =
+                incarnation_id.substr(marker + kBootMarker.size());
+            const auto first_separator = remainder.find(':');
+            if (first_separator == std::string_view::npos || first_separator == 0 ||
+                first_separator + 1 >= remainder.size())
+            {
+                return false;
+            }
+
+            const auto second_separator =
+                remainder.find(':', first_separator + 1);
+            if (second_separator == std::string_view::npos ||
+                second_separator == first_separator + 1 ||
+                second_separator + 1 >= remainder.size())
+            {
+                return false;
+            }
+
+            const auto started_at_unix_ns =
+                remainder.substr(0, first_separator);
+            const auto pid = remainder.substr(
+                first_separator + 1,
+                second_separator - first_separator - 1);
+            const auto ordinal = remainder.substr(second_separator + 1);
+
+            if (!TryParseUnsignedU64(started_at_unix_ns,
+                                     &parsed.started_at_unix_ns) ||
+                !TryParseUnsignedU64(pid, &parsed.pid) ||
+                !TryParseUnsignedU64(ordinal, &parsed.ordinal))
+            {
+                return false;
+            }
+
+            *parsed_out = std::move(parsed);
+            return true;
+        }
+
+        enum class IncarnationDecision : std::uint8_t
+        {
+            kUnknown = 0,
+            kSame = 1,
+            kIncomingNewer = 2,
+            kIncomingOlder = 3,
+        };
+
+        IncarnationDecision CompareIncarnationIds(
+            const std::string_view existing_incarnation_id,
+            const std::string_view incoming_incarnation_id)
+        {
+            if (existing_incarnation_id.empty() &&
+                incoming_incarnation_id.empty())
+            {
+                return IncarnationDecision::kSame;
+            }
+            if (existing_incarnation_id.empty())
+            {
+                return IncarnationDecision::kIncomingNewer;
+            }
+            if (incoming_incarnation_id.empty())
+            {
+                return IncarnationDecision::kIncomingOlder;
+            }
+            if (existing_incarnation_id == incoming_incarnation_id)
+            {
+                return IncarnationDecision::kSame;
+            }
+
+            ParsedProcessIncarnationId existing;
+            ParsedProcessIncarnationId incoming;
+            if (!TryParseProcessIncarnationId(existing_incarnation_id, &existing) ||
+                !TryParseProcessIncarnationId(incoming_incarnation_id, &incoming) ||
+                existing.node_id != incoming.node_id)
+            {
+                return incoming_incarnation_id > existing_incarnation_id
+                           ? IncarnationDecision::kIncomingNewer
+                           : IncarnationDecision::kIncomingOlder;
+            }
+
+            return std::tie(incoming.started_at_unix_ns,
+                            incoming.pid,
+                            incoming.ordinal) >
+                           std::tie(existing.started_at_unix_ns,
+                                    existing.pid,
+                                    existing.ordinal)
+                       ? IncarnationDecision::kIncomingNewer
+                       : IncarnationDecision::kIncomingOlder;
+        }
+
+        bool ResolveSelfRefreshIncarnationId(const HeartbeatNodeRequest &request,
+                                             std::string *incarnation_id_out)
+        {
+            if (!request.incarnation_id.empty())
+            {
+                ParsedProcessIncarnationId parsed;
+                if (!TryParseProcessIncarnationId(request.incarnation_id,
+                                                  &parsed) ||
+                    parsed.node_id != request.node_id)
+                {
+                    return false;
+                }
+                *incarnation_id_out = request.incarnation_id;
+                return true;
+            }
+
+            const std::string prefix =
+                "view-node-self-refresh-" + request.node_id + "-";
+            if (request.request_id.rfind(prefix, 0) != 0)
+            {
+                return false;
+            }
+
+            const auto suffix_separator = request.request_id.rfind('-');
+            if (suffix_separator == std::string::npos ||
+                suffix_separator <= prefix.size() ||
+                suffix_separator + 1 >= request.request_id.size())
+            {
+                return false;
+            }
+
+            const auto incarnation_id = request.request_id.substr(
+                prefix.size(),
+                suffix_separator - prefix.size());
+            ParsedProcessIncarnationId parsed;
+            if (!TryParseProcessIncarnationId(incarnation_id, &parsed) ||
+                parsed.node_id != request.node_id)
+            {
+                return false;
+            }
+
+            *incarnation_id_out = incarnation_id;
+            return true;
         }
 
         ViewRegistryConfig NormalizeConfig(ViewRegistryConfig config)
@@ -164,6 +347,59 @@ namespace viewdemo
                                    request_id,
                                    cluster_id,
                                    node_id);
+        }
+
+        bool SameDiagnosticIdentity(const ViewRegistryDiagnostic &lhs,
+                                    const ViewRegistryDiagnostic &rhs)
+        {
+            return lhs.code == rhs.code &&
+                   lhs.message == rhs.message &&
+                   lhs.cluster_id == rhs.cluster_id &&
+                   lhs.node_id == rhs.node_id &&
+                   lhs.endpoint == rhs.endpoint &&
+                   lhs.sequence == rhs.sequence;
+        }
+
+        void RememberStickyDiagnostic(Record *record,
+                                      const ViewRegistryDiagnostic &diagnostic)
+        {
+            if (record == nullptr)
+            {
+                return;
+            }
+
+            constexpr std::size_t kMaxStickyDiagnostics = 8;
+            auto &diagnostics = record->sticky_diagnostics;
+            const auto duplicate = std::find_if(
+                diagnostics.begin(),
+                diagnostics.end(),
+                [&diagnostic](const ViewRegistryDiagnostic &existing)
+                { return SameDiagnosticIdentity(existing, diagnostic); });
+            if (duplicate != diagnostics.end())
+            {
+                *duplicate = diagnostic;
+                return;
+            }
+
+            if (diagnostics.size() >= kMaxStickyDiagnostics)
+            {
+                diagnostics.erase(diagnostics.begin());
+            }
+            diagnostics.push_back(diagnostic);
+        }
+
+        void AppendStickyDiagnostics(
+            const Record &record,
+            std::vector<ViewRegistryDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            diagnostics->insert(diagnostics->end(),
+                                record.sticky_diagnostics.begin(),
+                                record.sticky_diagnostics.end());
         }
 
         ViewRegistryStatusCode ValidateRegistration(
@@ -461,6 +697,11 @@ namespace viewdemo
             // ViewNode 只补 discovery / observation status，不推导 Raft authority。
             normalized.membership_state =
                 MapObservedMembershipState(normalized, liveness, health);
+            if (liveness != ViewNodeLivenessState::kLive ||
+                health.health == ViewNodeHealth::kUnavailable)
+            {
+                normalized.leader_hint.reset();
+            }
             return normalized;
         }
 
@@ -472,15 +713,18 @@ namespace viewdemo
                 .cluster_id = record.registration.cluster_id,
                 .node_id = record.registration.node_id,
                 .node_type = record.registration.node_type,
+                .incarnation_id = record.observed_state.incarnation_id,
                 .endpoint = record.registration.endpoint,
                 .control_plane_endpoint =
                     record.registration.control_plane_endpoint,
                 .data_plane_endpoint = record.registration.data_plane_endpoint,
                 .data_dir_fingerprint = record.registration.data_dir_fingerprint,
+                .observed_state = record.observed_state,
                 .registered_at_unix_ms = record.registered_at_unix_ms,
-                .last_seen_unix_ms = record.last_seen_unix_ms,
-                .last_sequence = record.last_sequence,
-                .liveness = DetermineLiveness(record.last_seen_unix_ms,
+                .last_seen_unix_ms = record.observed_state.observed_at_unix_ms,
+                .last_sequence = record.observed_state.sequence,
+                .liveness = DetermineLiveness(
+                    record.observed_state.observed_at_unix_ms,
                                               now_unix_ms,
                                               config),
                 .failure_domain = record.registration.failure_domain,
@@ -495,6 +739,150 @@ namespace viewdemo
                 snapshot.health,
                 std::move(snapshot.metadata));
             return snapshot;
+        }
+
+        ViewRegistryPeerSnapshot MakePeerSnapshot(
+            const ClusterId &cluster_id,
+            const ClusterViewSnapshot &snapshot)
+        {
+            ViewRegistryPeerSnapshot peer_snapshot;
+            peer_snapshot.cluster_id = cluster_id;
+            peer_snapshot.generated_at_unix_ms = snapshot.observed_at_unix_ms;
+            peer_snapshot.view_nodes = snapshot.view_nodes;
+            peer_snapshot.metadata_nodes = snapshot.metadata_nodes;
+            peer_snapshot.storage_nodes = snapshot.storage_nodes;
+            peer_snapshot.leader_hint = snapshot.leader_hint;
+            return peer_snapshot;
+        }
+
+        NodeRegistration RegistrationFromPeerSnapshot(
+            const ViewNodeSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
+        {
+            NodeRegistration registration;
+            registration.cluster_id = snapshot.cluster_id.empty()
+                                          ? fallback_cluster_id
+                                          : snapshot.cluster_id;
+            registration.node_id = snapshot.node_id;
+            registration.node_type = snapshot.node_type;
+            registration.endpoint = snapshot.endpoint;
+            registration.control_plane_endpoint = snapshot.control_plane_endpoint;
+            registration.data_plane_endpoint = snapshot.data_plane_endpoint;
+            registration.data_dir_fingerprint = snapshot.data_dir_fingerprint;
+            registration.observed_at_unix_ms = snapshot.last_seen_unix_ms;
+            registration.failure_domain = snapshot.failure_domain;
+            registration.health = snapshot.health;
+            registration.capacity = snapshot.capacity;
+            registration.load = snapshot.load;
+            registration.metadata = snapshot.metadata;
+            return registration;
+        }
+
+        bool SnapshotClusterIdsMatch(
+            const std::vector<ViewNodeSnapshot> &snapshots,
+            const ClusterId &cluster_id)
+        {
+            return std::all_of(
+                snapshots.begin(),
+                snapshots.end(),
+                [&cluster_id](const ViewNodeSnapshot &snapshot)
+                {
+                    return snapshot.cluster_id.empty() ||
+                           snapshot.cluster_id == cluster_id;
+                });
+        }
+
+        void FillInvalidImportResult(ImportPeerSnapshotResult *result,
+                                     const ImportPeerSnapshotRequest &request,
+                                     const std::string &message)
+        {
+            SetSummary(&result->summary,
+                       ViewRegistryStatusCode::kInvalidArgument,
+                       message,
+                       request.request_id,
+                       request.cluster_id,
+                       {});
+            result->diagnostics.push_back(
+                MakeDiagnostic(ViewRegistryIssueCode::kClusterMismatch,
+                               message,
+                               request.request_id,
+                               request.cluster_id,
+                               {},
+                               {}));
+        }
+
+        void ImportPeerSnapshotCategory(
+            ViewNodeRegistry *registry,
+            const std::vector<ViewNodeSnapshot> &snapshots,
+            const RequestId &request_id,
+            const ClusterId &cluster_id,
+            ImportPeerSnapshotResult *result)
+        {
+            if (registry == nullptr || result == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &snapshot : snapshots)
+            {
+                ++result->received_node_count;
+
+                const auto registration =
+                    RegistrationFromPeerSnapshot(snapshot, cluster_id);
+                const auto register_result = registry->RegisterNode(
+                    RegisterNodeRequest{
+                        .request_id = request_id + "/peer-register/" +
+                                      snapshot.node_id,
+                        .registration = registration});
+                result->diagnostics.insert(result->diagnostics.end(),
+                                           register_result.diagnostics.begin(),
+                                           register_result.diagnostics.end());
+                if (!register_result.ok())
+                {
+                    ++result->conflict_node_count;
+                    continue;
+                }
+
+                ++result->accepted_node_count;
+                if (register_result.created)
+                {
+                    ++result->applied_node_count;
+                }
+
+                if (snapshot.last_sequence == 0U)
+                {
+                    continue;
+                }
+
+                const auto heartbeat_result = registry->HeartbeatNode(
+                    HeartbeatNodeRequest{
+                        .request_id = request_id + "/peer-heartbeat/" +
+                                      snapshot.node_id + "/" +
+                                      std::to_string(snapshot.last_sequence),
+                        .cluster_id = cluster_id,
+                        .node_id = snapshot.node_id,
+                        .node_type = snapshot.node_type,
+                        .incarnation_id = snapshot.incarnation_id,
+                        .sequence = snapshot.last_sequence,
+                        .observation = registration});
+                result->diagnostics.insert(result->diagnostics.end(),
+                                           heartbeat_result.diagnostics.begin(),
+                                           heartbeat_result.diagnostics.end());
+                if (!heartbeat_result.ok())
+                {
+                    ++result->conflict_node_count;
+                    continue;
+                }
+
+                if (heartbeat_result.applied)
+                {
+                    ++result->applied_node_count;
+                }
+                if (heartbeat_result.stale_ignored)
+                {
+                    ++result->stale_ignored_node_count;
+                }
+            }
         }
 
         SequenceDecision EvaluateSequenceDecision(
@@ -519,6 +907,31 @@ namespace viewdemo
             return SequenceDecision::kApply;
         }
 
+        SequenceDecision DetermineObservedStateMergeDecision(
+            const ViewNodeObservedState &existing_state,
+            const ViewNodeObservedState &incoming_state)
+        {
+            switch (CompareIncarnationIds(existing_state.incarnation_id,
+                                          incoming_state.incarnation_id))
+            {
+            case IncarnationDecision::kIncomingOlder:
+                return SequenceDecision::kStale;
+            case IncarnationDecision::kIncomingNewer:
+                return SequenceDecision::kApply;
+            case IncarnationDecision::kSame:
+            case IncarnationDecision::kUnknown:
+                return EvaluateSequenceDecision(existing_state.sequence,
+                                                existing_state.observed_at_unix_ms,
+                                                incoming_state.sequence,
+                                                incoming_state.observed_at_unix_ms);
+            }
+
+            return EvaluateSequenceDecision(existing_state.sequence,
+                                            existing_state.observed_at_unix_ms,
+                                            incoming_state.sequence,
+                                            incoming_state.observed_at_unix_ms);
+        }
+
         bool IsLiveForDiscovery(const ViewNodeSnapshot &snapshot,
                                 const bool live_only)
         {
@@ -528,10 +941,11 @@ namespace viewdemo
 
         bool IsWritableStorageNode(const ViewNodeSnapshot &snapshot)
         {
-            return snapshot.health.health != ViewNodeHealth::kUnavailable &&
-                   snapshot.health.health != ViewNodeHealth::kReadOnly &&
-                   snapshot.health.health != ViewNodeHealth::kDraining &&
+            return snapshot.health.health == ViewNodeHealth::kHealthy &&
+                   snapshot.health.disk_pressure != ViewNodeDiskPressure::kHigh &&
                    snapshot.health.disk_pressure != ViewNodeDiskPressure::kFull &&
+                   snapshot.capacity.total_capacity_bytes > 0 &&
+                   snapshot.capacity.available_capacity_bytes > 0 &&
                    !snapshot.load.write_admission_overloaded;
         }
 
@@ -570,7 +984,8 @@ namespace viewdemo
 
         bool IsObservedLeader(const ViewNodeSnapshot &snapshot)
         {
-            return snapshot.metadata.has_value() &&
+            return snapshot.liveness == ViewNodeLivenessState::kLive &&
+                   snapshot.metadata.has_value() &&
                    snapshot.metadata->raft_role ==
                        MetadataRaftObservedRole::kLeader;
         }
@@ -588,6 +1003,10 @@ namespace viewdemo
         void MaybeUpdateLeaderHint(const ViewNodeSnapshot &snapshot,
                                    std::optional<MetadataLeaderHint> *leader_hint)
         {
+            if (snapshot.liveness != ViewNodeLivenessState::kLive)
+            {
+                return;
+            }
             if (!snapshot.metadata.has_value() ||
                 !snapshot.metadata->leader_hint.has_value())
             {
@@ -600,6 +1019,52 @@ namespace viewdemo
             {
                 *leader_hint = candidate;
             }
+        }
+
+        std::string BuildMetadataNonAuthorityMessage(
+            const ViewNodeSnapshot &snapshot)
+        {
+            if (!snapshot.metadata.has_value())
+            {
+                return "metadata observation is discovery-only and cannot modify committed membership";
+            }
+
+            switch (snapshot.metadata->membership_state)
+            {
+            case MetadataMembershipObservedState::kVoter:
+                return "observed metadata voter state is discovery-only and does not enter committed voter membership";
+            case MetadataMembershipObservedState::kLearner:
+                return "observed metadata learner state is discovery-only and does not enter committed learner membership";
+            case MetadataMembershipObservedState::kJoining:
+                return "observed metadata joining state is discovery-only and does not bypass metadata leader validation";
+            case MetadataMembershipObservedState::kRegistered:
+            case MetadataMembershipObservedState::kDown:
+            case MetadataMembershipObservedState::kUnknown:
+                return "metadata observation is discovery-only and cannot modify committed membership";
+            }
+
+            return "metadata observation is discovery-only and cannot modify committed membership";
+        }
+
+        void AppendMetadataNonAuthorityDiagnostic(
+            const ViewNodeSnapshot &snapshot,
+            const RequestId &request_id,
+            std::vector<ViewRegistryDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr ||
+                snapshot.node_type != ViewNodeType::kMetadata)
+            {
+                return;
+            }
+
+            diagnostics->push_back(
+                MakeDiagnostic(ViewRegistryIssueCode::kNonAuthorityBoundary,
+                               BuildMetadataNonAuthorityMessage(snapshot),
+                               request_id,
+                               snapshot.cluster_id,
+                               snapshot.node_id,
+                               snapshot.endpoint,
+                               snapshot.last_sequence));
         }
 
         bool PassesMetadataFilters(const ViewNodeSnapshot &snapshot,
@@ -798,6 +1263,20 @@ namespace viewdemo
                                    key.cluster_id,
                                    key.node_id,
                                    request.registration.endpoint));
+                const auto owner = impl_->records.find(*endpoint_owner);
+                if (owner != impl_->records.end())
+                {
+                    RememberStickyDiagnostic(
+                        &owner->second,
+                        MakeDiagnostic(
+                            ViewRegistryIssueCode::kEndpointConflict,
+                            "conflicting registration attempted to reuse endpoint from node_id=" +
+                                key.node_id,
+                            request.request_id,
+                            key.cluster_id,
+                            owner->second.registration.node_id,
+                            request.registration.endpoint));
+                }
                 return result;
             }
         }
@@ -824,6 +1303,14 @@ namespace viewdemo
                                    key.cluster_id,
                                    key.node_id,
                                    request.registration.endpoint));
+                RememberStickyDiagnostic(
+                    &existing->second,
+                    MakeDiagnostic(issue_code,
+                                   message,
+                                   request.request_id,
+                                   key.cluster_id,
+                                   key.node_id,
+                                   request.registration.endpoint));
                 return result;
             }
 
@@ -843,8 +1330,8 @@ namespace viewdemo
         Record record;
         record.registration = request.registration;
         record.registered_at_unix_ms = request.registration.observed_at_unix_ms;
-        record.last_seen_unix_ms = request.registration.observed_at_unix_ms;
-        record.last_sequence = 0;
+        record.observed_state.observed_at_unix_ms =
+            request.registration.observed_at_unix_ms;
 
         const auto inserted = impl_->records.emplace(key, std::move(record));
         result.created = true;
@@ -864,6 +1351,21 @@ namespace viewdemo
         const HeartbeatNodeRequest &request)
     {
         HeartbeatNodeResult result;
+        if (!request.incarnation_id.empty())
+        {
+            ParsedProcessIncarnationId parsed;
+            if (!TryParseProcessIncarnationId(request.incarnation_id, &parsed) ||
+                parsed.node_id != request.node_id)
+            {
+                FillInvalidHeartbeatResult(
+                    &result,
+                    request,
+                    ViewRegistryStatusCode::kInvalidArgument,
+                    ViewRegistryIssueCode::kStaleHeartbeat,
+                    "heartbeat incarnation_id is invalid or does not match node_id");
+                return result;
+            }
+        }
         if (!IsValidClusterId(request.cluster_id))
         {
             FillInvalidHeartbeatResult(
@@ -961,15 +1463,25 @@ namespace viewdemo
                                request.node_id,
                                observation.endpoint,
                                request.sequence));
+            RememberStickyDiagnostic(
+                &existing->second,
+                MakeDiagnostic(issue_code,
+                               message,
+                               request.request_id,
+                               request.cluster_id,
+                               request.node_id,
+                               observation.endpoint,
+                               request.sequence));
             return result;
         }
 
-        result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(
-            existing->second.last_sequence,
-            existing->second.last_seen_unix_ms,
-            request.sequence,
-            observation.observed_at_unix_ms);
+        result.accepted_sequence = existing->second.observed_state.sequence;
+        const auto decision = DetermineObservedStateMergeDecision(
+            existing->second.observed_state,
+            ViewNodeObservedState{
+                .incarnation_id = request.incarnation_id,
+                .sequence = request.sequence,
+                .observed_at_unix_ms = observation.observed_at_unix_ms});
 
         if (decision == SequenceDecision::kStale)
         {
@@ -1009,8 +1521,14 @@ namespace viewdemo
         }
 
         MergeRegistrationFacts(&existing->second, observation);
-        existing->second.last_sequence = request.sequence;
-        existing->second.last_seen_unix_ms = observation.observed_at_unix_ms;
+        if (!request.incarnation_id.empty())
+        {
+            existing->second.observed_state.incarnation_id =
+                request.incarnation_id;
+        }
+        existing->second.observed_state.sequence = request.sequence;
+        existing->second.observed_state.observed_at_unix_ms =
+            observation.observed_at_unix_ms;
 
         result.applied = true;
         result.accepted_sequence = request.sequence;
@@ -1024,6 +1542,31 @@ namespace viewdemo
                                        observation.observed_at_unix_ms,
                                        impl_->config);
         return result;
+    }
+
+    HeartbeatNodeResult ViewNodeRegistry::RefreshSelfNode(
+        const HeartbeatNodeRequest &request)
+    {
+        std::string incarnation_id;
+        if (!ResolveSelfRefreshIncarnationId(request, &incarnation_id))
+        {
+            HeartbeatNodeResult result;
+            FillInvalidHeartbeatResult(
+                &result,
+                request,
+                ViewRegistryStatusCode::kInvalidArgument,
+                ViewRegistryIssueCode::kStaleHeartbeat,
+                "self refresh request must carry a valid process incarnation");
+            return result;
+        }
+
+        HeartbeatNodeRequest refresh_request = request;
+        refresh_request.incarnation_id = std::move(incarnation_id);
+
+        // self refresh 只是 ViewNode 对自己 observed state 的周期性更新，
+        // 故意复用 heartbeat 的 sequence / observed_at / liveness 语义，
+        // 避免把 self record 变成绕过 TTL 的永久 LIVE 特权。
+        return HeartbeatNode(refresh_request);
     }
 
     LookupNodeResult ViewNodeRegistry::LookupNode(
@@ -1085,6 +1628,13 @@ namespace viewdemo
         result.snapshot = MakeSnapshot(existing->second,
                                        now_unix_ms,
                                        impl_->config);
+        AppendStickyDiagnostics(existing->second, &result.diagnostics);
+        if (result.snapshot.has_value())
+        {
+            AppendMetadataNonAuthorityDiagnostic(*result.snapshot,
+                                                {},
+                                                &result.diagnostics);
+        }
         return result;
     }
 
@@ -1114,10 +1664,14 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.diagnostics);
             if (snapshot.node_type != ViewNodeType::kMetadata)
             {
                 continue;
             }
+            AppendMetadataNonAuthorityDiagnostic(snapshot,
+                                                request.request_id,
+                                                &result.diagnostics);
             if (!IsLiveForDiscovery(snapshot, request.live_only))
             {
                 AppendLivenessWarning(snapshot,
@@ -1126,7 +1680,8 @@ namespace viewdemo
                 continue;
             }
 
-            if (snapshot.metadata.has_value())
+            if (snapshot.liveness == ViewNodeLivenessState::kLive &&
+                snapshot.metadata.has_value())
             {
                 result.membership_epoch =
                     std::max(result.membership_epoch,
@@ -1194,6 +1749,7 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.diagnostics);
             if (snapshot.node_type != ViewNodeType::kStorage)
             {
                 continue;
@@ -1290,6 +1846,10 @@ namespace viewdemo
             }
 
             auto snapshot = MakeSnapshot(record, now_unix_ms, impl_->config);
+            AppendStickyDiagnostics(record, &result.snapshot.diagnostics);
+            AppendMetadataNonAuthorityDiagnostic(snapshot,
+                                                request.request_id,
+                                                &result.snapshot.diagnostics);
             if (!request.include_dead_nodes &&
                 snapshot.liveness == ViewNodeLivenessState::kDead)
             {
@@ -1336,6 +1896,89 @@ namespace viewdemo
         SetSummary(&result.summary,
                    ViewRegistryStatusCode::kOk,
                    "cluster view snapshot generated",
+                   request.request_id,
+                   request.cluster_id,
+                   {});
+        return result;
+    }
+
+    ExportPeerSnapshotResult ViewNodeRegistry::ExportPeerSnapshot(
+        const ExportPeerSnapshotRequest &request,
+        const std::uint64_t now_unix_ms) const
+    {
+        const auto cluster_view = GetClusterView(
+            GetClusterViewRequest{.request_id = request.request_id,
+                                  .cluster_id = request.cluster_id,
+                                  .include_dead_nodes = request.include_dead_nodes,
+                                  .include_warnings = request.include_warnings},
+            now_unix_ms);
+
+        ExportPeerSnapshotResult result;
+        result.summary = cluster_view.summary;
+        result.snapshot = MakePeerSnapshot(request.cluster_id,
+                                           cluster_view.snapshot);
+        result.diagnostics = cluster_view.snapshot.diagnostics;
+        return result;
+    }
+
+    ImportPeerSnapshotResult ViewNodeRegistry::ImportPeerSnapshot(
+        const ImportPeerSnapshotRequest &request)
+    {
+        ImportPeerSnapshotResult result;
+        if (!IsValidClusterId(request.cluster_id))
+        {
+            SetSummary(&result.summary,
+                       ViewRegistryStatusCode::kInvalidArgument,
+                       "cluster_id must contain only alnum, '-' or '_'",
+                       request.request_id,
+                       request.cluster_id,
+                       {});
+            return result;
+        }
+
+        if (!request.snapshot.cluster_id.empty() &&
+            request.snapshot.cluster_id != request.cluster_id)
+        {
+            FillInvalidImportResult(
+                &result,
+                request,
+                "peer sync snapshot cluster_id must match request cluster_id");
+            return result;
+        }
+
+        if (!SnapshotClusterIdsMatch(request.snapshot.view_nodes,
+                                     request.cluster_id) ||
+            !SnapshotClusterIdsMatch(request.snapshot.metadata_nodes,
+                                     request.cluster_id) ||
+            !SnapshotClusterIdsMatch(request.snapshot.storage_nodes,
+                                     request.cluster_id))
+        {
+            FillInvalidImportResult(
+                &result,
+                request,
+                "peer sync node snapshot cluster_id must match request cluster_id");
+            return result;
+        }
+
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.view_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.metadata_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+        ImportPeerSnapshotCategory(this,
+                                   request.snapshot.storage_nodes,
+                                   request.request_id,
+                                   request.cluster_id,
+                                   &result);
+
+        SetSummary(&result.summary,
+                   ViewRegistryStatusCode::kOk,
+                   "peer sync observed-state import completed",
                    request.request_id,
                    request.cluster_id,
                    {});

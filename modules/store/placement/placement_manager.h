@@ -7,6 +7,13 @@
 
 #include "store/placement/replica_policy.h"
 
+namespace viewdemo
+{
+    class ViewNodeRegistry;
+    struct DiscoverStorageRequest;
+    struct DiscoverStorageResult;
+}
+
 namespace storedemo
 {
     class StorageNodeRegistry;
@@ -104,6 +111,16 @@ namespace storedemo
         [[nodiscard]] PlacementDecisionResult SelectPlacement(
             const PlacementRequest &request,
             const ViewNodeBackedStorageNodeSnapshotResult &view_snapshot) const;
+
+        [[nodiscard]] PlacementDecisionResult SelectPlacement(
+            const PlacementRequest &request,
+            const viewdemo::DiscoverStorageResult &view_discovery_result) const;
+
+        [[nodiscard]] PlacementDecisionResult SelectPlacement(
+            const PlacementRequest &request,
+            const viewdemo::ViewNodeRegistry &registry,
+            const viewdemo::DiscoverStorageRequest &discovery_request,
+            std::uint64_t now_unix_ms) const;
 
         [[nodiscard]] PlacementDecisionResult SelectPlacement(
             const PlacementRequest &request,

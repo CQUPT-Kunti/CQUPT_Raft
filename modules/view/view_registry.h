@@ -191,15 +191,27 @@ namespace viewdemo
         std::optional<MetadataNodeObservation> metadata;
     };
 
+    struct ViewNodeObservedState
+    {
+        std::string incarnation_id;
+        std::uint64_t sequence{0};
+        std::uint64_t observed_at_unix_ms{0};
+    };
+
     struct ViewNodeSnapshot
     {
         ClusterId cluster_id;
         NodeId node_id;
         ViewNodeType node_type{ViewNodeType::kUnknown};
+        std::string incarnation_id;
         Endpoint endpoint;
         Endpoint control_plane_endpoint;
         Endpoint data_plane_endpoint;
         std::string data_dir_fingerprint;
+        // 结构化 observed-state 事实，供后续 incarnation-aware merge 使用。
+        // 兼容字段 `incarnation_id` / `last_sequence` / `last_seen_unix_ms`
+        // 保持现有调用方不回归。
+        ViewNodeObservedState observed_state;
         std::uint64_t registered_at_unix_ms{0};
         std::uint64_t last_seen_unix_ms{0};
         std::uint64_t last_sequence{0};
@@ -273,6 +285,7 @@ namespace viewdemo
         ClusterId cluster_id;
         NodeId node_id;
         ViewNodeType node_type{ViewNodeType::kUnknown};
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         NodeRegistration observation;
     };
@@ -385,6 +398,59 @@ namespace viewdemo
         }
     };
 
+    struct ViewRegistryPeerSnapshot
+    {
+        ClusterId cluster_id;
+        std::uint64_t generated_at_unix_ms{0};
+        std::vector<ViewNodeSnapshot> view_nodes;
+        std::vector<ViewNodeSnapshot> metadata_nodes;
+        std::vector<ViewNodeSnapshot> storage_nodes;
+        std::optional<MetadataLeaderHint> leader_hint;
+    };
+
+    struct ExportPeerSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        bool include_dead_nodes{true};
+        bool include_warnings{true};
+    };
+
+    struct ExportPeerSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        ViewRegistryPeerSnapshot snapshot;
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
+    struct ImportPeerSnapshotRequest
+    {
+        RequestId request_id;
+        ClusterId cluster_id;
+        ViewRegistryPeerSnapshot snapshot;
+    };
+
+    struct ImportPeerSnapshotResult
+    {
+        ViewRegistryResponseSummary summary;
+        std::uint32_t received_node_count{0};
+        std::uint32_t accepted_node_count{0};
+        std::uint32_t applied_node_count{0};
+        std::uint32_t stale_ignored_node_count{0};
+        std::uint32_t conflict_node_count{0};
+        std::vector<ViewRegistryDiagnostic> diagnostics;
+
+        [[nodiscard]] bool ok() const
+        {
+            return summary.ok();
+        }
+    };
+
     // ViewNodeRegistry 是 discovery-only / observation-only registry。
     // T016 在 .cpp 中实现注册幂等、heartbeat sequence 排序、
     // liveness transition 和 discovery snapshot。这里不包含 gRPC 映射。
@@ -403,6 +469,12 @@ namespace viewdemo
 
         HeartbeatNodeResult HeartbeatNode(const HeartbeatNodeRequest &request);
 
+        // self refresh 复用与普通 heartbeat 相同的 registry update 语义：
+        // 调用方必须提供当前 observed_at_unix_ms 和递增 sequence。
+        // 该入口只刷新本节点的 observed state，不绕过 TTL，也不授予
+        // 任何 membership authority。
+        HeartbeatNodeResult RefreshSelfNode(const HeartbeatNodeRequest &request);
+
         [[nodiscard]] LookupNodeResult LookupNode(
             std::string_view cluster_id,
             std::string_view node_id,
@@ -419,6 +491,18 @@ namespace viewdemo
         [[nodiscard]] GetClusterViewResult GetClusterView(
             const GetClusterViewRequest &request,
             std::uint64_t now_unix_ms) const;
+
+        // 导出 observed registry snapshot，供 peer ViewNode 做最终一致同步。
+        // 该快照不授予 Raft membership、quorum 或对象可见性 authority。
+        [[nodiscard]] ExportPeerSnapshotResult ExportPeerSnapshot(
+            const ExportPeerSnapshotRequest &request,
+            std::uint64_t now_unix_ms) const;
+
+        // 导入 peer 导出的 observed registry snapshot，并复用现有
+        // register/heartbeat deterministic merge ordering。
+        // 该入口只同步 observed state，不改变 Raft membership。
+        ImportPeerSnapshotResult ImportPeerSnapshot(
+            const ImportPeerSnapshotRequest &request);
 
         [[nodiscard]] std::size_t size() const;
         [[nodiscard]] const ViewRegistryConfig &config() const;

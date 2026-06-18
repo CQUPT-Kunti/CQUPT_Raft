@@ -103,6 +103,21 @@ namespace clusterdemo
             return nullptr;
         }
 
+        const ClusterConfigValidationIssue *FindIssueByFieldPath(
+            const ClusterConfigValidationResult &validation,
+            const ClusterConfigIssueCode code,
+            const std::string &field_path)
+        {
+            for (const ClusterConfigValidationIssue &issue : validation.issues)
+            {
+                if (issue.code == code && issue.field_path == field_path)
+                {
+                    return &issue;
+                }
+            }
+            return nullptr;
+        }
+
         std::string BuildEndpointAllocationSignature(
             const ClusterEndpointAllocationResult &allocation)
         {
@@ -184,7 +199,12 @@ namespace clusterdemo
             {
                 oss << "view|"
                     << node.node_id.value_or("") << '|'
-                    << node.endpoint << '|'
+                    << node.endpoint << '|';
+                for (const auto &peer_seed : node.peer_seeds)
+                {
+                    oss << peer_seed << ',';
+                }
+                oss << '|'
                     << node.data_dir.generic_string() << '\n';
             }
 
@@ -220,6 +240,14 @@ namespace clusterdemo
             }
 
             return oss.str();
+        }
+
+        void RemoveSubstringOrAssert(std::string *text, const std::string &needle)
+        {
+            ASSERT_NE(text, nullptr);
+            const std::size_t position = text->find(needle);
+            ASSERT_NE(position, std::string::npos) << needle;
+            text->erase(position, needle.size());
         }
 
         void ExpectUniqueAndNonEmpty(const std::vector<std::string> &values)
@@ -442,6 +470,178 @@ namespace clusterdemo
         }
 
         TEST(cluster_config_validation_test,
+             parses_single_view_config_without_peer_seeds_and_keeps_baseline_compatibility)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+            ASSERT_EQ(generated.config.view_nodes.size(), 1U);
+            EXPECT_TRUE(generated.config.view_nodes.front().peer_seeds.empty());
+
+            std::string json_text = SerializeClusterConfigToJson(generated.config);
+            RemoveSubstringOrAssert(&json_text, "      \"peer_seeds\": [],\n");
+
+            const std::filesystem::path json_path = MakeTempConfigPath(301);
+            WriteConfigJson(json_path, json_text);
+
+            const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+            ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+            ASSERT_TRUE(loaded.config.has_value());
+            ASSERT_EQ(loaded.config->view_nodes.size(), 1U);
+            EXPECT_TRUE(loaded.config->view_nodes.front().peer_seeds.empty());
+            EXPECT_EQ(loaded.config->view_nodes.front().endpoint,
+                      generated.config.view_nodes.front().endpoint);
+            EXPECT_EQ(loaded.config->metadata_nodes.size(),
+                      generated.config.metadata_nodes.size());
+            EXPECT_EQ(loaded.config->storage_nodes.size(),
+                      generated.config.storage_nodes.size());
+            EXPECT_EQ(loaded.config->initial_raft_membership.voter_raft_ids,
+                      generated.config.initial_raft_membership.voter_raft_ids);
+
+            std::error_code remove_ec;
+            std::filesystem::remove(json_path, remove_ec);
+        }
+
+        TEST(cluster_config_validation_test,
+             parses_multi_view_peer_seeds_and_keeps_initial_membership_unchanged)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.view_node_count = 2;
+            request.fixed_view_node_ids = {"view-peer-a", "view-peer-b"};
+            request.view_port_base = 28000;
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+            ASSERT_EQ(generated.config.view_nodes.size(), 2U);
+
+            ClusterConfig config_with_peers = generated.config;
+            config_with_peers.view_nodes[0].peer_seeds = {
+                config_with_peers.view_nodes[1].endpoint};
+            config_with_peers.view_nodes[1].peer_seeds = {
+                config_with_peers.view_nodes[0].endpoint};
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(config_with_peers);
+            ASSERT_TRUE(validation.ok());
+
+            const std::filesystem::path json_path = MakeTempConfigPath(302);
+            WriteConfigJson(json_path,
+                            SerializeClusterConfigToJson(config_with_peers));
+
+            const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+            ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+            ASSERT_TRUE(loaded.config.has_value());
+            ASSERT_EQ(loaded.config->view_nodes.size(), 2U);
+            EXPECT_EQ(loaded.config->view_nodes[0].peer_seeds,
+                      config_with_peers.view_nodes[0].peer_seeds);
+            EXPECT_EQ(loaded.config->view_nodes[1].peer_seeds,
+                      config_with_peers.view_nodes[1].peer_seeds);
+            EXPECT_EQ(loaded.config->initial_raft_membership.voter_raft_ids,
+                      generated.config.initial_raft_membership.voter_raft_ids);
+
+            const auto resolved_view_a = ResolveClusterNodeConfig(
+                *loaded.config,
+                ClusterNodeType::kView,
+                "view-peer-a");
+            ASSERT_TRUE(resolved_view_a.ok()) << resolved_view_a.error_detail;
+            ASSERT_TRUE(resolved_view_a.resolved.has_value());
+            EXPECT_EQ(resolved_view_a.resolved->view_peer_seed_endpoints,
+                      std::vector<std::string>{config_with_peers.view_nodes[1].endpoint});
+
+            const auto resolved_view_b = ResolveClusterNodeConfig(
+                *loaded.config,
+                ClusterNodeType::kView,
+                "view-peer-b");
+            ASSERT_TRUE(resolved_view_b.ok()) << resolved_view_b.error_detail;
+            ASSERT_TRUE(resolved_view_b.resolved.has_value());
+            EXPECT_EQ(resolved_view_b.resolved->view_peer_seed_endpoints,
+                      std::vector<std::string>{config_with_peers.view_nodes[0].endpoint});
+
+            const auto quorum = ComputeInitialRaftQuorum(*loaded.config);
+            ASSERT_TRUE(quorum.ok()) << quorum.error_detail;
+            ASSERT_TRUE(quorum.summary.has_value());
+            EXPECT_EQ(quorum.summary->voter_raft_ids,
+                      generated.config.initial_raft_membership.voter_raft_ids);
+            EXPECT_EQ(quorum.summary->election_quorum, 2U);
+
+            std::error_code remove_ec;
+            std::filesystem::remove(json_path, remove_ec);
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_invalid_view_peer_seed_endpoint_format_with_clear_diagnostics)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.view_node_count = 2;
+            request.fixed_view_node_ids = {"view-peer-a", "view-peer-b"};
+            request.view_port_base = 28100;
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.view_nodes[0].peer_seeds = {"not-an-endpoint"};
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssueByFieldPath(validation,
+                                     ClusterConfigIssueCode::kInvalidEndpoint,
+                                     "view_nodes[0].peer_seeds[0]");
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kView);
+            EXPECT_EQ(issue->node_id, "view-peer-a");
+            EXPECT_EQ(issue->endpoint, "not-an-endpoint");
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_view_peer_seed_self_reference_and_duplicates)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.view_node_count = 2;
+            request.fixed_view_node_ids = {"view-peer-a", "view-peer-b"};
+            request.view_port_base = 28200;
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.view_nodes[0].peer_seeds = {
+                invalid_config.view_nodes[0].endpoint,
+                invalid_config.view_nodes[1].endpoint,
+                invalid_config.view_nodes[1].endpoint,
+            };
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *self_issue =
+                FindIssueByFieldPath(validation,
+                                     ClusterConfigIssueCode::kIdentityConfigMismatch,
+                                     "view_nodes[0].peer_seeds[0]");
+            ASSERT_NE(self_issue, nullptr);
+            EXPECT_EQ(self_issue->node_type, ClusterNodeType::kView);
+            EXPECT_EQ(self_issue->node_id, "view-peer-a");
+            EXPECT_EQ(self_issue->endpoint, invalid_config.view_nodes[0].endpoint);
+
+            const ClusterConfigValidationIssue *duplicate_issue =
+                FindIssueByFieldPath(validation,
+                                     ClusterConfigIssueCode::kDuplicateEndpoint,
+                                     "view_nodes[0].peer_seeds[2]");
+            ASSERT_NE(duplicate_issue, nullptr);
+            EXPECT_EQ(duplicate_issue->node_type, ClusterNodeType::kView);
+            EXPECT_EQ(duplicate_issue->node_id, "view-peer-a");
+            EXPECT_EQ(duplicate_issue->endpoint, invalid_config.view_nodes[1].endpoint);
+        }
+
+        TEST(cluster_config_validation_test,
              rejects_zero_storage_capacity_in_generated_config)
         {
             ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
@@ -479,6 +679,157 @@ namespace clusterdemo
             EXPECT_EQ(issue->field_path, "metadata_nodes[1].raft_id");
             EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
             EXPECT_EQ(issue->node_id, request.fixed_metadata_node_ids[1]);
+        }
+
+        TEST(cluster_config_validation_test,
+             allows_metadata_candidate_outside_initial_membership_and_roundtrips_json)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+            ASSERT_EQ(generated.config.metadata_nodes.size(), 4U);
+            ASSERT_EQ(generated.config.initial_raft_membership.learner_raft_ids.size(), 1U);
+
+            ClusterConfig candidate_config = generated.config;
+            const auto candidate_raft_id =
+                candidate_config.metadata_nodes.back().raft_id;
+            candidate_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+            candidate_config.initial_raft_membership.learner_raft_ids.clear();
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(candidate_config);
+            EXPECT_TRUE(validation.ok());
+            EXPECT_EQ(candidate_config.initial_raft_membership.voter_raft_ids.size(),
+                      3U);
+            EXPECT_TRUE(candidate_config.initial_raft_membership.learner_raft_ids.empty());
+            EXPECT_EQ(std::find(candidate_config.initial_raft_membership.voter_raft_ids.begin(),
+                                candidate_config.initial_raft_membership.voter_raft_ids.end(),
+                                candidate_raft_id),
+                      candidate_config.initial_raft_membership.voter_raft_ids.end());
+
+            const InitialRaftQuorumComputationResult quorum =
+                ComputeInitialRaftQuorum(candidate_config);
+            ASSERT_TRUE(quorum.ok()) << quorum.error_detail;
+            ASSERT_TRUE(quorum.summary.has_value());
+            EXPECT_EQ(quorum.summary->voter_count, 3U);
+            EXPECT_EQ(quorum.summary->election_quorum, 2U);
+            EXPECT_EQ(quorum.summary->commit_quorum, 2U);
+            EXPECT_EQ(quorum.summary->voter_raft_ids,
+                      candidate_config.initial_raft_membership.voter_raft_ids);
+
+            const ClusterNodeResolutionResult resolved = ResolveClusterNodeConfig(
+                candidate_config,
+                ClusterNodeType::kMetadata,
+                "meta-candidate-d");
+            ASSERT_TRUE(resolved.ok()) << resolved.error_detail;
+            ASSERT_TRUE(resolved.resolved.has_value());
+            EXPECT_EQ(resolved.resolved->node_id, "meta-candidate-d");
+            EXPECT_EQ(resolved.resolved->metadata_initial_role,
+                      MetadataNodeInitialRole::kCandidate);
+            ASSERT_TRUE(resolved.resolved->raft_id.has_value());
+            EXPECT_GT(*resolved.resolved->raft_id, 0);
+            EXPECT_EQ(*resolved.resolved->raft_id, candidate_raft_id);
+
+            const std::filesystem::path json_path = MakeTempConfigPath(34);
+            WriteConfigJson(json_path,
+                            SerializeClusterConfigToJson(candidate_config));
+            const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+            ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+            ASSERT_TRUE(loaded.config.has_value());
+            ASSERT_EQ(loaded.config->metadata_nodes.size(), 4U);
+            EXPECT_EQ(loaded.config->metadata_nodes.back().initial_role,
+                      MetadataNodeInitialRole::kCandidate);
+            EXPECT_EQ(loaded.config->metadata_nodes.back().raft_id,
+                      candidate_raft_id);
+            EXPECT_TRUE(loaded.config->initial_raft_membership.learner_raft_ids.empty());
+            EXPECT_EQ(loaded.config->initial_raft_membership.voter_raft_ids.size(),
+                      3U);
+            EXPECT_EQ(std::find(loaded.config->initial_raft_membership.voter_raft_ids.begin(),
+                                loaded.config->initial_raft_membership.voter_raft_ids.end(),
+                                candidate_raft_id),
+                      loaded.config->initial_raft_membership.voter_raft_ids.end());
+
+            std::error_code remove_ec;
+            std::filesystem::remove(json_path, remove_ec);
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_metadata_candidate_that_stays_in_initial_membership)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssue(validation,
+                          ClusterConfigIssueCode::kInvalidInitialMembership);
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->field_path, "metadata_nodes[3].initial_role");
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
+            EXPECT_EQ(issue->node_id, "meta-candidate-d");
+        }
+
+        TEST(cluster_config_validation_test,
+             rejects_metadata_candidate_that_attempts_local_voter_role)
+        {
+            ClusterConfigGenerationRequest request = MakeGenerationRequest(3);
+            request.metadata_node_count = 4;
+            request.fixed_metadata_node_ids = {
+                "meta-fixed-a",
+                "meta-fixed-b",
+                "meta-fixed-c",
+                "meta-candidate-d",
+            };
+
+            const ClusterConfigGenerationResult generated =
+                GenerateDeterministicClusterConfig(request);
+            ASSERT_TRUE(generated.ok()) << generated.error_detail;
+
+            ClusterConfig invalid_config = generated.config;
+            invalid_config.metadata_nodes.back().initial_role =
+                MetadataNodeInitialRole::kCandidate;
+            invalid_config.initial_raft_membership.learner_raft_ids.clear();
+            invalid_config.initial_raft_membership.voter_raft_ids.push_back(
+                invalid_config.metadata_nodes.back().raft_id);
+
+            const ClusterConfigValidationResult validation =
+                ValidateClusterConfig(invalid_config);
+            EXPECT_FALSE(validation.ok());
+
+            const ClusterConfigValidationIssue *issue =
+                FindIssue(validation,
+                          ClusterConfigIssueCode::kInvalidInitialMembership);
+            ASSERT_NE(issue, nullptr);
+            EXPECT_EQ(issue->node_type, ClusterNodeType::kMetadata);
+            EXPECT_EQ(issue->node_id, "meta-candidate-d");
+            EXPECT_EQ(issue->field_path, "metadata_nodes[3].initial_role");
         }
 
         TEST(cluster_config_endpoint_allocation_test,

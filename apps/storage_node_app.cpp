@@ -66,6 +66,7 @@ namespace
     struct IdentityStartupState
     {
         clusterdemo::NodeIdentity identity;
+        clusterdemo::ProcessIncarnation process_incarnation;
         std::filesystem::path identity_path;
         bool loaded_existing{false};
         bool created_new{false};
@@ -598,8 +599,19 @@ namespace
                 "node.identity startup check failed: " + load_or_create.diagnostic);
         }
 
+        const auto process_incarnation =
+            clusterdemo::CreateProcessIncarnation(*load_or_create.identity);
+        if (!process_incarnation.ok())
+        {
+            throw IdentityStartupError(
+                process_incarnation.status,
+                "process incarnation startup check failed: " +
+                    process_incarnation.diagnostic);
+        }
+
         return IdentityStartupState{
             .identity = *load_or_create.identity,
+            .process_incarnation = *process_incarnation.incarnation,
             .identity_path = load_or_create.identity_path,
             .loaded_existing = load_or_create.loaded_existing,
             .created_new = load_or_create.created_new,
@@ -618,19 +630,28 @@ namespace
         facts.health.health = storedemo::StorageNodeHealth::kHealthy;
         facts.health.disk_pressure = storedemo::StorageNodeDiskPressure::kLow;
         facts.health.io_error_count = 0;
+        facts.health.writable = true;
         facts.failure_domain.zone = startup.failure_domain.zone;
         facts.failure_domain.rack = startup.failure_domain.rack;
         return facts;
     }
 
     [[nodiscard]] viewdemo::ViewNodeHealth ToViewNodeHealth(
-        const storedemo::StorageNodeHealth health)
+        const storedemo::StorageNodeRegistryHealthFacts &health)
     {
-        switch (health)
+        switch (health.health)
         {
         case storedemo::StorageNodeHealth::kHealthy:
+            if (!health.writable)
+            {
+                return viewdemo::ViewNodeHealth::kReadOnly;
+            }
             return viewdemo::ViewNodeHealth::kHealthy;
         case storedemo::StorageNodeHealth::kDegraded:
+            if (!health.writable)
+            {
+                return viewdemo::ViewNodeHealth::kReadOnly;
+            }
             return viewdemo::ViewNodeHealth::kDegraded;
         case storedemo::StorageNodeHealth::kReadOnly:
             return viewdemo::ViewNodeHealth::kReadOnly;
@@ -662,17 +683,19 @@ namespace
     }
 
     [[nodiscard]] std::string MakeRegisterRequestId(
-        const StorageNodeStartupConfig &startup)
+        const IdentityStartupState &identity_state)
     {
-        return "storage-node-register-" + startup.node_id + "-" +
+        return "storage-node-register-" + identity_state.identity.node_id + "-" +
+               identity_state.process_incarnation.incarnation_id + "-" +
                std::to_string(NowUnixMs());
     }
 
     [[nodiscard]] std::string MakeHeartbeatRequestId(
-        const StorageNodeStartupConfig &startup,
+        const IdentityStartupState &identity_state,
         const std::uint64_t sequence)
     {
-        return "storage-node-heartbeat-" + startup.node_id + "-" +
+        return "storage-node-heartbeat-" + identity_state.identity.node_id + "-" +
+               identity_state.process_incarnation.incarnation_id + "-" +
                std::to_string(sequence);
     }
 
@@ -689,11 +712,12 @@ namespace
 
     [[nodiscard]] viewdemo::NodeRegistration BuildViewNodeObservation(
         const StorageNodeStartupConfig &startup,
+        const IdentityStartupState &identity_state,
         const storedemo::StorageNodeRegistryFacts &facts)
     {
         viewdemo::NodeRegistration registration;
         registration.cluster_id = startup.cluster_id;
-        registration.node_id = startup.node_id;
+        registration.node_id = identity_state.identity.node_id;
         registration.node_type = viewdemo::ViewNodeType::kStorage;
         registration.endpoint = startup.listen_endpoint;
         registration.control_plane_endpoint = startup.listen_endpoint;
@@ -701,9 +725,11 @@ namespace
         registration.data_dir_fingerprint =
             startup.data_dir.lexically_normal().generic_string();
         registration.observed_at_unix_ms = NowUnixMs();
+        // Register RPC 当前仍通过 request_id 绑定这次 process incarnation；
+        // Heartbeat RPC 则会显式携带 incarnation_id。
         registration.failure_domain.zone = facts.failure_domain.zone;
         registration.failure_domain.rack = facts.failure_domain.rack;
-        registration.health.health = ToViewNodeHealth(facts.health.health);
+        registration.health.health = ToViewNodeHealth(facts.health);
         registration.health.disk_pressure =
             ToViewNodeDiskPressure(facts.health.disk_pressure);
         registration.health.io_error_count = facts.health.io_error_count;
@@ -726,11 +752,13 @@ namespace
 
     [[nodiscard]] storedemo::StorageNodeRegistryFacts ReadCurrentRegistryFacts(
         const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
-        const StorageNodeStartupConfig &startup)
+        const StorageNodeStartupConfig &startup,
+        const IdentityStartupState &identity_state)
     {
         if (registry != nullptr)
         {
-            const auto lookup = registry->LookupNode(startup.node_id, NowUnixMs());
+            const auto lookup =
+                registry->LookupNode(identity_state.identity.node_id, NowUnixMs());
             if (lookup.ok())
             {
                 return lookup.snapshot.facts;
@@ -766,6 +794,7 @@ namespace
 
     [[nodiscard]] bool RegisterWithAnyViewNode(
         const StorageNodeStartupConfig &startup,
+        const IdentityStartupState &identity_state,
         const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
         std::size_t *active_view_index)
     {
@@ -775,8 +804,9 @@ namespace
         }
 
         const storedemo::StorageNodeRegistryFacts facts =
-            ReadCurrentRegistryFacts(registry, startup);
-        const auto observation = BuildViewNodeObservation(startup, facts);
+            ReadCurrentRegistryFacts(registry, startup, identity_state);
+        const auto observation =
+            BuildViewNodeObservation(startup, identity_state, facts);
         const std::size_t endpoint_count = startup.view_endpoints.size();
         const std::size_t preferred_index =
             endpoint_count == 0 ? 0 : (*active_view_index % endpoint_count);
@@ -791,7 +821,8 @@ namespace
                 MakeViewNodeClient(target_endpoint, startup.view_client_config);
             const auto call = client.RegisterNode(
                 viewdemo::RegisterNodeRequest{
-                    .request_id = MakeRegisterRequestId(startup),
+                    .request_id =
+                        MakeRegisterRequestId(identity_state),
                     .registration = observation,
                 });
             if (call.ok())
@@ -816,29 +847,37 @@ namespace
         }
 
         std::cerr << "storage_node_app startup error: failed to register with any ViewNode "
-                  << "node_id=" << startup.node_id << " " << last_error << '\n';
+                  << "node_id=" << identity_state.identity.node_id
+                  << " incarnation="
+                  << identity_state.process_incarnation.incarnation_id
+                  << " " << last_error << '\n';
         return false;
     }
 
     [[nodiscard]] bool SendHeartbeatToViewNode(
         const StorageNodeStartupConfig &startup,
+        const IdentityStartupState &identity_state,
         const std::shared_ptr<storedemo::StorageNodeRegistry> &registry,
         const std::uint64_t sequence,
         const std::size_t active_view_index)
     {
         const storedemo::StorageNodeRegistryFacts facts =
-            ReadCurrentRegistryFacts(registry, startup);
-        const auto observation = BuildViewNodeObservation(startup, facts);
+            ReadCurrentRegistryFacts(registry, startup, identity_state);
+        const auto observation =
+            BuildViewNodeObservation(startup, identity_state, facts);
         const std::string &target_endpoint =
             startup.view_endpoints.at(active_view_index);
         auto client =
             MakeViewNodeClient(target_endpoint, startup.view_client_config);
         const auto call = client.HeartbeatNode(
             viewdemo::HeartbeatNodeRequest{
-                .request_id = MakeHeartbeatRequestId(startup, sequence),
+                .request_id =
+                    MakeHeartbeatRequestId(identity_state, sequence),
                 .cluster_id = startup.cluster_id,
-                .node_id = startup.node_id,
+                .node_id = identity_state.identity.node_id,
                 .node_type = viewdemo::ViewNodeType::kStorage,
+                .incarnation_id =
+                    identity_state.process_incarnation.incarnation_id,
                 .sequence = sequence,
                 .observation = observation,
             });
@@ -849,6 +888,8 @@ namespace
 
         std::cerr << "storage_node_app view heartbeat failed"
                   << " target_endpoint=" << target_endpoint
+                  << " incarnation="
+                  << identity_state.process_incarnation.incarnation_id
                   << " sequence=" << sequence
                   << " status=" << viewdemo::ToString(call.result.summary.status)
                   << " message=" << call.result.summary.message;
@@ -899,7 +940,7 @@ namespace
         auto chunk_store = std::make_shared<storedemo::LocalDiskChunkStore>(
             storedemo::LocalDiskChunkStoreConfig{
                 .data_dir = startup.data_dir,
-                .node_id = startup.node_id,
+                .node_id = identity_state.identity.node_id,
             });
         const auto init_result = chunk_store->Initialize();
         if (!init_result.ok())
@@ -915,8 +956,10 @@ namespace
         const auto local_facts = BuildRegistryFacts(startup);
         const auto registration_result = registry->RegisterStorageNode(
             storedemo::RegisterStorageNodeRequest{
-                .node_id = startup.node_id,
+                .node_id = identity_state.identity.node_id,
                 .endpoint = startup.listen_endpoint,
+                .incarnation_id =
+                    identity_state.process_incarnation.incarnation_id,
                 .observed_at_unix_ms = NowUnixMs(),
                 .facts = local_facts,
             });
@@ -930,7 +973,7 @@ namespace
 
         auto service = std::make_shared<storedemo::StorageNodeService>(
             chunk_store,
-            startup.node_id,
+            identity_state.identity.node_id,
             registry);
 
         grpc::ServerBuilder builder;
@@ -943,9 +986,9 @@ namespace
                                  &selected_port);
         builder.RegisterService(service.get());
 
-        // T047 只装配 StorageNode data-plane 已有边界：chunk store、service
-        // 和 gRPC 生命周期；不在 app 中实现 placement、heartbeat loop
-        // 或 metadata control-plane 逻辑。
+        // app 只装配 StorageNode data-plane 已有边界、gRPC 生命周期，
+        // 以及到 ViewNode 的注册/heartbeat 外围 wiring；不在这里实现
+        // placement 或 metadata control-plane 逻辑。
         std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
         if (server == nullptr || selected_port <= 0)
         {
@@ -957,7 +1000,10 @@ namespace
         std::size_t active_view_index = 0;
         // 注册和 heartbeat 只上报 StorageNode 的 data-plane 观测事实；
         // 不授予 ViewNode 对 object visibility、placement 或 metadata authority。
-        if (!RegisterWithAnyViewNode(startup, registry, &active_view_index))
+        if (!RegisterWithAnyViewNode(startup,
+                                     identity_state,
+                                     registry,
+                                     &active_view_index))
         {
             server->Shutdown();
             return static_cast<int>(ExitCode::kStartupError);
@@ -965,7 +1011,12 @@ namespace
 
         std::cout << "storage_node_app OK"
                   << " cluster_id=" << startup.cluster_id
+                  << " node_type=storage"
                   << " node_id=" << identity_state.identity.node_id
+                  << " incarnation="
+                  << identity_state.process_incarnation.incarnation_id
+                  << " startup_sequence_base="
+                  << identity_state.process_incarnation.startup_sequence_base
                   << " endpoint=" << startup.listen_endpoint
                   << " data_dir=" << startup.data_dir.generic_string()
                   << " capacity_bytes=" << startup.capacity_bytes
@@ -990,32 +1041,38 @@ namespace
         std::signal(SIGTERM, HandleSignal);
 #endif
 
-        std::thread heartbeat_thread([&startup, &registry, &active_view_index]() {
-            std::uint64_t next_sequence = 1;
-            while (!g_stop_requested.load())
-            {
-                if (!SleepWithStop(startup.heartbeat_interval))
+        std::thread heartbeat_thread(
+            [&startup, &identity_state, &registry, &active_view_index]() {
+                std::uint64_t next_sequence =
+                    identity_state.process_incarnation.startup_sequence_base;
+                while (!g_stop_requested.load())
                 {
-                    break;
-                }
+                    if (!SleepWithStop(startup.heartbeat_interval))
+                    {
+                        break;
+                    }
 
-                // app 只负责生命周期和观测上报；这里不接管 placement、
-                // chunk 业务语义或 COMMITTED 可见性判定。
-                if (SendHeartbeatToViewNode(startup,
-                                            registry,
-                                            next_sequence,
-                                            active_view_index))
-                {
-                    ++next_sequence;
-                    continue;
-                }
+                    // app 只负责生命周期和观测上报；这里不接管 placement、
+                    // chunk 业务语义或 COMMITTED 可见性判定。
+                    if (SendHeartbeatToViewNode(startup,
+                                                identity_state,
+                                                registry,
+                                                next_sequence,
+                                                active_view_index))
+                    {
+                        ++next_sequence;
+                        continue;
+                    }
 
-                if (RegisterWithAnyViewNode(startup, registry, &active_view_index))
-                {
-                    ++next_sequence;
+                    if (RegisterWithAnyViewNode(startup,
+                                                identity_state,
+                                                registry,
+                                                &active_view_index))
+                    {
+                        ++next_sequence;
+                    }
                 }
-            }
-        });
+            });
 
         std::thread wait_thread([&server]() {
             server->Wait();

@@ -11,8 +11,9 @@
 
 namespace clusterdemo
 {
-    inline constexpr std::uint32_t kNodeIdentityCurrentVersion{1};
+    inline constexpr std::uint32_t kNodeIdentityCurrentVersion{2};
     inline constexpr std::string_view kNodeIdentityFileName{"node.identity"};
+    inline constexpr std::uint64_t kProcessIncarnationInitialSequence{1};
 
     enum class NodeIdentitySource : std::uint8_t
     {
@@ -33,6 +34,16 @@ namespace clusterdemo
         kIoError = 6,
         kDurabilityError = 7,
         kInternalError = 8,
+    };
+
+    enum class NodeIdentityMembershipState : std::uint8_t
+    {
+        kUnknown = 0,
+        kNonRaft = 1,
+        kJoining = 2,
+        kCandidate = 3,
+        kLearner = 4,
+        kVoter = 5,
     };
 
     // issue code 只描述身份文件和配置匹配边界，不表达 Raft membership
@@ -58,6 +69,9 @@ namespace clusterdemo
         kUnsupportedDurabilityMode = 16,
         kDurabilityPublishFailed = 17,
         kIoFailure = 18,
+        kInvalidMembershipState = 19,
+        kMembershipStateMismatch = 20,
+        kInvalidPersistentGeneration = 21,
     };
 
     enum class NodeIdentityDurabilityMode : std::uint8_t
@@ -80,6 +94,9 @@ namespace clusterdemo
         ClusterNodeId node_id;
         ClusterNodeType node_type{ClusterNodeType::kUnknown};
         std::optional<std::int32_t> raft_id;
+        NodeIdentityMembershipState membership_state{
+            NodeIdentityMembershipState::kUnknown};
+        std::uint64_t persistent_generation{1};
         std::uint32_t identity_version{kNodeIdentityCurrentVersion};
         std::int64_t created_at_unix_ms{0};
         NodeIdentitySource source{NodeIdentitySource::kUnknown};
@@ -93,6 +110,7 @@ namespace clusterdemo
         std::optional<ClusterNodeId> node_id;
         ClusterNodeType node_type{ClusterNodeType::kUnknown};
         std::optional<std::int32_t> raft_id;
+        std::optional<NodeIdentityMembershipState> membership_state;
         std::optional<NodeIdentitySource> source;
         bool require_raft_id_for_metadata{true};
         bool forbid_raft_id_for_non_metadata{true};
@@ -154,6 +172,7 @@ namespace clusterdemo
     struct NodeIdentityStoreResult
     {
         NodeIdentityStatusCode status{NodeIdentityStatusCode::kOk};
+        std::optional<NodeIdentity> identity;
         std::filesystem::path identity_path;
         NodeIdentityValidationResult validation;
         bool created{false};
@@ -193,6 +212,33 @@ namespace clusterdemo
         }
     };
 
+    // 单次进程启动实例身份。它绑定长期 node_id，但不写回 node.identity，
+    // 也不表达 Raft membership authority。
+    struct ProcessIncarnation
+    {
+        ClusterId cluster_id;
+        ClusterNodeId node_id;
+        ClusterNodeType node_type{ClusterNodeType::kUnknown};
+        std::string incarnation_id;
+        std::int64_t started_at_unix_ms{0};
+        std::uint64_t startup_sequence_base{
+            kProcessIncarnationInitialSequence};
+    };
+
+    struct ProcessIncarnationResult
+    {
+        NodeIdentityStatusCode status{NodeIdentityStatusCode::kOk};
+        std::optional<ProcessIncarnation> incarnation;
+        NodeIdentityValidationResult validation;
+        std::string diagnostic;
+
+        [[nodiscard]] bool ok() const
+        {
+            return status == NodeIdentityStatusCode::kOk &&
+                   incarnation.has_value() && validation.ok();
+        }
+    };
+
     [[nodiscard]] std::filesystem::path ResolveNodeIdentityPath(
         const std::filesystem::path &data_dir);
 
@@ -203,8 +249,10 @@ namespace clusterdemo
         const NodeIdentity &identity,
         const ExpectedNodeIdentity &expected);
 
-    // 以下接口只声明 durable load/store 边界。T013 负责在 .cpp 中实现
-    // node.identity 的解析、临时文件写入、flush、atomic publish 和目录 durability。
+    // 以下接口声明 009 阶段 durable identity 的 load/store/load-or-create 边界。
+    // 当前实现已覆盖解析、临时文件写入、flush、atomic publish、restart
+    // validation、目录 durability，以及基于 durable identity 的 process
+    // incarnation / boot epoch 生成边界。
     [[nodiscard]] NodeIdentityLoadResult LoadNodeIdentity(
         const NodeIdentityLoadOptions &options);
 
@@ -215,7 +263,13 @@ namespace clusterdemo
     [[nodiscard]] NodeIdentityLoadOrCreateResult LoadOrCreateNodeIdentity(
         const NodeIdentityLoadOrCreateRequest &request);
 
+    // T013 只生成单次进程启动实例身份，不修改长期 durable identity。
+    // 调用方必须先成功 load/create NodeIdentity，再据此生成 incarnation。
+    [[nodiscard]] ProcessIncarnationResult CreateProcessIncarnation(
+        const NodeIdentity &identity);
+
     [[nodiscard]] const char *ToString(NodeIdentitySource source);
+    [[nodiscard]] const char *ToString(NodeIdentityMembershipState state);
     [[nodiscard]] const char *ToString(NodeIdentityStatusCode code);
     [[nodiscard]] const char *ToString(NodeIdentityIssueCode code);
     [[nodiscard]] const char *ToString(NodeIdentityDurabilityMode mode);

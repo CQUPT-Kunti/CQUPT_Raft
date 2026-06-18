@@ -102,6 +102,48 @@ namespace raftdemo
     kNonMember,
   };
 
+  enum class RuntimeMembershipRole
+  {
+    kUnknown,
+    kVoter,
+    kLearner,
+    kNonMember,
+  };
+
+  struct RuntimeMembershipEntry
+  {
+    std::int32_t raft_id{0};
+    std::string address;
+    RuntimeMembershipRole role{RuntimeMembershipRole::kUnknown};
+    bool committed{false};
+    bool pending{false};
+    std::uint64_t match_index{0};
+    std::uint64_t next_index{0};
+    std::uint64_t last_snapshot_index{0};
+    std::uint64_t last_snapshot_term{0};
+    std::uint64_t last_applied_index{0};
+    std::uint64_t observed_last_log_index{0};
+    std::string canonical_node_id;
+    std::string candidate_incarnation_id;
+    std::uint64_t candidate_sequence{0};
+    std::uint64_t persistent_generation{0};
+    std::string data_dir_fingerprint;
+  };
+
+  struct RuntimeMembershipSummary
+  {
+    std::uint64_t committed_log_index{0};
+    std::uint64_t committed_term{0};
+    std::vector<int> voter_ids;
+    std::vector<int> learner_ids;
+    std::vector<RuntimeMembershipEntry> voter_entries;
+    std::vector<RuntimeMembershipEntry> learner_entries;
+    std::size_t voter_count{0};
+    std::size_t learner_count{0};
+    std::size_t committed_voter_quorum_size{0};
+    RuntimeMembershipRole local_role{RuntimeMembershipRole::kUnknown};
+  };
+
   struct CommittedMembershipQuorumSummary
   {
     // 仅用于诊断：必须基于已提交 membership 计算，不能按 live 节点或 ViewNode 观测降 quorum。
@@ -113,6 +155,49 @@ namespace raftdemo
     std::size_t learner_count{0};
     std::size_t quorum_size{0};
     CommittedMembershipRole local_role{CommittedMembershipRole::kUnknown};
+  };
+
+  enum class AddLearnerProposalStatus : std::uint8_t
+  {
+    kAcceptedPendingCommit = 0,
+    kDuplicate = 1,
+    kPendingMembershipChange = 2,
+    kRejected = 3,
+    kNotLeader = 4,
+    kNodeStopping = 5,
+    kInvalidArgument = 6,
+  };
+
+  struct AddLearnerProposalRequest
+  {
+    std::string cluster_id;
+    std::string node_id;
+    std::int32_t candidate_raft_id{0};
+    std::string candidate_client_address;
+    std::string candidate_raft_address;
+    std::string candidate_incarnation_id;
+    std::uint64_t candidate_sequence{0};
+    std::uint64_t persistent_generation{0};
+    std::string data_dir_fingerprint;
+  };
+
+  struct AddLearnerProposalResult
+  {
+    AddLearnerProposalStatus status{
+        AddLearnerProposalStatus::kRejected};
+    int leader_id{-1};
+    std::uint64_t term{0};
+    std::uint64_t membership_epoch{0};
+    bool committed_membership_changed{false};
+    std::string canonical_node_id;
+    std::int32_t assigned_raft_id{0};
+    std::string message;
+
+    [[nodiscard]] bool ok() const
+    {
+      return status == AddLearnerProposalStatus::kAcceptedPendingCommit ||
+             status == AddLearnerProposalStatus::kDuplicate;
+    }
   };
 
   class RaftNode : public std::enable_shared_from_this<RaftNode>
@@ -144,8 +229,22 @@ namespace raftdemo
     const StrongConsistencyMetadataStateMachine *GetMetadataStateMachine() const;
     NodeStatusSnapshot GetStatusSnapshot() const;
     NodeMetricsSnapshot GetMetricsSnapshot() const;
+    // 运行时 membership 诊断接口：显式区分 committed voters 与 runtime learners。
+    // 当前阶段它不会改变 quorum/election/commit，只暴露运行时边界供后续
+    // learner catch-up / promote 安全实现复用。
+    RuntimeMembershipSummary GetRuntimeMembershipSummary() const;
     // 只读诊断接口：返回当前已提交 membership / quorum 摘要，不提供任何可变入口。
     CommittedMembershipQuorumSummary GetCommittedMembershipQuorumSummary() const;
+    // AddLearner proposal path 目前只提供 leader admission / duplicate /
+    // pending-conflict 边界。它不会直接修改 voter set，也不会伪造 committed
+    // membership 成功；后续真实 membership log proposal/catch-up/promote
+    // 需要在此边界之上继续实现。
+    AddLearnerProposalResult ProposeAddLearner(
+        const AddLearnerProposalRequest &request);
+    // 显式 batch promote 路由边界：只允许 leader 在现有 pending learners 上
+    // 触发原子 batch promote；真实 committed membership 仍只来自内部原子日志。
+    AddLearnerProposalResult PromoteReadyLearnerBatch(
+        const AddLearnerProposalRequest &request);
     bool IsRunning() const;
 
   private:
@@ -197,8 +296,35 @@ namespace raftdemo
       ProposeResult result;
     };
 
+    struct PendingAddLearnerProposal
+    {
+      std::string cluster_id;
+      std::string node_id;
+      std::int32_t candidate_raft_id{0};
+      std::string candidate_client_address;
+      std::string candidate_raft_address;
+      std::string candidate_incarnation_id;
+      std::uint64_t candidate_sequence{0};
+      std::uint64_t persistent_generation{0};
+      std::string data_dir_fingerprint;
+      std::uint64_t accepted_membership_epoch{0};
+    };
+
+    struct AtomicBatchPromotionTarget
+    {
+      std::int32_t raft_id{0};
+      std::string address;
+    };
+
     friend class Replicator;
     friend class RaftServiceImpl;
+    struct SnapshotProgress
+    {
+      std::uint64_t last_snapshot_index{0};
+      std::uint64_t last_snapshot_term{0};
+      std::uint64_t last_applied_index{0};
+      std::uint64_t last_log_index{0};
+    };
     void InitServer();
     void InitClients();
     Replicator *GetOrCreateReplicatorLocked(const PeerConfig &peer);
@@ -241,7 +367,9 @@ namespace raftdemo
         int peer_id, const raft::AppendEntriesRequest &request);
     std::optional<raft::InstallSnapshotResponse> InstallSnapshotRpc(
         int peer_id, const raft::InstallSnapshotRequest &request);
-    bool SendInstallSnapshotToPeer(int peer_id, std::uint64_t term);
+    bool SendInstallSnapshotToPeer(int peer_id,
+                                   std::uint64_t term,
+                                   SnapshotProgress *progress);
 
     static const char *RoleName(Role role);
 
@@ -269,7 +397,33 @@ namespace raftdemo
     void PruneCompletedMetadataProposalsLocked();
     bool PersistStateLocked(std::string *reason);
     bool ProposeNoOpEntry();
+    bool IsAtomicBatchPromotionCommand(const std::string &command_data) const;
+    ApplyResult ApplyAtomicBatchPromotionCommand(std::uint64_t apply_index,
+                                                 const std::string &command_data);
+    std::string BuildAtomicBatchPromotionCommandLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets) const;
+    bool ParseAtomicBatchPromotionCommand(
+        const std::string &command_data,
+        std::vector<AtomicBatchPromotionTarget> *targets,
+        std::string *reason) const;
+    std::size_t CommittedVoterCountLocked() const;
+    std::optional<std::string> ValidateTargetCommittedVoterCountLocked(
+        std::size_t target_voter_count) const;
+    std::optional<std::string> ValidateAtomicBatchPromotionTargetsLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets) const;
+    std::optional<std::uint64_t> PrepareAtomicBatchPromotionLogIndexLocked(
+        const std::vector<AtomicBatchPromotionTarget> &targets);
+    bool IsPendingLearnerReadyForPromotionLocked(
+        const PendingAddLearnerProposal &proposal) const;
+    std::vector<AtomicBatchPromotionTarget>
+    CollectAtomicBatchPromotionTargetsLocked() const;
     std::string AddressForNodeLocked(int node_id) const;
+    void EnsurePeerClientLocked(const PeerConfig &peer);
+    std::vector<PeerConfig> LearnerReplicationPeersLocked() const;
+    void InitializePendingLearnerReplicationStateLocked(
+        const PendingAddLearnerProposal &proposal);
+    void ResetPendingLearnerReplicationStateLocked(std::int32_t learner_raft_id);
+    void ResetAllPendingLearnerReplicationStateLocked();
     void MaybeRecordLeaderChangeLocked(int old_leader_id, int new_leader_id);
     void RecordProposeResult(bool success);
     void RecordElectionStarted();
@@ -279,6 +433,7 @@ namespace raftdemo
     static const char *RpcKindName(RpcKind kind);
     static std::vector<RpcMetricState> BuildRpcMetricStateTemplate();
     RpcMetricState &RpcMetricLocked(RpcKind kind);
+    RuntimeMembershipSummary BuildRuntimeMembershipSummaryLocked() const;
     void ValidateNodeIdentity();
 
     void StartSnapshotWorker();
@@ -305,6 +460,7 @@ namespace raftdemo
 
     std::unordered_map<int, std::uint64_t> next_index_;
     std::unordered_map<int, std::uint64_t> match_index_;
+    std::unordered_map<int, SnapshotProgress> peer_snapshot_progress_;
     std::unordered_map<int, std::unique_ptr<Replicator>> replicators_;
 
     std::unordered_map<int, std::unique_ptr<PeerClient>> clients_;
@@ -324,6 +480,8 @@ namespace raftdemo
     std::unique_ptr<grpc::Server> server_;
 
     std::mutex apply_mu_;
+    std::vector<PendingAddLearnerProposal> pending_add_learner_proposals_;
+    std::optional<std::uint64_t> inflight_atomic_batch_promotion_log_index_;
     std::unordered_map<std::string, std::shared_ptr<MetadataProposalTracker>>
         metadata_inflight_proposals_;
     std::unordered_map<std::string, CompletedMetadataProposal>
@@ -341,6 +499,8 @@ namespace raftdemo
     bool snapshot_in_progress_{false};
     std::uint64_t pending_snapshot_index_{0};
     std::uint64_t pending_snapshot_term_{0};
+    RuntimeMembershipRole local_runtime_membership_role_hint_{
+        RuntimeMembershipRole::kUnknown};
 
     mutable std::mutex metrics_mu_;
     std::uint64_t propose_success_count_{0};

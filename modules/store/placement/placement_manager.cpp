@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "store/node/storage_node_registry.h"
+#include "view/view_registry.h"
 
 namespace storedemo
 {
@@ -64,6 +65,205 @@ namespace storedemo
             }
 
             return std::nullopt;
+        }
+
+        StorageNodeStatusCode MapViewRegistryStatus(
+            const viewdemo::ViewRegistryStatusCode status)
+        {
+            switch (status)
+            {
+            case viewdemo::ViewRegistryStatusCode::kOk:
+            case viewdemo::ViewRegistryStatusCode::kIdempotentReplay:
+            case viewdemo::ViewRegistryStatusCode::kStaleIgnored:
+                return StorageNodeStatusCode::kOk;
+            case viewdemo::ViewRegistryStatusCode::kInvalidArgument:
+                return StorageNodeStatusCode::kInvalidArgument;
+            case viewdemo::ViewRegistryStatusCode::kNotFound:
+                return StorageNodeStatusCode::kNotFound;
+            case viewdemo::ViewRegistryStatusCode::kConflict:
+                return StorageNodeStatusCode::kConflict;
+            case viewdemo::ViewRegistryStatusCode::kTimeout:
+                return StorageNodeStatusCode::kTimeout;
+            case viewdemo::ViewRegistryStatusCode::kOverloaded:
+                return StorageNodeStatusCode::kOverloaded;
+            case viewdemo::ViewRegistryStatusCode::kServiceUnavailable:
+                return StorageNodeStatusCode::kNodeUnavailable;
+            case viewdemo::ViewRegistryStatusCode::kUnsupported:
+                return StorageNodeStatusCode::kUnsupported;
+            case viewdemo::ViewRegistryStatusCode::kInternalError:
+                return StorageNodeStatusCode::kIoError;
+            }
+
+            return StorageNodeStatusCode::kInvalidArgument;
+        }
+
+        ViewNodeBackedStorageNodeSnapshotIssueCode MapViewRegistryIssueCode(
+            const viewdemo::ViewRegistryIssueCode code)
+        {
+            switch (code)
+            {
+            case viewdemo::ViewRegistryIssueCode::kMissingNodeId:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kMissingNodeId;
+            case viewdemo::ViewRegistryIssueCode::kMissingEndpoint:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kMissingEndpoint;
+            case viewdemo::ViewRegistryIssueCode::kLivenessExcluded:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kLivenessExcluded;
+            case viewdemo::ViewRegistryIssueCode::kCapacityInsufficient:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kCapacityInvalid;
+            case viewdemo::ViewRegistryIssueCode::kHealthExcluded:
+            case viewdemo::ViewRegistryIssueCode::kStaleHeartbeat:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kObservationIncomplete;
+            case viewdemo::ViewRegistryIssueCode::kNonAuthorityBoundary:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kNonAuthorityBoundary;
+            case viewdemo::ViewRegistryIssueCode::kNodeUnavailable:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kSnapshotUnavailable;
+            default:
+                return ViewNodeBackedStorageNodeSnapshotIssueCode::kUnknown;
+            }
+        }
+
+        ViewNodeStorageLiveness MapViewLiveness(
+            const viewdemo::ViewNodeLivenessState liveness)
+        {
+            switch (liveness)
+            {
+            case viewdemo::ViewNodeLivenessState::kLive:
+                return ViewNodeStorageLiveness::kLive;
+            case viewdemo::ViewNodeLivenessState::kStale:
+                return ViewNodeStorageLiveness::kStale;
+            case viewdemo::ViewNodeLivenessState::kSuspect:
+                return ViewNodeStorageLiveness::kSuspect;
+            case viewdemo::ViewNodeLivenessState::kDead:
+                return ViewNodeStorageLiveness::kDead;
+            case viewdemo::ViewNodeLivenessState::kUnknown:
+                break;
+            }
+
+            return ViewNodeStorageLiveness::kUnknown;
+        }
+
+        StorageNodeHealth MapViewHealth(
+            const viewdemo::ViewNodeHealth health)
+        {
+            switch (health)
+            {
+            case viewdemo::ViewNodeHealth::kHealthy:
+                return StorageNodeHealth::kHealthy;
+            case viewdemo::ViewNodeHealth::kDegraded:
+                return StorageNodeHealth::kDegraded;
+            case viewdemo::ViewNodeHealth::kReadOnly:
+                return StorageNodeHealth::kReadOnly;
+            case viewdemo::ViewNodeHealth::kDraining:
+                return StorageNodeHealth::kDraining;
+            case viewdemo::ViewNodeHealth::kUnavailable:
+            case viewdemo::ViewNodeHealth::kUnknown:
+                break;
+            }
+
+            return StorageNodeHealth::kUnavailable;
+        }
+
+        StorageNodeDiskPressure MapViewDiskPressure(
+            const viewdemo::ViewNodeDiskPressure pressure)
+        {
+            switch (pressure)
+            {
+            case viewdemo::ViewNodeDiskPressure::kLow:
+                return StorageNodeDiskPressure::kLow;
+            case viewdemo::ViewNodeDiskPressure::kMedium:
+                return StorageNodeDiskPressure::kMedium;
+            case viewdemo::ViewNodeDiskPressure::kHigh:
+                return StorageNodeDiskPressure::kHigh;
+            case viewdemo::ViewNodeDiskPressure::kFull:
+                return StorageNodeDiskPressure::kFull;
+            case viewdemo::ViewNodeDiskPressure::kUnknown:
+                break;
+            }
+
+            return StorageNodeDiskPressure::kFull;
+        }
+
+        bool HasCompleteViewStorageFacts(const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            return snapshot.node_type == viewdemo::ViewNodeType::kStorage &&
+                   !snapshot.node_id.empty() &&
+                   !snapshot.endpoint.empty() &&
+                   snapshot.health.health != viewdemo::ViewNodeHealth::kUnknown &&
+                   snapshot.health.disk_pressure !=
+                       viewdemo::ViewNodeDiskPressure::kUnknown;
+        }
+
+        bool HasValidCapacityFacts(const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            return HasValidCapacityFacts(snapshot.capacity.total_capacity_bytes,
+                                         snapshot.capacity.used_capacity_bytes,
+                                         snapshot.capacity.available_capacity_bytes);
+        }
+
+        ViewNodeBackedStorageNodeSnapshot BuildViewBackedStorageSnapshot(
+            const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            ViewNodeBackedStorageNodeSnapshot converted;
+            converted.candidate.node_id = snapshot.node_id;
+            converted.candidate.endpoint = snapshot.endpoint;
+            converted.candidate.health = MapViewHealth(snapshot.health.health);
+            converted.candidate.disk_pressure =
+                MapViewDiskPressure(snapshot.health.disk_pressure);
+            converted.candidate.total_capacity_bytes =
+                snapshot.capacity.total_capacity_bytes;
+            converted.candidate.used_capacity_bytes =
+                snapshot.capacity.used_capacity_bytes;
+            converted.candidate.available_capacity_bytes =
+                snapshot.capacity.available_capacity_bytes;
+            converted.candidate.load.active_reads = snapshot.load.active_reads;
+            converted.candidate.load.active_writes = snapshot.load.active_writes;
+            converted.candidate.load.queued_ops = snapshot.load.queued_ops;
+            converted.candidate.write_admission_overloaded =
+                snapshot.load.write_admission_overloaded;
+            converted.candidate.zone = snapshot.failure_domain.zone;
+            converted.candidate.rack = snapshot.failure_domain.rack;
+            converted.liveness = MapViewLiveness(snapshot.liveness);
+            converted.last_seen_unix_ms = snapshot.last_seen_unix_ms;
+            converted.observed_at_unix_ms =
+                snapshot.observed_state.observed_at_unix_ms != 0
+                    ? snapshot.observed_state.observed_at_unix_ms
+                    : snapshot.last_seen_unix_ms;
+            converted.source_sequence = snapshot.last_sequence;
+            converted.has_complete_facts = HasCompleteViewStorageFacts(snapshot);
+            converted.has_valid_capacity_facts = HasValidCapacityFacts(snapshot);
+            return converted;
+        }
+
+        ViewNodeBackedStorageNodeSnapshotDiagnostic BuildViewBackedDiagnostic(
+            const viewdemo::ViewRegistryDiagnostic &diagnostic)
+        {
+            return ViewNodeBackedStorageNodeSnapshotDiagnostic{
+                .code = MapViewRegistryIssueCode(diagnostic.code),
+                .node_id = diagnostic.node_id,
+                .message = diagnostic.message,
+            };
+        }
+
+        ViewNodeBackedStorageNodeSnapshotResult BuildViewBackedSnapshotResult(
+            const viewdemo::DiscoverStorageResult &discovery_result)
+        {
+            ViewNodeBackedStorageNodeSnapshotResult result;
+            result.status = MapViewRegistryStatus(discovery_result.summary.status);
+            result.error_detail = discovery_result.summary.message;
+            result.snapshot_epoch = discovery_result.observed_at_unix_ms;
+            result.generated_at_unix_ms = discovery_result.observed_at_unix_ms;
+            result.nodes.reserve(discovery_result.storage_nodes.size());
+            for (const auto &snapshot : discovery_result.storage_nodes)
+            {
+                result.nodes.push_back(BuildViewBackedStorageSnapshot(snapshot));
+            }
+            result.diagnostics.reserve(discovery_result.diagnostics.size());
+            for (const auto &diagnostic : discovery_result.diagnostics)
+            {
+                result.diagnostics.push_back(
+                    BuildViewBackedDiagnostic(diagnostic));
+            }
+            return result;
         }
 
         const char *ToString(const ViewNodeStorageLiveness liveness)
@@ -351,6 +551,51 @@ namespace storedemo
         if (result.decision.reasons.size() >= 2)
         {
             result.decision.reasons.insert(result.decision.reasons.begin() + 2,
+                                           reason);
+        }
+        else
+        {
+            result.decision.reasons.push_back(reason);
+        }
+        return result;
+    }
+
+    PlacementDecisionResult PlacementManager::SelectPlacement(
+        const PlacementRequest &request,
+        const viewdemo::DiscoverStorageResult &view_discovery_result) const
+    {
+        auto view_snapshot = BuildViewBackedSnapshotResult(view_discovery_result);
+        auto result = SelectPlacement(request, view_snapshot);
+        const std::string reason =
+            "placement_manager consumed ViewNode DiscoverStorage observed_at_unix_ms=" +
+            std::to_string(view_discovery_result.observed_at_unix_ms);
+        if (result.decision.reasons.size() >= 3)
+        {
+            result.decision.reasons.insert(result.decision.reasons.begin() + 3,
+                                           reason);
+        }
+        else
+        {
+            result.decision.reasons.push_back(reason);
+        }
+        return result;
+    }
+
+    PlacementDecisionResult PlacementManager::SelectPlacement(
+        const PlacementRequest &request,
+        const viewdemo::ViewNodeRegistry &registry,
+        const viewdemo::DiscoverStorageRequest &discovery_request,
+        const std::uint64_t now_unix_ms) const
+    {
+        const auto discovery_result =
+            registry.DiscoverStorage(discovery_request, now_unix_ms);
+        auto result = SelectPlacement(request, discovery_result);
+        const std::string reason =
+            "placement_manager consumed ViewNode registry merged observed storage state at now_unix_ms=" +
+            std::to_string(now_unix_ms);
+        if (result.decision.reasons.size() >= 4)
+        {
+            result.decision.reasons.insert(result.decision.reasons.begin() + 4,
                                            reason);
         }
         else

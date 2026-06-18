@@ -12,6 +12,8 @@ service ViewNodeService {
   rpc DiscoverMetadata(DiscoverMetadataRequest) returns (DiscoverMetadataResponse);
   rpc DiscoverStorage(DiscoverStorageRequest) returns (DiscoverStorageResponse);
   rpc GetClusterView(GetClusterViewRequest) returns (GetClusterViewResponse);
+  rpc PullPeerViewSnapshot(PullPeerViewSnapshotRequest) returns (PullPeerViewSnapshotResponse);
+  rpc PushPeerViewSnapshot(PushPeerViewSnapshotRequest) returns (PushPeerViewSnapshotResponse);
 }
 
 enum ViewNodeStatusCode {
@@ -168,6 +170,7 @@ message ViewNodeSnapshot {
   ViewNodeHealthReport health = 13;
   ViewNodeCapacityReport capacity = 14;
   ViewNodeLoadReport load = 15;
+  string incarnation_id = 16;
   MetadataNodeObservation metadata = 20;
 }
 
@@ -176,6 +179,7 @@ message ClusterViewWarning {
   string message = 2;
   string node_id = 3;
   string endpoint = 4;
+  uint64 sequence = 5;
 }
 
 message RegisterNodeRequest {
@@ -199,6 +203,7 @@ message HeartbeatNodeRequest {
   ViewNodeType node_type = 4;
   uint64 sequence = 5;
   ViewNodeRegistration observation = 6;
+  string incarnation_id = 7;
 }
 
 message HeartbeatNodeResponse {
@@ -264,5 +269,45 @@ message GetClusterViewResponse {
   repeated ViewNodeSnapshot storage_nodes = 4;
   MetadataLeaderHint leader_hint = 5;
   uint64 observed_at_unix_ms = 6;
+  repeated ClusterViewWarning warnings = 7;
+}
+
+// ViewNode peer sync 只交换 observed registry state。
+// 它不授予 membership authority，也不把 Metadata/Storage 注册升级成 Raft 变更。
+message ViewPeerSyncSnapshot {
+  string cluster_id = 1;
+  uint64 generated_at_unix_ms = 2;
+  repeated ViewNodeSnapshot view_nodes = 3;
+  repeated ViewNodeSnapshot metadata_nodes = 4;
+  repeated ViewNodeSnapshot storage_nodes = 5;
+  MetadataLeaderHint leader_hint = 6;
+}
+
+message PullPeerViewSnapshotRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  bool include_dead_nodes = 3;
+  bool include_warnings = 4;
+}
+
+message PullPeerViewSnapshotResponse {
+  ViewNodeResponseSummary summary = 1;
+  ViewPeerSyncSnapshot snapshot = 2;
+  repeated ClusterViewWarning warnings = 3;
+}
+
+message PushPeerViewSnapshotRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  ViewPeerSyncSnapshot snapshot = 3;
+}
+
+message PushPeerViewSnapshotResponse {
+  ViewNodeResponseSummary summary = 1;
+  uint32 received_node_count = 2;
+  uint32 accepted_node_count = 3;
+  uint32 applied_node_count = 4;
+  uint32 stale_ignored_node_count = 5;
+  uint32 conflict_node_count = 6;
   repeated ClusterViewWarning warnings = 7;
 }

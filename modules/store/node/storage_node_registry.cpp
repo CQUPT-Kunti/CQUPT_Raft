@@ -1,6 +1,7 @@
 #include "store/node/storage_node_registry.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <exception>
 #include <utility>
@@ -14,6 +15,13 @@ namespace storedemo
             kApply = 0,
             kIdempotent = 1,
             kStale = 2,
+        };
+
+        enum class IncarnationDecision : std::uint8_t
+        {
+            kIncomingIsNewer = 0,
+            kSameIncarnation = 1,
+            kIncomingIsOlder = 2,
         };
 
         bool IsValidNodeId(const std::string_view node_id)
@@ -173,6 +181,40 @@ namespace storedemo
             return StorageNodeStatusCode::kOk;
         }
 
+        bool NormalizeWritableStatus(const StorageNodeRegistryHealthFacts &health)
+        {
+            if (!health.writable)
+            {
+                return false;
+            }
+
+            if (health.health == StorageNodeHealth::kReadOnly ||
+                health.health == StorageNodeHealth::kUnavailable)
+            {
+                return false;
+            }
+
+            if (health.disk_pressure == StorageNodeDiskPressure::kFull)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        StorageNodeRegistryHealthFacts NormalizeHealthFacts(
+            StorageNodeRegistryHealthFacts health)
+        {
+            health.writable = NormalizeWritableStatus(health);
+            return health;
+        }
+
+        StorageNodeRegistryFacts NormalizeRegistryFacts(StorageNodeRegistryFacts facts)
+        {
+            facts.health = NormalizeHealthFacts(std::move(facts.health));
+            return facts;
+        }
+
         StorageNodeStatusCode ValidateRegisterRequest(
             const RegisterStorageNodeRequest &request,
             std::string *error_detail)
@@ -237,6 +279,141 @@ namespace storedemo
             return SequenceDecision::kApply;
         }
 
+        struct IncarnationToken
+        {
+            std::string_view value;
+            bool present{false};
+        };
+
+        IncarnationToken NextIncarnationToken(std::string_view *remaining)
+        {
+            if (remaining == nullptr || remaining->empty())
+            {
+                return {};
+            }
+
+            const auto separator = remaining->find(':');
+            if (separator == std::string_view::npos)
+            {
+                const auto token = *remaining;
+                *remaining = {};
+                return IncarnationToken{.value = token, .present = true};
+            }
+
+            const auto token = remaining->substr(0, separator);
+            remaining->remove_prefix(separator + 1);
+            return IncarnationToken{.value = token, .present = true};
+        }
+
+        bool TryParseIncarnationNumber(const std::string_view token,
+                                       std::uint64_t *parsed)
+        {
+            if (token.empty() || parsed == nullptr)
+            {
+                return false;
+            }
+
+            std::uint64_t value = 0;
+            const auto *begin = token.data();
+            const auto *end = token.data() + token.size();
+            const auto parse_result = std::from_chars(begin, end, value);
+            if (parse_result.ec != std::errc{} || parse_result.ptr != end)
+            {
+                return false;
+            }
+
+            *parsed = value;
+            return true;
+        }
+
+        int CompareIncarnationIds(const std::string_view current_incarnation_id,
+                                  const std::string_view incoming_incarnation_id)
+        {
+            auto current_remaining = current_incarnation_id;
+            auto incoming_remaining = incoming_incarnation_id;
+
+            while (true)
+            {
+                const auto current_token = NextIncarnationToken(&current_remaining);
+                const auto incoming_token = NextIncarnationToken(&incoming_remaining);
+                if (!current_token.present && !incoming_token.present)
+                {
+                    break;
+                }
+                if (!current_token.present)
+                {
+                    return -1;
+                }
+                if (!incoming_token.present)
+                {
+                    return 1;
+                }
+
+                std::uint64_t current_number = 0;
+                std::uint64_t incoming_number = 0;
+                const bool current_is_number =
+                    TryParseIncarnationNumber(current_token.value, &current_number);
+                const bool incoming_is_number =
+                    TryParseIncarnationNumber(incoming_token.value, &incoming_number);
+                if (current_is_number && incoming_is_number)
+                {
+                    if (current_number < incoming_number)
+                    {
+                        return -1;
+                    }
+                    if (current_number > incoming_number)
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+
+                if (current_token.value < incoming_token.value)
+                {
+                    return -1;
+                }
+                if (current_token.value > incoming_token.value)
+                {
+                    return 1;
+                }
+            }
+
+            if (current_incarnation_id < incoming_incarnation_id)
+            {
+                return -1;
+            }
+            if (current_incarnation_id > incoming_incarnation_id)
+            {
+                return 1;
+            }
+            return 0;
+        }
+
+        IncarnationDecision EvaluateIncarnationDecision(
+            const std::string_view current_incarnation_id,
+            const std::string_view incoming_incarnation_id)
+        {
+            if (current_incarnation_id == incoming_incarnation_id)
+            {
+                return IncarnationDecision::kSameIncarnation;
+            }
+            if (current_incarnation_id.empty())
+            {
+                return incoming_incarnation_id.empty()
+                           ? IncarnationDecision::kSameIncarnation
+                           : IncarnationDecision::kIncomingIsNewer;
+            }
+            if (incoming_incarnation_id.empty())
+            {
+                return IncarnationDecision::kIncomingIsOlder;
+            }
+
+            return CompareIncarnationIds(current_incarnation_id,
+                                         incoming_incarnation_id) < 0
+                       ? IncarnationDecision::kIncomingIsNewer
+                       : IncarnationDecision::kIncomingIsOlder;
+        }
+
         StorageNodeRegistryLiveness DetermineLiveness(
             const std::uint64_t last_seen_unix_ms,
             const std::uint64_t now_unix_ms,
@@ -263,6 +440,7 @@ namespace storedemo
         StorageNodeRegistryNodeSnapshot MakeNodeSnapshot(
             const StorageNodeId &node_id,
             const std::string &endpoint,
+            const std::string &incarnation_id,
             const StorageNodeRegistryFacts &facts,
             const std::uint64_t last_sequence,
             const std::uint64_t last_seen_unix_ms,
@@ -272,6 +450,7 @@ namespace storedemo
             return StorageNodeRegistryNodeSnapshot{
                 .node_id = node_id,
                 .endpoint = endpoint,
+                .incarnation_id = incarnation_id,
                 .last_sequence = last_sequence,
                 .last_seen_unix_ms = last_seen_unix_ms,
                 .liveness = DetermineLiveness(last_seen_unix_ms,
@@ -300,43 +479,51 @@ namespace storedemo
         template <typename Record>
         void InitializeRegisteredRecord(Record *record,
                                         std::string endpoint,
+                                        std::string incarnation_id,
                                         const StorageNodeRegistryFacts &facts,
                                         const std::uint64_t observed_at_unix_ms)
         {
             record->endpoint = std::move(endpoint);
-            record->facts = facts;
+            record->incarnation_id = std::move(incarnation_id);
+            record->facts = NormalizeRegistryFacts(facts);
             record->last_sequence = 0;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }
 
         template <typename Record>
         void ApplyFullFacts(Record *record,
+                            std::string_view incarnation_id,
                             const StorageNodeRegistryFacts &facts,
                             const std::uint64_t sequence,
                             const std::uint64_t observed_at_unix_ms)
         {
-            record->facts = facts;
+            record->incarnation_id.assign(incarnation_id);
+            record->facts = NormalizeRegistryFacts(facts);
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }
 
         template <typename Record>
         void MergeHealthFacts(Record *record,
+                              std::string_view incarnation_id,
                               const StorageNodeRegistryHealthFacts &health,
                               const std::uint64_t sequence,
                               const std::uint64_t observed_at_unix_ms)
         {
-            record->facts.health = health;
+            record->incarnation_id.assign(incarnation_id);
+            record->facts.health = NormalizeHealthFacts(health);
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
         }
 
         template <typename Record>
         void MergeCapacityFacts(Record *record,
+                                std::string_view incarnation_id,
                                 const StorageNodeRegistryCapacityFacts &capacity,
                                 const std::uint64_t sequence,
                                 const std::uint64_t observed_at_unix_ms)
         {
+            record->incarnation_id.assign(incarnation_id);
             record->facts.capacity = capacity;
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
@@ -344,10 +531,12 @@ namespace storedemo
 
         template <typename Record>
         void MergeLoadFacts(Record *record,
+                            std::string_view incarnation_id,
                             const StorageNodeRegistryLoadFacts &load,
                             const std::uint64_t sequence,
                             const std::uint64_t observed_at_unix_ms)
         {
+            record->incarnation_id.assign(incarnation_id);
             record->facts.load = load;
             record->last_sequence = sequence;
             record->last_seen_unix_ms = observed_at_unix_ms;
@@ -372,6 +561,7 @@ namespace storedemo
             {
                 out->push_back(MakeNodeSnapshot(node_id,
                                                 record.endpoint,
+                                                record.incarnation_id,
                                                 record.facts,
                                                 record.last_sequence,
                                                 record.last_seen_unix_ms,
@@ -420,9 +610,44 @@ namespace storedemo
                 return result;
             }
 
+            const auto incarnation_decision =
+                EvaluateIncarnationDecision(existing->second.incarnation_id,
+                                            request.incarnation_id);
+            if (incarnation_decision == IncarnationDecision::kIncomingIsOlder)
+            {
+                result.status = StorageNodeStatusCode::kAlreadyExists;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+            if (incarnation_decision == IncarnationDecision::kIncomingIsNewer)
+            {
+                InitializeRegisteredRecord(&existing->second,
+                                           existing->second.endpoint,
+                                           request.incarnation_id,
+                                           request.facts,
+                                           request.observed_at_unix_ms);
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+
             result.idempotent = true;
             result.snapshot = MakeNodeSnapshot(request.node_id,
                                                existing->second.endpoint,
+                                               existing->second.incarnation_id,
                                                existing->second.facts,
                                                existing->second.last_sequence,
                                                existing->second.last_seen_unix_ms,
@@ -434,6 +659,7 @@ namespace storedemo
         Record record;
         InitializeRegisteredRecord(&record,
                                    request.endpoint,
+                                   request.incarnation_id,
                                    request.facts,
                                    request.observed_at_unix_ms);
         records_.emplace(request.node_id, record);
@@ -441,6 +667,7 @@ namespace storedemo
         result.created = true;
         result.snapshot = MakeNodeSnapshot(request.node_id,
                                            record.endpoint,
+                                           record.incarnation_id,
                                            record.facts,
                                            record.last_sequence,
                                            record.last_seen_unix_ms,
@@ -481,16 +708,16 @@ namespace storedemo
         }
 
         result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(existing->second.last_sequence,
-                                                       existing->second.last_seen_unix_ms,
-                                                       request.sequence,
-                                                       request.observed_at_unix_ms);
-        if (decision == SequenceDecision::kStale)
+        const auto incarnation_decision =
+            EvaluateIncarnationDecision(existing->second.incarnation_id,
+                                        request.incarnation_id);
+        if (incarnation_decision == IncarnationDecision::kIncomingIsOlder)
         {
             result.status = StorageNodeStatusCode::kAlreadyExists;
             result.stale_ignored = true;
             result.snapshot = MakeNodeSnapshot(request.node_id,
                                                existing->second.endpoint,
+                                               existing->second.incarnation_id,
                                                existing->second.facts,
                                                existing->second.last_sequence,
                                                existing->second.last_seen_unix_ms,
@@ -498,20 +725,44 @@ namespace storedemo
                                                config_);
             return result;
         }
-        if (decision == SequenceDecision::kIdempotent)
+        if (incarnation_decision == IncarnationDecision::kSameIncarnation)
         {
-            result.idempotent = true;
-            result.snapshot = MakeNodeSnapshot(request.node_id,
-                                               existing->second.endpoint,
-                                               existing->second.facts,
-                                               existing->second.last_sequence,
-                                               existing->second.last_seen_unix_ms,
-                                               request.observed_at_unix_ms,
-                                               config_);
-            return result;
+            const auto decision =
+                EvaluateSequenceDecision(existing->second.last_sequence,
+                                         existing->second.last_seen_unix_ms,
+                                         request.sequence,
+                                         request.observed_at_unix_ms);
+            if (decision == SequenceDecision::kStale)
+            {
+                result.status = StorageNodeStatusCode::kAlreadyExists;
+                result.stale_ignored = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+            if (decision == SequenceDecision::kIdempotent)
+            {
+                result.idempotent = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
         }
 
         ApplyFullFacts(&existing->second,
+                       request.incarnation_id,
                        request.facts,
                        request.sequence,
                        request.observed_at_unix_ms);
@@ -519,6 +770,7 @@ namespace storedemo
         result.accepted_sequence = request.sequence;
         result.snapshot = MakeNodeSnapshot(request.node_id,
                                            existing->second.endpoint,
+                                           existing->second.incarnation_id,
                                            existing->second.facts,
                                            existing->second.last_sequence,
                                            existing->second.last_seen_unix_ms,
@@ -552,16 +804,16 @@ namespace storedemo
         }
 
         result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(existing->second.last_sequence,
-                                                       existing->second.last_seen_unix_ms,
-                                                       request.sequence,
-                                                       request.observed_at_unix_ms);
-        if (decision == SequenceDecision::kStale)
+        const auto incarnation_decision =
+            EvaluateIncarnationDecision(existing->second.incarnation_id,
+                                        request.incarnation_id);
+        if (incarnation_decision == IncarnationDecision::kIncomingIsOlder)
         {
             result.status = StorageNodeStatusCode::kAlreadyExists;
             result.stale_ignored = true;
             result.snapshot = MakeNodeSnapshot(request.node_id,
                                                existing->second.endpoint,
+                                               existing->second.incarnation_id,
                                                existing->second.facts,
                                                existing->second.last_sequence,
                                                existing->second.last_seen_unix_ms,
@@ -569,20 +821,44 @@ namespace storedemo
                                                config_);
             return result;
         }
-        if (decision == SequenceDecision::kIdempotent)
+        if (incarnation_decision == IncarnationDecision::kSameIncarnation)
         {
-            result.idempotent = true;
-            result.snapshot = MakeNodeSnapshot(request.node_id,
-                                               existing->second.endpoint,
-                                               existing->second.facts,
-                                               existing->second.last_sequence,
-                                               existing->second.last_seen_unix_ms,
-                                               request.observed_at_unix_ms,
-                                               config_);
-            return result;
+            const auto decision =
+                EvaluateSequenceDecision(existing->second.last_sequence,
+                                         existing->second.last_seen_unix_ms,
+                                         request.sequence,
+                                         request.observed_at_unix_ms);
+            if (decision == SequenceDecision::kStale)
+            {
+                result.status = StorageNodeStatusCode::kAlreadyExists;
+                result.stale_ignored = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+            if (decision == SequenceDecision::kIdempotent)
+            {
+                result.idempotent = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
         }
 
         MergeHealthFacts(&existing->second,
+                         request.incarnation_id,
                          request.health,
                          request.sequence,
                          request.observed_at_unix_ms);
@@ -590,6 +866,7 @@ namespace storedemo
         result.accepted_sequence = request.sequence;
         result.snapshot = MakeNodeSnapshot(request.node_id,
                                            existing->second.endpoint,
+                                           existing->second.incarnation_id,
                                            existing->second.facts,
                                            existing->second.last_sequence,
                                            existing->second.last_seen_unix_ms,
@@ -631,16 +908,16 @@ namespace storedemo
         }
 
         result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(existing->second.last_sequence,
-                                                       existing->second.last_seen_unix_ms,
-                                                       request.sequence,
-                                                       request.observed_at_unix_ms);
-        if (decision == SequenceDecision::kStale)
+        const auto incarnation_decision =
+            EvaluateIncarnationDecision(existing->second.incarnation_id,
+                                        request.incarnation_id);
+        if (incarnation_decision == IncarnationDecision::kIncomingIsOlder)
         {
             result.status = StorageNodeStatusCode::kAlreadyExists;
             result.stale_ignored = true;
             result.snapshot = MakeNodeSnapshot(request.node_id,
                                                existing->second.endpoint,
+                                               existing->second.incarnation_id,
                                                existing->second.facts,
                                                existing->second.last_sequence,
                                                existing->second.last_seen_unix_ms,
@@ -648,20 +925,44 @@ namespace storedemo
                                                config_);
             return result;
         }
-        if (decision == SequenceDecision::kIdempotent)
+        if (incarnation_decision == IncarnationDecision::kSameIncarnation)
         {
-            result.idempotent = true;
-            result.snapshot = MakeNodeSnapshot(request.node_id,
-                                               existing->second.endpoint,
-                                               existing->second.facts,
-                                               existing->second.last_sequence,
-                                               existing->second.last_seen_unix_ms,
-                                               request.observed_at_unix_ms,
-                                               config_);
-            return result;
+            const auto decision =
+                EvaluateSequenceDecision(existing->second.last_sequence,
+                                         existing->second.last_seen_unix_ms,
+                                         request.sequence,
+                                         request.observed_at_unix_ms);
+            if (decision == SequenceDecision::kStale)
+            {
+                result.status = StorageNodeStatusCode::kAlreadyExists;
+                result.stale_ignored = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+            if (decision == SequenceDecision::kIdempotent)
+            {
+                result.idempotent = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
         }
 
         MergeCapacityFacts(&existing->second,
+                           request.incarnation_id,
                            request.capacity,
                            request.sequence,
                            request.observed_at_unix_ms);
@@ -669,6 +970,7 @@ namespace storedemo
         result.accepted_sequence = request.sequence;
         result.snapshot = MakeNodeSnapshot(request.node_id,
                                            existing->second.endpoint,
+                                           existing->second.incarnation_id,
                                            existing->second.facts,
                                            existing->second.last_sequence,
                                            existing->second.last_seen_unix_ms,
@@ -702,16 +1004,16 @@ namespace storedemo
         }
 
         result.accepted_sequence = existing->second.last_sequence;
-        const auto decision = EvaluateSequenceDecision(existing->second.last_sequence,
-                                                       existing->second.last_seen_unix_ms,
-                                                       request.sequence,
-                                                       request.observed_at_unix_ms);
-        if (decision == SequenceDecision::kStale)
+        const auto incarnation_decision =
+            EvaluateIncarnationDecision(existing->second.incarnation_id,
+                                        request.incarnation_id);
+        if (incarnation_decision == IncarnationDecision::kIncomingIsOlder)
         {
             result.status = StorageNodeStatusCode::kAlreadyExists;
             result.stale_ignored = true;
             result.snapshot = MakeNodeSnapshot(request.node_id,
                                                existing->second.endpoint,
+                                               existing->second.incarnation_id,
                                                existing->second.facts,
                                                existing->second.last_sequence,
                                                existing->second.last_seen_unix_ms,
@@ -719,20 +1021,44 @@ namespace storedemo
                                                config_);
             return result;
         }
-        if (decision == SequenceDecision::kIdempotent)
+        if (incarnation_decision == IncarnationDecision::kSameIncarnation)
         {
-            result.idempotent = true;
-            result.snapshot = MakeNodeSnapshot(request.node_id,
-                                               existing->second.endpoint,
-                                               existing->second.facts,
-                                               existing->second.last_sequence,
-                                               existing->second.last_seen_unix_ms,
-                                               request.observed_at_unix_ms,
-                                               config_);
-            return result;
+            const auto decision =
+                EvaluateSequenceDecision(existing->second.last_sequence,
+                                         existing->second.last_seen_unix_ms,
+                                         request.sequence,
+                                         request.observed_at_unix_ms);
+            if (decision == SequenceDecision::kStale)
+            {
+                result.status = StorageNodeStatusCode::kAlreadyExists;
+                result.stale_ignored = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
+            if (decision == SequenceDecision::kIdempotent)
+            {
+                result.idempotent = true;
+                result.snapshot = MakeNodeSnapshot(request.node_id,
+                                                   existing->second.endpoint,
+                                                   existing->second.incarnation_id,
+                                                   existing->second.facts,
+                                                   existing->second.last_sequence,
+                                                   existing->second.last_seen_unix_ms,
+                                                   request.observed_at_unix_ms,
+                                                   config_);
+                return result;
+            }
         }
 
         MergeLoadFacts(&existing->second,
+                       request.incarnation_id,
                        request.load,
                        request.sequence,
                        request.observed_at_unix_ms);
@@ -740,6 +1066,7 @@ namespace storedemo
         result.accepted_sequence = request.sequence;
         result.snapshot = MakeNodeSnapshot(request.node_id,
                                            existing->second.endpoint,
+                                           existing->second.incarnation_id,
                                            existing->second.facts,
                                            existing->second.last_sequence,
                                            existing->second.last_seen_unix_ms,
@@ -772,6 +1099,7 @@ namespace storedemo
         result.snapshot =
             MakeNodeSnapshot(existing->first,
                              existing->second.endpoint,
+                             existing->second.incarnation_id,
                              existing->second.facts,
                              existing->second.last_sequence,
                              existing->second.last_seen_unix_ms,

@@ -13,6 +13,7 @@ service MetadataService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc JoinMetadataCluster(JoinMetadataClusterRequest) returns (JoinMetadataClusterResponse);
 }
 
 message CreateBucketRequest {
@@ -123,4 +124,52 @@ message ListObjectsResponse {
   MetadataResponseSummary summary = 1;
   repeated ObjectRecord objects = 2;
   string next_continuation_token = 3;
+}
+
+enum JoinMetadataCandidateStateHint {
+  JOIN_METADATA_CANDIDATE_STATE_HINT_UNSPECIFIED = 0;
+  JOIN_METADATA_CANDIDATE_STATE_HINT_JOINING = 1;
+  JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE = 2;
+}
+
+enum JoinMetadataClusterDisposition {
+  JOIN_METADATA_CLUSTER_DISPOSITION_UNSPECIFIED = 0;
+  JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT = 1;
+  JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER = 2;
+  JOIN_METADATA_CLUSTER_DISPOSITION_DUPLICATE = 3;
+  JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE = 4;
+  JOIN_METADATA_CLUSTER_DISPOSITION_INVALID_CANDIDATE = 5;
+  JOIN_METADATA_CLUSTER_DISPOSITION_REJECTED = 6;
+}
+
+enum JoinMetadataTargetMembership {
+  JOIN_METADATA_TARGET_MEMBERSHIP_UNSPECIFIED = 0;
+  JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER = 1;
+}
+
+message JoinMetadataClusterRequest {
+  string request_id = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  int32 candidate_raft_id = 4;
+  string candidate_client_address = 5;
+  string candidate_raft_address = 6;
+  string candidate_incarnation_id = 7;
+  uint64 candidate_sequence = 8;
+  uint64 persistent_generation = 9;
+  string data_dir_fingerprint = 10;
+  JoinMetadataCandidateStateHint local_state_hint = 11;
+  string observed_view_node_id = 12;
+  uint64 observed_time_unix_ms = 13;
+  string observed_metadata_endpoint = 14;
+}
+
+message JoinMetadataClusterResponse {
+  MetadataResponseSummary summary = 1;
+  JoinMetadataClusterDisposition disposition = 2;
+  JoinMetadataTargetMembership requested_membership = 3;
+  bool committed_membership_changed = 4;
+  uint64 membership_epoch = 5;
+  string canonical_node_id = 6;
+  int32 assigned_raft_id = 7;
 }

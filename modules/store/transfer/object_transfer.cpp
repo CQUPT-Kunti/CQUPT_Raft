@@ -67,6 +67,13 @@ namespace storedemo
             }
         }
 
+        [[nodiscard]] std::string MakeMetadataOperationRequestId(
+            std::string_view base_request_id,
+            std::string_view operation_suffix)
+        {
+            return std::string(base_request_id) + "/" + std::string(operation_suffix);
+        }
+
         [[nodiscard]] std::uint32_t RotateRight(const std::uint32_t value,
                                                 const std::uint32_t bits)
         {
@@ -299,6 +306,17 @@ namespace storedemo
 
         [[nodiscard]] std::uint64_t MaxManifestChunkSize(
             const std::vector<TransferCommittedChunk> &chunks)
+        {
+            std::uint64_t max_chunk_size = 0;
+            for (const auto &chunk : chunks)
+            {
+                max_chunk_size = std::max(max_chunk_size, chunk.size);
+            }
+            return max_chunk_size;
+        }
+
+        [[nodiscard]] std::uint64_t MaxPreparedChunkSize(
+            const std::vector<TransferPreparedChunk> &chunks)
         {
             std::uint64_t max_chunk_size = 0;
             for (const auto &chunk : chunks)
@@ -1605,8 +1623,8 @@ namespace storedemo
                 const auto storage_targets = DiscoverStorageTargets(
                     request_.request_id,
                     request_.cluster_id,
-                    finalize_result.object_checksum.size,
-                    request_.desired_replica_count,
+                    MaxPreparedChunkSize(result.prepared_chunks),
+                    0,
                     true,
                     view_client_,
                     &result.diagnostics,
@@ -1921,7 +1939,8 @@ namespace storedemo
                 result.session = Snapshot();
 
                 const auto commit_call = discovered_metadata_client->CommitObject(
-                    {.request_id = request_.request_id,
+                    {.request_id = MakeMetadataOperationRequestId(request_.request_id,
+                                                                 "commit"),
                      .bucket = request_.bucket,
                      .object_key = request_.object_key,
                      .object_id = result.write_plan->object_id,
@@ -2181,9 +2200,25 @@ namespace storedemo
                     }
                 }
 
-                if (targets.empty())
+                const auto fallback_targets = SortedStorageTargets(storage_targets);
+                for (const auto &fallback_target : fallback_targets)
                 {
-                    targets = SortedStorageTargets(storage_targets);
+                    if (targets.size() >= desired_replica_count)
+                    {
+                        break;
+                    }
+
+                    const auto duplicate =
+                        std::find_if(targets.begin(),
+                                     targets.end(),
+                                     [&](const StorageTransferTarget &target)
+                                     {
+                                         return target.node_id == fallback_target.node_id;
+                                     });
+                    if (duplicate == targets.end())
+                    {
+                        targets.push_back(fallback_target);
+                    }
                 }
 
                 if (targets.size() > desired_replica_count)
@@ -2194,7 +2229,9 @@ namespace storedemo
                 {
                     SetErrorDetail(
                         error_detail,
-                        "ViewNode returned fewer writable StorageNode targets than desired_replica_count");
+                        result_write_plan_has_chunk_targets(chunk)
+                            ? "ViewNode returned fewer live/writable StorageNode targets than desired_replica_count after reconciling write plan candidate_nodes with current discovery facts"
+                            : "ViewNode returned fewer writable StorageNode targets than desired_replica_count");
                     return {};
                 }
                 return targets;

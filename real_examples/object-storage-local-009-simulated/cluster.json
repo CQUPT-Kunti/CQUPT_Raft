@@ -1,0 +1,127 @@
+{
+  "cluster_id": "example-local-009-simulated",
+  "base_dir": ".",
+  "view_nodes": [
+    {
+      "node_id": "view-1",
+      "endpoint": "127.0.0.1:9301",
+      "peer_seeds": ["127.0.0.1:9302"],
+      "data_dir": "nodes/view-1/data"
+    },
+    {
+      "node_id": "view-2",
+      "endpoint": "127.0.0.1:9302",
+      "peer_seeds": ["127.0.0.1:9301"],
+      "data_dir": "nodes/view-2/data"
+    }
+  ],
+  "metadata_nodes": [
+    {
+      "node_id": "meta-1",
+      "raft_id": 1,
+      "endpoint": "127.0.0.1:9401",
+      "data_dir": "nodes/meta-1/data",
+      "snapshot_dir": "nodes/meta-1/snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-2",
+      "raft_id": 2,
+      "endpoint": "127.0.0.1:9402",
+      "data_dir": "nodes/meta-2/data",
+      "snapshot_dir": "nodes/meta-2/snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-3",
+      "raft_id": 3,
+      "endpoint": "127.0.0.1:9403",
+      "data_dir": "nodes/meta-3/data",
+      "snapshot_dir": "nodes/meta-3/snapshots",
+      "initial_role": "voter"
+    }
+  ],
+  "storage_nodes": [
+    {
+      "node_id": "store-1",
+      "endpoint": "127.0.0.1:9501",
+      "data_dir": "nodes/store-1/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-a",
+        "rack": "rack-a1"
+      }
+    },
+    {
+      "node_id": "store-2",
+      "endpoint": "127.0.0.1:9502",
+      "data_dir": "nodes/store-2/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-a",
+        "rack": "rack-a2"
+      }
+    },
+    {
+      "node_id": "store-3",
+      "endpoint": "127.0.0.1:9503",
+      "data_dir": "nodes/store-3/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-b",
+        "rack": "rack-b1"
+      }
+    },
+    {
+      "node_id": "store-4",
+      "endpoint": "127.0.0.1:9504",
+      "data_dir": "nodes/store-4/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-b",
+        "rack": "rack-b2"
+      }
+    },
+    {
+      "node_id": "store-5",
+      "endpoint": "127.0.0.1:9505",
+      "data_dir": "nodes/store-5/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-c",
+        "rack": "rack-c1"
+      }
+    },
+    {
+      "node_id": "store-6",
+      "endpoint": "127.0.0.1:9506",
+      "data_dir": "nodes/store-6/data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-c",
+        "rack": "rack-c2"
+      }
+    }
+  ],
+  "initial_raft_membership": {
+    "membership_epoch": 1,
+    "voter_raft_ids": [1, 2, 3],
+    "learner_raft_ids": []
+  },
+  "chunk_policy": {
+    "chunk_size_bytes": 1048576,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "checksum_algorithm": "sha256"
+  },
+  "timeouts": {
+    "discovery_rpc_timeout_ms": 3000,
+    "metadata_rpc_timeout_ms": 3000,
+    "storage_rpc_timeout_ms": 3000,
+    "heartbeat_interval_ms": 1000,
+    "registration_timeout_ms": 3000,
+    "commit_deadline_ms": 5000,
+    "liveness_stale_timeout_ms": 5000,
+    "liveness_dead_timeout_ms": 15000
+  }
+}

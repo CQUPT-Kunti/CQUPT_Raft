@@ -182,6 +182,7 @@ namespace storedemo
         std::string request_id;
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryFacts facts;
     };
@@ -201,6 +202,7 @@ namespace storedemo
         std::string request_id;
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryFacts facts;
@@ -211,6 +213,7 @@ namespace storedemo
         std::string request_id;
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryHealthFacts health;
@@ -221,6 +224,7 @@ namespace storedemo
         std::string request_id;
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryCapacityFacts capacity;
@@ -231,6 +235,7 @@ namespace storedemo
         std::string request_id;
         StorageNodeId node_id;
         std::string endpoint;
+        std::string incarnation_id;
         std::uint64_t sequence{0};
         std::uint64_t observed_at_unix_ms{0};
         StorageNodeRegistryLoadFacts load;

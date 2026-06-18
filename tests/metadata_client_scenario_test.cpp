@@ -2,6 +2,8 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <google/protobuf/descriptor.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,11 +23,19 @@
 #error "RAFT_METADATA_CLIENT_PATH must be defined"
 #endif
 
+#ifndef METADATA_NODE_APP_PATH
+#error "METADATA_NODE_APP_PATH must be defined"
+#endif
+
 #ifndef _WIN32
+#include <csignal>
+#include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include "metadata.grpc.pb.h"
+#include "view.grpc.pb.h"
 
 #ifdef _WIN32
 int raft_metadata_client_entry(int argc, char **argv);
@@ -35,6 +46,11 @@ namespace
   std::string ClientBinaryPath()
   {
     return RAFT_METADATA_CLIENT_PATH;
+  }
+
+  std::string MetadataNodeAppBinaryPath()
+  {
+    return METADATA_NODE_APP_PATH;
   }
 
   std::string QuoteArg(const std::string &value)
@@ -56,6 +72,14 @@ namespace
   {
     int exit_code = -1;
     std::string output;
+  };
+
+  struct TimedProcessRunResult
+  {
+    int exit_code = -1;
+    std::string output;
+    bool matched_required_output = false;
+    bool terminated_by_test = false;
   };
 
   int NormalizeSystemExitCode(const int raw_code)
@@ -146,14 +170,516 @@ namespace
 #endif
   }
 
+  ClientRunResult RunExternalBinary(const std::string &binary_path,
+                                    const std::vector<std::string> &args,
+                                    const std::string &output_prefix,
+                                    const std::string &test_name)
+  {
+    const auto output_dir =
+        std::filesystem::current_path() / output_prefix;
+    std::filesystem::create_directories(output_dir);
+
+    const auto output_path =
+        output_dir / (test_name + "_" +
+                      std::to_string(static_cast<std::uint64_t>(
+                          std::chrono::steady_clock::now().time_since_epoch().count())) +
+                      ".log");
+
+    std::ostringstream command;
+    command << QuoteArg(binary_path);
+    for (const auto &arg : args)
+    {
+      command << ' ' << QuoteArg(arg);
+    }
+    command << " > " << QuoteArg(output_path.string()) << " 2>&1";
+
+    const int raw_exit = std::system(command.str().c_str());
+    std::ifstream input(output_path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return {NormalizeSystemExitCode(raw_exit), buffer.str()};
+  }
+
+  ClientRunResult RunMetadataNodeApp(const std::vector<std::string> &args,
+                                     const std::string &test_name)
+  {
+    return RunExternalBinary(MetadataNodeAppBinaryPath(),
+                             args,
+                             "metadata_node_app_scenario_outputs",
+                             test_name);
+  }
+
+#ifndef _WIN32
+  std::string ReadOptionalTextFile(const std::filesystem::path &path)
+  {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open())
+    {
+      return {};
+    }
+
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+  }
+
+  bool ContainsAll(const std::string &text,
+                   const std::vector<std::string> &needles)
+  {
+    return std::all_of(needles.begin(),
+                       needles.end(),
+                       [&](const std::string &needle)
+                       {
+                         return text.find(needle) != std::string::npos;
+                       });
+  }
+
+  TimedProcessRunResult RunExternalBinaryUntilOutput(
+      const std::string &binary_path,
+      const std::vector<std::string> &args,
+      const std::string &output_prefix,
+      const std::string &test_name,
+      const std::vector<std::string> &required_substrings,
+      const std::chrono::milliseconds timeout,
+      const int terminate_signal = SIGTERM)
+  {
+    const auto output_dir =
+        std::filesystem::current_path() / output_prefix;
+    std::filesystem::create_directories(output_dir);
+
+    const auto output_path =
+        output_dir / (test_name + "_" +
+                      std::to_string(static_cast<std::uint64_t>(
+                          std::chrono::steady_clock::now().time_since_epoch().count())) +
+                      ".log");
+
+    const pid_t child = fork();
+    if (child == 0)
+    {
+      const int fd = ::open(output_path.c_str(),
+                            O_CREAT | O_WRONLY | O_TRUNC,
+                            0644);
+      if (fd < 0)
+      {
+        _exit(127);
+      }
+
+      (void)::dup2(fd, STDOUT_FILENO);
+      (void)::dup2(fd, STDERR_FILENO);
+      ::close(fd);
+
+      std::vector<char *> argv;
+      argv.reserve(args.size() + 2);
+      argv.push_back(const_cast<char *>(binary_path.c_str()));
+      for (const auto &arg : args)
+      {
+        argv.push_back(const_cast<char *>(arg.c_str()));
+      }
+      argv.push_back(nullptr);
+
+      ::execv(binary_path.c_str(), argv.data());
+      _exit(127);
+    }
+
+    TimedProcessRunResult result;
+    if (child < 0)
+    {
+      result.exit_code = -1;
+      result.output = "fork failed";
+      return result;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool termination_requested = false;
+    int status = 0;
+
+    while (true)
+    {
+      const pid_t waited = ::waitpid(child, &status, WNOHANG);
+      if (waited == child)
+      {
+        break;
+      }
+
+      result.output = ReadOptionalTextFile(output_path);
+      if (!result.matched_required_output &&
+          ContainsAll(result.output, required_substrings))
+      {
+        result.matched_required_output = true;
+        (void)::kill(child, terminate_signal);
+        termination_requested = true;
+      }
+
+      if (std::chrono::steady_clock::now() >= deadline)
+      {
+        if (!termination_requested)
+        {
+          (void)::kill(child, terminate_signal);
+          termination_requested = true;
+        }
+
+        const auto grace_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < grace_deadline)
+        {
+          const pid_t grace_waited = ::waitpid(child, &status, WNOHANG);
+          if (grace_waited == child)
+          {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        if (::waitpid(child, &status, WNOHANG) == 0)
+        {
+          (void)::kill(child, SIGKILL);
+          (void)::waitpid(child, &status, 0);
+        }
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    result.terminated_by_test = termination_requested;
+    result.output = ReadOptionalTextFile(output_path);
+
+    if (WIFEXITED(status))
+    {
+      result.exit_code = WEXITSTATUS(status);
+    }
+    else if (WIFSIGNALED(status))
+    {
+      result.exit_code = 128 + WTERMSIG(status);
+    }
+    else
+    {
+      result.exit_code = status;
+    }
+
+    return result;
+  }
+
+  TimedProcessRunResult RunMetadataNodeAppUntilOutput(
+      const std::vector<std::string> &args,
+      const std::string &test_name,
+      const std::vector<std::string> &required_substrings,
+      const std::chrono::milliseconds timeout = std::chrono::seconds(5),
+      const int terminate_signal = SIGTERM)
+  {
+    return RunExternalBinaryUntilOutput(MetadataNodeAppBinaryPath(),
+                                        args,
+                                        "metadata_node_app_scenario_outputs",
+                                        test_name,
+                                        required_substrings,
+                                        timeout,
+                                        terminate_signal);
+  }
+#endif
+
   bool Contains(const std::string &text, const std::string &needle)
   {
     return text.find(needle) != std::string::npos;
   }
 
+  std::string JsonStringLiteral(const std::string &value)
+  {
+    std::string escaped = "\"";
+    for (const char ch : value)
+    {
+      switch (ch)
+      {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped.push_back(ch);
+        break;
+      }
+    }
+    escaped.push_back('"');
+    return escaped;
+  }
+
+  std::filesystem::path MakeScenarioDirectory(const std::string &test_name)
+  {
+    const auto dir =
+        std::filesystem::current_path() / "metadata_node_app_scenarios" /
+        (test_name + "_" +
+         std::to_string(static_cast<std::uint64_t>(
+             std::chrono::steady_clock::now().time_since_epoch().count())));
+    std::filesystem::create_directories(dir);
+    return dir;
+  }
+
+  std::string ReadRequiredTextFile(const std::filesystem::path &path)
+  {
+    std::ifstream input(path, std::ios::binary);
+    EXPECT_TRUE(input.is_open()) << path.string();
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    EXPECT_TRUE(input.good() || input.eof()) << path.string();
+    return buffer.str();
+  }
+
+  void WriteRequiredTextFile(const std::filesystem::path &path,
+                             const std::string &content)
+  {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output.is_open()) << path.string();
+    output << content;
+    output.close();
+    ASSERT_TRUE(output.good()) << path.string();
+  }
+
+  std::optional<std::string> ReadIdentityField(
+      const std::filesystem::path &path,
+      const std::string &field_name)
+  {
+    const std::string content = ReadRequiredTextFile(path);
+    const std::string prefix = field_name + "=";
+    std::istringstream lines(content);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+      if (line.rfind(prefix, 0) == 0)
+      {
+        return line.substr(prefix.size());
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::filesystem::path WriteDynamicJoinClusterConfigForCandidate(
+      const std::filesystem::path &root,
+      const std::string &cluster_id,
+      const std::string &view_endpoint,
+      const std::string &meta1_endpoint,
+      const std::string &meta2_endpoint,
+      const std::string &meta3_endpoint,
+      const std::string &candidate_node_id,
+      const std::int32_t candidate_raft_id,
+      const std::string &candidate_endpoint)
+  {
+    std::filesystem::create_directories(root / "nodes");
+
+    const auto config_path = root / "cluster.json";
+    std::ofstream out(config_path);
+    out << "{\n"
+        << "  \"cluster_id\": " << JsonStringLiteral(cluster_id) << ",\n"
+        << "  \"base_dir\": " << JsonStringLiteral(root.string()) << ",\n"
+        << "  \"view_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"view-join-1\",\n"
+        << "      \"endpoint\": " << JsonStringLiteral(view_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/view-join-1/data").string()) << "\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"metadata_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"meta-1\",\n"
+        << "      \"raft_id\": 1,\n"
+        << "      \"endpoint\": " << JsonStringLiteral(meta1_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/meta-1/data").string()) << ",\n"
+        << "      \"snapshot_dir\": " << JsonStringLiteral((root / "nodes/meta-1/snapshots").string()) << ",\n"
+        << "      \"initial_role\": \"voter\"\n"
+        << "    },\n"
+        << "    {\n"
+        << "      \"node_id\": \"meta-2\",\n"
+        << "      \"raft_id\": 2,\n"
+        << "      \"endpoint\": " << JsonStringLiteral(meta2_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/meta-2/data").string()) << ",\n"
+        << "      \"snapshot_dir\": " << JsonStringLiteral((root / "nodes/meta-2/snapshots").string()) << ",\n"
+        << "      \"initial_role\": \"voter\"\n"
+        << "    },\n"
+        << "    {\n"
+        << "      \"node_id\": \"meta-3\",\n"
+        << "      \"raft_id\": 3,\n"
+        << "      \"endpoint\": " << JsonStringLiteral(meta3_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/meta-3/data").string()) << ",\n"
+        << "      \"snapshot_dir\": " << JsonStringLiteral((root / "nodes/meta-3/snapshots").string()) << ",\n"
+        << "      \"initial_role\": \"voter\"\n"
+        << "    },\n"
+        << "    {\n"
+        << "      \"node_id\": "
+        << JsonStringLiteral(candidate_node_id) << ",\n"
+        << "      \"raft_id\": " << candidate_raft_id << ",\n"
+        << "      \"endpoint\": " << JsonStringLiteral(candidate_endpoint) << ",\n"
+        << "      \"data_dir\": "
+        << JsonStringLiteral(
+               (root / "nodes" / candidate_node_id / "data").string())
+        << ",\n"
+        << "      \"snapshot_dir\": "
+        << JsonStringLiteral(
+               (root / "nodes" / candidate_node_id / "snapshots").string())
+        << ",\n"
+        << "      \"initial_role\": \"candidate\"\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"storage_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"store-dummy-1\",\n"
+        << "      \"endpoint\": \"127.0.0.1:7999\",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/store-dummy-1/data").string()) << ",\n"
+        << "      \"capacity_bytes\": 1048576,\n"
+        << "      \"failure_domain\": {\n"
+        << "        \"zone\": \"zone-a\",\n"
+        << "        \"rack\": \"rack-a1\"\n"
+        << "      }\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"initial_raft_membership\": {\n"
+        << "    \"membership_epoch\": 1,\n"
+        << "    \"voter_raft_ids\": [1, 2, 3],\n"
+        << "    \"learner_raft_ids\": []\n"
+        << "  },\n"
+        << "  \"chunk_policy\": {\n"
+        << "    \"chunk_size_bytes\": 1024,\n"
+        << "    \"replica_count\": 1,\n"
+        << "    \"minimum_successful_writes\": 1,\n"
+        << "    \"checksum_algorithm\": \"sha256\"\n"
+        << "  },\n"
+        << "  \"timeouts\": {\n"
+        << "    \"discovery_rpc_timeout_ms\": 500,\n"
+        << "    \"metadata_rpc_timeout_ms\": 500,\n"
+        << "    \"storage_rpc_timeout_ms\": 500,\n"
+        << "    \"heartbeat_interval_ms\": 200,\n"
+        << "    \"registration_timeout_ms\": 500,\n"
+        << "    \"commit_deadline_ms\": 500,\n"
+        << "    \"liveness_stale_timeout_ms\": 2000,\n"
+        << "    \"liveness_dead_timeout_ms\": 5000\n"
+        << "  }\n"
+        << "}\n";
+    return config_path;
+  }
+
+  std::filesystem::path WriteDynamicJoinClusterConfig(
+      const std::filesystem::path &root,
+      const std::string &cluster_id,
+      const std::string &view_endpoint,
+      const std::string &meta1_endpoint,
+      const std::string &meta2_endpoint,
+      const std::string &meta3_endpoint,
+      const std::string &candidate_endpoint)
+  {
+    return WriteDynamicJoinClusterConfigForCandidate(root,
+                                                     cluster_id,
+                                                     view_endpoint,
+                                                     meta1_endpoint,
+                                                     meta2_endpoint,
+                                                     meta3_endpoint,
+                                                     "meta-candidate-1",
+                                                     11,
+                                                     candidate_endpoint);
+  }
+
+  std::filesystem::path WriteSingleMetadataBootstrapClusterConfig(
+      const std::filesystem::path &root,
+      const std::string &cluster_id,
+      const std::string &view_endpoint,
+      const std::string &metadata_endpoint)
+  {
+    std::filesystem::create_directories(root / "nodes");
+
+    const auto config_path = root / "cluster.json";
+    std::ofstream out(config_path);
+    out << "{\n"
+        << "  \"cluster_id\": " << JsonStringLiteral(cluster_id) << ",\n"
+        << "  \"base_dir\": " << JsonStringLiteral(root.string()) << ",\n"
+        << "  \"view_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"view-bootstrap-1\",\n"
+        << "      \"endpoint\": " << JsonStringLiteral(view_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/view-bootstrap-1/data").string()) << "\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"metadata_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"meta-bootstrap-1\",\n"
+        << "      \"raft_id\": 1,\n"
+        << "      \"endpoint\": " << JsonStringLiteral(metadata_endpoint) << ",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/meta-bootstrap-1/data").string()) << ",\n"
+        << "      \"snapshot_dir\": " << JsonStringLiteral((root / "nodes/meta-bootstrap-1/snapshots").string()) << ",\n"
+        << "      \"initial_role\": \"voter\"\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"storage_nodes\": [\n"
+        << "    {\n"
+        << "      \"node_id\": \"store-dummy-bootstrap-1\",\n"
+        << "      \"endpoint\": \"127.0.0.1:7998\",\n"
+        << "      \"data_dir\": " << JsonStringLiteral((root / "nodes/store-dummy-bootstrap-1/data").string()) << ",\n"
+        << "      \"capacity_bytes\": 1048576,\n"
+        << "      \"failure_domain\": {\n"
+        << "        \"zone\": \"zone-a\",\n"
+        << "        \"rack\": \"rack-a1\"\n"
+        << "      }\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"initial_raft_membership\": {\n"
+        << "    \"membership_epoch\": 1,\n"
+        << "    \"voter_raft_ids\": [1],\n"
+        << "    \"learner_raft_ids\": []\n"
+        << "  },\n"
+        << "  \"chunk_policy\": {\n"
+        << "    \"chunk_size_bytes\": 1024,\n"
+        << "    \"replica_count\": 1,\n"
+        << "    \"minimum_successful_writes\": 1,\n"
+        << "    \"checksum_algorithm\": \"sha256\"\n"
+        << "  },\n"
+        << "  \"timeouts\": {\n"
+        << "    \"discovery_rpc_timeout_ms\": 500,\n"
+        << "    \"metadata_rpc_timeout_ms\": 500,\n"
+        << "    \"storage_rpc_timeout_ms\": 500,\n"
+        << "    \"heartbeat_interval_ms\": 200,\n"
+        << "    \"registration_timeout_ms\": 500,\n"
+        << "    \"commit_deadline_ms\": 500,\n"
+        << "    \"liveness_stale_timeout_ms\": 2000,\n"
+        << "    \"liveness_dead_timeout_ms\": 5000\n"
+        << "  }\n"
+        << "}\n";
+    return config_path;
+  }
+
   std::string ObjectIdentity(const std::string &bucket, const std::string &object_key)
   {
     return bucket + "\n" + object_key;
+  }
+
+  bool MetadataServiceHasMethod(const std::string &method_name)
+  {
+    const auto *file = raft::HeadObjectRequest::descriptor()->file();
+    if (file == nullptr)
+    {
+      return false;
+    }
+
+    const auto *service = file->FindServiceByName("MetadataService");
+    if (service == nullptr)
+    {
+      return false;
+    }
+
+    return service->FindMethodByName(method_name) != nullptr;
+  }
+
+  bool MessageHasField(const google::protobuf::Descriptor *descriptor,
+                       const std::string &field_name)
+  {
+    return descriptor != nullptr &&
+           descriptor->FindFieldByName(field_name) != nullptr;
   }
 
   template <typename Response>
@@ -1084,6 +1610,560 @@ namespace
     std::unique_ptr<grpc::Server> server_;
   };
 
+  class FakeJoinMetadataService final : public raft::MetadataService::Service
+  {
+  public:
+    struct JoinReply
+    {
+      raft::MetadataStatusCode code = raft::METADATA_STATUS_CODE_OK;
+      raft::JoinMetadataClusterDisposition disposition =
+          raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT;
+      std::string message =
+          "join validation accepted on leader; no committed membership change performed";
+      bool include_leader_hint = false;
+      int leader_hint_id = 0;
+      std::string leader_hint_address;
+      std::uint64_t membership_epoch = 3;
+    };
+
+    void SetJoinReply(JoinReply reply)
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      reply_ = std::move(reply);
+    }
+
+    std::size_t join_call_count() const
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      return join_call_count_;
+    }
+
+    std::optional<raft::JoinMetadataClusterRequest> last_join_request() const
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      return last_join_request_;
+    }
+
+    std::vector<raft::JoinMetadataClusterRequest> join_requests() const
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      return join_requests_;
+    }
+
+    grpc::Status JoinMetadataCluster(
+        grpc::ServerContext *,
+        const raft::JoinMetadataClusterRequest *request,
+        raft::JoinMetadataClusterResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++join_call_count_;
+      last_join_request_ = *request;
+      join_requests_.push_back(*request);
+
+      response->mutable_summary()->set_code(reply_.code);
+      response->mutable_summary()->set_message(reply_.message);
+      response->mutable_summary()->set_request_id(request->request_id());
+      response->mutable_summary()->set_term(7);
+      response->mutable_summary()->set_log_index(reply_.membership_epoch);
+      if (reply_.include_leader_hint)
+      {
+        response->mutable_summary()->mutable_leader_hint()->set_leader_id(
+            reply_.leader_hint_id);
+        response->mutable_summary()->mutable_leader_hint()->set_leader_address(
+            reply_.leader_hint_address);
+      }
+      else
+      {
+        response->mutable_summary()->clear_leader_hint();
+      }
+      response->set_disposition(reply_.disposition);
+      response->set_requested_membership(
+          raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+      response->set_committed_membership_changed(false);
+      response->set_membership_epoch(reply_.membership_epoch);
+      response->set_canonical_node_id(request->node_id());
+      response->set_assigned_raft_id(request->candidate_raft_id());
+      return grpc::Status::OK;
+    }
+
+  private:
+    mutable std::mutex mu_;
+    JoinReply reply_;
+    std::size_t join_call_count_ = 0;
+    std::optional<raft::JoinMetadataClusterRequest> last_join_request_;
+    std::vector<raft::JoinMetadataClusterRequest> join_requests_;
+  };
+
+  class ScopedFakeJoinMetadataServer
+  {
+  public:
+    ScopedFakeJoinMetadataServer()
+    {
+      grpc::ServerBuilder builder;
+      builder.AddListeningPort("127.0.0.1:0",
+                               grpc::InsecureServerCredentials(),
+                               &selected_port_);
+      builder.RegisterService(&service_);
+      server_ = builder.BuildAndStart();
+      address_ = "127.0.0.1:" + std::to_string(selected_port_);
+    }
+
+    ~ScopedFakeJoinMetadataServer()
+    {
+      if (server_ != nullptr)
+      {
+        server_->Shutdown();
+      }
+    }
+
+    const std::string &address() const
+    {
+      return address_;
+    }
+
+    FakeJoinMetadataService &service()
+    {
+      return service_;
+    }
+
+  private:
+    int selected_port_ = 0;
+    std::string address_;
+    FakeJoinMetadataService service_;
+    std::unique_ptr<grpc::Server> server_;
+  };
+
+  class FakeViewNodeService final : public view::ViewNodeService::Service
+  {
+  public:
+    struct MetadataCandidate
+    {
+      std::string node_id;
+      std::string endpoint;
+      view::MetadataMembershipObservedState membership_state =
+          view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER;
+      view::MetadataRaftObservedRole raft_role =
+          view::METADATA_RAFT_OBSERVED_ROLE_FOLLOWER;
+    };
+
+    struct DiscoverPlan
+    {
+      std::string view_node_id = "view-join-1";
+      std::vector<MetadataCandidate> metadata_candidates;
+      std::optional<view::MetadataLeaderHint> leader_hint;
+      std::uint64_t observed_at_unix_ms = 1710000000123ULL;
+      std::uint64_t membership_epoch = 1;
+    };
+
+    void SetPlan(DiscoverPlan plan)
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      plan_ = std::move(plan);
+    }
+
+    std::size_t discover_call_count() const
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      return discover_call_count_;
+    }
+
+    grpc::Status DiscoverMetadata(
+        grpc::ServerContext *,
+        const view::DiscoverMetadataRequest *request,
+        view::DiscoverMetadataResponse *response) override
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++discover_call_count_;
+
+      response->mutable_summary()->set_code(view::VIEW_NODE_STATUS_CODE_OK);
+      response->mutable_summary()->set_message("ok");
+      response->mutable_summary()->set_request_id(request->request_id());
+      response->mutable_summary()->set_cluster_id(request->cluster_id());
+      response->mutable_summary()->set_node_id(plan_.view_node_id);
+      response->set_observed_at_unix_ms(plan_.observed_at_unix_ms);
+      response->set_membership_epoch(plan_.membership_epoch);
+
+      for (const auto &candidate : plan_.metadata_candidates)
+      {
+        auto *snapshot = response->add_metadata_nodes();
+        snapshot->set_cluster_id(request->cluster_id());
+        snapshot->set_node_id(candidate.node_id);
+        snapshot->set_node_type(view::VIEW_NODE_TYPE_METADATA);
+        snapshot->set_endpoint(candidate.endpoint);
+        snapshot->set_control_plane_endpoint(candidate.endpoint);
+        snapshot->set_registered_at_unix_ms(plan_.observed_at_unix_ms);
+        snapshot->set_last_seen_unix_ms(plan_.observed_at_unix_ms);
+        snapshot->set_last_sequence(1);
+        snapshot->set_liveness(view::VIEW_NODE_LIVENESS_STATE_LIVE);
+        snapshot->mutable_health()->set_health(view::VIEW_NODE_HEALTH_HEALTHY);
+        snapshot->mutable_health()->set_disk_pressure(
+            view::VIEW_NODE_DISK_PRESSURE_LOW);
+        snapshot->mutable_metadata()->set_raft_id(
+            candidate.node_id == "meta-1" ? 1
+            : candidate.node_id == "meta-2" ? 2
+                                          : 3);
+        snapshot->mutable_metadata()->set_raft_role(candidate.raft_role);
+        snapshot->mutable_metadata()->set_membership_state(
+            candidate.membership_state);
+        snapshot->mutable_metadata()->set_observed_term(9);
+        snapshot->mutable_metadata()->set_commit_index(12);
+        snapshot->mutable_metadata()->set_membership_epoch(plan_.membership_epoch);
+      }
+
+      if (plan_.leader_hint.has_value())
+      {
+        response->mutable_leader_hint()->CopyFrom(*plan_.leader_hint);
+      }
+      return grpc::Status::OK;
+    }
+
+  private:
+    mutable std::mutex mu_;
+    DiscoverPlan plan_;
+    std::size_t discover_call_count_ = 0;
+  };
+
+  class ScopedFakeViewNodeServer
+  {
+  public:
+    ScopedFakeViewNodeServer()
+    {
+      grpc::ServerBuilder builder;
+      builder.AddListeningPort("127.0.0.1:0",
+                               grpc::InsecureServerCredentials(),
+                               &selected_port_);
+      builder.RegisterService(&service_);
+      server_ = builder.BuildAndStart();
+      address_ = "127.0.0.1:" + std::to_string(selected_port_);
+    }
+
+    ~ScopedFakeViewNodeServer()
+    {
+      if (server_ != nullptr)
+      {
+        server_->Shutdown();
+      }
+    }
+
+    const std::string &address() const
+    {
+      return address_;
+    }
+
+    FakeViewNodeService &service()
+    {
+      return service_;
+    }
+
+  private:
+    int selected_port_ = 0;
+    std::string address_;
+    FakeViewNodeService service_;
+    std::unique_ptr<grpc::Server> server_;
+  };
+
+  class ScopedViewNodeRegistryServer
+  {
+  public:
+    ScopedViewNodeRegistryServer()
+    {
+      grpc::ServerBuilder builder;
+      builder.AddListeningPort("127.0.0.1:0",
+                               grpc::InsecureServerCredentials(),
+                               &selected_port_);
+      builder.RegisterService(&service_);
+      server_ = builder.BuildAndStart();
+      address_ = "127.0.0.1:" + std::to_string(selected_port_);
+    }
+
+    ~ScopedViewNodeRegistryServer()
+    {
+      if (server_ != nullptr)
+      {
+        server_->Shutdown();
+      }
+    }
+
+    const std::string &address() const
+    {
+      return address_;
+    }
+
+    void SeedMetadataNode(const std::string &cluster_id,
+                          const std::string &node_id,
+                          const std::string &endpoint,
+                          const std::int32_t raft_id,
+                          const view::MetadataRaftObservedRole raft_role,
+                          const view::MetadataMembershipObservedState
+                              membership_state)
+    {
+      const std::uint64_t now_unix_ms =
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch())
+                  .count());
+
+      service_.SeedMetadataNode(cluster_id,
+                                node_id,
+                                endpoint,
+                                raft_id,
+                                raft_role,
+                                membership_state,
+                                now_unix_ms);
+    }
+
+    view::GetClusterViewResponse GetClusterView(
+        const std::string &cluster_id)
+    {
+      grpc::ServerContext context;
+      view::GetClusterViewRequest request;
+      request.set_request_id("get-cluster-view");
+      request.set_cluster_id(cluster_id);
+      request.set_include_dead_nodes(true);
+      request.set_include_warnings(true);
+
+      view::GetClusterViewResponse response;
+      const auto status = service_.GetClusterView(&context, &request, &response);
+      EXPECT_TRUE(status.ok()) << status.error_message();
+      return response;
+    }
+
+  private:
+    class InMemoryViewRegistryService final : public view::ViewNodeService::Service
+    {
+    public:
+      void SeedMetadataNode(const std::string &cluster_id,
+                            const std::string &node_id,
+                            const std::string &endpoint,
+                            const std::int32_t raft_id,
+                            const view::MetadataRaftObservedRole raft_role,
+                            const view::MetadataMembershipObservedState
+                                membership_state,
+                            const std::uint64_t now_unix_ms)
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto &snapshot = metadata_nodes_[node_id];
+        snapshot.set_cluster_id(cluster_id);
+        snapshot.set_node_id(node_id);
+        snapshot.set_node_type(view::VIEW_NODE_TYPE_METADATA);
+        snapshot.set_endpoint(endpoint);
+        snapshot.set_control_plane_endpoint(endpoint);
+        snapshot.set_data_dir_fingerprint("seed-" + node_id);
+        snapshot.set_registered_at_unix_ms(now_unix_ms);
+        snapshot.set_last_seen_unix_ms(now_unix_ms);
+        snapshot.set_last_sequence(1);
+        snapshot.set_liveness(view::VIEW_NODE_LIVENESS_STATE_LIVE);
+        snapshot.set_incarnation_id(node_id + ":seed");
+        snapshot.mutable_health()->set_health(view::VIEW_NODE_HEALTH_HEALTHY);
+        snapshot.mutable_health()->set_disk_pressure(
+            view::VIEW_NODE_DISK_PRESSURE_LOW);
+        snapshot.mutable_metadata()->set_raft_id(raft_id);
+        snapshot.mutable_metadata()->set_raft_role(raft_role);
+        snapshot.mutable_metadata()->set_membership_state(membership_state);
+        snapshot.mutable_metadata()->set_observed_term(9);
+        snapshot.mutable_metadata()->set_commit_index(12);
+        snapshot.mutable_metadata()->set_membership_epoch(1);
+        if (raft_role == view::METADATA_RAFT_OBSERVED_ROLE_LEADER)
+        {
+          leader_hint_.set_node_id(node_id);
+          leader_hint_.set_raft_id(raft_id);
+          leader_hint_.set_endpoint(endpoint);
+          leader_hint_.set_observed_term(9);
+          leader_hint_.set_observed_at_unix_ms(now_unix_ms);
+        }
+      }
+
+      grpc::Status RegisterNode(grpc::ServerContext *,
+                                const view::RegisterNodeRequest *request,
+                                view::RegisterNodeResponse *response) override
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++register_call_count_;
+        auto &snapshot = metadata_nodes_[request->registration().node_id()];
+        const bool created = snapshot.node_id().empty();
+        PopulateSnapshotFromRegistration(request->registration(),
+                                         0,
+                                         request->registration().node_id() +
+                                             ":registered",
+                                         &snapshot);
+
+        FillSummary(request->request_id(),
+                    request->registration().cluster_id(),
+                    request->registration().node_id(),
+                    response->mutable_summary());
+        response->set_created(created);
+        response->set_idempotent(!created);
+        response->set_conflict(false);
+        response->mutable_snapshot()->CopyFrom(snapshot);
+        return grpc::Status::OK;
+      }
+
+      grpc::Status HeartbeatNode(grpc::ServerContext *,
+                                 const view::HeartbeatNodeRequest *request,
+                                 view::HeartbeatNodeResponse *response) override
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++heartbeat_call_count_;
+        auto &snapshot = metadata_nodes_[request->node_id()];
+        PopulateSnapshotFromRegistration(request->observation(),
+                                         request->sequence(),
+                                         request->incarnation_id(),
+                                         &snapshot);
+
+        FillSummary(request->request_id(),
+                    request->cluster_id(),
+                    request->node_id(),
+                    response->mutable_summary());
+        response->set_accepted_sequence(request->sequence());
+        response->set_applied(true);
+        response->set_idempotent(false);
+        response->set_stale_ignored(false);
+        response->mutable_snapshot()->CopyFrom(snapshot);
+        return grpc::Status::OK;
+      }
+
+      grpc::Status DiscoverMetadata(
+          grpc::ServerContext *,
+          const view::DiscoverMetadataRequest *request,
+          view::DiscoverMetadataResponse *response) override
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++discover_call_count_;
+        FillSummary(request->request_id(),
+                    request->cluster_id(),
+                    view_node_id_,
+                    response->mutable_summary());
+
+        std::vector<view::ViewNodeSnapshot> ordered;
+        ordered.reserve(metadata_nodes_.size());
+        for (const auto &[_, snapshot] : metadata_nodes_)
+        {
+          if (snapshot.cluster_id() != request->cluster_id())
+          {
+            continue;
+          }
+          ordered.push_back(snapshot);
+        }
+
+        std::stable_sort(ordered.begin(),
+                         ordered.end(),
+                         [](const view::ViewNodeSnapshot &lhs,
+                            const view::ViewNodeSnapshot &rhs)
+                         {
+                           const bool lhs_leader =
+                               lhs.metadata().raft_role() ==
+                               view::METADATA_RAFT_OBSERVED_ROLE_LEADER;
+                           const bool rhs_leader =
+                               rhs.metadata().raft_role() ==
+                               view::METADATA_RAFT_OBSERVED_ROLE_LEADER;
+                           if (lhs_leader != rhs_leader)
+                           {
+                             return lhs_leader;
+                           }
+                           return lhs.node_id() < rhs.node_id();
+                         });
+
+        for (const auto &snapshot : ordered)
+        {
+          response->add_metadata_nodes()->CopyFrom(snapshot);
+        }
+        if (!leader_hint_.endpoint().empty())
+        {
+          response->mutable_leader_hint()->CopyFrom(leader_hint_);
+        }
+        response->set_observed_at_unix_ms(
+            ordered.empty() ? 0 : ordered.front().last_seen_unix_ms());
+        response->set_membership_epoch(1);
+        return grpc::Status::OK;
+      }
+
+      grpc::Status GetClusterView(grpc::ServerContext *,
+                                  const view::GetClusterViewRequest *request,
+                                  view::GetClusterViewResponse *response) override
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        FillSummary(request->request_id(),
+                    request->cluster_id(),
+                    view_node_id_,
+                    response->mutable_summary());
+        response->set_observed_at_unix_ms(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count()));
+        if (!leader_hint_.endpoint().empty())
+        {
+          response->mutable_leader_hint()->CopyFrom(leader_hint_);
+        }
+        for (const auto &[_, snapshot] : metadata_nodes_)
+        {
+          if (snapshot.cluster_id() != request->cluster_id())
+          {
+            continue;
+          }
+          response->add_metadata_nodes()->CopyFrom(snapshot);
+        }
+        return grpc::Status::OK;
+      }
+
+    private:
+      static void FillSummary(const std::string &request_id,
+                              const std::string &cluster_id,
+                              const std::string &node_id,
+                              view::ViewNodeResponseSummary *summary)
+      {
+        summary->set_code(view::VIEW_NODE_STATUS_CODE_OK);
+        summary->set_message("ok");
+        summary->set_request_id(request_id);
+        summary->set_cluster_id(cluster_id);
+        summary->set_node_id(node_id);
+      }
+
+      static void PopulateSnapshotFromRegistration(
+          const view::ViewNodeRegistration &registration,
+          const std::uint64_t sequence,
+          const std::string &incarnation_id,
+          view::ViewNodeSnapshot *snapshot)
+      {
+        snapshot->set_cluster_id(registration.cluster_id());
+        snapshot->set_node_id(registration.node_id());
+        snapshot->set_node_type(registration.node_type());
+        snapshot->set_endpoint(registration.endpoint());
+        snapshot->set_control_plane_endpoint(
+            registration.control_plane_endpoint());
+        snapshot->set_data_plane_endpoint(registration.data_plane_endpoint());
+        snapshot->set_data_dir_fingerprint(
+            registration.data_dir_fingerprint());
+        if (snapshot->registered_at_unix_ms() == 0)
+        {
+          snapshot->set_registered_at_unix_ms(
+              registration.observed_at_unix_ms());
+        }
+        snapshot->set_last_seen_unix_ms(registration.observed_at_unix_ms());
+        snapshot->set_last_sequence(sequence);
+        snapshot->set_incarnation_id(incarnation_id);
+        snapshot->set_liveness(view::VIEW_NODE_LIVENESS_STATE_LIVE);
+        snapshot->mutable_health()->CopyFrom(registration.health());
+        snapshot->mutable_capacity()->CopyFrom(registration.capacity());
+        snapshot->mutable_load()->CopyFrom(registration.load());
+        snapshot->mutable_metadata()->CopyFrom(registration.metadata());
+      }
+
+      mutable std::mutex mu_;
+      std::string view_node_id_ = "view-join-1";
+      std::map<std::string, view::ViewNodeSnapshot> metadata_nodes_;
+      view::MetadataLeaderHint leader_hint_;
+      std::size_t register_call_count_ = 0;
+      std::size_t heartbeat_call_count_ = 0;
+      std::size_t discover_call_count_ = 0;
+    };
+
+    int selected_port_ = 0;
+    std::string address_;
+    InMemoryViewRegistryService service_;
+    std::unique_ptr<grpc::Server> server_;
+  };
+
   class MetadataClientScenarioTest : public ::testing::Test
   {
   protected:
@@ -1311,6 +2391,125 @@ TEST_F(MetadataClientScenarioTest, ClientShowsRetryableAdmissionStatuses)
   }
 }
 
+TEST_F(MetadataClientScenarioTest,
+       JoinMetadataClusterContractIsExposedByMetadataServiceProto)
+{
+  EXPECT_TRUE(MetadataServiceHasMethod("JoinMetadataCluster"));
+  EXPECT_FALSE(MetadataServiceHasMethod("AddLearner"));
+
+  const auto *request_descriptor = raft::JoinMetadataClusterRequest::descriptor();
+  ASSERT_NE(request_descriptor, nullptr);
+  EXPECT_TRUE(MessageHasField(request_descriptor, "request_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "cluster_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "node_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_raft_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_client_address"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_raft_address"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_incarnation_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "candidate_sequence"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "persistent_generation"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "data_dir_fingerprint"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "local_state_hint"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_view_node_id"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_time_unix_ms"));
+  EXPECT_TRUE(MessageHasField(request_descriptor, "observed_metadata_endpoint"));
+
+  const auto *response_descriptor = raft::JoinMetadataClusterResponse::descriptor();
+  ASSERT_NE(response_descriptor, nullptr);
+  EXPECT_TRUE(MessageHasField(response_descriptor, "summary"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "disposition"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "requested_membership"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "committed_membership_changed"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "membership_epoch"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "canonical_node_id"));
+  EXPECT_TRUE(MessageHasField(response_descriptor, "assigned_raft_id"));
+
+  raft::JoinMetadataClusterRequest request;
+  request.set_request_id("req-join-contract");
+  request.set_cluster_id("cluster-alpha");
+  request.set_node_id("meta-candidate-1");
+  request.set_candidate_raft_id(401);
+  request.set_candidate_client_address("127.0.0.1:7501");
+  request.set_candidate_raft_address("127.0.0.1:7601");
+  request.set_candidate_incarnation_id("meta-candidate-1:boot:123");
+  request.set_candidate_sequence(7);
+  request.set_persistent_generation(1);
+  request.set_data_dir_fingerprint("fp-meta-candidate-1");
+  request.set_local_state_hint(
+      raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+  request.set_observed_view_node_id("view-1");
+  request.set_observed_time_unix_ms(1710000000123ULL);
+  request.set_observed_metadata_endpoint("127.0.0.1:7501");
+
+  raft::JoinMetadataClusterResponse response;
+  response.mutable_summary()->set_code(raft::METADATA_STATUS_CODE_NOT_LEADER);
+  response.mutable_summary()->set_message("join authority belongs to metadata leader");
+  response.mutable_summary()->set_request_id(request.request_id());
+  response.mutable_summary()->mutable_leader_hint()->set_leader_id(2);
+  response.mutable_summary()->mutable_leader_hint()->set_leader_address(
+      "127.0.0.1:7412");
+  response.set_disposition(
+      raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER);
+  response.set_requested_membership(
+      raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+  response.set_committed_membership_changed(false);
+  response.set_membership_epoch(3);
+  response.set_canonical_node_id(request.node_id());
+  response.set_assigned_raft_id(request.candidate_raft_id());
+
+  EXPECT_EQ(response.summary().code(), raft::METADATA_STATUS_CODE_NOT_LEADER);
+  EXPECT_EQ(response.disposition(),
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER);
+  EXPECT_EQ(response.requested_membership(),
+            raft::JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER);
+  EXPECT_FALSE(response.committed_membership_changed());
+  EXPECT_EQ(response.summary().leader_hint().leader_address(),
+            "127.0.0.1:7412");
+  EXPECT_NE(response.disposition(),
+            raft::JOIN_METADATA_CLUSTER_DISPOSITION_ACCEPTED_PENDING_COMMIT);
+}
+
+TEST_F(MetadataClientScenarioTest,
+       UnsupportedJoinMetadataClusterCliDoesNotBypassLeaderAuthority)
+{
+  const ClientRunResult result = RunClient(
+      {server_.address(), "join-metadata-cluster",
+       "--request-id", "req-join-leader-validation",
+       "--bucket", kBucket},
+      "join_metadata_cluster_unsupported");
+
+  ASSERT_EQ(result.exit_code, 2) << result.output;
+  EXPECT_TRUE(Contains(result.output,
+                       "unsupported command: join-metadata-cluster"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "Usage:")) << result.output;
+}
+
+TEST_F(MetadataClientScenarioTest,
+       FutureJoinLeaderValidationMustReturnNotLeaderAndLeaderHintForFollowerAuthority)
+{
+  server_.service().SetLeaderAddress("127.0.0.1:7412");
+  server_.service().ForceWriteResponse(
+      "req-join-authority-not-leader",
+      raft::METADATA_STATUS_CODE_NOT_LEADER,
+      "join authority belongs to metadata leader");
+
+  const ClientRunResult result = RunClient(
+      {server_.address(), "create-bucket",
+       "--request-id", "req-join-authority-not-leader",
+       "--bucket", "join-authority-probe"},
+      "join_authority_not_leader");
+
+  ASSERT_NE(result.exit_code, 0);
+  EXPECT_TRUE(Contains(result.output, "status=NOT_LEADER")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "retryable=true")) << result.output;
+  EXPECT_TRUE(Contains(result.output, "leader_address=127.0.0.1:7412"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output,
+                       "message=\"join authority belongs to metadata leader\""))
+      << result.output;
+}
+
 TEST_F(MetadataClientScenarioTest, ClientShowsIdempotencyConflictAsNonRetryable)
 {
   ASSERT_EQ(RunClient(
@@ -1424,4 +2623,1162 @@ TEST_F(MetadataClientScenarioTest, ChunkLayoutAndCustomEtagAreExposed)
   EXPECT_TRUE(Contains(result.output, "chunks=3")) << result.output;
   EXPECT_TRUE(Contains(result.output, "object_record.chunk[0]")) << result.output;
   EXPECT_TRUE(Contains(result.output, "object_record.chunk[2]")) << result.output;
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeCandidateUsesViewLeaderHintBeforeFollowerFallback)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app long-running candidate startup is only validated on POSIX";
+#else
+  ScopedFakeJoinMetadataServer follower;
+  ScopedFakeJoinMetadataServer leader;
+  ScopedFakeJoinMetadataServer spare;
+  ScopedFakeViewNodeServer view_server;
+
+  follower.service().SetJoinReply(FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_NOT_LEADER,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER,
+      .message = "join authority belongs to metadata leader",
+      .include_leader_hint = true,
+      .leader_hint_id = 2,
+      .leader_hint_address = leader.address(),
+      .membership_epoch = 3,
+  });
+  leader.service().SetJoinReply(FakeJoinMetadataService::JoinReply{});
+  spare.service().SetJoinReply(FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE,
+      .message = "pending membership change already exists",
+      .membership_epoch = 3,
+  });
+
+  view::MetadataLeaderHint leader_hint;
+  leader_hint.set_node_id("meta-2");
+  leader_hint.set_raft_id(2);
+  leader_hint.set_endpoint(leader.address());
+  leader_hint.set_observed_term(9);
+  leader_hint.set_observed_at_unix_ms(1710000000123ULL);
+  view_server.service().SetPlan(FakeViewNodeService::DiscoverPlan{
+      .view_node_id = "view-join-1",
+      .metadata_candidates = {
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-1",
+                                                 .endpoint = follower.address()},
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-2",
+                                                 .endpoint = leader.address()},
+      },
+      .leader_hint = leader_hint,
+      .observed_at_unix_ms = 1710000000123ULL,
+      .membership_epoch = 1,
+  });
+
+  const auto scenario_dir = MakeScenarioDirectory("t062_view_hint");
+  const auto config_path = WriteDynamicJoinClusterConfig(
+      scenario_dir,
+      "cluster-t062-hint",
+      view_server.address(),
+      follower.address(),
+      leader.address(),
+      spare.address(),
+      "127.0.0.1:7811");
+
+  const TimedProcessRunResult result = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", "meta-candidate-1"},
+      "t062_view_hint",
+      {"metadata_node_app candidate join bootstrap",
+       "metadata_node_app OK",
+       "discovery_source=view_candidates"});
+
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(result.matched_required_output) << result.output;
+  EXPECT_TRUE(result.terminated_by_test);
+  EXPECT_TRUE(Contains(result.output, "metadata_node_app candidate join bootstrap"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "discovery_source=view_candidates"))
+      << result.output;
+  EXPECT_GE(view_server.service().discover_call_count(), 1U);
+  EXPECT_EQ(follower.service().join_call_count(), 0U);
+  EXPECT_GE(leader.service().join_call_count(), 1U);
+
+  const auto leader_request = leader.service().last_join_request();
+  ASSERT_TRUE(leader_request.has_value());
+  EXPECT_EQ(leader_request->observed_view_node_id(), "view-join-1");
+  EXPECT_EQ(leader_request->observed_metadata_endpoint(), leader.address());
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeCandidateFallsBackToNextDiscoveredMetadataNodeWithoutLeaderHint)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app long-running candidate startup is only validated on POSIX";
+#else
+  ScopedFakeJoinMetadataServer follower;
+  ScopedFakeJoinMetadataServer leader;
+  ScopedFakeJoinMetadataServer spare;
+  ScopedFakeViewNodeServer view_server;
+
+  follower.service().SetJoinReply(FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_NOT_LEADER,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER,
+      .message = "join authority belongs to metadata leader",
+      .membership_epoch = 3,
+  });
+  leader.service().SetJoinReply(FakeJoinMetadataService::JoinReply{});
+  spare.service().SetJoinReply(FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_STATE_CONFLICT,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_PENDING_MEMBERSHIP_CHANGE,
+      .message = "pending membership change already exists",
+      .membership_epoch = 3,
+  });
+
+  view_server.service().SetPlan(FakeViewNodeService::DiscoverPlan{
+      .view_node_id = "view-join-1",
+      .metadata_candidates = {
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-1",
+                                                 .endpoint = follower.address()},
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-2",
+                                                 .endpoint = leader.address()},
+      },
+      .leader_hint = std::nullopt,
+      .observed_at_unix_ms = 1710000001123ULL,
+      .membership_epoch = 1,
+  });
+
+  const auto scenario_dir = MakeScenarioDirectory("t062_discovered_fallback");
+  const auto config_path = WriteDynamicJoinClusterConfig(
+      scenario_dir,
+      "cluster-t062-fallback",
+      view_server.address(),
+      follower.address(),
+      leader.address(),
+      spare.address(),
+      "127.0.0.1:7812");
+
+  const TimedProcessRunResult result = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", "meta-candidate-1"},
+      "t062_discovered_fallback",
+      {"metadata_node_app candidate join bootstrap",
+       "metadata_node_app OK",
+       "discovery_source=view_candidates"});
+
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_TRUE(result.matched_required_output) << result.output;
+  EXPECT_TRUE(result.terminated_by_test);
+  EXPECT_TRUE(Contains(result.output, "metadata_node_app candidate join bootstrap"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "discovery_source=view_candidates"))
+      << result.output;
+  EXPECT_GE(view_server.service().discover_call_count(), 1U);
+  EXPECT_GE(follower.service().join_call_count(), 1U);
+  EXPECT_GE(leader.service().join_call_count(), 1U);
+
+  const auto leader_request = leader.service().last_join_request();
+  ASSERT_TRUE(leader_request.has_value());
+  EXPECT_EQ(leader_request->observed_view_node_id(), "view-join-1");
+  EXPECT_EQ(leader_request->observed_metadata_endpoint(), leader.address());
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeCandidateReportsClearFailureWhenAllDiscoveredMetadataCandidatesFail)
+{
+  ScopedFakeJoinMetadataServer first;
+  ScopedFakeJoinMetadataServer second;
+  ScopedFakeJoinMetadataServer spare;
+  ScopedFakeViewNodeServer view_server;
+
+  const auto not_leader_reply = FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_NOT_LEADER,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER,
+      .message = "join authority belongs to metadata leader",
+      .membership_epoch = 3,
+  };
+  first.service().SetJoinReply(not_leader_reply);
+  second.service().SetJoinReply(not_leader_reply);
+  spare.service().SetJoinReply(not_leader_reply);
+
+  view_server.service().SetPlan(FakeViewNodeService::DiscoverPlan{
+      .view_node_id = "view-join-1",
+      .metadata_candidates = {
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-1",
+                                                 .endpoint = first.address()},
+          FakeViewNodeService::MetadataCandidate{.node_id = "meta-2",
+                                                 .endpoint = second.address()},
+      },
+      .leader_hint = std::nullopt,
+      .observed_at_unix_ms = 1710000002123ULL,
+      .membership_epoch = 1,
+  });
+
+  const auto scenario_dir = MakeScenarioDirectory("t062_all_fail");
+  const auto config_path = WriteDynamicJoinClusterConfig(
+      scenario_dir,
+      "cluster-t062-fail",
+      view_server.address(),
+      first.address(),
+      second.address(),
+      spare.address(),
+      "127.0.0.1:7813");
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", "meta-candidate-1"},
+      "t062_all_fail");
+
+  ASSERT_EQ(result.exit_code, 6) << result.output;
+  EXPECT_TRUE(Contains(result.output,
+                       "dynamic join failed: no metadata leader accepted join admission"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "discovery_source=view_candidates"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "attempts=[")) << result.output;
+  EXPECT_TRUE(Contains(result.output, first.address())) << result.output;
+  EXPECT_TRUE(Contains(result.output, second.address())) << result.output;
+  EXPECT_EQ(first.service().join_call_count(), 1U);
+  EXPECT_EQ(second.service().join_call_count(), 1U);
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeDynamicJoinRegistersObservedLearnerAndKeepsIdentityStableAcrossRestart)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app long-running candidate startup is only validated on POSIX";
+#else
+  ScopedFakeJoinMetadataServer leader;
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t111-dynamic-join";
+  constexpr const char *kCandidateNodeId = "meta-candidate-1";
+  constexpr const char *kCandidateEndpoint = "127.0.0.1:7814";
+
+  view_server.SeedMetadataNode(kClusterId,
+                               "meta-2",
+                               leader.address(),
+                               2,
+                               view::METADATA_RAFT_OBSERVED_ROLE_LEADER,
+                               view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+
+  const auto scenario_dir = MakeScenarioDirectory("t111_dynamic_join_restart");
+  const auto config_path = WriteDynamicJoinClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      "127.0.0.1:7811",
+      leader.address(),
+      "127.0.0.1:7813",
+      kCandidateEndpoint);
+
+  const auto identity_path =
+      scenario_dir / "nodes" / kCandidateNodeId / "data" / "node.identity";
+
+  const TimedProcessRunResult first_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kCandidateNodeId},
+      "t111_dynamic_join_first_start",
+      {"metadata_node_app candidate join bootstrap",
+       "metadata_node_app OK",
+       "identity_membership_state=candidate",
+       "requested_membership=JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER"},
+      std::chrono::seconds(6));
+
+  ASSERT_EQ(first_run.exit_code, 0) << first_run.output;
+  ASSERT_TRUE(first_run.matched_required_output) << first_run.output;
+  EXPECT_TRUE(first_run.terminated_by_test);
+  EXPECT_TRUE(std::filesystem::exists(identity_path)) << identity_path.string();
+  EXPECT_TRUE(Contains(first_run.output, "discovery_source=view_candidates"))
+      << first_run.output;
+
+  const auto first_join_request = leader.service().last_join_request();
+  ASSERT_TRUE(first_join_request.has_value());
+  EXPECT_EQ(first_join_request->cluster_id(), kClusterId);
+  EXPECT_EQ(first_join_request->node_id(), kCandidateNodeId);
+  EXPECT_EQ(first_join_request->candidate_raft_id(), 11);
+  EXPECT_EQ(first_join_request->candidate_client_address(), kCandidateEndpoint);
+  EXPECT_EQ(first_join_request->candidate_raft_address(), kCandidateEndpoint);
+  EXPECT_EQ(first_join_request->persistent_generation(), 1U);
+  EXPECT_EQ(first_join_request->local_state_hint(),
+            raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+  const std::string first_incarnation =
+      first_join_request->candidate_incarnation_id();
+  ASSERT_FALSE(first_incarnation.empty());
+
+  const auto first_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto first_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto first_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto first_source = ReadIdentityField(identity_path, "source");
+  const std::string first_identity_content =
+      ReadRequiredTextFile(identity_path);
+  ASSERT_TRUE(first_node_id.has_value());
+  ASSERT_TRUE(first_membership_state.has_value());
+  ASSERT_TRUE(first_generation.has_value());
+  ASSERT_TRUE(first_source.has_value());
+  EXPECT_EQ(*first_node_id, kCandidateNodeId);
+  EXPECT_EQ(*first_membership_state, "candidate");
+  EXPECT_EQ(*first_generation, "1");
+  EXPECT_EQ(*first_source, "explicit_override");
+
+  const auto first_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(first_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << first_view.summary().message();
+  const auto candidate_it =
+      std::find_if(first_view.metadata_nodes().begin(),
+                   first_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-candidate-1";
+                   });
+  ASSERT_NE(candidate_it, first_view.metadata_nodes().end());
+  EXPECT_TRUE(candidate_it->has_metadata());
+  EXPECT_EQ(candidate_it->metadata().raft_id(), 11);
+  EXPECT_EQ(candidate_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_LEARNER);
+  EXPECT_EQ(candidate_it->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEARNER);
+  EXPECT_EQ(candidate_it->endpoint(), kCandidateEndpoint);
+
+  const std::size_t first_join_call_count = leader.service().join_call_count();
+  ASSERT_GE(first_join_call_count, 1U);
+
+  const TimedProcessRunResult restart_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kCandidateNodeId},
+      "t111_dynamic_join_restart",
+      {"metadata_node_app candidate join bootstrap",
+       "metadata_node_app OK",
+       "identity_membership_state=candidate",
+       "requested_membership=JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER"},
+      std::chrono::seconds(6));
+
+  ASSERT_EQ(restart_run.exit_code, 0) << restart_run.output;
+  ASSERT_TRUE(restart_run.matched_required_output) << restart_run.output;
+  EXPECT_TRUE(restart_run.terminated_by_test);
+  EXPECT_TRUE(Contains(restart_run.output, "discovery_source=view_candidates"))
+      << restart_run.output;
+
+  const auto restart_join_request = leader.service().last_join_request();
+  ASSERT_TRUE(restart_join_request.has_value());
+  EXPECT_GT(leader.service().join_call_count(), first_join_call_count);
+  EXPECT_EQ(restart_join_request->cluster_id(), kClusterId);
+  EXPECT_EQ(restart_join_request->node_id(), kCandidateNodeId);
+  EXPECT_EQ(restart_join_request->candidate_raft_id(), 11);
+  EXPECT_EQ(restart_join_request->persistent_generation(), 1U);
+  EXPECT_EQ(restart_join_request->local_state_hint(),
+            raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+  EXPECT_NE(restart_join_request->candidate_incarnation_id(), first_incarnation);
+
+  const auto restart_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto restart_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto restart_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto restart_source = ReadIdentityField(identity_path, "source");
+  ASSERT_TRUE(restart_node_id.has_value());
+  ASSERT_TRUE(restart_membership_state.has_value());
+  ASSERT_TRUE(restart_generation.has_value());
+  ASSERT_TRUE(restart_source.has_value());
+  EXPECT_EQ(*restart_node_id, *first_node_id);
+  EXPECT_EQ(*restart_membership_state, *first_membership_state);
+  EXPECT_EQ(*restart_generation, *first_generation);
+  EXPECT_EQ(*restart_source, *first_source);
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), first_identity_content);
+
+  const auto restart_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(restart_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << restart_view.summary().message();
+  const auto restart_candidate_it =
+      std::find_if(restart_view.metadata_nodes().begin(),
+                   restart_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-candidate-1";
+                   });
+  ASSERT_NE(restart_candidate_it, restart_view.metadata_nodes().end());
+  EXPECT_TRUE(restart_candidate_it->has_metadata());
+  EXPECT_EQ(restart_candidate_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_LEARNER);
+  EXPECT_EQ(restart_candidate_it->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEARNER);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeConcurrentDynamicJoinPreservesStableRegistryAndIdentityUniqueness)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app concurrent dynamic join safety is only validated on POSIX";
+#else
+  ScopedFakeJoinMetadataServer leader;
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t112-concurrent-join";
+  constexpr const char *kStableLeaderNodeId = "meta-2";
+  constexpr const char *kCandidateNodeId1 = "meta-candidate-1";
+  constexpr const char *kCandidateNodeId2 = "meta-candidate-2";
+  constexpr const char *kCandidateEndpoint1 = "127.0.0.1:7822";
+  constexpr const char *kCandidateEndpoint2 = "127.0.0.1:7823";
+  constexpr std::int32_t kCandidateRaftId1 = 11;
+  constexpr std::int32_t kCandidateRaftId2 = 12;
+
+  view_server.SeedMetadataNode(kClusterId,
+                               kStableLeaderNodeId,
+                               leader.address(),
+                               2,
+                               view::METADATA_RAFT_OBSERVED_ROLE_LEADER,
+                               view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+
+  const auto scenario_dir_1 = MakeScenarioDirectory("t112_concurrent_join_1");
+  const auto scenario_dir_2 = MakeScenarioDirectory("t112_concurrent_join_2");
+  const auto config_path_1 = WriteDynamicJoinClusterConfigForCandidate(
+      scenario_dir_1,
+      kClusterId,
+      view_server.address(),
+      "127.0.0.1:7811",
+      leader.address(),
+      "127.0.0.1:7813",
+      kCandidateNodeId1,
+      kCandidateRaftId1,
+      kCandidateEndpoint1);
+  const auto config_path_2 = WriteDynamicJoinClusterConfigForCandidate(
+      scenario_dir_2,
+      kClusterId,
+      view_server.address(),
+      "127.0.0.1:7811",
+      leader.address(),
+      "127.0.0.1:7813",
+      kCandidateNodeId2,
+      kCandidateRaftId2,
+      kCandidateEndpoint2);
+  const auto identity_path_1 =
+      scenario_dir_1 / "nodes" / kCandidateNodeId1 / "data" / "node.identity";
+  const auto identity_path_2 =
+      scenario_dir_2 / "nodes" / kCandidateNodeId2 / "data" / "node.identity";
+
+  TimedProcessRunResult candidate_1_result;
+  TimedProcessRunResult candidate_2_result;
+  std::thread candidate_1_thread(
+      [&]
+      {
+        candidate_1_result = RunMetadataNodeAppUntilOutput(
+            {"--config", config_path_1.string(),
+             "--node_id", kCandidateNodeId1},
+            "t112_concurrent_join_1",
+            {"metadata_node_app candidate join bootstrap",
+             "metadata_node_app OK",
+             "identity_membership_state=candidate",
+             "requested_membership=JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER"},
+            std::chrono::seconds(8));
+      });
+  std::thread candidate_2_thread(
+      [&]
+      {
+        candidate_2_result = RunMetadataNodeAppUntilOutput(
+            {"--config", config_path_2.string(),
+             "--node_id", kCandidateNodeId2},
+            "t112_concurrent_join_2",
+            {"metadata_node_app candidate join bootstrap",
+             "metadata_node_app OK",
+             "identity_membership_state=candidate",
+             "requested_membership=JOIN_METADATA_TARGET_MEMBERSHIP_LEARNER"},
+            std::chrono::seconds(8));
+      });
+  candidate_1_thread.join();
+  candidate_2_thread.join();
+
+  ASSERT_EQ(candidate_1_result.exit_code, 0) << candidate_1_result.output;
+  ASSERT_EQ(candidate_2_result.exit_code, 0) << candidate_2_result.output;
+  ASSERT_TRUE(candidate_1_result.matched_required_output)
+      << candidate_1_result.output;
+  ASSERT_TRUE(candidate_2_result.matched_required_output)
+      << candidate_2_result.output;
+  EXPECT_TRUE(candidate_1_result.terminated_by_test);
+  EXPECT_TRUE(candidate_2_result.terminated_by_test);
+  EXPECT_TRUE(
+      Contains(candidate_1_result.output, "discovery_source=view_candidates"))
+      << candidate_1_result.output;
+  EXPECT_TRUE(
+      Contains(candidate_2_result.output, "discovery_source=view_candidates"))
+      << candidate_2_result.output;
+
+  const auto join_requests = leader.service().join_requests();
+  ASSERT_GE(join_requests.size(), 2U);
+  bool saw_candidate_1 = false;
+  bool saw_candidate_2 = false;
+  for (const auto &request : join_requests)
+  {
+    if (request.node_id() == kCandidateNodeId1)
+    {
+      saw_candidate_1 = true;
+      EXPECT_EQ(request.cluster_id(), kClusterId);
+      EXPECT_EQ(request.candidate_raft_id(), kCandidateRaftId1);
+      EXPECT_EQ(request.candidate_client_address(), kCandidateEndpoint1);
+      EXPECT_EQ(request.candidate_raft_address(), kCandidateEndpoint1);
+      EXPECT_EQ(request.persistent_generation(), 1U);
+      EXPECT_EQ(request.local_state_hint(),
+                raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+      EXPECT_FALSE(request.candidate_incarnation_id().empty());
+    }
+    if (request.node_id() == kCandidateNodeId2)
+    {
+      saw_candidate_2 = true;
+      EXPECT_EQ(request.cluster_id(), kClusterId);
+      EXPECT_EQ(request.candidate_raft_id(), kCandidateRaftId2);
+      EXPECT_EQ(request.candidate_client_address(), kCandidateEndpoint2);
+      EXPECT_EQ(request.candidate_raft_address(), kCandidateEndpoint2);
+      EXPECT_EQ(request.persistent_generation(), 1U);
+      EXPECT_EQ(request.local_state_hint(),
+                raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+      EXPECT_FALSE(request.candidate_incarnation_id().empty());
+    }
+  }
+  EXPECT_TRUE(saw_candidate_1);
+  EXPECT_TRUE(saw_candidate_2);
+
+  ASSERT_TRUE(std::filesystem::exists(identity_path_1))
+      << identity_path_1.string();
+  ASSERT_TRUE(std::filesystem::exists(identity_path_2))
+      << identity_path_2.string();
+  const auto identity_node_id_1 = ReadIdentityField(identity_path_1, "node_id");
+  const auto identity_node_id_2 = ReadIdentityField(identity_path_2, "node_id");
+  const auto identity_membership_1 =
+      ReadIdentityField(identity_path_1, "membership_state");
+  const auto identity_membership_2 =
+      ReadIdentityField(identity_path_2, "membership_state");
+  const auto identity_generation_1 =
+      ReadIdentityField(identity_path_1, "persistent_generation");
+  const auto identity_generation_2 =
+      ReadIdentityField(identity_path_2, "persistent_generation");
+  const auto identity_source_1 = ReadIdentityField(identity_path_1, "source");
+  const auto identity_source_2 = ReadIdentityField(identity_path_2, "source");
+  ASSERT_TRUE(identity_node_id_1.has_value());
+  ASSERT_TRUE(identity_node_id_2.has_value());
+  ASSERT_TRUE(identity_membership_1.has_value());
+  ASSERT_TRUE(identity_membership_2.has_value());
+  ASSERT_TRUE(identity_generation_1.has_value());
+  ASSERT_TRUE(identity_generation_2.has_value());
+  ASSERT_TRUE(identity_source_1.has_value());
+  ASSERT_TRUE(identity_source_2.has_value());
+  EXPECT_EQ(*identity_node_id_1, kCandidateNodeId1);
+  EXPECT_EQ(*identity_node_id_2, kCandidateNodeId2);
+  EXPECT_EQ(*identity_membership_1, "candidate");
+  EXPECT_EQ(*identity_membership_2, "candidate");
+  EXPECT_EQ(*identity_generation_1, "1");
+  EXPECT_EQ(*identity_generation_2, "1");
+  EXPECT_EQ(*identity_source_1, "explicit_override");
+  EXPECT_EQ(*identity_source_2, "explicit_override");
+
+  const auto cluster_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(cluster_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << cluster_view.summary().message();
+  ASSERT_EQ(cluster_view.metadata_nodes_size(), 3);
+
+  const auto stable_it =
+      std::find_if(cluster_view.metadata_nodes().begin(),
+                   cluster_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-2";
+                   });
+  ASSERT_NE(stable_it, cluster_view.metadata_nodes().end());
+  ASSERT_TRUE(stable_it->has_metadata());
+  EXPECT_EQ(stable_it->endpoint(), leader.address());
+  EXPECT_EQ(stable_it->metadata().raft_id(), 2);
+  EXPECT_EQ(stable_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+  EXPECT_EQ(stable_it->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEADER);
+
+  const auto candidate_1_it =
+      std::find_if(cluster_view.metadata_nodes().begin(),
+                   cluster_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-candidate-1";
+                   });
+  ASSERT_NE(candidate_1_it, cluster_view.metadata_nodes().end());
+  ASSERT_TRUE(candidate_1_it->has_metadata());
+  EXPECT_EQ(candidate_1_it->endpoint(), kCandidateEndpoint1);
+  EXPECT_EQ(candidate_1_it->metadata().raft_id(), kCandidateRaftId1);
+  EXPECT_EQ(candidate_1_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_LEARNER);
+  EXPECT_EQ(candidate_1_it->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEARNER);
+
+  const auto candidate_2_it =
+      std::find_if(cluster_view.metadata_nodes().begin(),
+                   cluster_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-candidate-2";
+                   });
+  ASSERT_NE(candidate_2_it, cluster_view.metadata_nodes().end());
+  ASSERT_TRUE(candidate_2_it->has_metadata());
+  EXPECT_EQ(candidate_2_it->endpoint(), kCandidateEndpoint2);
+  EXPECT_EQ(candidate_2_it->metadata().raft_id(), kCandidateRaftId2);
+  EXPECT_EQ(candidate_2_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_LEARNER);
+  EXPECT_EQ(candidate_2_it->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEARNER);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeDynamicJoinFailureDoesNotPolluteRegistryOrCandidateIdentity)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app dynamic join failure isolation is only validated on POSIX";
+#else
+  ScopedFakeJoinMetadataServer leader;
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t112-join-failure";
+  constexpr const char *kStableLeaderNodeId = "meta-2";
+  constexpr const char *kCandidateNodeId = "meta-candidate-1";
+  constexpr const char *kCandidateEndpoint = "127.0.0.1:7824";
+
+  const auto not_leader_reply = FakeJoinMetadataService::JoinReply{
+      .code = raft::METADATA_STATUS_CODE_NOT_LEADER,
+      .disposition = raft::JOIN_METADATA_CLUSTER_DISPOSITION_NOT_LEADER,
+      .message = "join authority belongs to metadata leader",
+      .membership_epoch = 3,
+  };
+  leader.service().SetJoinReply(not_leader_reply);
+  view_server.SeedMetadataNode(kClusterId,
+                               kStableLeaderNodeId,
+                               leader.address(),
+                               2,
+                               view::METADATA_RAFT_OBSERVED_ROLE_LEADER,
+                               view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+
+  const auto scenario_dir = MakeScenarioDirectory("t112_join_failure");
+  const auto config_path = WriteDynamicJoinClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      "127.0.0.1:7811",
+      leader.address(),
+      "127.0.0.1:7813",
+      kCandidateEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kCandidateNodeId / "data" / "node.identity";
+
+  const auto before_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(before_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << before_view.summary().message();
+  ASSERT_EQ(before_view.metadata_nodes_size(), 1);
+
+  const ClientRunResult first_result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kCandidateNodeId},
+      "t112_join_failure_first");
+
+  ASSERT_EQ(first_result.exit_code, 6) << first_result.output;
+  EXPECT_TRUE(Contains(first_result.output,
+                       "dynamic join failed: no metadata leader accepted join admission"))
+      << first_result.output;
+  EXPECT_TRUE(Contains(first_result.output, "discovery_source=view_candidates"))
+      << first_result.output;
+  EXPECT_EQ(leader.service().join_call_count(), 1U);
+
+  ASSERT_TRUE(std::filesystem::exists(identity_path)) << identity_path.string();
+  const auto first_identity_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto first_identity_membership =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto first_identity_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto first_identity_source = ReadIdentityField(identity_path, "source");
+  ASSERT_TRUE(first_identity_node_id.has_value());
+  ASSERT_TRUE(first_identity_membership.has_value());
+  ASSERT_TRUE(first_identity_generation.has_value());
+  ASSERT_TRUE(first_identity_source.has_value());
+  EXPECT_EQ(*first_identity_node_id, kCandidateNodeId);
+  EXPECT_EQ(*first_identity_membership, "candidate");
+  EXPECT_EQ(*first_identity_generation, "1");
+  EXPECT_EQ(*first_identity_source, "explicit_override");
+  const std::string first_identity_content = ReadRequiredTextFile(identity_path);
+
+  const auto first_join_request = leader.service().last_join_request();
+  ASSERT_TRUE(first_join_request.has_value());
+  EXPECT_EQ(first_join_request->node_id(), kCandidateNodeId);
+  EXPECT_EQ(first_join_request->candidate_raft_id(), 11);
+  EXPECT_EQ(first_join_request->persistent_generation(), 1U);
+  EXPECT_EQ(first_join_request->local_state_hint(),
+            raft::JOIN_METADATA_CANDIDATE_STATE_HINT_CANDIDATE);
+
+  const auto after_first_failure_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(after_first_failure_view.summary().code(),
+            view::VIEW_NODE_STATUS_CODE_OK)
+      << after_first_failure_view.summary().message();
+  ASSERT_EQ(after_first_failure_view.metadata_nodes_size(), 1);
+  const auto stable_after_first =
+      std::find_if(after_first_failure_view.metadata_nodes().begin(),
+                   after_first_failure_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-2";
+                   });
+  ASSERT_NE(stable_after_first, after_first_failure_view.metadata_nodes().end());
+  ASSERT_TRUE(stable_after_first->has_metadata());
+  EXPECT_EQ(stable_after_first->endpoint(), leader.address());
+  EXPECT_EQ(stable_after_first->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+  EXPECT_EQ(stable_after_first->metadata().raft_role(),
+            view::METADATA_RAFT_OBSERVED_ROLE_LEADER);
+
+  const ClientRunResult restart_result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kCandidateNodeId},
+      "t112_join_failure_restart");
+
+  ASSERT_EQ(restart_result.exit_code, 6) << restart_result.output;
+  EXPECT_TRUE(Contains(restart_result.output,
+                       "dynamic join failed: no metadata leader accepted join admission"))
+      << restart_result.output;
+  EXPECT_EQ(leader.service().join_call_count(), 2U);
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), first_identity_content);
+  const auto restart_identity_membership =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto restart_identity_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  ASSERT_TRUE(restart_identity_membership.has_value());
+  ASSERT_TRUE(restart_identity_generation.has_value());
+  EXPECT_EQ(*restart_identity_membership, "candidate");
+  EXPECT_EQ(*restart_identity_generation, "1");
+
+  const auto after_restart_failure_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(after_restart_failure_view.summary().code(),
+            view::VIEW_NODE_STATUS_CODE_OK)
+      << after_restart_failure_view.summary().message();
+  ASSERT_EQ(after_restart_failure_view.metadata_nodes_size(), 1);
+  const auto candidate_after_restart =
+      std::find_if(after_restart_failure_view.metadata_nodes().begin(),
+                   after_restart_failure_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-candidate-1";
+                   });
+  EXPECT_EQ(candidate_after_restart,
+            after_restart_failure_view.metadata_nodes().end());
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapConsistencyRepeatStartReusesPersistedIdentity)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app bootstrap consistency is only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t108-bootstrap-consistency";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7818";
+
+  const auto scenario_dir = MakeScenarioDirectory("t108_bootstrap_consistency");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+
+  const TimedProcessRunResult first_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t108_bootstrap_first_start",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGTERM);
+
+  ASSERT_EQ(first_run.exit_code, 0) << first_run.output;
+  ASSERT_TRUE(first_run.matched_required_output) << first_run.output;
+  EXPECT_TRUE(first_run.terminated_by_test);
+  ASSERT_TRUE(std::filesystem::exists(identity_path)) << identity_path.string();
+
+  const auto first_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto first_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto first_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto first_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto first_source = ReadIdentityField(identity_path, "source");
+  const auto first_raft_id = ReadIdentityField(identity_path, "raft_id");
+  const std::string first_identity_content =
+      ReadRequiredTextFile(identity_path);
+  ASSERT_TRUE(first_node_id.has_value());
+  ASSERT_TRUE(first_node_type.has_value());
+  ASSERT_TRUE(first_membership_state.has_value());
+  ASSERT_TRUE(first_generation.has_value());
+  ASSERT_TRUE(first_source.has_value());
+  ASSERT_TRUE(first_raft_id.has_value());
+  EXPECT_EQ(*first_node_id, kBootstrapNodeId);
+  EXPECT_EQ(*first_node_type, "metadata");
+  EXPECT_EQ(*first_membership_state, "voter");
+  EXPECT_EQ(*first_generation, "1");
+  EXPECT_EQ(*first_source, "config_generator");
+  EXPECT_EQ(*first_raft_id, "1");
+
+  const TimedProcessRunResult second_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t108_bootstrap_second_start",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGTERM);
+
+  ASSERT_EQ(second_run.exit_code, 0) << second_run.output;
+  ASSERT_TRUE(second_run.matched_required_output) << second_run.output;
+  EXPECT_TRUE(second_run.terminated_by_test);
+
+  const auto second_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto second_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto second_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto second_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto second_source = ReadIdentityField(identity_path, "source");
+  const auto second_raft_id = ReadIdentityField(identity_path, "raft_id");
+  ASSERT_TRUE(second_node_id.has_value());
+  ASSERT_TRUE(second_node_type.has_value());
+  ASSERT_TRUE(second_membership_state.has_value());
+  ASSERT_TRUE(second_generation.has_value());
+  ASSERT_TRUE(second_source.has_value());
+  ASSERT_TRUE(second_raft_id.has_value());
+  EXPECT_EQ(*second_node_id, *first_node_id);
+  EXPECT_EQ(*second_node_type, *first_node_type);
+  EXPECT_EQ(*second_membership_state, *first_membership_state);
+  EXPECT_EQ(*second_generation, *first_generation);
+  EXPECT_EQ(*second_source, *first_source);
+  EXPECT_EQ(*second_raft_id, *first_raft_id);
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), first_identity_content);
+
+  const auto cluster_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(cluster_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << cluster_view.summary().message();
+  const auto snapshot_it =
+      std::find_if(cluster_view.metadata_nodes().begin(),
+                   cluster_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-bootstrap-1";
+                   });
+  ASSERT_NE(snapshot_it, cluster_view.metadata_nodes().end());
+  ASSERT_TRUE(snapshot_it->has_metadata());
+  EXPECT_EQ(snapshot_it->endpoint(), kBootstrapEndpoint);
+  EXPECT_EQ(snapshot_it->metadata().raft_id(), 1);
+  EXPECT_EQ(snapshot_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsCorruptPersistedIdentityWithoutSilentRewrite)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-corrupt";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7816";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_corrupt");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string corrupt_identity =
+      "not-a-valid-node-identity\nmissing-equals-line\n";
+  WriteRequiredTextFile(identity_path, corrupt_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_corrupt");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), corrupt_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedStorageIdentityRoleMismatch)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-node-type";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7815";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_node_type");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string wrong_role_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-node-type\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=storage\n"
+      "raft_id=\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=non_raft\n"
+      "persistent_generation=1\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, wrong_role_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_node_type");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "node_type mismatch")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), wrong_role_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedInvalidMembershipState)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-membership";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7814";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_membership");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string invalid_membership_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-membership\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=metadata\n"
+      "raft_id=1\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=not-a-valid-state\n"
+      "persistent_generation=1\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, invalid_membership_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_membership");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "membership_state")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), invalid_membership_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRejectsPersistedInvalidPersistentGeneration)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app identity failure scenarios are only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t109-bootstrap-generation";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7817";
+
+  const auto scenario_dir = MakeScenarioDirectory("t109_bootstrap_generation");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+  const std::string invalid_generation_identity =
+      "identity_version=2\n"
+      "cluster_id=cluster-t109-bootstrap-generation\n"
+      "node_id=meta-bootstrap-1\n"
+      "node_type=metadata\n"
+      "raft_id=1\n"
+      "created_at_unix_ms=1710000000000\n"
+      "membership_state=voter\n"
+      "persistent_generation=0\n"
+      "source=config_generator\n";
+  WriteRequiredTextFile(identity_path, invalid_generation_identity);
+
+  const ClientRunResult result = RunMetadataNodeApp(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t109_bootstrap_generation");
+
+  ASSERT_EQ(result.exit_code, 4) << result.output;
+  EXPECT_TRUE(Contains(result.output, "node.identity startup check failed"))
+      << result.output;
+  EXPECT_TRUE(Contains(result.output, "persistent_generation")) << result.output;
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), invalid_generation_identity);
+#endif
+}
+
+TEST_F(MetadataClientScenarioTest,
+       MetadataNodeBootstrapRestartRecoveryReusesIdentityAfterForcedExit)
+{
+#ifdef _WIN32
+  GTEST_SKIP() << "metadata_node_app long-running restart lifecycle is only validated on POSIX";
+#else
+  ScopedViewNodeRegistryServer view_server;
+
+  constexpr const char *kClusterId = "cluster-t110-bootstrap-restart";
+  constexpr const char *kBootstrapNodeId = "meta-bootstrap-1";
+  constexpr const char *kBootstrapEndpoint = "127.0.0.1:7821";
+
+  const auto scenario_dir = MakeScenarioDirectory("t110_bootstrap_restart");
+  const auto config_path = WriteSingleMetadataBootstrapClusterConfig(
+      scenario_dir,
+      kClusterId,
+      view_server.address(),
+      kBootstrapEndpoint);
+  const auto identity_path =
+      scenario_dir / "nodes" / kBootstrapNodeId / "data" / "node.identity";
+
+  const TimedProcessRunResult first_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t110_bootstrap_first_start",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGKILL);
+
+  ASSERT_TRUE(first_run.matched_required_output) << first_run.output;
+  EXPECT_TRUE(first_run.terminated_by_test);
+  EXPECT_EQ(first_run.exit_code, 128 + SIGKILL) << first_run.output;
+  ASSERT_TRUE(std::filesystem::exists(identity_path)) << identity_path.string();
+
+  const auto first_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto first_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto first_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto first_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto first_source = ReadIdentityField(identity_path, "source");
+  const auto first_raft_id = ReadIdentityField(identity_path, "raft_id");
+  const std::string first_identity_content =
+      ReadRequiredTextFile(identity_path);
+  ASSERT_TRUE(first_node_id.has_value());
+  ASSERT_TRUE(first_node_type.has_value());
+  ASSERT_TRUE(first_membership_state.has_value());
+  ASSERT_TRUE(first_generation.has_value());
+  ASSERT_TRUE(first_source.has_value());
+  ASSERT_TRUE(first_raft_id.has_value());
+  EXPECT_EQ(*first_node_id, kBootstrapNodeId);
+  EXPECT_EQ(*first_node_type, "metadata");
+  EXPECT_EQ(*first_membership_state, "voter");
+  EXPECT_EQ(*first_generation, "1");
+  EXPECT_EQ(*first_source, "config_generator");
+  EXPECT_EQ(*first_raft_id, "1");
+
+  const auto first_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(first_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << first_view.summary().message();
+  const auto first_snapshot_it =
+      std::find_if(first_view.metadata_nodes().begin(),
+                   first_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-bootstrap-1";
+                   });
+  ASSERT_NE(first_snapshot_it, first_view.metadata_nodes().end());
+  ASSERT_TRUE(first_snapshot_it->has_metadata());
+  EXPECT_EQ(first_snapshot_it->metadata().raft_id(), 1);
+  EXPECT_EQ(first_snapshot_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+  EXPECT_EQ(first_snapshot_it->endpoint(), kBootstrapEndpoint);
+
+  const TimedProcessRunResult restart_run = RunMetadataNodeAppUntilOutput(
+      {"--config", config_path.string(),
+       "--node_id", kBootstrapNodeId},
+      "t110_bootstrap_restart",
+      {"metadata_node_app OK",
+       "node_id=meta-bootstrap-1",
+       "identity_membership_state=voter"},
+      std::chrono::seconds(6),
+      SIGTERM);
+
+  ASSERT_EQ(restart_run.exit_code, 0) << restart_run.output;
+  ASSERT_TRUE(restart_run.matched_required_output) << restart_run.output;
+  EXPECT_TRUE(restart_run.terminated_by_test);
+
+  const auto restart_node_id = ReadIdentityField(identity_path, "node_id");
+  const auto restart_node_type = ReadIdentityField(identity_path, "node_type");
+  const auto restart_membership_state =
+      ReadIdentityField(identity_path, "membership_state");
+  const auto restart_generation =
+      ReadIdentityField(identity_path, "persistent_generation");
+  const auto restart_source = ReadIdentityField(identity_path, "source");
+  const auto restart_raft_id = ReadIdentityField(identity_path, "raft_id");
+  ASSERT_TRUE(restart_node_id.has_value());
+  ASSERT_TRUE(restart_node_type.has_value());
+  ASSERT_TRUE(restart_membership_state.has_value());
+  ASSERT_TRUE(restart_generation.has_value());
+  ASSERT_TRUE(restart_source.has_value());
+  ASSERT_TRUE(restart_raft_id.has_value());
+  EXPECT_EQ(*restart_node_id, *first_node_id);
+  EXPECT_EQ(*restart_node_type, *first_node_type);
+  EXPECT_EQ(*restart_membership_state, *first_membership_state);
+  EXPECT_EQ(*restart_generation, *first_generation);
+  EXPECT_EQ(*restart_source, *first_source);
+  EXPECT_EQ(*restart_raft_id, *first_raft_id);
+  EXPECT_EQ(ReadRequiredTextFile(identity_path), first_identity_content);
+
+  const auto restart_view = view_server.GetClusterView(kClusterId);
+  ASSERT_EQ(restart_view.summary().code(), view::VIEW_NODE_STATUS_CODE_OK)
+      << restart_view.summary().message();
+  const auto restart_snapshot_it =
+      std::find_if(restart_view.metadata_nodes().begin(),
+                   restart_view.metadata_nodes().end(),
+                   [](const view::ViewNodeSnapshot &snapshot)
+                   {
+                     return snapshot.node_id() == "meta-bootstrap-1";
+                   });
+  ASSERT_NE(restart_snapshot_it, restart_view.metadata_nodes().end());
+  ASSERT_TRUE(restart_snapshot_it->has_metadata());
+  EXPECT_EQ(restart_snapshot_it->metadata().raft_id(), 1);
+  EXPECT_EQ(restart_snapshot_it->metadata().membership_state(),
+            view::METADATA_MEMBERSHIP_OBSERVED_STATE_VOTER);
+  EXPECT_EQ(restart_snapshot_it->endpoint(), kBootstrapEndpoint);
+#endif
 }

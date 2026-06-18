@@ -285,11 +285,13 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
 
   add_dependencies(test_metadata_client_scenario
     raft_metadata_client
+    metadata_node_app
   )
 
   target_link_libraries(test_metadata_client_scenario
     PRIVATE
       metadata_proto
+      view_proto
       GTest::gtest_main
   )
 
@@ -301,6 +303,7 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata_client_scenario_test.cpp")
   target_compile_definitions(test_metadata_client_scenario
     PRIVATE
       RAFT_METADATA_CLIENT_PATH="$<TARGET_FILE:raft_metadata_client>"
+      METADATA_NODE_APP_PATH="$<TARGET_FILE:metadata_node_app>"
   )
 
   gtest_discover_tests(test_metadata_client_scenario
@@ -978,6 +981,27 @@ if(TARGET test_view_node_discovery)
     PRIVATE
       view_proto
   )
+endif()
+add_raft_gtest(view_failover_test
+  view_failover_test.cpp
+  "${RAFT_008_LABELS_VIEW_NODE}")
+if(TARGET view_failover_test)
+  target_link_libraries(view_failover_test
+    PRIVATE
+      view_proto
+  )
+endif()
+set(VIEW_FAILOVER_SCRIPT_TEST
+  "${CMAKE_CURRENT_SOURCE_DIR}/view_failover_script_test.sh")
+if (EXISTS "${VIEW_FAILOVER_SCRIPT_TEST}")
+  add_test(NAME ViewFailoverScriptValidation
+    COMMAND bash "${VIEW_FAILOVER_SCRIPT_TEST}"
+      "${CMAKE_SOURCE_DIR}/examples/object-storage-local-009-dynamic/rpc_demo.sh"
+  )
+  set_tests_properties(ViewFailoverScriptValidation PROPERTIES
+    LABELS "view-node;linux-primary-diagnosis")
+else()
+  message(STATUS "Skip ViewFailoverScriptValidation: view_failover_script_test.sh not found")
 endif()
 add_raft_gtest(test_node_identity
   node_identity_test.cpp

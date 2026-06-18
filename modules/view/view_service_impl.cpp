@@ -661,6 +661,7 @@ namespace viewdemo
                 snapshot.registered_at_unix_ms);
             proto_snapshot->set_last_seen_unix_ms(snapshot.last_seen_unix_ms);
             proto_snapshot->set_last_sequence(snapshot.last_sequence);
+            proto_snapshot->set_incarnation_id(snapshot.incarnation_id);
             proto_snapshot->set_liveness(ToProtoLiveness(snapshot.liveness));
             proto_snapshot->mutable_failure_domain()->set_zone(
                 snapshot.failure_domain.zone);
@@ -702,6 +703,42 @@ namespace viewdemo
             }
         }
 
+        void FillProtoPeerSyncSnapshot(const ViewRegistryPeerSnapshot &snapshot,
+                                       ::view::ViewPeerSyncSnapshot *proto_snapshot)
+        {
+            if (proto_snapshot == nullptr)
+            {
+                return;
+            }
+
+            proto_snapshot->set_cluster_id(snapshot.cluster_id);
+            proto_snapshot->set_generated_at_unix_ms(
+                snapshot.generated_at_unix_ms);
+            for (const auto &view_node : snapshot.view_nodes)
+            {
+                FillProtoSnapshot(view_node, proto_snapshot->add_view_nodes());
+            }
+            for (const auto &metadata_node : snapshot.metadata_nodes)
+            {
+                FillProtoSnapshot(metadata_node,
+                                  proto_snapshot->add_metadata_nodes());
+            }
+            for (const auto &storage_node : snapshot.storage_nodes)
+            {
+                FillProtoSnapshot(storage_node,
+                                  proto_snapshot->add_storage_nodes());
+            }
+            if (snapshot.leader_hint.has_value())
+            {
+                FillProtoLeaderHint(*snapshot.leader_hint,
+                                    proto_snapshot->mutable_leader_hint());
+            }
+            else
+            {
+                proto_snapshot->clear_leader_hint();
+            }
+        }
+
         template <typename Response>
         void AppendWarnings(
             const std::vector<ViewRegistryDiagnostic> &diagnostics,
@@ -717,6 +754,88 @@ namespace viewdemo
                         : diagnostic.message);
                 warning->set_node_id(diagnostic.node_id);
                 warning->set_endpoint(diagnostic.endpoint);
+                warning->set_sequence(diagnostic.sequence);
+            }
+        }
+
+        template <typename Response>
+        void AppendNonAuthorityBoundaryWarning(const ClusterId &cluster_id,
+                                               const RequestId &request_id,
+                                               Response *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            auto *warning = response->add_warnings();
+            warning->set_code(ToString(ViewRegistryIssueCode::kNonAuthorityBoundary));
+            warning->set_message(
+                "peer sync exchanges observed registry state only; it does not change Raft membership, quorum, or committed object visibility");
+            warning->clear_node_id();
+            warning->clear_endpoint();
+            warning->set_sequence(0);
+            static_cast<void>(cluster_id);
+            static_cast<void>(request_id);
+        }
+
+        std::string BuildViewSelfRefreshDiagnosticMessage(
+            const viewdemo::ViewNodeSnapshot &snapshot)
+        {
+            std::string message = "self_refresh_state";
+            const auto append_text_field =
+                [&message](const std::string_view key, const std::string_view value)
+            {
+                message.push_back(' ');
+                message.append(key);
+                message.push_back('=');
+                message.append(value);
+            };
+            const auto append_u64_field =
+                [&append_text_field](const std::string_view key,
+                                     const std::uint64_t value)
+            {
+                append_text_field(key, std::to_string(value));
+            };
+
+            const bool refreshed = !snapshot.incarnation_id.empty() ||
+                                   snapshot.last_sequence != 0;
+            append_text_field("source",
+                              refreshed ? "self_refresh" : "registration_only");
+            append_text_field("node_id",
+                              snapshot.node_id.empty() ? "<unknown>"
+                                                       : snapshot.node_id);
+            append_text_field("endpoint",
+                              snapshot.endpoint.empty() ? "<unknown>"
+                                                        : snapshot.endpoint);
+            append_text_field("incarnation",
+                              snapshot.incarnation_id.empty() ? "<none>"
+                                                              : snapshot.incarnation_id);
+            append_u64_field("sequence", snapshot.last_sequence);
+            append_u64_field("last_seen_unix_ms", snapshot.last_seen_unix_ms);
+            append_text_field("health", ToString(snapshot.health.health));
+            append_text_field("liveness", ToString(snapshot.liveness));
+            return message;
+        }
+
+        void AppendViewSelfRefreshDiagnostics(
+            const ClusterViewSnapshot &snapshot,
+            ::view::GetClusterViewResponse *response)
+        {
+            if (response == nullptr)
+            {
+                return;
+            }
+
+            for (const auto &view_node : snapshot.view_nodes)
+            {
+                auto *warning = response->add_warnings();
+                warning->set_code("self_refresh_state");
+                warning->set_message(
+                    BuildViewSelfRefreshDiagnosticMessage(view_node));
+                warning->set_node_id(view_node.node_id);
+                warning->set_endpoint(view_node.endpoint);
+                warning->set_sequence(view_node.observed_state.sequence);
             }
         }
 
@@ -781,6 +900,103 @@ namespace viewdemo
                     "view registry is not configured");
             }
             return ::grpc::Status::OK;
+        }
+
+        ViewNodeSnapshot FromProtoSnapshot(
+            const ::view::ViewNodeSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
+        {
+            ViewNodeSnapshot result;
+            result.cluster_id = snapshot.cluster_id().empty()
+                                    ? fallback_cluster_id
+                                    : snapshot.cluster_id();
+            result.node_id = snapshot.node_id();
+            result.node_type = FromProtoNodeType(snapshot.node_type());
+            result.incarnation_id = snapshot.incarnation_id();
+            result.endpoint = snapshot.endpoint();
+            result.control_plane_endpoint =
+                snapshot.control_plane_endpoint();
+            result.data_plane_endpoint =
+                snapshot.data_plane_endpoint();
+            result.data_dir_fingerprint =
+                snapshot.data_dir_fingerprint();
+            result.observed_state.incarnation_id = result.incarnation_id;
+            result.observed_state.sequence = snapshot.last_sequence();
+            result.observed_state.observed_at_unix_ms =
+                snapshot.last_seen_unix_ms();
+            result.registered_at_unix_ms = snapshot.registered_at_unix_ms();
+            result.last_seen_unix_ms = snapshot.last_seen_unix_ms();
+            result.last_sequence = snapshot.last_sequence();
+            result.liveness = FromProtoLiveness(snapshot.liveness());
+            result.failure_domain.zone =
+                snapshot.failure_domain().zone();
+            result.failure_domain.rack =
+                snapshot.failure_domain().rack();
+            result.health.health =
+                FromProtoHealth(snapshot.health().health());
+            result.health.disk_pressure =
+                FromProtoDiskPressure(snapshot.health().disk_pressure());
+            result.health.io_error_count =
+                snapshot.health().io_error_count();
+            result.capacity.total_capacity_bytes =
+                snapshot.capacity().total_capacity_bytes();
+            result.capacity.used_capacity_bytes =
+                snapshot.capacity().used_capacity_bytes();
+            result.capacity.available_capacity_bytes =
+                snapshot.capacity().available_capacity_bytes();
+            result.capacity.chunk_count =
+                snapshot.capacity().chunk_count();
+            result.load.active_reads = snapshot.load().active_reads();
+            result.load.active_writes = snapshot.load().active_writes();
+            result.load.queued_ops = snapshot.load().queued_ops();
+            result.load.write_admission_overloaded =
+                snapshot.load().write_admission_overloaded();
+            result.load.read_admission_overloaded =
+                snapshot.load().read_admission_overloaded();
+            if (snapshot.has_metadata())
+            {
+                result.metadata =
+                    FromProtoMetadataObservation(snapshot.metadata());
+            }
+            return result;
+        }
+
+        ViewRegistryPeerSnapshot FromProtoPeerSyncSnapshot(
+            const ::view::ViewPeerSyncSnapshot &snapshot,
+            const ClusterId &fallback_cluster_id)
+        {
+            ViewRegistryPeerSnapshot result;
+            result.cluster_id = snapshot.cluster_id().empty()
+                                    ? fallback_cluster_id
+                                    : snapshot.cluster_id();
+            result.generated_at_unix_ms = snapshot.generated_at_unix_ms();
+            result.view_nodes.reserve(
+                static_cast<std::size_t>(snapshot.view_nodes_size()));
+            result.metadata_nodes.reserve(
+                static_cast<std::size_t>(snapshot.metadata_nodes_size()));
+            result.storage_nodes.reserve(
+                static_cast<std::size_t>(snapshot.storage_nodes_size()));
+            for (const auto &view_node : snapshot.view_nodes())
+            {
+                result.view_nodes.push_back(
+                    FromProtoSnapshot(view_node, result.cluster_id));
+            }
+            for (const auto &metadata_node : snapshot.metadata_nodes())
+            {
+                result.metadata_nodes.push_back(
+                    FromProtoSnapshot(metadata_node, result.cluster_id));
+            }
+            for (const auto &storage_node : snapshot.storage_nodes())
+            {
+                result.storage_nodes.push_back(
+                    FromProtoSnapshot(storage_node, result.cluster_id));
+            }
+            if (snapshot.has_leader_hint())
+            {
+                result.leader_hint =
+                    FromProtoLeaderHint(snapshot.leader_hint());
+            }
+            return result;
         }
 
         ::grpc::Status MakeInternalStatus(const std::string_view rpc_name,
@@ -955,6 +1171,7 @@ namespace viewdemo
                 .cluster_id = request->cluster_id(),
                 .node_id = request->node_id(),
                 .node_type = FromProtoNodeType(request->node_type()),
+                .incarnation_id = request->incarnation_id(),
                 .sequence = request->sequence(),
                 .observation = FromProtoRegistration(request->observation())});
 
@@ -1185,6 +1402,10 @@ namespace viewdemo
                 response->clear_leader_hint();
             }
             AppendWarnings(result.snapshot.diagnostics, response);
+            if (request->include_warnings())
+            {
+                AppendViewSelfRefreshDiagnostics(result.snapshot, response);
+            }
             return ::grpc::Status::OK;
         }
         catch (const std::exception &ex)
@@ -1202,6 +1423,127 @@ namespace viewdemo
                                request->request_id(),
                                request->cluster_id());
             return MakeUnknownInternalStatus("GetClusterView");
+        }
+    }
+
+    ::grpc::Status ViewNodeServiceImpl::PullPeerViewSnapshot(
+        ::grpc::ServerContext *context,
+        const ::view::PullPeerViewSnapshotRequest *request,
+        ::view::PullPeerViewSnapshotResponse *response)
+    {
+        static_cast<void>(context);
+        if (request == nullptr)
+        {
+            SetInternalSummary(response, "request must not be null");
+            return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                                  "request must not be null");
+        }
+
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
+        if (!state.ok())
+        {
+            return state;
+        }
+
+        try
+        {
+            const auto result = registry_->ExportPeerSnapshot(
+                ExportPeerSnapshotRequest{
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .include_dead_nodes = request->include_dead_nodes(),
+                    .include_warnings = request->include_warnings()},
+                ResolveNowUnixMs(config_));
+
+            FillProtoSummary(result.summary, response->mutable_summary());
+            FillProtoPeerSyncSnapshot(result.snapshot,
+                                     response->mutable_snapshot());
+            AppendWarnings(result.diagnostics, response);
+            AppendNonAuthorityBoundaryWarning(request->cluster_id(),
+                                              request->request_id(),
+                                              response);
+            return ::grpc::Status::OK;
+        }
+        catch (const std::exception &ex)
+        {
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeInternalStatus("PullPeerViewSnapshot", ex);
+        }
+        catch (...)
+        {
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeUnknownInternalStatus("PullPeerViewSnapshot");
+        }
+    }
+
+    ::grpc::Status ViewNodeServiceImpl::PushPeerViewSnapshot(
+        ::grpc::ServerContext *context,
+        const ::view::PushPeerViewSnapshotRequest *request,
+        ::view::PushPeerViewSnapshotResponse *response)
+    {
+        static_cast<void>(context);
+        if (request == nullptr)
+        {
+            SetInternalSummary(response, "request must not be null");
+            return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                                  "request must not be null");
+        }
+
+        const auto state = ValidateRpcState(response,
+                                            registry_.get(),
+                                            request->request_id(),
+                                            request->cluster_id());
+        if (!state.ok())
+        {
+            return state;
+        }
+
+        try
+        {
+            const auto result = registry_->ImportPeerSnapshot(
+                ImportPeerSnapshotRequest{
+                    .request_id = request->request_id(),
+                    .cluster_id = request->cluster_id(),
+                    .snapshot = FromProtoPeerSyncSnapshot(request->snapshot(),
+                                                          request->cluster_id())});
+
+            FillProtoSummary(result.summary, response->mutable_summary());
+            response->set_received_node_count(result.received_node_count);
+            response->set_accepted_node_count(result.accepted_node_count);
+            response->set_applied_node_count(result.applied_node_count);
+            response->set_stale_ignored_node_count(
+                result.stale_ignored_node_count);
+            response->set_conflict_node_count(result.conflict_node_count);
+            AppendWarnings(result.diagnostics, response);
+            AppendNonAuthorityBoundaryWarning(request->cluster_id(),
+                                              request->request_id(),
+                                              response);
+            return ::grpc::Status::OK;
+        }
+        catch (const std::exception &ex)
+        {
+            SetInternalSummary(response,
+                               ex.what(),
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeInternalStatus("PushPeerViewSnapshot", ex);
+        }
+        catch (...)
+        {
+            SetInternalSummary(response,
+                               "unknown internal error",
+                               request->request_id(),
+                               request->cluster_id());
+            return MakeUnknownInternalStatus("PushPeerViewSnapshot");
         }
     }
 
