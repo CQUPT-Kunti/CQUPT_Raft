@@ -119,3 +119,9 @@ Mitigation: Any future runtime registry persistence/load path should reuse the s
 Risk: During T109 validation, the first broad `ctest --preset debug-tests -R "Metadata|NodeIdentity" --output-on-failure` run failed once in `MetadataRecoveryStressTest.RestartRecoveryAfterConcurrentWritesKeepsCommittedAndDeletedMetadataStable`, while the focused rerun and the subsequent full broad rerun both passed. This suggests a residual timing-sensitive recovery stress path outside the T109 identity-boundary changes. It does not currently prove a deterministic logic regression, but it can still block future phase-closure tasks if left invisible.
 
 Mitigation: Treat current T109 PASS as valid because the focused T109 scenarios and the final broad rerun both passed, but keep this recovery-stress flake explicit. Later phase-closure work should either stabilize that recovery stress test or document its timing envelope so broad metadata regressions do not fail nondeterministically.
+
+## R26: Windows/macOS Smoke Gap Still Limits Cross-Platform Release Confidence
+
+Risk: T115 closed the Linux targeted validation set, but 009 still has no real Windows or macOS smoke execution for build preset, targeted CTest, identity durability boundary, or local RPC example startup/status. The implementation may be logically portable or intentionally fail fast on unsupported durability paths, yet that is not equivalent to runtime platform validation. Claiming broad cross-platform confidence without real smoke would overstate the evidence.
+
+Mitigation: Keep Linux as the only primary validated platform in 009 closure documents. Record Windows/macOS strictly as pending / not run until real host-based smoke exists. Before raising release confidence beyond Linux, run at least targeted build + targeted CTest + identity durability boundary + baseline local RPC startup/status on Windows and macOS, and store the commands, results, and log paths in task reports.

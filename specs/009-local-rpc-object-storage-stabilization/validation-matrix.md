@@ -109,6 +109,14 @@
 - Skipped build/test due to build lock or missing platform must be recorded in `task-reports/`.
 - Windows/macOS without real environment should be marked pending, not assumed passed.
 
+## Final Platform Validation Status
+
+| Platform | Status | Scope | Evidence | Notes |
+|----------|--------|-------|----------|-------|
+| Linux | PASS | targeted app build, targeted test build, targeted CTest, baseline local RPC example, sibling `009 dynamic` local RPC example | `task-reports/t115-run-final-targeted-linux-validation-set-from-quickstart.md` | 009 当前 primary validated platform |
+| Windows | PENDING / NOT RUN | none | no 009 Windows smoke report | 没有 Windows host；不能把设计兼容或未执行结果写成 PASS |
+| macOS | PENDING / NOT RUN | none | no 009 macOS smoke report | 没有 macOS host；不能把设计兼容或未执行结果写成 PASS |
+
 ## US2 Phase 5 Closure Snapshot
 
 - Linux targeted validation:
