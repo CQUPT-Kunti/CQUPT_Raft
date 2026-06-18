@@ -15,7 +15,7 @@
 
 ## Phase 1: Foundation
 
-- [ ] T001 [US4] Unify production chunk-size default and remove config-driven chunk_size semantics in `modules/store/common/store_types.h`, `apps/storage_client.cpp`, and targeted storage/client tests.
+- [X] T001 [US4] Unify production chunk-size default and remove config-driven chunk_size semantics in `modules/store/common/store_types.h`, `apps/storage_client.cpp`, and targeted storage/client tests.
 
 修改目标：新增或复用一个 store/common 代码级 production chunk-size 入口，消除 `apps/storage_client.cpp` 的 4MiB 重复默认和 `chunk_size_bytes` 配置语义读取。  
 涉及文件：`modules/store/common/store_types.h`、`modules/store/common/store_types.cpp` 如需、`apps/storage_client.cpp`、相关 `tests/*config*` 或 storage client parsing tests。  

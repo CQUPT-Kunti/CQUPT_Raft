@@ -36,7 +36,7 @@ namespace
         std::filesystem::path config_path;
         std::string cluster_id;
         std::string view_endpoint;
-        std::uint64_t chunk_size{4ULL * 1024ULL * 1024ULL};
+        std::uint64_t chunk_size{storedemo::kProductionChunkSizeBytes};
         std::uint32_t replica_count{1};
         std::uint32_t minimum_successful_writes{1};
         std::chrono::milliseconds discovery_timeout{3000};
@@ -325,11 +325,10 @@ namespace
             config.cluster_id = *cluster_id;
             config.view_endpoint = *view_endpoint;
 
-            if (const auto value = ExtractUnsignedConfigValue(content, "chunk_size_bytes");
-                value.has_value() && *value > 0)
-            {
-                config.chunk_size = *value;
-            }
+            // Production upload chunk size is intentionally code-driven.
+            // `chunk_size_bytes` may still exist in cluster/app config for
+            // broader config compatibility, but it must not override the
+            // storage_client upload default.
             if (const auto value = ExtractUnsignedConfigValue(content, "replica_count");
                 value.has_value() && *value > 0)
             {
@@ -1059,7 +1058,7 @@ namespace
     {
         clusterdemo::ChunkPolicyConfig policy;
         policy.chunk_size_bytes =
-            args.chunk_size.value_or(4ULL * 1024ULL * 1024ULL);
+            args.chunk_size.value_or(storedemo::kProductionChunkSizeBytes);
         policy.replica_count = args.replica_count.value_or(3U);
         policy.minimum_successful_writes =
             args.minimum_successful_writes.value_or(2U);
