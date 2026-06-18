@@ -232,7 +232,7 @@
 - [x] T112 Add dynamic metadata join safety constraints and consistency validation in `tests/metadata_client_scenario_test.cpp` and `specs/009-local-rpc-object-storage-stabilization/task-reports/t112-add-dynamic-metadata-join-safety-constraints-and-consistency-validation.md` (验证: `test_metadata_client_scenario`, `ctest --preset debug-tests -R "Metadata|Join|NodeIdentity" --output-on-failure`)
 - [x] T113 Confirm `specs/009-local-rpc-object-storage-stabilization/spec.md`, `plan.md`, and `tasks.md` do not contain execution logs (验证: document review)
 - [x] T114 Confirm no committed voter membership test allows even voter count in `tests/integrated_object_storage_quorum_test.cpp` (验证: `integrated_object_storage_quorum`)
-- [ ] T115 Run final targeted Linux validation set from `specs/009-local-rpc-object-storage-stabilization/quickstart.md` when build lock is available (验证: targeted CMake/CTest/local RPC commands)
+- [x] T115 Run final targeted Linux validation set from `specs/009-local-rpc-object-storage-stabilization/quickstart.md` when build lock is available (验证: targeted CMake/CTest/local RPC commands)
 - [ ] T116 Record Windows/macOS pending or smoke results in `specs/009-local-rpc-object-storage-stabilization/task-reports/final-summary.md` (验证: explicit pending status if no machines)
 
 ---
