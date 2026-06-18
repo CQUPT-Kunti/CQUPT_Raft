@@ -187,5 +187,5 @@ CTEST_PARALLEL_LEVEL=1 ./test.sh --group all
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read
-`specs/009-local-rpc-object-storage-stabilization/plan.md`
+`specs/010-object-storage-config-industrialization/plan.md`
 <!-- SPECKIT END -->
