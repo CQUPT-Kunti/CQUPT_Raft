@@ -147,6 +147,16 @@ T004 后 upload 第二遍执行的约束是：
 - `candidate_nodes`、discovery 返回的其他健康节点、以及任何按 `node_id` / endpoint 排序的 fallback，都不能参与补点或重新 placement
 - 若 `selected_replica_nodes` 为空、数量不匹配、重复，或某个 selected `node_id` 无法在当前 discovery 中解析到 endpoint，upload 必须在写入前显式失败
 
+T005-A 后 upload 第二遍对单个 chunk 的 replica fan-out 边界是：
+
+- 同一个 chunk 的 selected replica writes 通过 `BoundedStorageExecutor` 并行执行
+- fan-out worker 上限当前由 `object_transfer.cpp` 内部常量控制，当前实现上限为 `2`
+- 任务队列容量按当前 chunk 的 `desired_replica_count` 建立，避免为每个 replica 创建独立线程
+- upload 会等待当前 chunk 已启动的全部 replica task 完成后，再做 `minimum_successful_writes` 聚合
+- 聚合顺序按 selected replica 的稳定顺序执行，不依赖任务完成先后
+- manifest / `CommitObject` 只记录实际 durable success 的 replica nodes
+- 当前尚未实现 quorum 达成后的提前返回，也不会主动取消已经启动的慢副本 RPC；这是 T005-B 的继续收紧方向
+
 ### download
 
 download 当前是 manifest-driven、逐 chunk、临时文件重建流程：

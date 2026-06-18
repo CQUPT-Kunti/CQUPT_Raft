@@ -1,6 +1,7 @@
 #include "store/transfer/object_transfer.h"
 
 #include "store/placement/placement_manager.h"
+#include "store/runtime/storage_executor.h"
 #include "store/transfer/metadata_transfer_client.h"
 #include "store/transfer/storage_transfer_client.h"
 #include "view/view_client.h"
@@ -10,10 +11,12 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <unordered_set>
@@ -27,6 +30,7 @@ namespace storedemo
         constexpr std::array<std::uint32_t, 8> kSha256InitialState = {
             0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
             0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+        constexpr std::size_t kMaxReplicaFanoutWorkers = 2;
 
         constexpr std::array<std::uint32_t, 64> kSha256RoundConstants = {
             0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -54,6 +58,14 @@ namespace storedemo
             std::uint64_t total_bytes{0};
         };
 
+        struct ReplicaWriteTaskSharedState
+        {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::vector<std::optional<StorageTransferWriteResult>> results;
+            std::size_t completed_tasks{0};
+        };
+
         [[nodiscard]] bool IsFinishedStage(const ObjectTransferStage stage)
         {
             return stage == ObjectTransferStage::kCompleted ||
@@ -74,6 +86,52 @@ namespace storedemo
             std::string_view operation_suffix)
         {
             return std::string(base_request_id) + "/" + std::string(operation_suffix);
+        }
+
+        [[nodiscard]] std::size_t ResolveReplicaFanoutWorkerCount(
+            const std::size_t selected_target_count)
+        {
+            return std::max<std::size_t>(
+                1,
+                std::min<std::size_t>(selected_target_count,
+                                      kMaxReplicaFanoutWorkers));
+        }
+
+        void RecordReplicaWriteTaskResult(
+            ReplicaWriteTaskSharedState *state,
+            const std::size_t result_index,
+            StorageTransferWriteResult result)
+        {
+            if (state == nullptr)
+            {
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (result_index < state->results.size())
+                {
+                    state->results[result_index] = std::move(result);
+                }
+                ++state->completed_tasks;
+            }
+            state->cv.notify_all();
+        }
+
+        void WaitForReplicaWriteTasks(ReplicaWriteTaskSharedState *state,
+                                      const std::size_t expected_tasks)
+        {
+            if (state == nullptr)
+            {
+                return;
+            }
+
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock,
+                           [state, expected_tasks]()
+                           {
+                               return state->completed_tasks >= expected_tasks;
+                           });
         }
 
         [[nodiscard]] std::uint32_t RotateRight(const std::uint32_t value,
@@ -1922,6 +1980,15 @@ namespace storedemo
                 std::vector<TransferCommittedChunk> durable_chunks;
                 durable_chunks.reserve(result.prepared_chunks.size());
                 bool uncertain_cleanup_possible = false;
+                BoundedStorageExecutor replica_fanout_executor(
+                    StorageExecutorConfig{
+                        .worker_count = ResolveReplicaFanoutWorkerCount(
+                            static_cast<std::size_t>(
+                                request_.desired_replica_count)),
+                        .queue_capacity = std::max<std::size_t>(
+                            1,
+                            static_cast<std::size_t>(
+                                request_.desired_replica_count))});
 
                 if (!result.prepared_chunks.empty())
                 {
@@ -2107,50 +2174,181 @@ namespace storedemo
                             "StorageNode WriteChunk did not reach minimum_successful_writes";
                         StorageTransferTarget last_failure_target;
                         bool last_failure_retryable = false;
+                        auto shared_payload =
+                            std::make_shared<const std::string>(
+                                std::move(chunk.payload));
+                        auto replica_write_state =
+                            std::make_shared<ReplicaWriteTaskSharedState>();
+                        replica_write_state->results.resize(chunk_targets.size());
 
-                        for (const auto &target : chunk_targets)
+                        std::size_t submitted_replica_tasks = 0;
+                        std::optional<StorageExecutorSubmitResult>
+                            submit_failure;
+                        for (std::size_t target_index = 0;
+                             target_index < chunk_targets.size();
+                             ++target_index)
                         {
-                            const auto write_result = storage_client_->WriteChunk(
-                                {.request_id = request_.request_id + "/chunk-" +
-                                                 std::to_string(prepared_chunk.chunk_index) +
-                                                 "/node-" + target.node_id,
-                                 .target = target,
-                                 .identity = identity,
-                                 .offset = prepared_chunk.offset,
-                                 .expected_size = prepared_chunk.size,
-                                 .expected_checksum = prepared_chunk.checksum,
-                                 .payload = chunk.payload});
+                            const auto &target = chunk_targets[target_index];
+                            const auto submit_result =
+                                replica_fanout_executor.Submit(
+                                    StorageExecutorSubmitRequest{
+                                        .task_name =
+                                            "upload-replica-write/chunk-" +
+                                            std::to_string(
+                                                prepared_chunk.chunk_index) +
+                                            "/node-" + target.node_id,
+                                        .task =
+                                            [this,
+                                             request_id = request_.request_id,
+                                             target,
+                                             identity,
+                                             offset = prepared_chunk.offset,
+                                             expected_size = prepared_chunk.size,
+                                             expected_checksum =
+                                                 prepared_chunk.checksum,
+                                             shared_payload,
+                                             replica_write_state,
+                                             target_index]()
+                                            {
+                                                StorageTransferWriteResult write_result;
+                                                try
+                                                {
+                                                    write_result =
+                                                        storage_client_->WriteChunk(
+                                                            {.request_id =
+                                                                 request_id +
+                                                                 "/chunk-" +
+                                                                 std::to_string(
+                                                                     identity.chunk_index) +
+                                                                 "/node-" +
+                                                                 target.node_id,
+                                                             .target = target,
+                                                             .identity = identity,
+                                                             .offset = offset,
+                                                             .expected_size =
+                                                                 expected_size,
+                                                             .expected_checksum =
+                                                                 expected_checksum,
+                                                             .payload =
+                                                                 *shared_payload});
+                                                }
+                                                catch (const std::exception &ex)
+                                                {
+                                                    write_result.status =
+                                                        StorageNodeStatusCode::kIoError;
+                                                    write_result.error_detail =
+                                                        "fan-out replica write threw exception: " +
+                                                        std::string(ex.what());
+                                                    write_result.target = target;
+                                                }
+                                                catch (...)
+                                                {
+                                                    write_result.status =
+                                                        StorageNodeStatusCode::kIoError;
+                                                    write_result.error_detail =
+                                                        "fan-out replica write threw unknown exception";
+                                                    write_result.target = target;
+                                                }
+
+                                                if (write_result.target.node_id.empty())
+                                                {
+                                                    write_result.target = target;
+                                                }
+
+                                                RecordReplicaWriteTaskResult(
+                                                    replica_write_state.get(),
+                                                    target_index,
+                                                    std::move(write_result));
+                                            }});
+                            if (!submit_result.accepted())
+                            {
+                                submit_failure = submit_result;
+                                break;
+                            }
+                            ++submitted_replica_tasks;
+                        }
+
+                        WaitForReplicaWriteTasks(replica_write_state.get(),
+                                                 submitted_replica_tasks);
+
+                        if (submit_failure.has_value())
+                        {
+                            reader.Close();
+                            BuildCleanupCandidates(&result,
+                                                   durable_chunks,
+                                                   uncertain_cleanup_possible);
+                            Fail(&result,
+                                 MapStorageStatus(
+                                     submit_failure->status_code()),
+                                 "bounded replica fan-out rejected task for chunk " +
+                                     identity.chunk_id + ": " +
+                                     submit_failure->error_detail,
+                                 prepared_chunk.chunk_index,
+                                 prepared_chunk.offset,
+                                 identity.chunk_id);
+                            return result;
+                        }
+
+                        for (std::size_t target_index = 0;
+                             target_index < chunk_targets.size();
+                             ++target_index)
+                        {
+                            const auto &target = chunk_targets[target_index];
+                            const auto &write_result =
+                                replica_write_state->results[target_index];
+                            if (!write_result.has_value())
+                            {
+                                reader.Close();
+                                BuildCleanupCandidates(&result,
+                                                       durable_chunks,
+                                                       uncertain_cleanup_possible);
+                                Fail(&result,
+                                     ObjectTransferStatusCode::kInternalError,
+                                     "bounded replica fan-out lost result for chunk " +
+                                         identity.chunk_id + " target node_id=" +
+                                         target.node_id,
+                                     prepared_chunk.chunk_index,
+                                     prepared_chunk.offset,
+                                     identity.chunk_id,
+                                     target.node_id,
+                                     target.endpoint);
+                                return result;
+                            }
+
                             AppendStorageWriteDiagnostic(request_.request_id,
-                                                         write_result,
+                                                         *write_result,
                                                          identity,
                                                          prepared_chunk.chunk_index,
                                                          prepared_chunk.offset,
                                                          &result.diagnostics);
 
-                            if (write_result.ok())
+                            if (write_result->ok())
                             {
                                 if (!have_durable_result)
                                 {
-                                    first_durable_result = write_result;
+                                    first_durable_result = *write_result;
                                     have_durable_result = true;
                                 }
                                 durable_replicas.push_back(
-                                    write_result.target.node_id.empty()
+                                    write_result->target.node_id.empty()
                                         ? target.node_id
-                                        : write_result.target.node_id);
+                                        : write_result->target.node_id);
                                 continue;
                             }
 
-                            last_failure_status = MapStorageStatus(write_result.status);
+                            last_failure_status =
+                                MapStorageStatus(write_result->status);
                             last_failure_message =
                                 "StorageNode WriteChunk failed: " +
-                                write_result.error_detail;
-                            last_failure_target = write_result.target.endpoint.empty()
-                                                      ? target
-                                                      : write_result.target;
-                            last_failure_retryable = write_result.retryable;
+                                write_result->error_detail;
+                            last_failure_target =
+                                write_result->target.endpoint.empty()
+                                    ? target
+                                    : write_result->target;
+                            last_failure_retryable = write_result->retryable;
                             uncertain_cleanup_possible =
-                                uncertain_cleanup_possible || write_result.retryable;
+                                uncertain_cleanup_possible ||
+                                write_result->retryable;
                         }
 
                         if (durable_replicas.size() < minimum_successful_writes)
