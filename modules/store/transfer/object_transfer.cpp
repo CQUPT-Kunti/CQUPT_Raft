@@ -992,32 +992,94 @@ namespace storedemo
             return std::nullopt;
         }
 
-        [[nodiscard]] std::vector<StorageTransferTarget> SortedStorageTargets(
-            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets)
+        [[nodiscard]] std::vector<StorageTransferTarget>
+        ResolveSelectedChunkTargetsFromPlan(
+            const TransferChunkPlan &chunk_plan,
+            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets,
+            std::string *error_detail)
         {
-            std::vector<StorageTransferTarget> targets;
-            targets.reserve(storage_targets.size());
-            for (const auto &[node_id, target] : storage_targets)
+            const auto chunk_identity = chunk_plan.identity.chunk_id.empty()
+                                            ? ("chunk_index=" +
+                                               std::to_string(
+                                                   chunk_plan.identity.chunk_index))
+                                            : ("chunk_id=" +
+                                               chunk_plan.identity.chunk_id +
+                                               " chunk_index=" +
+                                               std::to_string(
+                                                   chunk_plan.identity.chunk_index));
+
+            if (chunk_plan.required_replica_count == 0)
             {
-                (void)node_id;
-                if (target.node_id.empty() || target.endpoint.empty())
-                {
-                    continue;
-                }
-                targets.push_back(target);
+                SetErrorDetail(
+                    error_detail,
+                    "upload write plan selected_replica_nodes are invalid for " +
+                        chunk_identity +
+                        ": required_replica_count must be greater than zero");
+                return {};
             }
 
-            std::sort(targets.begin(),
-                      targets.end(),
-                      [](const StorageTransferTarget &lhs,
-                         const StorageTransferTarget &rhs)
-                      {
-                          if (lhs.node_id != rhs.node_id)
-                          {
-                              return lhs.node_id < rhs.node_id;
-                          }
-                          return lhs.endpoint < rhs.endpoint;
-                      });
+            if (chunk_plan.selected_replica_nodes.empty())
+            {
+                SetErrorDetail(
+                    error_detail,
+                    "upload write plan selected_replica_nodes are empty for " +
+                        chunk_identity);
+                return {};
+            }
+
+            if (chunk_plan.selected_replica_nodes.size() !=
+                chunk_plan.required_replica_count)
+            {
+                SetErrorDetail(
+                    error_detail,
+                    "upload write plan selected_replica_nodes count=" +
+                        std::to_string(
+                            chunk_plan.selected_replica_nodes.size()) +
+                        " does not match required_replica_count=" +
+                        std::to_string(chunk_plan.required_replica_count) +
+                        " for " + chunk_identity);
+                return {};
+            }
+
+            std::vector<StorageTransferTarget> targets;
+            targets.reserve(chunk_plan.selected_replica_nodes.size());
+            std::unordered_set<StorageNodeId> unique_selected_nodes;
+            unique_selected_nodes.reserve(chunk_plan.selected_replica_nodes.size());
+            for (const auto &node_id : chunk_plan.selected_replica_nodes)
+            {
+                if (node_id.empty())
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "upload write plan selected_replica_nodes contain empty node_id for " +
+                            chunk_identity);
+                    return {};
+                }
+
+                if (!unique_selected_nodes.insert(node_id).second)
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "upload write plan selected_replica_nodes contain duplicate node_id=" +
+                            node_id + " for " + chunk_identity);
+                    return {};
+                }
+
+                const auto it = storage_targets.find(node_id);
+                if (it == storage_targets.end() ||
+                    it->second.endpoint.empty())
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "upload write plan selected node_id=" + node_id +
+                            " for " + chunk_identity +
+                            " is not discoverable via ViewNode storage endpoints");
+                    return {};
+                }
+
+                targets.push_back(it->second);
+            }
+
             return targets;
         }
 
@@ -1834,10 +1896,6 @@ namespace storedemo
                         chunk_plan.selected_replica_nodes.push_back(
                             selected_replica.node_id);
                     }
-                    // T004 之前 upload 仍消费 candidate_nodes，并且仍保留 fallback。
-                    // 这里先把执行 authority 显式写入 selected_replica_nodes，同时把
-                    // candidate_nodes 对齐到同一组选点，避免当前路径静默改回 discovery 顺序。
-                    chunk_plan.candidate_nodes = chunk_plan.selected_replica_nodes;
                     result.write_plan->chunks.push_back(std::move(chunk_plan));
                 }
 
@@ -2387,70 +2445,36 @@ namespace storedemo
                 const std::uint32_t desired_replica_count,
                 std::string *error_detail) const
             {
-                std::vector<StorageTransferTarget> targets;
-                if (result_write_plan_has_chunk_targets(chunk))
+                const auto *chunk_plan = FindChunkPlan(chunk.chunk_index);
+                if (chunk_plan == nullptr)
                 {
-                    const auto *chunk_plan = FindChunkPlan(chunk.chunk_index);
-                    if (chunk_plan != nullptr)
-                    {
-                        for (const auto &node_id : chunk_plan->candidate_nodes)
-                        {
-                            const auto it = storage_targets.find(node_id);
-                            if (it == storage_targets.end() ||
-                                it->second.endpoint.empty())
-                            {
-                                continue;
-                            }
-                            const auto duplicate =
-                                std::find_if(targets.begin(),
-                                             targets.end(),
-                                             [&](const StorageTransferTarget &target)
-                                             {
-                                                 return target.node_id == it->second.node_id;
-                                             });
-                            if (duplicate == targets.end())
-                            {
-                                targets.push_back(it->second);
-                            }
-                        }
-                    }
+                    const auto chunk_identity = chunk.chunk_index;
+                    SetErrorDetail(
+                        error_detail,
+                        "upload write plan is missing chunk placement for chunk_index=" +
+                            std::to_string(chunk_identity));
+                    return {};
                 }
 
-                const auto fallback_targets = SortedStorageTargets(storage_targets);
-                for (const auto &fallback_target : fallback_targets)
-                {
-                    if (targets.size() >= desired_replica_count)
-                    {
-                        break;
-                    }
-
-                    const auto duplicate =
-                        std::find_if(targets.begin(),
-                                     targets.end(),
-                                     [&](const StorageTransferTarget &target)
-                                     {
-                                         return target.node_id == fallback_target.node_id;
-                                     });
-                    if (duplicate == targets.end())
-                    {
-                        targets.push_back(fallback_target);
-                    }
-                }
-
-                if (targets.size() > desired_replica_count)
-                {
-                    targets.resize(desired_replica_count);
-                }
-                if (targets.size() < desired_replica_count)
+                if (desired_replica_count != 0 &&
+                    chunk_plan->required_replica_count != 0 &&
+                    chunk_plan->required_replica_count != desired_replica_count)
                 {
                     SetErrorDetail(
                         error_detail,
-                        result_write_plan_has_chunk_targets(chunk)
-                            ? "ViewNode returned fewer live/writable StorageNode targets than desired_replica_count after reconciling write plan candidate_nodes with current discovery facts"
-                            : "ViewNode returned fewer writable StorageNode targets than desired_replica_count");
+                        "upload write plan required_replica_count=" +
+                            std::to_string(chunk_plan->required_replica_count) +
+                            " does not match desired_replica_count=" +
+                            std::to_string(desired_replica_count) +
+                            " for chunk_id=" + chunk_plan->identity.chunk_id +
+                            " chunk_index=" +
+                            std::to_string(chunk_plan->identity.chunk_index));
                     return {};
                 }
-                return targets;
+
+                return ResolveSelectedChunkTargetsFromPlan(*chunk_plan,
+                                                           storage_targets,
+                                                           error_detail);
             }
 
             [[nodiscard]] const TransferChunkPlan *FindChunkPlan(
@@ -2468,13 +2492,6 @@ namespace storedemo
                     }
                 }
                 return nullptr;
-            }
-
-            [[nodiscard]] bool result_write_plan_has_chunk_targets(
-                const TransferPreparedChunk &chunk) const
-            {
-                const auto *chunk_plan = FindChunkPlan(chunk.chunk_index);
-                return chunk_plan != nullptr && !chunk_plan->candidate_nodes.empty();
             }
 
             [[nodiscard]] std::uint32_t ResolveMinimumSuccessfulWrites(
@@ -3142,6 +3159,16 @@ namespace storedemo
             std::shared_ptr<viewdemo::ViewNodeClient> view_client_;
         };
     } // namespace
+
+    std::vector<StorageTransferTarget> ResolveSelectedChunkTargetsForTesting(
+        const TransferChunkPlan &chunk_plan,
+        const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets,
+        std::string *error_detail)
+    {
+        return ResolveSelectedChunkTargetsFromPlan(chunk_plan,
+                                                   storage_targets,
+                                                   error_detail);
+    }
 
     TransferChunkReader::~TransferChunkReader() = default;
 

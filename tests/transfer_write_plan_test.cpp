@@ -6,12 +6,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,14 @@
 #include "support/store_test_utils.h"
 #include "view/view_client.h"
 #include "view.grpc.pb.h"
+
+namespace storedemo
+{
+    std::vector<StorageTransferTarget> ResolveSelectedChunkTargetsForTesting(
+        const TransferChunkPlan &chunk_plan,
+        const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets,
+        std::string *error_detail);
+}
 
 namespace
 {
@@ -358,6 +368,21 @@ namespace
             const storedemo::StorageTransferWriteRequest &request) override
         {
             writes.push_back(request);
+            const auto chunk_attempt =
+                ++write_attempts_by_chunk[request.identity.chunk_index];
+
+            if (write_behavior)
+            {
+                auto forced = write_behavior(request, chunk_attempt);
+                if (forced.has_value())
+                {
+                    if (forced->target.node_id.empty())
+                    {
+                        forced->target = request.target;
+                    }
+                    return *forced;
+                }
+            }
 
             storedemo::StorageTransferWriteResult result;
             result.status = storedemo::StorageNodeStatusCode::kOk;
@@ -381,7 +406,14 @@ namespace
             return result;
         }
 
+        std::function<std::optional<storedemo::StorageTransferWriteResult>(
+            const storedemo::StorageTransferWriteRequest &request,
+            std::size_t chunk_attempt)>
+            write_behavior;
         std::vector<storedemo::StorageTransferWriteRequest> writes;
+
+    private:
+        std::unordered_map<std::uint32_t, std::size_t> write_attempts_by_chunk;
     };
 
     view::ViewNodeSnapshot MakeStorageSnapshot(const std::string &cluster_id,
@@ -422,6 +454,29 @@ namespace
         std::vector<std::string> ordered(node_ids.begin(), node_ids.end());
         std::sort(ordered.begin(), ordered.end());
         return ordered;
+    }
+
+    storedemo::StorageTransferTarget MakeResolvedTarget(const std::size_t index)
+    {
+        storedemo::StorageTransferTarget target;
+        target.node_id = storedemo::test::MakeStorageNodeIdFixture(index);
+        target.endpoint = "127.0.0.1:" + std::to_string(8400 + index);
+        return target;
+    }
+
+    std::vector<std::string> CollectWriteTargetsForChunk(
+        const RecordingStorageTransferClient &storage_client,
+        const std::uint32_t chunk_index)
+    {
+        std::vector<std::string> targets;
+        for (const auto &write : storage_client.writes)
+        {
+            if (write.identity.chunk_index == chunk_index)
+            {
+                targets.push_back(write.target.node_id);
+            }
+        }
+        return targets;
     }
 }
 
@@ -594,7 +649,7 @@ TEST(ObjectTransferWritePlanTest,
         EXPECT_EQ(chunk_plan.required_replica_count, 3U);
         EXPECT_EQ(chunk_plan.minimum_successful_writes, 2U);
         ASSERT_EQ(chunk_plan.selected_replica_nodes.size(), 3U);
-        EXPECT_EQ(chunk_plan.candidate_nodes, chunk_plan.selected_replica_nodes);
+        EXPECT_TRUE(chunk_plan.candidate_nodes.empty());
 
         std::set<std::string> unique_chunk_nodes(chunk_plan.selected_replica_nodes.begin(),
                                                  chunk_plan.selected_replica_nodes.end());
@@ -620,7 +675,332 @@ TEST(ObjectTransferWritePlanTest,
         std::vector<std::string> committed_nodes(commit_request->chunks(index).replica_nodes().begin(),
                                                  commit_request->chunks(index).replica_nodes().end());
         EXPECT_EQ(committed_nodes, planned_chunk.selected_replica_nodes);
+        EXPECT_EQ(CollectWriteTargetsForChunk(*storage_client,
+                                              planned_chunk.identity.chunk_index),
+                  planned_chunk.selected_replica_nodes);
     }
+}
+
+TEST(ObjectTransferWritePlanTest,
+     ResolveSelectedChunkTargetsRejectsEmptySelectedNodesEvenIfCandidateNodesExist)
+{
+    storedemo::TransferChunkPlan chunk_plan;
+    chunk_plan.identity.chunk_id = "chunk-empty-selected";
+    chunk_plan.identity.chunk_index = 3;
+    chunk_plan.required_replica_count = 3;
+    chunk_plan.minimum_successful_writes = 2;
+    chunk_plan.candidate_nodes = {
+        storedemo::test::MakeStorageNodeIdFixture(1),
+        storedemo::test::MakeStorageNodeIdFixture(2),
+        storedemo::test::MakeStorageNodeIdFixture(3)};
+
+    const std::unordered_map<std::string, storedemo::StorageTransferTarget> storage_targets{
+        {storedemo::test::MakeStorageNodeIdFixture(1), MakeResolvedTarget(1)},
+        {storedemo::test::MakeStorageNodeIdFixture(2), MakeResolvedTarget(2)},
+        {storedemo::test::MakeStorageNodeIdFixture(3), MakeResolvedTarget(3)},
+        {storedemo::test::MakeStorageNodeIdFixture(9), MakeResolvedTarget(9)},
+    };
+
+    std::string error_detail;
+    const auto targets = storedemo::ResolveSelectedChunkTargetsForTesting(
+        chunk_plan,
+        storage_targets,
+        &error_detail);
+
+    EXPECT_TRUE(targets.empty());
+    EXPECT_NE(error_detail.find("selected_replica_nodes are empty"),
+              std::string::npos);
+    EXPECT_NE(error_detail.find(chunk_plan.identity.chunk_id), std::string::npos);
+}
+
+TEST(ObjectTransferWritePlanTest,
+     ResolveSelectedChunkTargetsRejectsInsufficientOrDuplicateSelectedNodes)
+{
+    const auto node1 = storedemo::test::MakeStorageNodeIdFixture(1);
+    const auto node2 = storedemo::test::MakeStorageNodeIdFixture(2);
+    const auto node3 = storedemo::test::MakeStorageNodeIdFixture(3);
+    const std::unordered_map<std::string, storedemo::StorageTransferTarget> storage_targets{
+        {node1, MakeResolvedTarget(1)},
+        {node2, MakeResolvedTarget(2)},
+        {node3, MakeResolvedTarget(3)},
+    };
+
+    storedemo::TransferChunkPlan insufficient_plan;
+    insufficient_plan.identity.chunk_id = "chunk-insufficient-selected";
+    insufficient_plan.identity.chunk_index = 1;
+    insufficient_plan.required_replica_count = 3;
+    insufficient_plan.minimum_successful_writes = 2;
+    insufficient_plan.selected_replica_nodes = {node1, node2};
+
+    std::string insufficient_error;
+    const auto insufficient_targets =
+        storedemo::ResolveSelectedChunkTargetsForTesting(insufficient_plan,
+                                                         storage_targets,
+                                                         &insufficient_error);
+    EXPECT_TRUE(insufficient_targets.empty());
+    EXPECT_NE(insufficient_error.find("does not match required_replica_count"),
+              std::string::npos);
+    EXPECT_NE(insufficient_error.find(insufficient_plan.identity.chunk_id),
+              std::string::npos);
+
+    storedemo::TransferChunkPlan duplicate_plan;
+    duplicate_plan.identity.chunk_id = "chunk-duplicate-selected";
+    duplicate_plan.identity.chunk_index = 2;
+    duplicate_plan.required_replica_count = 3;
+    duplicate_plan.minimum_successful_writes = 2;
+    duplicate_plan.selected_replica_nodes = {node1, node1, node2};
+
+    std::string duplicate_error;
+    const auto duplicate_targets =
+        storedemo::ResolveSelectedChunkTargetsForTesting(duplicate_plan,
+                                                         storage_targets,
+                                                         &duplicate_error);
+    EXPECT_TRUE(duplicate_targets.empty());
+    EXPECT_NE(duplicate_error.find("duplicate node_id=" + node1),
+              std::string::npos);
+    EXPECT_NE(duplicate_error.find(duplicate_plan.identity.chunk_id),
+              std::string::npos);
+}
+
+TEST(ObjectTransferWritePlanTest,
+     ResolveSelectedChunkTargetsRejectsMissingDiscoveryNodeWithoutFallback)
+{
+    const auto node1 = storedemo::test::MakeStorageNodeIdFixture(1);
+    const auto node2 = storedemo::test::MakeStorageNodeIdFixture(2);
+    const auto node3 = storedemo::test::MakeStorageNodeIdFixture(3);
+    const auto extra_node = storedemo::test::MakeStorageNodeIdFixture(9);
+
+    storedemo::TransferChunkPlan chunk_plan;
+    chunk_plan.identity.chunk_id = "chunk-missing-selected-node";
+    chunk_plan.identity.chunk_index = 4;
+    chunk_plan.required_replica_count = 3;
+    chunk_plan.minimum_successful_writes = 2;
+    chunk_plan.selected_replica_nodes = {node1, node2, node3};
+    chunk_plan.candidate_nodes = {node1, node2, node3, extra_node};
+
+    const std::unordered_map<std::string, storedemo::StorageTransferTarget> storage_targets{
+        {node1, MakeResolvedTarget(1)},
+        {node2, MakeResolvedTarget(2)},
+        {extra_node, MakeResolvedTarget(9)},
+    };
+
+    std::string error_detail;
+    const auto targets = storedemo::ResolveSelectedChunkTargetsForTesting(
+        chunk_plan,
+        storage_targets,
+        &error_detail);
+
+    EXPECT_TRUE(targets.empty());
+    EXPECT_NE(error_detail.find("selected node_id=" + node3),
+              std::string::npos);
+    EXPECT_NE(error_detail.find("not discoverable via ViewNode storage endpoints"),
+              std::string::npos);
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadCommitsOnlyActualDurableSelectedReplicasIntoManifest)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        {
+            MakeStorageSnapshot("cluster-plan-manifest", 9, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-manifest", 1, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-manifest", 5, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan-manifest", 3, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-manifest", 7, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-manifest", 2, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-manifest", 8, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-manifest", 4, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan-manifest", 6, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+        },
+        1714001002000ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address(),
+        {.create_write_plan_timeout = std::chrono::milliseconds(2500)});
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    std::unordered_map<std::uint32_t, std::string> failed_node_by_chunk;
+    storage_client->write_behavior =
+        [&failed_node_by_chunk](
+            const storedemo::StorageTransferWriteRequest &request,
+            const std::size_t chunk_attempt)
+        -> std::optional<storedemo::StorageTransferWriteResult>
+    {
+        if (chunk_attempt != 3U)
+        {
+            return std::nullopt;
+        }
+
+        failed_node_by_chunk[request.identity.chunk_index] = request.target.node_id;
+
+        storedemo::StorageTransferWriteResult result;
+        result.status = storedemo::StorageNodeStatusCode::kOverloaded;
+        result.error_detail = "forced third selected replica failure";
+        result.target = request.target;
+        result.retryable = true;
+        return result;
+    };
+
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address(),
+        viewdemo::ViewNodeClientConfig{
+            .discovery_timeout = std::chrono::milliseconds(1800)});
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    std::string payload;
+    for (std::size_t index = 0; index < 3; ++index)
+    {
+        payload += storedemo::test::MakeChunkPayload(
+            48,
+            "manifest-chunk-" + std::to_string(index));
+    }
+
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_manifest_success");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-plan-manifest";
+    request.cluster_id = "cluster-plan-manifest";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/manifest.bin";
+    request.object_id = "obj-plan-manifest";
+    request.source_path = source_path;
+    request.chunk_size = 48;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714001002100ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    ASSERT_TRUE(result.ok()) << result.error_detail;
+    ASSERT_TRUE(result.committed);
+    ASSERT_TRUE(result.write_plan.has_value());
+    ASSERT_EQ(result.committed_chunks.size(), result.write_plan->chunks.size());
+
+    const auto commit_request = metadata_server.service().last_commit_request();
+    ASSERT_TRUE(commit_request.has_value());
+    ASSERT_EQ(commit_request->chunks_size(),
+              static_cast<int>(result.write_plan->chunks.size()));
+
+    for (std::size_t index = 0; index < result.write_plan->chunks.size(); ++index)
+    {
+        const auto &planned_chunk = result.write_plan->chunks[index];
+        ASSERT_EQ(planned_chunk.selected_replica_nodes.size(), 3U);
+        const auto failed_it =
+            failed_node_by_chunk.find(planned_chunk.identity.chunk_index);
+        ASSERT_NE(failed_it, failed_node_by_chunk.end());
+
+        const auto actual_targets =
+            CollectWriteTargetsForChunk(*storage_client,
+                                        planned_chunk.identity.chunk_index);
+        EXPECT_EQ(actual_targets, planned_chunk.selected_replica_nodes);
+
+        std::vector<std::string> committed_nodes(
+            commit_request->chunks(static_cast<int>(index)).replica_nodes().begin(),
+            commit_request->chunks(static_cast<int>(index)).replica_nodes().end());
+        ASSERT_EQ(committed_nodes.size(), 2U);
+        EXPECT_EQ(committed_nodes[0], planned_chunk.selected_replica_nodes[0]);
+        EXPECT_EQ(committed_nodes[1], planned_chunk.selected_replica_nodes[1]);
+        EXPECT_EQ(std::find(committed_nodes.begin(),
+                            committed_nodes.end(),
+                            failed_it->second),
+                  committed_nodes.end());
+        EXPECT_EQ(result.committed_chunks[index].replica_nodes, committed_nodes);
+    }
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadDoesNotCommitWhenSelectedReplicasDoNotReachMinimumWritesAndDoesNotUseExtraNodes)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        {
+            MakeStorageSnapshot("cluster-plan-failure", 9, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-failure", 1, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-failure", 5, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan-failure", 3, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-failure", 7, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-failure", 2, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-failure", 8, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan-failure", 4, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan-failure", 6, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+        },
+        1714001003000ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address());
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    storage_client->write_behavior =
+        [](const storedemo::StorageTransferWriteRequest &request,
+           const std::size_t chunk_attempt)
+        -> std::optional<storedemo::StorageTransferWriteResult>
+    {
+        if (chunk_attempt != 3U)
+        {
+            return std::nullopt;
+        }
+
+        storedemo::StorageTransferWriteResult result;
+        result.status = storedemo::StorageNodeStatusCode::kNodeUnavailable;
+        result.error_detail = "forced third selected replica failure";
+        result.target = request.target;
+        result.retryable = true;
+        return result;
+    };
+
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address());
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    const std::string payload =
+        storedemo::test::MakeChunkPayload(64, "plan-no-commit");
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_no_commit");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-plan-no-commit";
+    request.cluster_id = "cluster-plan-failure";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/no-commit.bin";
+    request.object_id = "obj-plan-no-commit";
+    request.source_path = source_path;
+    request.chunk_size = 64;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 3;
+    request.client_time_unix_ms = 1714001003100ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kStorageRejected);
+    EXPECT_FALSE(result.committed);
+    EXPECT_EQ(metadata_server.service().commit_calls(), 0U);
+    EXPECT_FALSE(metadata_server.service().last_commit_request().has_value());
+    ASSERT_TRUE(result.write_plan.has_value());
+    ASSERT_EQ(result.write_plan->chunks.size(), 1U);
+    EXPECT_EQ(CollectWriteTargetsForChunk(*storage_client, 0U),
+              result.write_plan->chunks.front().selected_replica_nodes);
+    EXPECT_EQ(storage_client->writes.size(),
+              result.write_plan->chunks.front().selected_replica_nodes.size());
 }
 
 TEST(ObjectTransferWritePlanTest,

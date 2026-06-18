@@ -41,7 +41,7 @@
 验收标准：每个 chunk plan 有 selected replica nodes；新增核心 struct 数量为 0，除非实现说明 1 个内部 helper 的必要性。  
 测试方式：metadata transfer/write-plan test + descriptor/manifest regression if proto touched。
 
-- [ ] T004 [US1] Make upload consume selected plan nodes and remove silent sorted-target fallback in `modules/store/transfer/object_transfer.cpp` with upload integration tests.
+- [X] T004 [US1] Make upload consume selected plan nodes and remove silent sorted-target fallback in `modules/store/transfer/object_transfer.cpp` with upload integration tests.
 
 修改目标：upload second pass 只写 CreateWritePlan 选出的 nodes；selected node 缺失或不可发现时返回明确 plan/discovery error。  
 涉及文件：`modules/store/transfer/object_transfer.cpp`、`modules/store/transfer/module-notes.md`、`tests/storage_upload_integration_test.cpp`、`tests/storage_upload_coordinator_test.cpp` 如需同步 helper。  

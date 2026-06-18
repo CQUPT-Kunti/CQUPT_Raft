@@ -136,9 +136,16 @@
 其中：
 
 - `selected_replica_nodes` 是 upload 执行 authority
-- `candidate_nodes` 当前只保留给兼容路径/诊断；后续 T004 仍需继续清理旧 fallback
+- `candidate_nodes` 只保留给可选诊断/调试，不参与 upload 执行选点
 - `placement_epoch` 当前来自 ViewNode `DiscoverStorage.observed_at_unix_ms`
 - `expires_at_unix_ms` 当前是基于 discovery / CreateWritePlan timeout 推导出的第一阶段客户端有效期边界，不宣称强一致快照承诺
+
+T004 后 upload 第二遍执行的约束是：
+
+- 每个 chunk 只消费对应 `selected_replica_nodes`
+- discovery 只负责把 selected `node_id -> data-plane endpoint` 解析成 `StorageTransferTarget`
+- `candidate_nodes`、discovery 返回的其他健康节点、以及任何按 `node_id` / endpoint 排序的 fallback，都不能参与补点或重新 placement
+- 若 `selected_replica_nodes` 为空、数量不匹配、重复，或某个 selected `node_id` 无法在当前 discovery 中解析到 endpoint，upload 必须在写入前显式失败
 
 ### download
 
