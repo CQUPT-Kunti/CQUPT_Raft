@@ -91,6 +91,10 @@
    - 记录 `prepared_chunks`
 3. 通过 ViewNode `DiscoverMetadata`
 4. 调用 `MetadataTransferClient::CreateWritePlan(...)`
+   - 当前逻辑边界是：
+     - 先创建 pending object
+     - 再基于 `prepared_chunks` 和当前 `DiscoverStorage` 结果做 per-chunk placement
+     - 再返回完整 `TransferWritePlan`
 5. 通过 ViewNode `DiscoverStorage`
 6. 第二遍重新按 bounded chunk 读取源文件
 7. 对每个 chunk：
@@ -105,6 +109,36 @@
 
 - `CreateWritePlan` / `CommitObject` 都不传真实 payload
 - 即使 chunk 已经 durable，未成功 `CommitObject` 前对象也不能被普通读路径视为可见
+
+当前 `TransferWritePlan` 的关键字段包括：
+
+- plan 级：
+  - `request_id`
+  - `bucket`
+  - `object_key`
+  - `object_id`
+  - `version`
+  - `chunk_size_bytes`
+  - `total_chunks`
+  - `replica_count`
+  - `minimum_successful_writes`
+  - `placement_epoch`
+  - `created_at_unix_ms`
+  - `expires_at_unix_ms`
+- chunk 级：
+  - `identity`
+  - `offset`
+  - `expected_size`
+  - `expected_checksum`
+  - `selected_replica_nodes`
+  - `candidate_nodes`
+
+其中：
+
+- `selected_replica_nodes` 是 upload 执行 authority
+- `candidate_nodes` 当前只保留给兼容路径/诊断；后续 T004 仍需继续清理旧 fallback
+- `placement_epoch` 当前来自 ViewNode `DiscoverStorage.observed_at_unix_ms`
+- `expires_at_unix_ms` 当前是基于 discovery / CreateWritePlan timeout 推导出的第一阶段客户端有效期边界，不宣称强一致快照承诺
 
 ### download
 
@@ -138,8 +172,9 @@ download 不接受：
 `metadata_transfer_client.cpp` 当前采用“现有 MetadataService 最小映射”：
 
 - `CreateWritePlan`
-  - 当前通过现有 `CreateObject` RPC 建立 pending metadata
-  - 由于当前 service 没有显式 chunk layout/placement 返回，`TransferWritePlan.chunks` 不由 adapter 伪造
+  - 当前先通过现有 `CreateObject` RPC 建立 pending metadata
+  - metadata adapter 只负责 object/version/time/policy 等基础 facts
+  - 完整 chunk layout / selected replica nodes 由 transfer upload 编排层基于本地 `prepared_chunks` 和当前 storage 观测结果组装
 - `CommitObject`
   - 通过现有 `CommitObject` RPC 提交 chunk manifest facts
 - `GetObjectManifest`

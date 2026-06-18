@@ -82,8 +82,10 @@ namespace storedemo
     struct TransferChunkPlan
     {
         ChunkIdentity identity;
+        std::uint64_t offset{0};
         std::uint64_t expected_size{0};
         ChunkChecksum expected_checksum;
+        std::vector<StorageNodeId> selected_replica_nodes;
         std::vector<StorageNodeId> candidate_nodes;
         std::uint32_t required_replica_count{0};
         std::uint32_t minimum_successful_writes{0};
@@ -116,6 +118,11 @@ namespace storedemo
         std::string object_key;
         std::string object_id;
         std::uint64_t version{0};
+        std::uint64_t chunk_size_bytes{0};
+        std::uint32_t total_chunks{0};
+        std::uint32_t replica_count{0};
+        std::uint32_t minimum_successful_writes{0};
+        std::uint64_t placement_epoch{0};
         TransferObjectChecksumFacts object_checksum;
         std::vector<TransferChunkPlan> chunks;
         std::uint64_t created_at_unix_ms{0};

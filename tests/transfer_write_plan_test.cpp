@@ -1,0 +1,676 @@
+#include <gtest/gtest.h>
+
+#include <grpcpp/grpcpp.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "metadata.grpc.pb.h"
+#include "store/transfer/metadata_transfer_client.h"
+#include "store/transfer/object_transfer.h"
+#include "store/transfer/storage_transfer_client.h"
+#include "support/store_test_utils.h"
+#include "view/view_client.h"
+#include "view.grpc.pb.h"
+
+namespace
+{
+    storedemo::ChunkChecksum ComputeChecksumOrThrow(const std::string_view payload)
+    {
+        storedemo::ChunkChecksum checksum;
+        std::string error_detail;
+        const auto status =
+            storedemo::ComputeChunkChecksum(payload, &checksum, &error_detail);
+        if (status != storedemo::StorageNodeStatusCode::kOk)
+        {
+            throw std::runtime_error("failed to compute checksum: " + error_detail);
+        }
+        return checksum;
+    }
+
+    storedemo::TransferObjectChecksumFacts MakeObjectChecksumFacts(
+        const std::string_view payload)
+    {
+        const auto checksum = ComputeChecksumOrThrow(payload);
+        storedemo::TransferObjectChecksumFacts facts;
+        facts.size = static_cast<std::uint64_t>(payload.size());
+        facts.checksum = checksum;
+        facts.etag = checksum.value;
+        return facts;
+    }
+
+    std::filesystem::path WritePayloadFile(const std::filesystem::path &root,
+                                           const std::string &payload)
+    {
+        const auto path = root / "upload.bin";
+        std::ofstream output(path, std::ios::binary);
+        output.write(payload.data(),
+                     static_cast<std::streamsize>(payload.size()));
+        output.close();
+        if (!output)
+        {
+            throw std::runtime_error("failed to write upload payload file");
+        }
+        return path;
+    }
+
+    class FakeMetadataService final : public raft::MetadataService::Service
+    {
+    public:
+        grpc::Status CreateObject(grpc::ServerContext *,
+                                  const raft::CreateObjectRequest *request,
+                                  raft::CreateObjectResponse *response) override
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++create_calls_;
+            last_create_request_ = *request;
+
+            response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_OK);
+            response->mutable_summary()->set_message("ok");
+            response->mutable_summary()->set_request_id(request->request_id());
+            response->mutable_summary()->set_bucket(request->bucket());
+            response->mutable_summary()->set_object_key(request->object_key());
+            response->mutable_summary()->set_object_id(request->object_id());
+            response->mutable_summary()->set_state(raft::METADATA_OBJECT_STATE_PENDING);
+            response->mutable_summary()->set_term(7);
+            response->mutable_summary()->set_log_index(11);
+            response->mutable_summary()->mutable_leader_hint()->set_leader_id(1);
+            response->mutable_summary()->mutable_leader_hint()->set_leader_address(
+                leader_address_);
+
+            auto *object = response->mutable_object();
+            object->set_bucket(request->bucket());
+            object->set_object_key(request->object_key());
+            object->set_object_id(request->object_id());
+            object->set_version(next_version_);
+            object->set_size(request->size());
+            object->set_etag(request->etag());
+            object->set_state(raft::METADATA_OBJECT_STATE_PENDING);
+            object->set_create_time(created_at_unix_ms_);
+            return grpc::Status::OK;
+        }
+
+        grpc::Status CommitObject(grpc::ServerContext *,
+                                  const raft::CommitObjectRequest *request,
+                                  raft::CommitObjectResponse *response) override
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++commit_calls_;
+            last_commit_request_ = *request;
+
+            response->mutable_summary()->set_code(raft::METADATA_STATUS_CODE_OK);
+            response->mutable_summary()->set_message("ok");
+            response->mutable_summary()->set_request_id(request->request_id());
+            response->mutable_summary()->set_bucket(request->bucket());
+            response->mutable_summary()->set_object_key(request->object_key());
+            response->mutable_summary()->set_object_id(request->object_id());
+            response->mutable_summary()->set_state(
+                raft::METADATA_OBJECT_STATE_COMMITTED);
+            response->mutable_summary()->set_term(7);
+            response->mutable_summary()->set_log_index(12);
+            response->mutable_summary()->mutable_leader_hint()->set_leader_id(1);
+            response->mutable_summary()->mutable_leader_hint()->set_leader_address(
+                leader_address_);
+
+            auto *object = response->mutable_object();
+            object->set_bucket(request->bucket());
+            object->set_object_key(request->object_key());
+            object->set_object_id(request->object_id());
+            object->set_version(request->version());
+            object->set_size(request->size());
+            object->set_etag(request->etag());
+            object->set_state(raft::METADATA_OBJECT_STATE_COMMITTED);
+            object->set_create_time(created_at_unix_ms_);
+            object->set_commit_time(commit_at_unix_ms_);
+            for (const auto &chunk : request->chunks())
+            {
+                object->add_chunks()->CopyFrom(chunk);
+            }
+            return grpc::Status::OK;
+        }
+
+        void SetLeaderAddress(std::string leader_address)
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            leader_address_ = std::move(leader_address);
+        }
+
+        [[nodiscard]] std::size_t create_calls() const
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            return create_calls_;
+        }
+
+        [[nodiscard]] std::size_t commit_calls() const
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            return commit_calls_;
+        }
+
+        [[nodiscard]] std::optional<raft::CreateObjectRequest> last_create_request() const
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            return last_create_request_;
+        }
+
+        [[nodiscard]] std::optional<raft::CommitObjectRequest> last_commit_request() const
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            return last_commit_request_;
+        }
+
+        [[nodiscard]] std::uint64_t created_at_unix_ms() const
+        {
+            return created_at_unix_ms_;
+        }
+
+    private:
+        mutable std::mutex mu_;
+        std::string leader_address_;
+        std::uint64_t next_version_{7};
+        std::uint64_t created_at_unix_ms_{1714000000000ULL};
+        std::uint64_t commit_at_unix_ms_{1714000001234ULL};
+        std::size_t create_calls_{0};
+        std::size_t commit_calls_{0};
+        std::optional<raft::CreateObjectRequest> last_create_request_;
+        std::optional<raft::CommitObjectRequest> last_commit_request_;
+    };
+
+    class ScopedFakeMetadataServer
+    {
+    public:
+        ScopedFakeMetadataServer()
+        {
+            grpc::ServerBuilder builder;
+            builder.AddListeningPort("127.0.0.1:0",
+                                     grpc::InsecureServerCredentials(),
+                                     &selected_port_);
+            builder.RegisterService(&service_);
+            server_ = builder.BuildAndStart();
+            if (server_ == nullptr || selected_port_ <= 0)
+            {
+                throw std::runtime_error("failed to start fake metadata server");
+            }
+            address_ = "127.0.0.1:" + std::to_string(selected_port_);
+            service_.SetLeaderAddress(address_);
+        }
+
+        ~ScopedFakeMetadataServer()
+        {
+            if (server_ != nullptr)
+            {
+                server_->Shutdown();
+            }
+        }
+
+        [[nodiscard]] const std::string &address() const
+        {
+            return address_;
+        }
+
+        [[nodiscard]] FakeMetadataService &service()
+        {
+            return service_;
+        }
+
+    private:
+        int selected_port_{0};
+        std::string address_;
+        FakeMetadataService service_;
+        std::unique_ptr<grpc::Server> server_;
+    };
+
+    class FakeViewNodeService final : public view::ViewNodeService::Service
+    {
+    public:
+        void SetMetadataEndpoint(std::string metadata_endpoint)
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            metadata_endpoint_ = std::move(metadata_endpoint);
+        }
+
+        void SetStorageNodes(std::vector<view::ViewNodeSnapshot> storage_nodes,
+                             const std::uint64_t observed_at_unix_ms)
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            storage_nodes_ = std::move(storage_nodes);
+            observed_at_unix_ms_ = observed_at_unix_ms;
+        }
+
+        grpc::Status DiscoverMetadata(grpc::ServerContext *,
+                                      const view::DiscoverMetadataRequest *request,
+                                      view::DiscoverMetadataResponse *response) override
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+
+            response->mutable_summary()->set_code(view::VIEW_NODE_STATUS_CODE_OK);
+            response->mutable_summary()->set_message("ok");
+            response->mutable_summary()->set_request_id(request->request_id());
+            response->mutable_summary()->set_cluster_id(request->cluster_id());
+            response->mutable_summary()->set_node_id("view-test-1");
+            response->set_observed_at_unix_ms(observed_at_unix_ms_);
+            response->set_membership_epoch(5);
+            response->mutable_leader_hint()->set_node_id("meta-test-1");
+            response->mutable_leader_hint()->set_endpoint(metadata_endpoint_);
+            response->mutable_leader_hint()->set_observed_at_unix_ms(
+                observed_at_unix_ms_);
+
+            auto *snapshot = response->add_metadata_nodes();
+            snapshot->set_cluster_id(request->cluster_id());
+            snapshot->set_node_id("meta-test-1");
+            snapshot->set_node_type(view::VIEW_NODE_TYPE_METADATA);
+            snapshot->set_endpoint(metadata_endpoint_);
+            snapshot->set_control_plane_endpoint(metadata_endpoint_);
+            snapshot->set_registered_at_unix_ms(observed_at_unix_ms_);
+            snapshot->set_last_seen_unix_ms(observed_at_unix_ms_);
+            snapshot->set_last_sequence(1);
+            snapshot->set_liveness(view::VIEW_NODE_LIVENESS_STATE_LIVE);
+            snapshot->mutable_health()->set_health(view::VIEW_NODE_HEALTH_HEALTHY);
+            snapshot->mutable_health()->set_disk_pressure(
+                view::VIEW_NODE_DISK_PRESSURE_LOW);
+            return grpc::Status::OK;
+        }
+
+        grpc::Status DiscoverStorage(grpc::ServerContext *,
+                                     const view::DiscoverStorageRequest *request,
+                                     view::DiscoverStorageResponse *response) override
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+
+            response->mutable_summary()->set_code(view::VIEW_NODE_STATUS_CODE_OK);
+            response->mutable_summary()->set_message("ok");
+            response->mutable_summary()->set_request_id(request->request_id());
+            response->mutable_summary()->set_cluster_id(request->cluster_id());
+            response->mutable_summary()->set_node_id("view-test-1");
+            response->set_observed_at_unix_ms(observed_at_unix_ms_);
+
+            for (const auto &storage_node : storage_nodes_)
+            {
+                response->add_storage_nodes()->CopyFrom(storage_node);
+            }
+            return grpc::Status::OK;
+        }
+
+    private:
+        mutable std::mutex mu_;
+        std::string metadata_endpoint_;
+        std::uint64_t observed_at_unix_ms_{1714001000000ULL};
+        std::vector<view::ViewNodeSnapshot> storage_nodes_;
+    };
+
+    class ScopedFakeViewServer
+    {
+    public:
+        ScopedFakeViewServer()
+        {
+            grpc::ServerBuilder builder;
+            builder.AddListeningPort("127.0.0.1:0",
+                                     grpc::InsecureServerCredentials(),
+                                     &selected_port_);
+            builder.RegisterService(&service_);
+            server_ = builder.BuildAndStart();
+            if (server_ == nullptr || selected_port_ <= 0)
+            {
+                throw std::runtime_error("failed to start fake view server");
+            }
+            address_ = "127.0.0.1:" + std::to_string(selected_port_);
+        }
+
+        ~ScopedFakeViewServer()
+        {
+            if (server_ != nullptr)
+            {
+                server_->Shutdown();
+            }
+        }
+
+        [[nodiscard]] const std::string &address() const
+        {
+            return address_;
+        }
+
+        [[nodiscard]] FakeViewNodeService &service()
+        {
+            return service_;
+        }
+
+    private:
+        int selected_port_{0};
+        std::string address_;
+        FakeViewNodeService service_;
+        std::unique_ptr<grpc::Server> server_;
+    };
+
+    class RecordingStorageTransferClient final : public storedemo::StorageTransferClient
+    {
+    public:
+        storedemo::StorageTransferWriteResult WriteChunk(
+            const storedemo::StorageTransferWriteRequest &request) override
+        {
+            writes.push_back(request);
+
+            storedemo::StorageTransferWriteResult result;
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.target = request.target;
+            result.durable = true;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = static_cast<std::uint64_t>(request.payload.size());
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            return result;
+        }
+
+        storedemo::StorageTransferReadResult ReadChunk(
+            const storedemo::StorageTransferReadRequest &request) override
+        {
+            storedemo::StorageTransferReadResult result;
+            result.status = storedemo::StorageNodeStatusCode::kUnsupported;
+            result.target = request.target;
+            result.error_detail = "read path not implemented in recording client";
+            return result;
+        }
+
+        std::vector<storedemo::StorageTransferWriteRequest> writes;
+    };
+
+    view::ViewNodeSnapshot MakeStorageSnapshot(const std::string &cluster_id,
+                                               const std::size_t index,
+                                               const std::uint64_t available_capacity_bytes,
+                                               const std::uint32_t queued_ops,
+                                               const std::string &zone)
+    {
+        view::ViewNodeSnapshot snapshot;
+        snapshot.set_cluster_id(cluster_id);
+        snapshot.set_node_id(storedemo::test::MakeStorageNodeIdFixture(index));
+        snapshot.set_node_type(view::VIEW_NODE_TYPE_STORAGE);
+        snapshot.set_endpoint("127.0.0.1:" + std::to_string(7400 + index));
+        snapshot.set_data_plane_endpoint("127.0.0.1:" + std::to_string(8400 + index));
+        snapshot.set_registered_at_unix_ms(1714001000000ULL);
+        snapshot.set_last_seen_unix_ms(1714001000000ULL);
+        snapshot.set_last_sequence(static_cast<std::uint64_t>(index));
+        snapshot.set_liveness(view::VIEW_NODE_LIVENESS_STATE_LIVE);
+        snapshot.mutable_failure_domain()->set_zone(zone);
+        snapshot.mutable_failure_domain()->set_rack("rack-" + std::to_string(index % 3));
+        snapshot.mutable_health()->set_health(view::VIEW_NODE_HEALTH_HEALTHY);
+        snapshot.mutable_health()->set_disk_pressure(view::VIEW_NODE_DISK_PRESSURE_LOW);
+        snapshot.mutable_capacity()->set_total_capacity_bytes(
+            available_capacity_bytes + 8192ULL);
+        snapshot.mutable_capacity()->set_used_capacity_bytes(8192ULL);
+        snapshot.mutable_capacity()->set_available_capacity_bytes(
+            available_capacity_bytes);
+        snapshot.mutable_load()->set_queued_ops(queued_ops);
+        snapshot.mutable_load()->set_active_reads(queued_ops);
+        snapshot.mutable_load()->set_active_writes(queued_ops / 2U);
+        snapshot.mutable_load()->set_write_admission_overloaded(false);
+        return snapshot;
+    }
+
+    std::vector<std::string> SortedReplicaSet(
+        const std::vector<storedemo::StorageNodeId> &node_ids)
+    {
+        std::vector<std::string> ordered(node_ids.begin(), node_ids.end());
+        std::sort(ordered.begin(), ordered.end());
+        return ordered;
+    }
+}
+
+TEST(MetadataTransferClientTest,
+     CreateWritePlanReturnsBaseObjectAndPolicyFactsWithoutProtoChanges)
+{
+    ScopedFakeMetadataServer metadata_server;
+    auto client = storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+
+    const std::string payload = storedemo::test::MakeChunkPayload(257, "plan-base");
+    const auto checksum_facts = MakeObjectChecksumFacts(payload);
+
+    const auto call = client->CreateWritePlan(
+        {.request_id = "create-plan-base",
+         .bucket = "bucket-plan",
+         .object_key = "objects/base.bin",
+         .object_id = "obj-plan-base",
+         .expected_object_checksum = checksum_facts,
+         .chunk_size = 64,
+         .desired_replica_count = 3,
+         .minimum_successful_writes = 2,
+         .client_time_unix_ms = 1714000000100ULL});
+
+    ASSERT_TRUE(call.transport_ok()) << call.rpc.grpc_error_message;
+    ASSERT_TRUE(call.result.ok()) << call.result.summary.message;
+    ASSERT_TRUE(call.result.write_plan.has_value());
+    ASSERT_TRUE(call.result.created_pending);
+    EXPECT_EQ(call.result.write_plan->request_id, "create-plan-base");
+    EXPECT_EQ(call.result.write_plan->bucket, "bucket-plan");
+    EXPECT_EQ(call.result.write_plan->object_key, "objects/base.bin");
+    EXPECT_EQ(call.result.write_plan->object_id, "obj-plan-base");
+    EXPECT_EQ(call.result.write_plan->version, 7U);
+    EXPECT_EQ(call.result.write_plan->chunk_size_bytes, 64U);
+    EXPECT_EQ(call.result.write_plan->replica_count, 3U);
+    EXPECT_EQ(call.result.write_plan->minimum_successful_writes, 2U);
+    EXPECT_EQ(call.result.write_plan->total_chunks, 0U);
+    EXPECT_EQ(call.result.write_plan->placement_epoch, 0U);
+    EXPECT_TRUE(call.result.write_plan->chunks.empty());
+    EXPECT_EQ(call.result.write_plan->created_at_unix_ms,
+              metadata_server.service().created_at_unix_ms());
+
+    const auto create_request = metadata_server.service().last_create_request();
+    ASSERT_TRUE(create_request.has_value());
+    EXPECT_EQ(create_request->size(), checksum_facts.size);
+    EXPECT_EQ(create_request->etag(), checksum_facts.etag);
+}
+
+TEST(MetadataTransferClientTest,
+     CreateWritePlanRejectsInvalidReplicaCountsBeforeRpc)
+{
+    ScopedFakeMetadataServer metadata_server;
+    auto client = storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+
+    const std::string payload = storedemo::test::MakeChunkPayload(128, "plan-invalid");
+    const auto checksum_facts = MakeObjectChecksumFacts(payload);
+
+    const auto zero_replica_call = client->CreateWritePlan(
+        {.request_id = "create-plan-zero-replica",
+         .bucket = "bucket-plan",
+         .object_key = "objects/invalid.bin",
+         .object_id = "obj-plan-invalid",
+         .expected_object_checksum = checksum_facts,
+         .chunk_size = 64,
+         .desired_replica_count = 0,
+         .minimum_successful_writes = 1,
+         .client_time_unix_ms = 1714000000200ULL});
+    EXPECT_EQ(zero_replica_call.result.summary.status,
+              storedemo::MetadataTransferStatusCode::kInvalidArgument);
+
+    const auto quorum_violation_call = client->CreateWritePlan(
+        {.request_id = "create-plan-min-gt-replica",
+         .bucket = "bucket-plan",
+         .object_key = "objects/invalid.bin",
+         .object_id = "obj-plan-invalid",
+         .expected_object_checksum = checksum_facts,
+         .chunk_size = 64,
+         .desired_replica_count = 2,
+         .minimum_successful_writes = 3,
+         .client_time_unix_ms = 1714000000201ULL});
+    EXPECT_EQ(quorum_violation_call.result.summary.status,
+              storedemo::MetadataTransferStatusCode::kInvalidArgument);
+
+    EXPECT_EQ(metadata_server.service().create_calls(), 0U);
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadAssemblesPerChunkSelectedReplicaNodesIntoTransferWritePlan)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        {
+            MakeStorageSnapshot("cluster-plan", 9, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan", 1, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan", 5, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan", 3, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan", 7, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan", 2, 128ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan", 8, 128ULL * 1024ULL * 1024ULL, 0, "zone-c"),
+            MakeStorageSnapshot("cluster-plan", 4, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+            MakeStorageSnapshot("cluster-plan", 6, 128ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+        },
+        1714001000000ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address(),
+        {.create_write_plan_timeout = std::chrono::milliseconds(2500)});
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address(),
+        viewdemo::ViewNodeClientConfig{
+            .discovery_timeout = std::chrono::milliseconds(1800)});
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    std::string payload;
+    for (std::size_t index = 0; index < 8; ++index)
+    {
+        payload += storedemo::test::MakeChunkPayload(32, "plan-chunk-" + std::to_string(index));
+    }
+
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_upload");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-plan";
+    request.cluster_id = "cluster-plan";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/plan.bin";
+    request.object_id = "obj-plan-upload";
+    request.source_path = source_path;
+    request.chunk_size = 32;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714001000100ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    ASSERT_TRUE(result.ok()) << result.error_detail;
+    ASSERT_TRUE(result.write_plan.has_value());
+    ASSERT_TRUE(result.committed);
+    ASSERT_EQ(result.write_plan->chunk_size_bytes, 32U);
+    ASSERT_EQ(result.write_plan->total_chunks, 8U);
+    ASSERT_EQ(result.write_plan->replica_count, 3U);
+    ASSERT_EQ(result.write_plan->minimum_successful_writes, 2U);
+    ASSERT_EQ(result.write_plan->placement_epoch, 1714001000000ULL);
+    EXPECT_GT(result.write_plan->expires_at_unix_ms,
+              result.write_plan->placement_epoch);
+    ASSERT_EQ(result.write_plan->chunks.size(), 8U);
+
+    std::set<std::vector<std::string>> unique_replica_sets;
+    std::set<std::string> covered_nodes;
+    std::uint64_t expected_offset = 0;
+    for (std::size_t index = 0; index < result.write_plan->chunks.size(); ++index)
+    {
+        const auto &chunk_plan = result.write_plan->chunks[index];
+        EXPECT_EQ(chunk_plan.identity.chunk_index, index);
+        EXPECT_EQ(chunk_plan.identity.offset, expected_offset);
+        EXPECT_EQ(chunk_plan.offset, expected_offset);
+        EXPECT_EQ(chunk_plan.expected_size, 32U);
+        EXPECT_TRUE(chunk_plan.expected_checksum.IsSet());
+        EXPECT_EQ(chunk_plan.required_replica_count, 3U);
+        EXPECT_EQ(chunk_plan.minimum_successful_writes, 2U);
+        ASSERT_EQ(chunk_plan.selected_replica_nodes.size(), 3U);
+        EXPECT_EQ(chunk_plan.candidate_nodes, chunk_plan.selected_replica_nodes);
+
+        std::set<std::string> unique_chunk_nodes(chunk_plan.selected_replica_nodes.begin(),
+                                                 chunk_plan.selected_replica_nodes.end());
+        EXPECT_EQ(unique_chunk_nodes.size(), 3U);
+        for (const auto &node_id : unique_chunk_nodes)
+        {
+            covered_nodes.insert(node_id);
+        }
+        unique_replica_sets.insert(SortedReplicaSet(chunk_plan.selected_replica_nodes));
+        expected_offset += chunk_plan.expected_size;
+    }
+
+    EXPECT_GE(covered_nodes.size(), 6U);
+    EXPECT_GE(unique_replica_sets.size(), 2U);
+
+    const auto commit_request = metadata_server.service().last_commit_request();
+    ASSERT_TRUE(commit_request.has_value());
+    ASSERT_EQ(commit_request->chunks_size(),
+              static_cast<int>(result.write_plan->chunks.size()));
+    for (int index = 0; index < commit_request->chunks_size(); ++index)
+    {
+        const auto &planned_chunk = result.write_plan->chunks[static_cast<std::size_t>(index)];
+        std::vector<std::string> committed_nodes(commit_request->chunks(index).replica_nodes().begin(),
+                                                 commit_request->chunks(index).replica_nodes().end());
+        EXPECT_EQ(committed_nodes, planned_chunk.selected_replica_nodes);
+    }
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadFailsPlanningWhenHealthyStorageNodesAreFewerThanReplicaCount)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        {
+            MakeStorageSnapshot("cluster-plan-fail", 1, 64ULL * 1024ULL * 1024ULL, 0, "zone-a"),
+            MakeStorageSnapshot("cluster-plan-fail", 2, 64ULL * 1024ULL * 1024ULL, 0, "zone-b"),
+        },
+        1714002000000ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address());
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address());
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    const std::string payload = storedemo::test::MakeChunkPayload(96, "plan-fail");
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_fail");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-plan-fail";
+    request.cluster_id = "cluster-plan-fail";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/plan-fail.bin";
+    request.object_id = "obj-plan-fail";
+    request.source_path = source_path;
+    request.chunk_size = 32;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714002000100ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kStorageRejected);
+    EXPECT_FALSE(result.committed);
+    EXPECT_EQ(metadata_server.service().commit_calls(), 0U);
+    EXPECT_TRUE(storage_client->writes.empty());
+}

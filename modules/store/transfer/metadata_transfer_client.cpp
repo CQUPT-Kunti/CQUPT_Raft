@@ -800,6 +800,12 @@ namespace storedemo
                 write_plan.object_key = request.object_key;
                 write_plan.object_id = request.object_id;
                 write_plan.version = proto_response.object().version();
+                write_plan.chunk_size_bytes = request.chunk_size;
+                write_plan.replica_count = request.desired_replica_count;
+                write_plan.minimum_successful_writes =
+                    request.minimum_successful_writes;
+                write_plan.total_chunks = 0;
+                write_plan.placement_epoch = 0;
                 write_plan.object_checksum = request.expected_object_checksum;
                 if (!proto_response.object().etag().empty())
                 {

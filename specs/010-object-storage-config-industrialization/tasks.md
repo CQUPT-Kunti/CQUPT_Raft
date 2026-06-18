@@ -33,7 +33,7 @@
 验收标准：打乱 node_id/name/config order 不会出现固定取前 N 节点；测试可用 deterministic seed 复现。  
 测试方式：`store_placement_policy_test`。
 
-- [ ] T003 [US1] Make CreateWritePlan express per-chunk selected replica nodes by extending existing transfer plan facts in `modules/store/transfer/object_transfer.h`, `modules/store/transfer/metadata_transfer_client.*`, and plan/manifest tests.
+- [X] T003 [US1] Make CreateWritePlan express per-chunk selected replica nodes by extending existing transfer plan facts in `modules/store/transfer/object_transfer.h`, `modules/store/transfer/metadata_transfer_client.*`, and plan/manifest tests.
 
 修改目标：复用 `TransferWritePlan` / `TransferChunkPlan` 表达 chunk_size、total_chunks、replica_count、minimum_successful_writes、placement_epoch、expiry 和 selected replica nodes。  
 涉及文件：`modules/store/transfer/object_transfer.h`、`modules/store/transfer/metadata_transfer_client.h`、`modules/store/transfer/metadata_transfer_client.cpp`、必要时 `proto/metadata.proto` / `proto/common.proto` 仅做 additive payload-free 扩展、`tests/metadata_manifest_test.cpp`、transfer adapter tests。  

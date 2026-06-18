@@ -526,6 +526,33 @@ else()
   message(STATUS "Skip test_storage_client_config: storage_client_config_test.cpp not found")
 endif()
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/transfer_write_plan_test.cpp")
+  add_executable(test_transfer_write_plan
+    transfer_write_plan_test.cpp
+  )
+
+  target_link_libraries(test_transfer_write_plan
+    PRIVATE
+      raft_core
+      view_proto
+      metadata_proto
+      GTest::gtest_main
+  )
+
+  target_include_directories(test_transfer_write_plan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_test(NAME transfer_write_plan
+    COMMAND test_transfer_write_plan
+  )
+  set_tests_properties(transfer_write_plan PROPERTIES
+    LABELS "platform-neutral;integrated-object-storage;storage-transfer")
+else()
+  message(STATUS "Skip test_transfer_write_plan: transfer_write_plan_test.cpp not found")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_read_integration_test.cpp")
   add_executable(test_storage_read_integration
     storage_read_integration_test.cpp

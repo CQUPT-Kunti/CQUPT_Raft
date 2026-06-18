@@ -1,5 +1,6 @@
 #include "store/transfer/object_transfer.h"
 
+#include "store/placement/placement_manager.h"
 #include "store/transfer/metadata_transfer_client.h"
 #include "store/transfer/storage_transfer_client.h"
 #include "view/view_client.h"
@@ -15,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <unordered_map>
 #include <utility>
 
@@ -631,7 +633,8 @@ namespace storedemo
             const std::shared_ptr<viewdemo::ViewNodeClient> &view_client,
             std::vector<ObjectTransferDiagnostic> *diagnostics,
             ObjectTransferStatusCode *status,
-            std::string *error_detail)
+            std::string *error_detail,
+            viewdemo::DiscoverStorageResult *discovery_result = nullptr)
         {
             std::unordered_map<StorageNodeId, StorageTransferTarget> targets;
             if (view_client == nullptr)
@@ -676,6 +679,11 @@ namespace storedemo
                 return targets;
             }
 
+            if (discovery_result != nullptr)
+            {
+                *discovery_result = discovery_call.result;
+            }
+
             for (const auto &snapshot : discovery_call.result.storage_nodes)
             {
                 StorageTransferTarget target = MakeStorageTargetFromSnapshot(snapshot);
@@ -713,6 +721,104 @@ namespace storedemo
                 *status = ObjectTransferStatusCode::kOk;
             }
             return targets;
+        }
+
+        [[nodiscard]] std::uint64_t ResolvePlanExpiryWindowMs(
+            const MetadataTransferClient &metadata_client,
+            const viewdemo::ViewNodeClient *view_client)
+        {
+            const auto metadata_timeout_ms = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(
+                    0,
+                    metadata_client.config().create_write_plan_timeout.count()));
+            const auto discovery_timeout_ms =
+                view_client == nullptr
+                    ? 0ULL
+                    : static_cast<std::uint64_t>(std::max<std::int64_t>(
+                          0,
+                          view_client->config().discovery_timeout.count()));
+            return std::max<std::uint64_t>(
+                1000ULL,
+                std::max<std::uint64_t>(metadata_timeout_ms,
+                                        discovery_timeout_ms));
+        }
+
+        [[nodiscard]] std::optional<std::string> ValidateWritePlanLayout(
+            const TransferWritePlan &plan)
+        {
+            if (plan.chunk_size_bytes == 0)
+            {
+                return "write plan chunk_size_bytes must be greater than zero";
+            }
+            if (plan.replica_count == 0)
+            {
+                return "write plan replica_count must be greater than zero";
+            }
+            if (plan.minimum_successful_writes == 0 ||
+                plan.minimum_successful_writes > plan.replica_count)
+            {
+                return "write plan minimum_successful_writes must be in [1, replica_count]";
+            }
+            if (plan.total_chunks != plan.chunks.size())
+            {
+                return "write plan total_chunks does not match chunk plan count";
+            }
+            if (plan.object_checksum.size == 0 && !plan.chunks.empty())
+            {
+                return "empty-object write plan must not contain chunk plans";
+            }
+
+            std::uint64_t expected_offset = 0;
+            for (const auto &chunk : plan.chunks)
+            {
+                if (chunk.identity.offset != expected_offset || chunk.offset != expected_offset)
+                {
+                    return "write plan chunk offsets are not contiguous";
+                }
+                if (chunk.offset != chunk.identity.offset)
+                {
+                    return "write plan chunk offset does not match chunk identity offset";
+                }
+                if (chunk.expected_size == 0)
+                {
+                    return "write plan chunk expected_size must be greater than zero";
+                }
+                if (!chunk.expected_checksum.IsSet())
+                {
+                    return "write plan chunk is missing checksum facts";
+                }
+                if (chunk.required_replica_count == 0)
+                {
+                    return "write plan chunk required_replica_count must be greater than zero";
+                }
+                if (chunk.minimum_successful_writes == 0 ||
+                    chunk.minimum_successful_writes > chunk.required_replica_count)
+                {
+                    return "write plan chunk minimum_successful_writes must be in [1, required_replica_count]";
+                }
+                if (chunk.selected_replica_nodes.size() != chunk.required_replica_count)
+                {
+                    return "write plan chunk selected_replica_nodes count does not match required_replica_count";
+                }
+
+                std::unordered_set<std::string> unique_selected_nodes(
+                    chunk.selected_replica_nodes.begin(),
+                    chunk.selected_replica_nodes.end());
+                if (unique_selected_nodes.size() !=
+                    chunk.selected_replica_nodes.size())
+                {
+                    return "write plan chunk selected_replica_nodes contain duplicates";
+                }
+
+                expected_offset += chunk.expected_size;
+            }
+
+            if (plan.object_checksum.size != 0 &&
+                expected_offset != plan.object_checksum.size)
+            {
+                return "write plan chunk layout does not match object size";
+            }
+            return std::nullopt;
         }
 
         [[nodiscard]] ObjectTransferStatusCode MapStorageStatus(
@@ -1592,7 +1698,6 @@ namespace storedemo
                     return result;
                 }
                 result.write_plan = create_plan_call.result.write_plan;
-                current_write_plan_ = result.write_plan;
 
                 const std::string resolved_object_id =
                     !result.write_plan->object_id.empty()
@@ -1620,6 +1725,7 @@ namespace storedemo
                 result.session = Snapshot();
 
                 std::string storage_discovery_error;
+                viewdemo::DiscoverStorageResult storage_discovery_result;
                 const auto storage_targets = DiscoverStorageTargets(
                     request_.request_id,
                     request_.cluster_id,
@@ -1629,7 +1735,8 @@ namespace storedemo
                     view_client_,
                     &result.diagnostics,
                     &discovery_status,
-                    &storage_discovery_error);
+                    &storage_discovery_error,
+                    &storage_discovery_result);
                 if (storage_targets.empty())
                 {
                     Fail(&result,
@@ -1637,6 +1744,115 @@ namespace storedemo
                          std::move(storage_discovery_error));
                     return result;
                 }
+
+                result.write_plan->chunk_size_bytes = request_.chunk_size;
+                result.write_plan->total_chunks = static_cast<std::uint32_t>(
+                    result.prepared_chunks.size());
+                result.write_plan->replica_count = request_.desired_replica_count;
+                result.write_plan->minimum_successful_writes =
+                    request_.minimum_successful_writes;
+                result.write_plan->placement_epoch =
+                    storage_discovery_result.observed_at_unix_ms;
+                if (result.write_plan->placement_epoch == 0)
+                {
+                    result.write_plan->placement_epoch =
+                        result.write_plan->created_at_unix_ms != 0
+                            ? result.write_plan->created_at_unix_ms
+                            : request_.client_time_unix_ms;
+                }
+                if (result.write_plan->placement_epoch != 0)
+                {
+                    result.write_plan->expires_at_unix_ms =
+                        result.write_plan->placement_epoch +
+                        ResolvePlanExpiryWindowMs(*discovered_metadata_client,
+                                                  view_client_.get());
+                }
+
+                result.write_plan->chunks.clear();
+                result.write_plan->chunks.reserve(result.prepared_chunks.size());
+                PlacementManager placement_manager;
+                for (const auto &prepared_chunk : result.prepared_chunks)
+                {
+                    std::string identity_error;
+                    const ChunkIdentity identity = BuildChunkIdentity(
+                        prepared_chunk,
+                        resolved_object_id,
+                        result.write_plan->version,
+                        &identity_error);
+                    if (!identity_error.empty())
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kInternalError,
+                             "failed to build chunk identity for write plan: " +
+                                 identity_error,
+                             prepared_chunk.chunk_index,
+                             prepared_chunk.offset);
+                        return result;
+                    }
+
+                    PlacementRequest placement_request;
+                    placement_request.identity = identity;
+                    placement_request.chunk_size_bytes = prepared_chunk.size;
+                    placement_request.policy.replica_count =
+                        request_.desired_replica_count;
+                    placement_request.policy.minimum_successful_writes =
+                        request_.minimum_successful_writes;
+                    placement_request.policy.avoid_same_node = true;
+                    placement_request.decision_epoch =
+                        result.write_plan->placement_epoch;
+
+                    const auto placement_result = placement_manager.SelectPlacement(
+                        placement_request,
+                        storage_discovery_result);
+                    if (!placement_result.ok())
+                    {
+                        Fail(&result,
+                             ObjectTransferStatusCode::kStorageRejected,
+                             "CreateWritePlan placement failed for chunk " +
+                                 std::to_string(prepared_chunk.chunk_index) + ": " +
+                                 placement_result.error_detail,
+                             prepared_chunk.chunk_index,
+                             prepared_chunk.offset,
+                             identity.chunk_id);
+                        return result;
+                    }
+
+                    TransferChunkPlan chunk_plan;
+                    chunk_plan.identity = identity;
+                    chunk_plan.offset = prepared_chunk.offset;
+                    chunk_plan.expected_size = prepared_chunk.size;
+                    chunk_plan.expected_checksum = prepared_chunk.checksum;
+                    chunk_plan.required_replica_count =
+                        request_.desired_replica_count;
+                    chunk_plan.minimum_successful_writes =
+                        request_.minimum_successful_writes;
+                    chunk_plan.selected_replica_nodes.reserve(
+                        placement_result.decision.replica_nodes.size());
+                    for (const auto &selected_replica :
+                         placement_result.decision.replica_nodes)
+                    {
+                        chunk_plan.selected_replica_nodes.push_back(
+                            selected_replica.node_id);
+                    }
+                    // T004 之前 upload 仍消费 candidate_nodes，并且仍保留 fallback。
+                    // 这里先把执行 authority 显式写入 selected_replica_nodes，同时把
+                    // candidate_nodes 对齐到同一组选点，避免当前路径静默改回 discovery 顺序。
+                    chunk_plan.candidate_nodes = chunk_plan.selected_replica_nodes;
+                    result.write_plan->chunks.push_back(std::move(chunk_plan));
+                }
+
+                if (const auto write_plan_error =
+                        ValidateWritePlanLayout(*result.write_plan);
+                    write_plan_error.has_value())
+                {
+                    Fail(&result,
+                         ObjectTransferStatusCode::kMetadataRejected,
+                         "CreateWritePlan produced invalid transfer facts: " +
+                             *write_plan_error);
+                    return result;
+                }
+                current_write_plan_ = result.write_plan;
+
                 if (storage_client_ == nullptr)
                 {
                     Fail(&result,
