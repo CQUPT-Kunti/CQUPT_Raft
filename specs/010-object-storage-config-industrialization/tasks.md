@@ -25,7 +25,7 @@
 
 ## Phase 2: User Story 1 - Per-Chunk Dynamic Placement (Priority: P1)
 
-- [ ] T002 [P] [US1] Remove node-id/name/config-order placement priority and add deterministic chunk-scoped distribution in `modules/store/placement/replica_policy.cpp` with placement policy tests.
+- [X] T002 [P] [US1] Remove node-id/name/config-order placement priority and add deterministic chunk-scoped distribution in `modules/store/placement/replica_policy.cpp` with placement policy tests.
 
 修改目标：资源过滤和排序保持 resource-aware；等价资源条件下使用 chunk-scoped deterministic jitter，禁止 lexical `node_id` tie-break 和 config-order fallback。  
 涉及文件：`modules/store/placement/replica_policy.h` 如需、`modules/store/placement/replica_policy.cpp`、`modules/store/placement/module-notes.md`、`tests/store_placement_policy_test.cpp`。  

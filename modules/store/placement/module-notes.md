@@ -543,14 +543,18 @@
 ### 5. 对合格候选做稳定排序
 
 - 排序优先级是：
-  - `available_capacity_bytes` 更大优先
-  - `load.TotalInflight()` 更低优先
-  - `load.active_writes` 更低优先
-  - `load.active_reads` 更低优先
-  - `node_id` 字典序更小优先
-  - `original_index` 更小优先
-- 最后一层 `original_index` 兜底的作用是：
-  - 当所有可观测指标都完全相同时，输出仍然稳定可预测
+  - 先按 resource tier 排序：
+    - `available_capacity_bytes` 对应的 post-write headroom tier 更大优先
+    - `load.TotalInflight()` tier 更低优先
+    - `load.active_writes` tier 更低优先
+    - `load.active_reads` tier 更低优先
+  - 对处于同一资源 tier 的候选，使用 chunk-scoped deterministic jitter 做稳定分散
+  - 仅在极少数 hash 冲突或完全等价条目场景下，才用内部稳定兜底维持严格弱序
+- jitter 输入使用：
+  - `chunk_id`
+  - `decision_epoch`
+  - `node_id`
+- 这里的 `node_id` 只作为 hash identity input，不是 lexical priority，也不是生产权重
 
 ### 6. 两阶段选点
 
@@ -587,7 +591,7 @@
 - 如果成功选满：
   - 返回 `kOk`
   - 向 `decision.reasons` 追加一条排序依据说明：
-    - `replicas are ordered by available capacity, lower inflight load, then node_id`
+    - `replicas are ordered by resource tiers first, then chunk-scoped deterministic jitter`
 
 ## 当前选择语义
 
@@ -599,11 +603,8 @@
   - 可用容量不足以容纳 `chunk_size_bytes + reserve_capacity_bytes`
   - 调用方显式排除的节点
 - 节点排序固定为：
-  - `available_capacity_bytes` 更大优先
-  - `load.TotalInflight()` 更低优先
-  - `load.active_writes` 更低优先
-  - `load.active_reads` 更低优先
-  - `node_id` 字典序兜底
+  - 先按容量和负载 tier 保持 resource-aware 优先级
+  - tier 内使用 chunk-scoped deterministic jitter 分散热点
 - 输出副本节点不会重复 `node_id`
 - `prefer_distinct_zones = true` 时，会先尽量跨 zone 选点，再按常规排序补齐剩余副本
 - `PlacementManager` 不改变 `ReplicaPolicySelector` 的排序和筛选结果，只在输出里补决策摘要

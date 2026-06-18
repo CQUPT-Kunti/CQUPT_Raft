@@ -12,10 +12,23 @@ namespace storedemo
 {
     namespace
     {
+        constexpr std::uint64_t kFnv1a64OffsetBasis = 1469598103934665603ULL;
+        constexpr std::uint64_t kFnv1a64Prime = 1099511628211ULL;
+        constexpr std::uint64_t kMinimumCapacityTierQuantumBytes = 1024ULL;
+        constexpr std::uint64_t kInflightTierQuantum = 2ULL;
+        constexpr std::uint64_t kActiveWritesTierQuantum = 2ULL;
+        constexpr std::uint64_t kActiveReadsTierQuantum = 2ULL;
+
         struct RankedCandidate
         {
             StorageNodePlacementCandidate candidate;
             std::size_t original_index{0};
+            std::uint64_t capacity_tier{0};
+            std::uint64_t inflight_tier{0};
+            std::uint64_t active_writes_tier{0};
+            std::uint64_t active_reads_tier{0};
+            std::uint64_t chunk_scoped_jitter{0};
+            std::uint64_t node_identity_hash{0};
         };
 
         struct RankedReadReplicaCandidate
@@ -36,6 +49,81 @@ namespace storedemo
             decision->excluded_nodes.push_back(
                 PlacementNodeExclusion{.node_id = std::string(node_id),
                                        .reason = std::move(reason)});
+        }
+
+        void AppendHashBytes(std::uint64_t *hash, std::string_view bytes)
+        {
+            if (hash == nullptr)
+            {
+                return;
+            }
+
+            for (const unsigned char byte : bytes)
+            {
+                *hash ^= static_cast<std::uint64_t>(byte);
+                *hash *= kFnv1a64Prime;
+            }
+        }
+
+        template <typename UInt>
+        void AppendHashInteger(std::uint64_t *hash, const UInt value)
+        {
+            for (std::size_t index = 0; index < sizeof(UInt); ++index)
+            {
+                const auto byte = static_cast<unsigned char>(
+                    (value >> (index * 8U)) & 0xFFU);
+                *hash ^= static_cast<std::uint64_t>(byte);
+                *hash *= kFnv1a64Prime;
+            }
+        }
+
+        std::uint64_t ComputeStableNodeIdentityHash(std::string_view node_id)
+        {
+            std::uint64_t hash = kFnv1a64OffsetBasis;
+            AppendHashBytes(&hash, "placement-node");
+            AppendHashBytes(&hash, node_id);
+            return hash;
+        }
+
+        std::uint64_t ComputeChunkScopedJitter(std::string_view chunk_id,
+                                               const std::uint64_t decision_epoch,
+                                               std::string_view node_id)
+        {
+            std::uint64_t hash = kFnv1a64OffsetBasis;
+            AppendHashBytes(&hash, "placement-jitter");
+            AppendHashBytes(&hash, chunk_id);
+            AppendHashInteger(&hash, decision_epoch);
+            AppendHashBytes(&hash, node_id);
+            return hash;
+        }
+
+        std::uint64_t ResolveCapacityTierQuantumBytes(const PlacementRequest &request)
+        {
+            return std::max(kMinimumCapacityTierQuantumBytes,
+                            request.chunk_size_bytes);
+        }
+
+        std::uint64_t ComputeCapacityTier(
+            const StorageNodePlacementCandidate &candidate,
+            const PlacementRequest &request)
+        {
+            const std::uint64_t required_with_reserve =
+                request.chunk_size_bytes + request.policy.reserve_capacity_bytes;
+            const std::uint64_t post_write_headroom =
+                candidate.available_capacity_bytes > required_with_reserve
+                    ? candidate.available_capacity_bytes - required_with_reserve
+                    : 0ULL;
+            return post_write_headroom / ResolveCapacityTierQuantumBytes(request);
+        }
+
+        std::uint64_t ComputeTier(const std::uint64_t value,
+                                  const std::uint64_t quantum)
+        {
+            if (quantum == 0)
+            {
+                return value;
+            }
+            return value / quantum;
         }
 
         StorageNodeStatusCode ResolveChunkId(const ChunkIdentity &identity,
@@ -368,44 +456,54 @@ namespace storedemo
 
             eligible_candidates.push_back(RankedCandidate{
                 .candidate = candidate,
-                .original_index = index});
+                .original_index = index,
+                .capacity_tier = ComputeCapacityTier(candidate, request),
+                .inflight_tier = ComputeTier(candidate.load.TotalInflight(),
+                                             kInflightTierQuantum),
+                .active_writes_tier = ComputeTier(candidate.load.active_writes,
+                                                  kActiveWritesTierQuantum),
+                .active_reads_tier = ComputeTier(candidate.load.active_reads,
+                                                kActiveReadsTierQuantum),
+                .chunk_scoped_jitter = ComputeChunkScopedJitter(
+                    result.decision.chunk_id,
+                    request.decision_epoch,
+                    candidate.node_id),
+                .node_identity_hash = ComputeStableNodeIdentityHash(
+                    candidate.node_id)});
         }
 
         std::sort(eligible_candidates.begin(),
                   eligible_candidates.end(),
                   [](const RankedCandidate &lhs, const RankedCandidate &rhs)
                   {
-                      if (lhs.candidate.available_capacity_bytes !=
-                          rhs.candidate.available_capacity_bytes)
+                      if (lhs.capacity_tier != rhs.capacity_tier)
                       {
-                          return lhs.candidate.available_capacity_bytes >
-                                 rhs.candidate.available_capacity_bytes;
+                          return lhs.capacity_tier > rhs.capacity_tier;
                       }
 
-                      if (lhs.candidate.load.TotalInflight() !=
-                          rhs.candidate.load.TotalInflight())
+                      if (lhs.inflight_tier != rhs.inflight_tier)
                       {
-                          return lhs.candidate.load.TotalInflight() <
-                                 rhs.candidate.load.TotalInflight();
+                          return lhs.inflight_tier < rhs.inflight_tier;
                       }
 
-                      if (lhs.candidate.load.active_writes !=
-                          rhs.candidate.load.active_writes)
+                      if (lhs.active_writes_tier != rhs.active_writes_tier)
                       {
-                          return lhs.candidate.load.active_writes <
-                                 rhs.candidate.load.active_writes;
+                          return lhs.active_writes_tier < rhs.active_writes_tier;
                       }
 
-                      if (lhs.candidate.load.active_reads !=
-                          rhs.candidate.load.active_reads)
+                      if (lhs.active_reads_tier != rhs.active_reads_tier)
                       {
-                          return lhs.candidate.load.active_reads <
-                                 rhs.candidate.load.active_reads;
+                          return lhs.active_reads_tier < rhs.active_reads_tier;
                       }
 
-                      if (lhs.candidate.node_id != rhs.candidate.node_id)
+                      if (lhs.chunk_scoped_jitter != rhs.chunk_scoped_jitter)
                       {
-                          return lhs.candidate.node_id < rhs.candidate.node_id;
+                          return lhs.chunk_scoped_jitter < rhs.chunk_scoped_jitter;
+                      }
+
+                      if (lhs.node_identity_hash != rhs.node_identity_hash)
+                      {
+                          return lhs.node_identity_hash < rhs.node_identity_hash;
                       }
 
                       return lhs.original_index < rhs.original_index;
@@ -481,7 +579,7 @@ namespace storedemo
         }
 
         result.decision.reasons.push_back(
-            "replicas are ordered by available capacity, lower inflight load, then node_id");
+            "replicas are ordered by resource tiers first, then chunk-scoped deterministic jitter");
         return result;
     }
 
