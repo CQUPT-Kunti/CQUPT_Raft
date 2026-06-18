@@ -1125,6 +1125,9 @@ namespace raftdemo
 
             QuorumTestCluster MakeCluster(const std::size_t voter_count) const
             {
+                EXPECT_NE(voter_count, 4U)
+                    << "integrated quorum test helper must not bootstrap a committed "
+                       "4-voter cluster directly";
                 return QuorumTestCluster(root_, base_port_, voter_count);
             }
 
@@ -1185,6 +1188,9 @@ namespace raftdemo
             const std::vector<int> &expected_voter_ids,
             const std::size_t expected_quorum_size)
         {
+            ASSERT_NE(expected_voter_ids.size(), 4U)
+                << "integrated quorum tests must not assert an even 4-voter committed "
+                   "membership as a valid expected state";
             for (std::size_t index = 0; index < cluster.Size(); ++index)
             {
                 if (!cluster.IsRunning(index))
@@ -1220,6 +1226,9 @@ namespace raftdemo
             const std::chrono::milliseconds timeout,
             std::string *diagnostics)
         {
+            EXPECT_NE(expected_voter_ids.size(), 4U)
+                << "integrated quorum tests must not wait for an even 4-voter committed "
+                   "membership as a success condition";
             const auto deadline = Clock::now() + timeout;
             std::string last_diagnostics;
             while (Clock::now() < deadline)
