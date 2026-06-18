@@ -51,7 +51,7 @@
 
 ## Phase 3: User Story 2 - Bounded High-Concurrency Upload (Priority: P1)
 
-- [ ] T005 [US2] Add parallel per-chunk replica fan-out with minimum_successful_writes aggregation in `modules/store/transfer/object_transfer.cpp` and fan-out tests.
+- [X] T005 [US2] Add parallel per-chunk replica fan-out with minimum_successful_writes aggregation in `modules/store/transfer/object_transfer.cpp` and fan-out tests.
 
 修改目标：同一 chunk 的 replica writes 并行执行，成功条件由 `minimum_successful_writes` 控制，慢/失败副本进入诊断和 cleanup/repair candidate facts。  
 涉及文件：`modules/store/transfer/object_transfer.cpp`、`modules/store/transfer/object_transfer.h` 如需诊断字段、`tests/storage_upload_integration_test.cpp`、`tests/support/storage_upload_test_utils.h`。  

@@ -157,6 +157,16 @@ T005-A 后 upload 第二遍对单个 chunk 的 replica fan-out 边界是：
 - manifest / `CommitObject` 只记录实际 durable success 的 replica nodes
 - 当前尚未实现 quorum 达成后的提前返回，也不会主动取消已经启动的慢副本 RPC；这是 T005-B 的继续收紧方向
 
+T005-B 后该路径的正式 quorum / slow-replica 语义是：
+
+- chunk commit-eligibility 的唯一条件是 `durable_success_count >= minimum_successful_writes`
+- 每个 replica write 都带显式 `StorageTaskContext.timeout_ms`，当前由 `object_transfer.cpp` 内部常量控制
+- quorum 达成后，upload 不会把后续普通失败回写成 chunk failure；但仍会等待当前 chunk 已启动任务在各自 bounded deadline 内完成收尾
+- timeout / retryable / transport-uncertain 节点不会进入 manifest，只进入 diagnostics 和 cleanup risk facts
+- non-retryable failure 与 uncertain failure 会在 chunk 聚合阶段显式区分；当 quorum 未达成且存在 uncertain 节点时，chunk 失败优先暴露 uncertain/timeout 语义
+- manifest facts 会在 `CommitObject` 前基于 actual durable success nodes 冻结；planned、attempted、failed、uncertain 节点都不会进入 committed manifest
+- chunk 之间仍然串行；multi-chunk concurrency 继续留给 T006
+
 ### download
 
 download 当前是 manifest-driven、逐 chunk、临时文件重建流程：

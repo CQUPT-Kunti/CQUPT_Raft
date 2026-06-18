@@ -31,6 +31,7 @@ namespace storedemo
             0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
             0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
         constexpr std::size_t kMaxReplicaFanoutWorkers = 2;
+        constexpr std::uint64_t kReplicaWriteTimeoutMs = 200;
 
         constexpr std::array<std::uint32_t, 64> kSha256RoundConstants = {
             0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -97,6 +98,14 @@ namespace storedemo
                                       kMaxReplicaFanoutWorkers));
         }
 
+        [[nodiscard]] StorageTaskContext ResolveReplicaWriteTaskContext()
+        {
+            StorageTaskContext context;
+            context.timeout_ms = kReplicaWriteTimeoutMs;
+            context.best_effort_cancel = false;
+            return context;
+        }
+
         void RecordReplicaWriteTaskResult(
             ReplicaWriteTaskSharedState *state,
             const std::size_t result_index,
@@ -132,6 +141,62 @@ namespace storedemo
                            {
                                return state->completed_tasks >= expected_tasks;
                            });
+        }
+
+        [[nodiscard]] bool IsUncertainReplicaWriteResult(
+            const StorageTransferWriteResult &write_result)
+        {
+            return write_result.retryable ||
+                   write_result.status == StorageNodeStatusCode::kTimeout;
+        }
+
+        [[nodiscard]] StorageNodeId ResolveDurableSuccessNodeId(
+            const StorageTransferTarget &target,
+            const StorageTransferWriteResult &write_result)
+        {
+            return write_result.target.node_id.empty()
+                       ? target.node_id
+                       : write_result.target.node_id;
+        }
+
+        void AppendChunkFanoutSummaryDiagnostic(
+            const std::string &request_id,
+            const ChunkIdentity &identity,
+            const std::uint32_t selected_target_count,
+            const std::uint32_t durable_success_count,
+            const std::uint32_t failed_target_count,
+            const std::uint32_t uncertain_target_count,
+            const bool commit_eligible,
+            std::vector<ObjectTransferDiagnostic> *diagnostics)
+        {
+            if (diagnostics == nullptr)
+            {
+                return;
+            }
+
+            ObjectTransferDiagnostic diagnostic;
+            diagnostic.status =
+                commit_eligible ? ObjectTransferStatusCode::kOk
+                                : (uncertain_target_count != 0
+                                       ? ObjectTransferStatusCode::kTimeout
+                                       : ObjectTransferStatusCode::kStorageRejected);
+            diagnostic.message =
+                "chunk fan-out summary: selected_targets=" +
+                std::to_string(selected_target_count) +
+                ", durable_successes=" +
+                std::to_string(durable_success_count) +
+                ", failed_targets=" +
+                std::to_string(failed_target_count) +
+                ", uncertain_targets=" +
+                std::to_string(uncertain_target_count) +
+                ", commit_eligible=" +
+                std::string(commit_eligible ? "true" : "false");
+            diagnostic.request_id = request_id;
+            diagnostic.chunk_id = identity.chunk_id;
+            diagnostic.chunk_index = identity.chunk_index;
+            diagnostic.offset = identity.offset;
+            diagnostic.retryable = uncertain_target_count != 0;
+            diagnostics->push_back(std::move(diagnostic));
         }
 
         [[nodiscard]] std::uint32_t RotateRight(const std::uint32_t value,
@@ -2166,6 +2231,8 @@ namespace storedemo
 
                         std::vector<StorageNodeId> durable_replicas;
                         durable_replicas.reserve(chunk_targets.size());
+                        std::unordered_set<StorageNodeId> durable_replica_nodes;
+                        durable_replica_nodes.reserve(chunk_targets.size());
                         StorageTransferWriteResult first_durable_result;
                         bool have_durable_result = false;
                         ObjectTransferStatusCode last_failure_status =
@@ -2174,6 +2241,12 @@ namespace storedemo
                             "StorageNode WriteChunk did not reach minimum_successful_writes";
                         StorageTransferTarget last_failure_target;
                         bool last_failure_retryable = false;
+                        bool have_uncertain_failure = false;
+                        std::string last_uncertain_message =
+                            "StorageNode WriteChunk ended with uncertain durable state";
+                        StorageTransferTarget last_uncertain_target;
+                        std::uint32_t failed_target_count = 0;
+                        std::uint32_t uncertain_target_count = 0;
                         auto shared_payload =
                             std::make_shared<const std::string>(
                                 std::move(chunk.payload));
@@ -2229,6 +2302,8 @@ namespace storedemo
                                                                  expected_size,
                                                              .expected_checksum =
                                                                  expected_checksum,
+                                                             .context =
+                                                                 ResolveReplicaWriteTaskContext(),
                                                              .payload =
                                                                  *shared_payload});
                                                 }
@@ -2324,15 +2399,22 @@ namespace storedemo
 
                             if (write_result->ok())
                             {
-                                if (!have_durable_result)
+                                const auto resolved_success_node_id =
+                                    ResolveDurableSuccessNodeId(
+                                        target,
+                                        *write_result);
+                                if (durable_replica_nodes.insert(
+                                        resolved_success_node_id)
+                                        .second)
                                 {
-                                    first_durable_result = *write_result;
-                                    have_durable_result = true;
+                                    if (!have_durable_result)
+                                    {
+                                        first_durable_result = *write_result;
+                                        have_durable_result = true;
+                                    }
+                                    durable_replicas.push_back(
+                                        resolved_success_node_id);
                                 }
-                                durable_replicas.push_back(
-                                    write_result->target.node_id.empty()
-                                        ? target.node_id
-                                        : write_result->target.node_id);
                                 continue;
                             }
 
@@ -2346,12 +2428,37 @@ namespace storedemo
                                     ? target
                                     : write_result->target;
                             last_failure_retryable = write_result->retryable;
+                            ++failed_target_count;
+                            if (IsUncertainReplicaWriteResult(*write_result))
+                            {
+                                ++uncertain_target_count;
+                                have_uncertain_failure = true;
+                                last_uncertain_message =
+                                    "StorageNode WriteChunk ended with uncertain durable state: " +
+                                    write_result->error_detail;
+                                last_uncertain_target =
+                                    write_result->target.endpoint.empty()
+                                        ? target
+                                        : write_result->target;
+                            }
                             uncertain_cleanup_possible =
                                 uncertain_cleanup_possible ||
-                                write_result->retryable;
+                                IsUncertainReplicaWriteResult(*write_result);
                         }
 
-                        if (durable_replicas.size() < minimum_successful_writes)
+                        const bool chunk_commit_eligible =
+                            durable_replicas.size() >= minimum_successful_writes;
+                        AppendChunkFanoutSummaryDiagnostic(
+                            request_.request_id,
+                            identity,
+                            static_cast<std::uint32_t>(chunk_targets.size()),
+                            static_cast<std::uint32_t>(durable_replicas.size()),
+                            failed_target_count,
+                            uncertain_target_count,
+                            chunk_commit_eligible,
+                            &result.diagnostics);
+
+                        if (!chunk_commit_eligible)
                         {
                             reader.Close();
                             if (have_durable_result)
@@ -2367,21 +2474,35 @@ namespace storedemo
                                 &result,
                                 durable_chunks,
                                 uncertain_cleanup_possible,
-                                last_failure_retryable
-                                    ? "upload failure left uncertain chunk placement facts; cleanup_candidate_possible stays true even if candidate list is partial"
+                                uncertain_target_count != 0
+                                    ? "upload failure left uncertain chunk placement facts after bounded slow-replica drain; cleanup_candidate_possible stays true even if durable replica list is partial"
                                     : std::string());
+                            const auto failure_status =
+                                have_uncertain_failure
+                                    ? ObjectTransferStatusCode::kTimeout
+                                    : last_failure_status;
+                            const auto failure_message =
+                                have_uncertain_failure
+                                    ? last_uncertain_message
+                                    : last_failure_message;
+                            const auto failure_target =
+                                have_uncertain_failure
+                                    ? last_uncertain_target
+                                    : last_failure_target;
+                            const auto failure_retryable =
+                                have_uncertain_failure || last_failure_retryable;
                             Fail(&result,
-                                 last_failure_status,
+                                 failure_status,
                                  "chunk " + identity.chunk_id +
                                      " did not reach minimum_successful_writes=" +
                                      std::to_string(minimum_successful_writes) +
-                                     "; " + last_failure_message,
+                                     "; " + failure_message,
                                  prepared_chunk.chunk_index,
                                  prepared_chunk.offset,
                                  identity.chunk_id,
-                                 last_failure_target.node_id,
-                                 last_failure_target.endpoint,
-                                 last_failure_retryable);
+                                 failure_target.node_id,
+                                 failure_target.endpoint,
+                                 failure_retryable);
                             return result;
                         }
 

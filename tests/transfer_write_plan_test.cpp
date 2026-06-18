@@ -510,6 +510,18 @@ namespace
         }
         return targets;
     }
+
+    bool HasDiagnosticContaining(const storedemo::UploadObjectResult &result,
+                                 const std::string &needle)
+    {
+        return std::any_of(
+            result.diagnostics.begin(),
+            result.diagnostics.end(),
+            [&](const storedemo::ObjectTransferDiagnostic &diagnostic)
+            {
+                return diagnostic.message.find(needle) != std::string::npos;
+            });
+    }
 }
 
 TEST(MetadataTransferClientTest,
@@ -1073,6 +1085,7 @@ TEST(ObjectTransferWritePlanTest,
     EXPECT_TRUE(payload_valid);
     EXPECT_EQ(max_active_replica_tasks, 2U);
     EXPECT_EQ(active_replica_tasks, 0U);
+    EXPECT_GT(storage_client->writes.front().context.timeout_ms, 0U);
 
     const auto selected_nodes =
         result.write_plan->chunks.front().selected_replica_nodes;
@@ -1094,6 +1107,274 @@ TEST(ObjectTransferWritePlanTest,
                         committed_nodes.end(),
                         selected_nodes[2]),
               committed_nodes.end());
+    EXPECT_TRUE(HasDiagnosticContaining(result, "commit_eligible=true"));
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadSucceedsAfterQuorumWithBoundedSlowReplicaTimeoutAndExcludesTimeoutNode)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        MakeBalancedStorageSnapshots("cluster-plan-timeout-success"),
+        1714001002800ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address());
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+
+    std::atomic<std::size_t> timeout_observed{0};
+    storage_client->write_behavior =
+        [&timeout_observed](
+            const storedemo::StorageTransferWriteRequest &request,
+            const std::size_t chunk_attempt)
+        -> std::optional<storedemo::StorageTransferWriteResult>
+    {
+        if (chunk_attempt == 3U)
+        {
+            timeout_observed.store(request.context.timeout_ms);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(request.context.timeout_ms + 20U));
+            storedemo::StorageTransferWriteResult result;
+            result.status = storedemo::StorageNodeStatusCode::kTimeout;
+            result.error_detail = "forced slow replica timeout";
+            result.target = request.target;
+            result.retryable = true;
+            return result;
+        }
+
+        return std::nullopt;
+    };
+
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address());
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    const std::string payload =
+        storedemo::test::MakeChunkPayload(64, "slow-timeout-success");
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_timeout_success");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-timeout-success";
+    request.cluster_id = "cluster-plan-timeout-success";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/timeout-success.bin";
+    request.object_id = "obj-timeout-success";
+    request.source_path = source_path;
+    request.chunk_size = 64;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714001002810ULL;
+
+    const auto start = std::chrono::steady_clock::now();
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+
+    ASSERT_TRUE(result.ok()) << result.error_detail;
+    ASSERT_TRUE(result.committed);
+    ASSERT_EQ(result.committed_chunks.size(), 1U);
+    ASSERT_GT(timeout_observed.load(), 0U);
+    EXPECT_LT(elapsed_ms, 700);
+
+    const auto selected_nodes =
+        result.write_plan->chunks.front().selected_replica_nodes;
+    const auto commit_request = metadata_server.service().last_commit_request();
+    ASSERT_TRUE(commit_request.has_value());
+    std::vector<std::string> committed_nodes(
+        commit_request->chunks(0).replica_nodes().begin(),
+        commit_request->chunks(0).replica_nodes().end());
+    ASSERT_EQ(committed_nodes.size(), 2U);
+    EXPECT_EQ(std::find(committed_nodes.begin(),
+                        committed_nodes.end(),
+                        selected_nodes[2]),
+              committed_nodes.end());
+    EXPECT_TRUE(HasDiagnosticContaining(result, "uncertain_targets=1"));
+    EXPECT_TRUE(HasDiagnosticContaining(result, "commit_eligible=true"));
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadFailsWhenUniqueDurableSuccessesDoNotReachMinimumAndTracksUncertainFacts)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        MakeBalancedStorageSnapshots("cluster-plan-uncertain-failure"),
+        1714001002900ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address());
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    std::atomic<std::size_t> completed_replica_tasks{0};
+    storage_client->write_behavior =
+        [&completed_replica_tasks](
+            const storedemo::StorageTransferWriteRequest &request,
+            const std::size_t chunk_attempt)
+        -> std::optional<storedemo::StorageTransferWriteResult>
+    {
+        completed_replica_tasks.fetch_add(1U);
+        if (chunk_attempt == 1U)
+        {
+            return std::nullopt;
+        }
+        if (chunk_attempt == 2U)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(request.context.timeout_ms + 10U));
+            storedemo::StorageTransferWriteResult result;
+            result.status = storedemo::StorageNodeStatusCode::kTimeout;
+            result.error_detail = "forced timeout";
+            result.target = request.target;
+            result.retryable = true;
+            return result;
+        }
+
+        storedemo::StorageTransferWriteResult result;
+        result.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
+        result.error_detail = "forced checksum mismatch";
+        result.target = request.target;
+        result.retryable = false;
+        return result;
+    };
+
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address());
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    const std::string payload =
+        storedemo::test::MakeChunkPayload(64, "uncertain-failure");
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_uncertain_failure");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-uncertain-failure";
+    request.cluster_id = "cluster-plan-uncertain-failure";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/uncertain-failure.bin";
+    request.object_id = "obj-uncertain-failure";
+    request.source_path = source_path;
+    request.chunk_size = 64;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714001002910ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kTimeout);
+    EXPECT_FALSE(result.committed);
+    EXPECT_EQ(metadata_server.service().commit_calls(), 0U);
+    EXPECT_TRUE(result.cleanup_candidate_possible);
+    EXPECT_EQ(completed_replica_tasks.load(), 3U);
+    ASSERT_EQ(result.cleanup_candidates.size(), 1U);
+    ASSERT_EQ(result.cleanup_candidates.front().replica_nodes.size(), 1U);
+    EXPECT_TRUE(HasDiagnosticContaining(result, "uncertain_targets=1"));
+    EXPECT_TRUE(HasDiagnosticContaining(result, "commit_eligible=false"));
+}
+
+TEST(ObjectTransferWritePlanTest,
+     UploadDoesNotDoubleCountDurableSuccessWhenReplicaResponsesCollapseToSameNodeId)
+{
+    ScopedFakeMetadataServer metadata_server;
+    ScopedFakeViewServer view_server;
+    view_server.service().SetMetadataEndpoint(metadata_server.address());
+    view_server.service().SetStorageNodes(
+        MakeBalancedStorageSnapshots("cluster-plan-duplicate-success"),
+        1714001002950ULL);
+
+    auto metadata_client = storedemo::CreateGrpcMetadataTransferClient(
+        metadata_server.address());
+    auto storage_client =
+        std::make_shared<RecordingStorageTransferClient>();
+    std::string first_success_node_id;
+    storage_client->write_behavior =
+        [&first_success_node_id](
+            const storedemo::StorageTransferWriteRequest &request,
+            const std::size_t chunk_attempt)
+        -> std::optional<storedemo::StorageTransferWriteResult>
+    {
+        if (chunk_attempt == 1U)
+        {
+            first_success_node_id = request.target.node_id;
+            return std::nullopt;
+        }
+        if (chunk_attempt == 2U)
+        {
+            storedemo::StorageTransferWriteResult result;
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.durable = true;
+            result.target = request.target;
+            result.target.node_id = first_success_node_id;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = first_success_node_id;
+            result.metadata.size = static_cast<std::uint64_t>(request.payload.size());
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            return result;
+        }
+
+        storedemo::StorageTransferWriteResult result;
+        result.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
+        result.error_detail = "forced third replica rejection";
+        result.target = request.target;
+        result.retryable = false;
+        return result;
+    };
+
+    auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+        grpc::CreateChannel(view_server.address(),
+                            grpc::InsecureChannelCredentials()),
+        view_server.address());
+
+    storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+    const std::string payload =
+        storedemo::test::MakeChunkPayload(64, "duplicate-success");
+    storedemo::test::ScopedStoreTestDir temp_dir("transfer_write_plan_duplicate_success");
+    const auto source_path = WritePayloadFile(temp_dir.root(), payload);
+
+    storedemo::UploadObjectRequest request;
+    request.request_id = "upload-duplicate-success";
+    request.cluster_id = "cluster-plan-duplicate-success";
+    request.bucket = "bucket-plan";
+    request.object_key = "objects/duplicate-success.bin";
+    request.object_id = "obj-duplicate-success";
+    request.source_path = source_path;
+    request.chunk_size = 64;
+    request.concurrency = 1;
+    request.desired_replica_count = 3;
+    request.minimum_successful_writes = 2;
+    request.client_time_unix_ms = 1714001002960ULL;
+
+    auto session = transfer.StartUploadSession(request);
+    auto reader = storedemo::CreateFileTransferChunkReader();
+    auto checksum_state = storedemo::CreateTransferChecksumState();
+    const auto result = session->Execute(*reader, *checksum_state);
+
+    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kChecksumMismatch);
+    EXPECT_FALSE(result.committed);
+    EXPECT_EQ(metadata_server.service().commit_calls(), 0U);
+    EXPECT_TRUE(HasDiagnosticContaining(result, "durable_successes=1"));
 }
 
 TEST(ObjectTransferWritePlanTest,
@@ -1162,7 +1443,7 @@ TEST(ObjectTransferWritePlanTest,
     auto checksum_state = storedemo::CreateTransferChecksumState();
     const auto result = session->Execute(*reader, *checksum_state);
 
-    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kStorageRejected);
+    EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kTimeout);
     EXPECT_FALSE(result.committed);
     EXPECT_EQ(metadata_server.service().commit_calls(), 0U);
     EXPECT_FALSE(metadata_server.service().last_commit_request().has_value());
