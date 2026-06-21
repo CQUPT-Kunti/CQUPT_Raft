@@ -40,8 +40,17 @@ namespace
                << "  },\n"
                << "  \"store\": {\n"
                << "    \"upload_concurrency\": 4,\n"
+               << "    \"download_concurrency\": 2,\n"
                << "    \"max_inflight_bytes\": 536870912,\n"
-               << "    \"replica_fanout_concurrency\": 3\n"
+               << "    \"replica_fanout_concurrency\": 3,\n"
+               << "    \"chunk_write_timeout_ms\": 61000,\n"
+               << "    \"chunk_read_timeout_ms\": 62000,\n"
+               << "    \"max_write_retries\": 2,\n"
+               << "    \"max_transient_write_retries\": 3,\n"
+               << "    \"max_transient_read_retries\": 4,\n"
+               << "    \"initial_backoff_ms\": 50,\n"
+               << "    \"max_backoff_ms\": 1000,\n"
+               << "    \"wait_for_ready\": true\n"
                << "  }\n"
                << "}\n";
         return config_path;
@@ -69,8 +78,18 @@ TEST(StorageClientConfigTest,
     EXPECT_EQ(config.replica_count, 3U);
     EXPECT_EQ(config.minimum_successful_writes, 2U);
     EXPECT_EQ(config.upload_concurrency, 4U);
+    EXPECT_EQ(config.download_concurrency, 2U);
     EXPECT_EQ(config.max_inflight_bytes, 536870912ULL);
     EXPECT_EQ(config.replica_fanout_concurrency, 3U);
+    EXPECT_EQ(config.chunk_write_timeout.count(), 61000);
+    EXPECT_EQ(config.chunk_read_timeout.count(), 62000);
+    EXPECT_EQ(config.max_write_retries, 2U);
+    EXPECT_EQ(config.max_transient_write_retries, 3U);
+    EXPECT_EQ(config.max_transient_read_retries, 4U);
+    EXPECT_EQ(config.initial_backoff_ms, 50U);
+    EXPECT_EQ(config.max_backoff_ms, 1000U);
+    EXPECT_TRUE(config.transfer_wait_for_ready);
+    EXPECT_TRUE(config.view_wait_for_ready);
 }
 
 TEST(StorageClientConfigTest,

@@ -38,6 +38,7 @@ namespace
         std::string view_endpoint;
         std::uint64_t chunk_size{storedemo::kProductionChunkSizeBytes};
         std::uint32_t upload_concurrency{1};
+        std::uint32_t download_concurrency{1};
         std::uint64_t max_inflight_bytes{storedemo::kProductionChunkSizeBytes};
         std::uint32_t replica_fanout_concurrency{1};
         std::uint32_t replica_count{1};
@@ -46,6 +47,15 @@ namespace
         std::chrono::milliseconds metadata_timeout{3000};
         std::chrono::milliseconds storage_timeout{3000};
         std::chrono::milliseconds commit_deadline{5000};
+        std::chrono::milliseconds chunk_write_timeout{3000};
+        std::chrono::milliseconds chunk_read_timeout{3000};
+        std::uint32_t max_write_retries{0};
+        std::uint32_t max_transient_write_retries{1};
+        std::uint32_t max_transient_read_retries{1};
+        std::uint32_t initial_backoff_ms{10};
+        std::uint32_t max_backoff_ms{50};
+        bool transfer_wait_for_ready{false};
+        bool view_wait_for_ready{false};
     };
 
     class ClientConfigError final : public std::runtime_error
@@ -208,6 +218,86 @@ namespace
         return std::nullopt;
     }
 
+    [[nodiscard]] std::optional<std::string> ExtractJsonObjectSection(
+        const std::string &content,
+        const std::string_view key)
+    {
+        const std::string needle = "\"" + std::string(key) + "\"";
+        const std::size_t key_pos = content.find(needle);
+        if (key_pos == std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        const std::size_t colon_pos = content.find(':', key_pos + needle.size());
+        if (colon_pos == std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        std::size_t object_begin = colon_pos + 1;
+        while (object_begin < content.size() &&
+               std::isspace(static_cast<unsigned char>(content[object_begin])) != 0)
+        {
+            ++object_begin;
+        }
+        if (object_begin >= content.size() || content[object_begin] != '{')
+        {
+            return std::nullopt;
+        }
+
+        std::size_t depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (std::size_t pos = object_begin; pos < content.size(); ++pos)
+        {
+            const char ch = content[pos];
+            if (in_string)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                    continue;
+                }
+                if (ch == '\\')
+                {
+                    escaped = true;
+                    continue;
+                }
+                if (ch == '"')
+                {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                in_string = true;
+                continue;
+            }
+            if (ch == '{')
+            {
+                ++depth;
+                continue;
+            }
+            if (ch == '}')
+            {
+                if (depth == 0)
+                {
+                    return std::nullopt;
+                }
+                --depth;
+                if (depth == 0)
+                {
+                    return content.substr(object_begin, pos - object_begin + 1);
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::optional<std::uint64_t> ExtractJsonUnsignedField(
         const std::string &content,
         const std::string_view key)
@@ -244,6 +334,41 @@ namespace
         }
 
         return std::stoull(content.substr(value_begin, value_end - value_begin));
+    }
+
+    [[nodiscard]] std::optional<bool> ExtractJsonBoolField(
+        const std::string &content,
+        const std::string_view key)
+    {
+        const std::string needle = "\"" + std::string(key) + "\"";
+        const std::size_t key_pos = content.find(needle);
+        if (key_pos == std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        const std::size_t colon_pos = content.find(':', key_pos + needle.size());
+        if (colon_pos == std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        std::size_t value_begin = colon_pos + 1;
+        while (value_begin < content.size() &&
+               std::isspace(static_cast<unsigned char>(content[value_begin])) != 0)
+        {
+            ++value_begin;
+        }
+
+        if (content.compare(value_begin, 4, "true") == 0)
+        {
+            return true;
+        }
+        if (content.compare(value_begin, 5, "false") == 0)
+        {
+            return false;
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] std::optional<std::string> ExtractViewEndpoint(
@@ -290,6 +415,48 @@ namespace
         return ExtractJsonUnsignedField(content, key);
     }
 
+    [[nodiscard]] std::optional<bool> ExtractBoolConfigValue(
+        const std::string &content,
+        const std::string_view key)
+    {
+        if (const auto kv = ExtractKeyValueLine(content, key); kv.has_value())
+        {
+            if (*kv == "true")
+            {
+                return true;
+            }
+            if (*kv == "false")
+            {
+                return false;
+            }
+            throw ClientConfigError("invalid boolean value for " +
+                                    std::string(key) + ": " + *kv);
+        }
+        return ExtractJsonBoolField(content, key);
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> ExtractUnsignedFromSection(
+        const std::optional<std::string> &section,
+        const std::string_view key)
+    {
+        if (!section.has_value())
+        {
+            return std::nullopt;
+        }
+        return ExtractJsonUnsignedField(*section, key);
+    }
+
+    [[nodiscard]] std::optional<bool> ExtractBoolFromSection(
+        const std::optional<std::string> &section,
+        const std::string_view key)
+    {
+        if (!section.has_value())
+        {
+            return std::nullopt;
+        }
+        return ExtractJsonBoolField(*section, key);
+    }
+
     [[nodiscard]] std::string ReadWholeFile(
         const std::filesystem::path &path)
     {
@@ -324,6 +491,9 @@ namespace
                 throw ClientConfigError(
                     "config is missing a ViewNode endpoint for storage_client");
             }
+            const auto cluster_section = ExtractJsonObjectSection(content, "cluster");
+            const auto store_section = ExtractJsonObjectSection(content, "store");
+            const auto view_section = ExtractJsonObjectSection(content, "view");
 
             config.cluster_id = *cluster_id;
             config.view_endpoint = *view_endpoint;
@@ -332,39 +502,61 @@ namespace
             // `chunk_size_bytes` may still exist in cluster/app config for
             // broader config compatibility, but it must not override the
             // storage_client upload default.
-            if (const auto value = ExtractUnsignedConfigValue(content, "replica_count");
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "replica_count");
                 value.has_value() && *value > 0)
             {
                 config.replica_count = static_cast<std::uint32_t>(*value);
             }
+            else if (const auto value =
+                         ExtractUnsignedFromSection(cluster_section, "replica_count");
+                     value.has_value() && *value > 0)
+            {
+                config.replica_count = static_cast<std::uint32_t>(*value);
+            }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "upload_concurrency");
+                    ExtractUnsignedFromSection(store_section, "upload_concurrency");
                 value.has_value())
             {
                 config.upload_concurrency = static_cast<std::uint32_t>(*value);
             }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "max_inflight_bytes");
+                    ExtractUnsignedFromSection(store_section, "download_concurrency");
+                value.has_value())
+            {
+                config.download_concurrency = static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "max_inflight_bytes");
                 value.has_value())
             {
                 config.max_inflight_bytes = *value;
             }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "replica_fanout_concurrency");
+                    ExtractUnsignedFromSection(store_section, "replica_fanout_concurrency");
                 value.has_value())
             {
                 config.replica_fanout_concurrency =
                     static_cast<std::uint32_t>(*value);
             }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "minimum_successful_writes");
+                    ExtractUnsignedFromSection(store_section, "minimum_successful_writes");
                 value.has_value() && *value > 0)
             {
                 config.minimum_successful_writes =
                     static_cast<std::uint32_t>(*value);
             }
+            else if (const auto value =
+                         ExtractUnsignedFromSection(cluster_section,
+                                                    "minimum_successful_writes");
+                     value.has_value() && *value > 0)
+            {
+                config.minimum_successful_writes =
+                    static_cast<std::uint32_t>(*value);
+            }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "discovery_rpc_timeout_ms");
+                    ExtractUnsignedFromSection(cluster_section,
+                                               "discovery_rpc_timeout_ms");
                 value.has_value())
             {
                 config.discovery_timeout = std::chrono::milliseconds(*value);
@@ -376,7 +568,8 @@ namespace
                 config.discovery_timeout = std::chrono::milliseconds(*value);
             }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "metadata_rpc_timeout_ms");
+                    ExtractUnsignedFromSection(cluster_section,
+                                               "metadata_rpc_timeout_ms");
                 value.has_value())
             {
                 config.metadata_timeout = std::chrono::milliseconds(*value);
@@ -388,7 +581,8 @@ namespace
                 config.metadata_timeout = std::chrono::milliseconds(*value);
             }
             if (const auto value =
-                    ExtractUnsignedConfigValue(content, "storage_rpc_timeout_ms");
+                    ExtractUnsignedFromSection(cluster_section,
+                                               "storage_rpc_timeout_ms");
                 value.has_value())
             {
                 config.storage_timeout = std::chrono::milliseconds(*value);
@@ -399,7 +593,14 @@ namespace
             {
                 config.storage_timeout = std::chrono::milliseconds(*value);
             }
-            if (const auto value = ExtractUnsignedConfigValue(content, "commit_deadline_ms");
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "commit_object_timeout_ms");
+                value.has_value())
+            {
+                config.commit_deadline = std::chrono::milliseconds(*value);
+            }
+            else if (const auto value =
+                         ExtractUnsignedConfigValue(content, "commit_deadline_ms");
                 value.has_value())
             {
                 config.commit_deadline = std::chrono::milliseconds(*value);
@@ -410,11 +611,72 @@ namespace
             {
                 config.commit_deadline = std::chrono::milliseconds(*value);
             }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "chunk_write_timeout_ms");
+                value.has_value())
+            {
+                config.chunk_write_timeout = std::chrono::milliseconds(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "chunk_read_timeout_ms");
+                value.has_value())
+            {
+                config.chunk_read_timeout = std::chrono::milliseconds(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "max_write_retries");
+                value.has_value())
+            {
+                config.max_write_retries = static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section,
+                                               "max_transient_write_retries");
+                value.has_value())
+            {
+                config.max_transient_write_retries =
+                    static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section,
+                                               "max_transient_read_retries");
+                value.has_value())
+            {
+                config.max_transient_read_retries =
+                    static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "initial_backoff_ms");
+                value.has_value())
+            {
+                config.initial_backoff_ms = static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedFromSection(store_section, "max_backoff_ms");
+                value.has_value())
+            {
+                config.max_backoff_ms = static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value = ExtractBoolFromSection(store_section, "wait_for_ready");
+                value.has_value())
+            {
+                config.transfer_wait_for_ready = *value;
+            }
+            if (const auto value = ExtractBoolFromSection(view_section, "wait_for_ready");
+                value.has_value())
+            {
+                config.view_wait_for_ready = *value;
+            }
 
             if (config.upload_concurrency < 1)
             {
                 throw ClientConfigError(
                     "config upload_concurrency must be greater than or equal to 1");
+            }
+            if (config.download_concurrency < 1)
+            {
+                throw ClientConfigError(
+                    "config download_concurrency must be greater than or equal to 1");
             }
             if (config.max_inflight_bytes < storedemo::kProductionChunkSizeBytes)
             {
@@ -1284,6 +1546,7 @@ namespace
         viewdemo::ViewNodeClientConfig client_config;
         client_config.discovery_timeout = config.discovery_timeout;
         client_config.cluster_view_timeout = config.discovery_timeout;
+        client_config.wait_for_ready = config.view_wait_for_ready;
         return std::make_shared<viewdemo::ViewNodeClient>(
             grpc::CreateChannel(config.view_endpoint,
                                 grpc::InsecureChannelCredentials()),
@@ -1301,15 +1564,33 @@ namespace
         client_config.commit_object_timeout = config.commit_deadline;
         client_config.head_object_timeout = config.metadata_timeout;
         client_config.get_manifest_timeout = config.metadata_timeout;
+        client_config.wait_for_ready = config.transfer_wait_for_ready;
         return storedemo::CreateGrpcMetadataTransferClient(config.view_endpoint,
                                                            std::move(client_config));
+    }
+
+    [[nodiscard]] storedemo::StorageTransferClientConfig MakeStorageTransferClientConfig(
+        const ClientConfig &config)
+    {
+        storedemo::StorageTransferClientConfig client_config;
+        client_config.max_write_retries = config.max_write_retries;
+        client_config.max_transient_write_retries =
+            config.max_transient_write_retries;
+        client_config.max_transient_read_retries =
+            config.max_transient_read_retries;
+        client_config.initial_backoff_ms = config.initial_backoff_ms;
+        client_config.max_backoff_ms = config.max_backoff_ms;
+        client_config.grpc_message_limit_bytes =
+            storedemo::kProductionChunkSizeBytes + (1024ULL * 1024ULL);
+        return client_config;
     }
 
     [[nodiscard]] storedemo::ObjectTransfer CreateObjectTransfer(
         const ClientConfig &config)
     {
         return storedemo::ObjectTransfer(CreateMetadataClientSeed(config),
-                                         storedemo::CreateGrpcStorageTransferClient(),
+                                         storedemo::CreateGrpcStorageTransferClient(
+                                             MakeStorageTransferClientConfig(config)),
                                          CreateViewClient(config));
     }
 
@@ -1333,7 +1614,7 @@ namespace
              .max_inflight_bytes = config.max_inflight_bytes,
              .replica_fanout_concurrency = config.replica_fanout_concurrency,
              .replica_write_timeout_ms = static_cast<std::uint64_t>(
-                 config.storage_timeout.count()),
+                 config.chunk_write_timeout.count()),
              .desired_replica_count =
                  args.replica_count.value_or(config.replica_count),
              .minimum_successful_writes =
@@ -1405,7 +1686,7 @@ namespace
              .object_id = args.object_id,
              .version = args.version,
              .destination_path = args.destination_path,
-             .concurrency = args.concurrency.value_or(1)});
+             .concurrency = args.concurrency.value_or(config.download_concurrency)});
 
         auto checksum_state = storedemo::CreateTransferChecksumState();
         const storedemo::DownloadObjectResult result =
