@@ -59,7 +59,7 @@
 验收标准：阻塞 writer 测试观察到 same-chunk 多副本 overlap；minimum_successful_writes 未满足时不调用 CommitObject。  
 测试方式：fan-out unit/integration test + existing failed upload cleanup tests。
 
-- [ ] T006 [US2] Add bounded multi-chunk upload pipeline with max_inflight_chunks and max_inflight_bytes backpressure in `modules/store/transfer/object_transfer.cpp` and concurrency tests.
+- [X] T006 [US2] Add bounded multi-chunk upload pipeline with max_inflight_chunks and max_inflight_bytes backpressure in `modules/store/transfer/object_transfer.cpp` and concurrency tests.
 
 修改目标：第二遍上传在读取 chunk payload 前获取 chunk/byte budget；完成后释放预算；不得把整文件读入内存。  
 涉及文件：`modules/store/transfer/object_transfer.cpp`、`modules/store/transfer/object_transfer.h` 如需 session diagnostics、`modules/store/runtime/storage_executor.*` 仅在复用有界执行器时修改、`tests/integrated_object_storage_concurrency_test.cpp`。  

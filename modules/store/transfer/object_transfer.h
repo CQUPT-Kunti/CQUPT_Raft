@@ -393,6 +393,9 @@ namespace storedemo
     public:
         ~UploadTransferSession() override;
 
+        static void SetMaxInflightPayloadBytesOverrideForTesting(
+            std::uint64_t max_bytes);
+
         [[nodiscard]] virtual const UploadObjectRequest &request() const = 0;
         virtual UploadObjectResult Execute(
             TransferChunkReader &reader,
