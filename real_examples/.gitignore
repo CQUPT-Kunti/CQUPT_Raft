@@ -1,2 +1,4 @@
 *.chunk
 *.log
+*.zip
+/object-storage-local-009-simulated/downloads/*

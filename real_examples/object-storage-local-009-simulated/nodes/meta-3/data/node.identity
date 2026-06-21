@@ -1,0 +1,9 @@
+identity_version=2
+cluster_id=example-local-009-simulated
+node_id=meta-3
+node_type=metadata
+raft_id=3
+created_at_unix_ms=1782049393852
+membership_state=voter
+persistent_generation=1
+source=config_generator
