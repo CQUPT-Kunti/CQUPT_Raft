@@ -204,7 +204,8 @@ download 当前是 manifest-driven、逐 chunk、临时文件重建流程：
 6. 通过 ViewNode `DiscoverStorage`
 7. 创建临时输出文件
 8. 逐 chunk：
-   - 从 manifest 选 replica target
+   - 只从该 chunk 的 manifest `replica_nodes` 解析 replica targets
+   - 首个 replica read 失败后，继续尝试同 chunk 下一个 manifest replica
    - 调用 `StorageTransferClient::ReadChunk(...)`
    - 校验 chunk checksum / size
    - 按 offset 写入临时文件
@@ -216,6 +217,15 @@ download 不接受：
 - PENDING 对象
 - ViewNode 推断出来的“看起来可能存在”的对象
 - StorageNode 本地 live chunk 列表作为可见性 authority
+
+T007-A 后 download 的 manifest-scoped fallback 边界是：
+
+- 每个 chunk 的 candidate list 只能来自该 chunk committed manifest 的 `replica_nodes`
+- 不同 chunk 可以拥有不同 replica set；download 必须逐 chunk 独立解析
+- discovery 只负责把 manifest node_id 解析到 data-plane endpoint，不允许扩展候选集合
+- 若 manifest 某个 node_id 缺少当前 observed facts，但 discovery 仍能解析 endpoint，该节点仍可作为中性 fallback 尝试
+- 不允许从 fixed replica group、其他 chunk、或 manifest 外的健康 StorageNode 推断 fallback
+- 当前阶段只建立 same-chunk manifest fallback 主路径；checksum mismatch diagnostics、所有副本失败的完整聚合输出留给 T007-B
 
 ## 当前 adapter 语义
 

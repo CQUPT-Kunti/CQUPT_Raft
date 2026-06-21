@@ -561,6 +561,8 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage_read_integration_test.cpp")
   target_link_libraries(test_storage_read_integration
     PRIVATE
       raft_core
+      view_proto
+      metadata_proto
       GTest::gtest_main
   )
 

@@ -1255,6 +1255,23 @@ namespace storedemo
             return std::nullopt;
         }
 
+        [[nodiscard]] std::vector<StorageTransferTarget> ResolveManifestReplicaTargets(
+            const TransferCommittedChunk &chunk,
+            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets)
+        {
+            std::vector<StorageTransferTarget> targets;
+            targets.reserve(chunk.replica_nodes.size());
+            for (const auto &replica_node_id : chunk.replica_nodes)
+            {
+                const auto it = storage_targets.find(replica_node_id);
+                if (it != storage_targets.end() && !it->second.endpoint.empty())
+                {
+                    targets.push_back(it->second);
+                }
+            }
+            return targets;
+        }
+
         [[nodiscard]] std::vector<StorageTransferTarget>
         ResolveSelectedChunkTargetsFromPlan(
             const TransferChunkPlan &chunk_plan,
@@ -3643,8 +3660,9 @@ namespace storedemo
 
                 for (const auto &chunk : ordered_chunks)
                 {
-                    const auto target = ResolveReplicaTarget(chunk, storage_targets);
-                    if (!target.has_value())
+                    const auto manifest_targets =
+                        ResolveManifestReplicaTargets(chunk, storage_targets);
+                    if (manifest_targets.empty())
                     {
                         Fail(&result,
                              ObjectTransferStatusCode::kDiscoveryUnavailable,
@@ -3656,29 +3674,69 @@ namespace storedemo
                         return result;
                     }
 
-                    const auto read_result = storage_client_->ReadChunk(
-                        {.request_id = request_.request_id,
-                         .target = *target,
-                         .identity = chunk.identity,
-                         .expected_checksum = chunk.checksum,
-                         .verify_checksum = true});
-                    if (!read_result.ok())
+                    std::optional<StorageTransferReadResult> successful_read;
+                    std::optional<StorageTransferReadResult> last_failure;
+                    std::optional<StorageTransferTarget> last_attempted_target;
+                    for (const auto &target : manifest_targets)
                     {
-                        const auto status = MapStorageStatus(read_result.status);
+                        const auto read_result = storage_client_->ReadChunk(
+                            {.request_id = request_.request_id,
+                             .target = target,
+                             .identity = chunk.identity,
+                             .expected_checksum = chunk.checksum,
+                             .verify_checksum = true});
+                        if (read_result.ok())
+                        {
+                            successful_read = read_result;
+                            last_attempted_target = target;
+                            break;
+                        }
+
+                        last_failure = read_result;
+                        last_attempted_target = target;
+                        result.diagnostics.push_back(
+                            MakeDiagnostic(
+                                MapStorageStatus(read_result.status),
+                                "manifest replica read attempt failed; trying next same-chunk manifest replica when available: " +
+                                    read_result.error_detail,
+                                request_.request_id,
+                                chunk.identity.chunk_index,
+                                chunk.identity.offset,
+                                chunk.identity.chunk_id,
+                                read_result.retryable));
+                        result.diagnostics.back().node_id = target.node_id;
+                        result.diagnostics.back().endpoint = target.endpoint;
+                    }
+
+                    if (!successful_read.has_value())
+                    {
+                        const auto fallback_status =
+                            last_failure.has_value()
+                                ? MapStorageStatus(last_failure->status)
+                                : ObjectTransferStatusCode::kStorageRejected;
                         Fail(&result,
-                             status,
-                             "StorageNode ReadChunk failed: " +
-                                 read_result.error_detail,
+                             fallback_status,
+                             last_failure.has_value()
+                                 ? "StorageNode ReadChunk failed for all same-chunk manifest replicas: " +
+                                       last_failure->error_detail
+                                 : "StorageNode ReadChunk failed for all same-chunk manifest replicas",
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             target->node_id,
-                             target->endpoint,
+                             last_attempted_target.has_value()
+                                 ? last_attempted_target->node_id
+                                 : std::string(),
+                             last_attempted_target.has_value()
+                                 ? last_attempted_target->endpoint
+                                 : std::string(),
                              chunk.identity.chunk_id,
-                             read_result.retryable);
+                             last_failure.has_value() && last_failure->retryable);
                         close_output();
                         cleanup_temp();
                         return result;
                     }
+
+                    const auto &read_result = *successful_read;
+                    const auto &selected_target = *last_attempted_target;
 
                     if (static_cast<std::uint64_t>(read_result.payload.size()) !=
                         chunk.size)
@@ -3688,8 +3746,8 @@ namespace storedemo
                              "StorageNode returned payload size inconsistent with COMMITTED manifest",
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             target->node_id,
-                             target->endpoint,
+                             selected_target.node_id,
+                             selected_target.endpoint,
                              chunk.identity.chunk_id,
                              false);
                         close_output();
@@ -3709,8 +3767,8 @@ namespace storedemo
                              checksum_update.error_detail,
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             target->node_id,
-                             target->endpoint,
+                             selected_target.node_id,
+                             selected_target.endpoint,
                              chunk.identity.chunk_id,
                              false);
                         close_output();
@@ -3727,8 +3785,8 @@ namespace storedemo
                              "failed to seek temporary download file",
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             target->node_id,
-                             target->endpoint,
+                             selected_target.node_id,
+                             selected_target.endpoint,
                              chunk.identity.chunk_id,
                              false);
                         close_output();
@@ -3746,8 +3804,8 @@ namespace storedemo
                              "failed to write chunk payload into temporary download file",
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             target->node_id,
-                             target->endpoint,
+                             selected_target.node_id,
+                             selected_target.endpoint,
                              chunk.identity.chunk_id,
                              false);
                         close_output();
