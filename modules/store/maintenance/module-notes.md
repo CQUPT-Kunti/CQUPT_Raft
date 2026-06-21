@@ -46,6 +46,20 @@
 - copy flow 只处理 chunk data-plane payload 和 checksum/size 事实，不调用 metadata / Raft，也不保存 object payload 到 metadata / Raft。
 - under-replicated detection 只依赖 scrub manifest、replica checksum/state 事实和 registry snapshot；不直接修改 metadata manifest，不做 read-side repair，也不把 repair completed 伪装成 manifest 已协调。
 
+## T008-A/T008-B repair-ready 边界补充
+
+- committed manifest 仍然是 repair source authority。`RepairManager` 不得把 discovery、registry 或 scrub 看到的 manifest 外节点当成“既有 source replica”。
+- `healthy_source_replicas` 必须来自 committed manifest 中当前仍通过 registry/health 事实可用的副本；manifest 外健康节点最多只能参与 replacement target placement。
+- replacement target 继续复用 `PlacementManager` / `PlacementDecision`；manager 层不自己拼 target 排序，也不对 placement failure 做隐式 fallback。
+- `RepairTask` 现在保留 repair-ready facts：
+  - chunk identity
+  - existing manifest replicas
+  - retained healthy source replicas
+  - bad replicas
+  - source / target exclusion reasons
+  - replacement placement decision
+- 这些 facts 只用于后续 repair-B 诊断和决策准备；本阶段仍不执行 source `ReadChunk`、target `WriteChunk`、checksum verify、新副本 durable publish、manifest update、Raft proposal 或后台 repair scheduling。
+
 ## T087 fixed boundary
 
 - T087 新增生产 `RebalanceManager` task model，负责创建并维护 capacity imbalance / hotspot / new node join / draining / maintenance rebalance task。

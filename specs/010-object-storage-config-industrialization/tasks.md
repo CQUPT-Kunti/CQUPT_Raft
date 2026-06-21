@@ -77,7 +77,7 @@
 验收标准：首选副本 not found/checksum mismatch 时，下载能从第二健康副本成功；所有副本失败时返回聚合错误。  
 测试方式：`storage_read_integration_test` targeted fallback cases。
 
-- [ ] T008 [US3] Preserve repair-B-ready manifest and placement facts in `modules/store/placement/*`, `modules/store/maintenance/repair_manager.*`, and manifest/repair direction tests without implementing full repair loop.
+- [X] T008 [US3] Preserve repair-B-ready manifest and placement facts in `modules/store/placement/*`, `modules/store/maintenance/repair_manager.*`, and manifest/repair direction tests without implementing full repair loop.
 
 修改目标：placement 支持排除已有健康副本和不可写节点后重新选择新目标；repair task/fact 不假设必须补回原节点。  
 涉及文件：`modules/store/placement/placement_manager.*`、`modules/store/placement/replica_policy.*`、`modules/store/maintenance/repair_manager.*` 如需只调整 facts、`tests/store_placement_manager_test.cpp`、`tests/storage_scrub_repair_test.cpp`。  

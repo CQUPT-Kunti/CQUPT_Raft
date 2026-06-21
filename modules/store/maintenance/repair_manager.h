@@ -11,6 +11,7 @@
 
 #include "store/chunk/chunk_store.h"
 #include "store/maintenance/scrub_manager.h"
+#include "store/placement/placement_manager.h"
 #include "store/runtime/storage_executor.h"
 
 namespace storedemo
@@ -77,7 +78,10 @@ namespace storedemo
         ChunkChecksum expected_checksum;
         std::uint64_t expected_size{0};
         std::vector<StorageNodeId> existing_replica_nodes;
+        std::vector<StorageNodeId> healthy_source_replicas;
         std::vector<StorageNodeId> bad_replicas;
+        std::vector<PlacementNodeExclusion> excluded_nodes;
+        PlacementDecision replacement_decision;
         StorageTaskContext context;
         RepairTaskState state{RepairTaskState::kQueued};
         std::uint32_t progress_percent{0};
