@@ -225,7 +225,10 @@ T007-A 后 download 的 manifest-scoped fallback 边界是：
 - discovery 只负责把 manifest node_id 解析到 data-plane endpoint，不允许扩展候选集合
 - 若 manifest 某个 node_id 缺少当前 observed facts，但 discovery 仍能解析 endpoint，该节点仍可作为中性 fallback 尝试
 - 不允许从 fixed replica group、其他 chunk、或 manifest 外的健康 StorageNode 推断 fallback
-- 当前阶段只建立 same-chunk manifest fallback 主路径；checksum mismatch diagnostics、所有副本失败的完整聚合输出留给 T007-B
+- T007-B 后，replica read 返回 `NotFound` / timeout / retryable failure / corruption / size mismatch / chunk checksum mismatch 时，当前 replica 都会被视为失败并继续尝试同 chunk 下一个 manifest replica
+- 只有某个 replica 完整通过 size + chunk checksum 校验后，chunk payload 才会写入临时输出文件
+- 若同 chunk 所有 manifest replicas 都失败，download 返回 chunk-scoped 聚合错误，detail 至少保留 attempted node ids 与逐节点 failure 分类，便于后续 repair-ready 诊断消费
+- 最终 output 只有在全部 chunk 成功且最终 object checksum 通过后才会 `rename` 发布；object checksum mismatch 或 chunk 失败时会清理 `.part` 临时文件，不留下可误判为成功的输出
 
 ## 当前 adapter 语义
 

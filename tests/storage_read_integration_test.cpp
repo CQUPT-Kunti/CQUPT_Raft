@@ -372,6 +372,7 @@ namespace
         storedemo::StorageTransferWriteResult WriteChunk(
             const storedemo::StorageTransferWriteRequest &) override
         {
+            ++write_calls;
             storedemo::StorageTransferWriteResult result;
             result.status = storedemo::StorageNodeStatusCode::kUnsupported;
             result.error_detail = "write not implemented";
@@ -404,6 +405,7 @@ namespace
             const storedemo::StorageTransferReadRequest &request)>
             read_behavior;
         std::vector<storedemo::StorageTransferReadRequest> reads;
+        std::size_t write_calls{0};
 
     private:
         std::mutex mu_;
@@ -477,6 +479,35 @@ namespace
         }
         return std::string(std::istreambuf_iterator<char>(input),
                            std::istreambuf_iterator<char>());
+    }
+
+    bool ResultHasDiagnosticContaining(
+        const storedemo::DownloadObjectResult &result,
+        const std::string_view needle,
+        const std::string_view node_id = {})
+    {
+        return std::any_of(
+            result.diagnostics.begin(),
+            result.diagnostics.end(),
+            [needle, node_id](const storedemo::ObjectTransferDiagnostic &diagnostic)
+            {
+                if (!node_id.empty() && diagnostic.node_id != node_id)
+                {
+                    return false;
+                }
+                return diagnostic.message.find(needle) != std::string::npos;
+            });
+    }
+
+    std::filesystem::path MakeExpectedDownloadTempPath(
+        const std::filesystem::path &destination_path,
+        const std::string_view request_id)
+    {
+        auto temp_path = destination_path;
+        temp_path += ".";
+        temp_path += request_id;
+        temp_path += ".part";
+        return temp_path;
     }
 
     class StorageReadIntegrationTest : public ::testing::Test
@@ -2445,5 +2476,470 @@ namespace
         ASSERT_EQ(storage_client->reads.size(), 2U);
         EXPECT_EQ(storage_client->reads[0].target.node_id, "replica-a");
         EXPECT_EQ(storage_client->reads[1].target.node_id, "replica-b");
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           ProductionDownloadFallsBackAfterChunkChecksumMismatch)
+    {
+        ScopedManifestMetadataServer metadata_server;
+        ScopedManifestViewServer view_server;
+        view_server.service().SetMetadataEndpoint(metadata_server.address());
+
+        const std::string cluster_id = "cluster-t007b-checksum-fallback";
+        const std::string bucket = "bucket-t007b-checksum-fallback";
+        const std::string object_key = "objects/checksum-fallback.bin";
+        const std::string object_id = "obj-t007b-checksum-fallback";
+        const std::uint64_t version = 11;
+        const std::string payload = storedemo::test::MakeChunkPayload(32, "cs");
+        const std::string corrupted_payload =
+            storedemo::test::MakeChunkPayload(32, "bad");
+
+        const auto chunk0 = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+        const std::vector<raftdemo::ChunkRef> manifest{
+            MakeChunkRef(chunk0, payload, {"replica-a", "replica-b"})};
+        metadata_server.service().SetCommittedObject(
+            MakeCommittedObjectRecord(bucket, object_key, object_id, version, payload, manifest));
+
+        view_server.service().SetStorageNodes(
+            {
+                MakeReadStorageSnapshot(cluster_id, "replica-a", "127.0.0.1:8901",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-b", "127.0.0.1:8902",
+                                        128ULL * 1024ULL * 1024ULL),
+            },
+            1714002000000ULL);
+
+        auto metadata_client =
+            storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+        auto storage_client = std::make_shared<RecordingReadStorageTransferClient>();
+        storage_client->read_behavior =
+            [&](const storedemo::StorageTransferReadRequest &request)
+        {
+            storedemo::StorageTransferReadResult result;
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.target = request.target;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = request.expected_checksum.size_bytes;
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            if (request.target.node_id == "replica-a")
+            {
+                result.payload = corrupted_payload;
+                result.actual_checksum =
+                    storedemo::test::ComputeStoreChecksumOrThrow(corrupted_payload);
+                result.verified = false;
+                return result;
+            }
+
+            result.payload = payload;
+            result.actual_checksum = request.expected_checksum;
+            result.verified = true;
+            return result;
+        };
+
+        auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+            grpc::CreateChannel(view_server.address(),
+                                grpc::InsecureChannelCredentials()),
+            view_server.address());
+        storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t007b_checksum");
+        const auto destination_path = temp_dir.Path("download.bin");
+        auto session = transfer.StartDownloadSession(
+            storedemo::DownloadObjectRequest{
+                .request_id = "download-t007b-checksum",
+                .cluster_id = cluster_id,
+                .bucket = bucket,
+                .object_key = object_key,
+                .object_id = object_id,
+                .version = version,
+                .destination_path = destination_path,
+                .concurrency = 1});
+        auto checksum_state = storedemo::CreateTransferChecksumState();
+        const auto result = session->Execute(*checksum_state);
+
+        ASSERT_TRUE(result.ok()) << result.error_detail;
+        EXPECT_TRUE(result.checksum_verified);
+        EXPECT_EQ(ReadBinaryFileOrThrow(destination_path), payload);
+        ASSERT_EQ(storage_client->reads.size(), 2U);
+        EXPECT_EQ(storage_client->reads[0].target.node_id, "replica-a");
+        EXPECT_EQ(storage_client->reads[1].target.node_id, "replica-b");
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "checksum mismatch", "replica-a"));
+        EXPECT_EQ(storage_client->write_calls, 0U);
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           ProductionDownloadFallsBackAfterChunkSizeMismatch)
+    {
+        ScopedManifestMetadataServer metadata_server;
+        ScopedManifestViewServer view_server;
+        view_server.service().SetMetadataEndpoint(metadata_server.address());
+
+        const std::string cluster_id = "cluster-t007b-size-fallback";
+        const std::string bucket = "bucket-t007b-size-fallback";
+        const std::string object_key = "objects/size-fallback.bin";
+        const std::string object_id = "obj-t007b-size-fallback";
+        const std::uint64_t version = 12;
+        const std::string payload = storedemo::test::MakeChunkPayload(36, "sz");
+        const std::string truncated_payload = payload.substr(0, payload.size() - 5U);
+
+        const auto chunk0 = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+        const std::vector<raftdemo::ChunkRef> manifest{
+            MakeChunkRef(chunk0, payload, {"replica-a", "replica-b"})};
+        metadata_server.service().SetCommittedObject(
+            MakeCommittedObjectRecord(bucket, object_key, object_id, version, payload, manifest));
+
+        view_server.service().SetStorageNodes(
+            {
+                MakeReadStorageSnapshot(cluster_id, "replica-a", "127.0.0.1:8911",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-b", "127.0.0.1:8912",
+                                        128ULL * 1024ULL * 1024ULL),
+            },
+            1714002000000ULL);
+
+        auto metadata_client =
+            storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+        auto storage_client = std::make_shared<RecordingReadStorageTransferClient>();
+        storage_client->read_behavior =
+            [&](const storedemo::StorageTransferReadRequest &request)
+        {
+            storedemo::StorageTransferReadResult result;
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.target = request.target;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = request.expected_checksum.size_bytes;
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            if (request.target.node_id == "replica-a")
+            {
+                result.payload = truncated_payload;
+                result.actual_checksum =
+                    storedemo::test::ComputeStoreChecksumOrThrow(truncated_payload);
+                result.verified = false;
+                return result;
+            }
+
+            result.payload = payload;
+            result.actual_checksum = request.expected_checksum;
+            result.verified = true;
+            return result;
+        };
+
+        auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+            grpc::CreateChannel(view_server.address(),
+                                grpc::InsecureChannelCredentials()),
+            view_server.address());
+        storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t007b_size");
+        const auto destination_path = temp_dir.Path("download.bin");
+        auto session = transfer.StartDownloadSession(
+            storedemo::DownloadObjectRequest{
+                .request_id = "download-t007b-size",
+                .cluster_id = cluster_id,
+                .bucket = bucket,
+                .object_key = object_key,
+                .object_id = object_id,
+                .version = version,
+                .destination_path = destination_path,
+                .concurrency = 1});
+        auto checksum_state = storedemo::CreateTransferChecksumState();
+        const auto result = session->Execute(*checksum_state);
+
+        ASSERT_TRUE(result.ok()) << result.error_detail;
+        EXPECT_EQ(ReadBinaryFileOrThrow(destination_path), payload);
+        ASSERT_EQ(storage_client->reads.size(), 2U);
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "size mismatch", "replica-a"));
+        EXPECT_EQ(storage_client->write_calls, 0U);
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           ProductionDownloadAggregatesAllManifestReplicaFailuresAndCleansOutput)
+    {
+        ScopedManifestMetadataServer metadata_server;
+        ScopedManifestViewServer view_server;
+        view_server.service().SetMetadataEndpoint(metadata_server.address());
+
+        const std::string cluster_id = "cluster-t007b-all-fail";
+        const std::string bucket = "bucket-t007b-all-fail";
+        const std::string object_key = "objects/all-fail.bin";
+        const std::string object_id = "obj-t007b-all-fail";
+        const std::uint64_t version = 13;
+        const std::string payload = storedemo::test::MakeChunkPayload(40, "af");
+        const std::string corrupted_payload =
+            storedemo::test::MakeChunkPayload(40, "bad");
+
+        const auto chunk0 = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+        const std::vector<raftdemo::ChunkRef> manifest{
+            MakeChunkRef(chunk0,
+                         payload,
+                         {"replica-a", "replica-b", "replica-c"})};
+        metadata_server.service().SetCommittedObject(
+            MakeCommittedObjectRecord(bucket, object_key, object_id, version, payload, manifest));
+
+        view_server.service().SetStorageNodes(
+            {
+                MakeReadStorageSnapshot(cluster_id, "replica-a", "127.0.0.1:8921",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-b", "127.0.0.1:8922",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-c", "127.0.0.1:8923",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-extra", "127.0.0.1:8999",
+                                        128ULL * 1024ULL * 1024ULL),
+            },
+            1714002000000ULL);
+
+        auto metadata_client =
+            storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+        auto storage_client = std::make_shared<RecordingReadStorageTransferClient>();
+        storage_client->read_behavior =
+            [&](const storedemo::StorageTransferReadRequest &request)
+        {
+            EXPECT_NE(request.target.node_id, "replica-extra");
+
+            storedemo::StorageTransferReadResult result;
+            result.target = request.target;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = request.expected_checksum.size_bytes;
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            if (request.target.node_id == "replica-a")
+            {
+                result.status = storedemo::StorageNodeStatusCode::kTimeout;
+                result.error_detail = "replica-a timed out";
+                result.retryable = true;
+                return result;
+            }
+            if (request.target.node_id == "replica-b")
+            {
+                result.status = storedemo::StorageNodeStatusCode::kNotFound;
+                result.error_detail = "replica-b missing chunk";
+                return result;
+            }
+
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.payload = corrupted_payload;
+            result.actual_checksum =
+                storedemo::test::ComputeStoreChecksumOrThrow(corrupted_payload);
+            result.verified = false;
+            return result;
+        };
+
+        auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+            grpc::CreateChannel(view_server.address(),
+                                grpc::InsecureChannelCredentials()),
+            view_server.address());
+        storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t007b_all_fail");
+        const auto destination_path = temp_dir.Path("download.bin");
+        const auto temp_output_path = MakeExpectedDownloadTempPath(
+            destination_path,
+            "download-t007b-all-fail");
+        auto session = transfer.StartDownloadSession(
+            storedemo::DownloadObjectRequest{
+                .request_id = "download-t007b-all-fail",
+                .cluster_id = cluster_id,
+                .bucket = bucket,
+                .object_key = object_key,
+                .object_id = object_id,
+                .version = version,
+                .destination_path = destination_path,
+                .concurrency = 1});
+        auto checksum_state = storedemo::CreateTransferChecksumState();
+        const auto result = session->Execute(*checksum_state);
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kChecksumMismatch);
+        EXPECT_NE(result.error_detail.find("chunk 0"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("replica-a"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("replica-b"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("replica-c"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("timeout"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("missing"), std::string::npos);
+        EXPECT_NE(result.error_detail.find("checksum mismatch"), std::string::npos);
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "timeout", "replica-a"));
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "missing", "replica-b"));
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "checksum mismatch",
+                                                  "replica-c"));
+        EXPECT_EQ(storage_client->reads.size(), 3U);
+        EXPECT_EQ(storage_client->write_calls, 0U);
+        EXPECT_FALSE(std::filesystem::exists(destination_path));
+        EXPECT_FALSE(std::filesystem::exists(temp_output_path));
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           ProductionDownloadRejectsFinalObjectChecksumMismatchWithoutPublishingOutput)
+    {
+        ScopedManifestMetadataServer metadata_server;
+        ScopedManifestViewServer view_server;
+        view_server.service().SetMetadataEndpoint(metadata_server.address());
+
+        const std::string cluster_id = "cluster-t007b-object-checksum";
+        const std::string bucket = "bucket-t007b-object-checksum";
+        const std::string object_key = "objects/object-checksum.bin";
+        const std::string object_id = "obj-t007b-object-checksum";
+        const std::uint64_t version = 14;
+        const std::string payload =
+            storedemo::test::MakeChunkPayload(18, "oc0") +
+            storedemo::test::MakeChunkPayload(18, "oc1");
+
+        const auto chunk0 = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+        const auto chunk1 = MakeStoreIdentityOrThrow(object_id, version, 1, 18);
+        const std::vector<raftdemo::ChunkRef> manifest{
+            MakeChunkRef(chunk0, payload.substr(0, 18), {"replica-a"}),
+            MakeChunkRef(chunk1, payload.substr(18), {"replica-b"})};
+        auto object = MakeCommittedObjectRecord(
+            bucket, object_key, object_id, version, payload, manifest);
+        object.set_etag(std::string(64, '0'));
+        metadata_server.service().SetCommittedObject(object);
+
+        view_server.service().SetStorageNodes(
+            {
+                MakeReadStorageSnapshot(cluster_id, "replica-a", "127.0.0.1:8931",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-b", "127.0.0.1:8932",
+                                        128ULL * 1024ULL * 1024ULL),
+            },
+            1714002000000ULL);
+
+        auto metadata_client =
+            storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+        auto storage_client = std::make_shared<RecordingReadStorageTransferClient>();
+        storage_client->read_behavior =
+            [&](const storedemo::StorageTransferReadRequest &request)
+        {
+            storedemo::StorageTransferReadResult result;
+            result.status = storedemo::StorageNodeStatusCode::kOk;
+            result.target = request.target;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = request.expected_checksum.size_bytes;
+            result.metadata.checksum = request.expected_checksum;
+            result.metadata.state = storedemo::ChunkState::kLive;
+            result.payload = request.identity.chunk_index == 0
+                                 ? payload.substr(0, 18)
+                                 : payload.substr(18);
+            result.actual_checksum = request.expected_checksum;
+            result.verified = true;
+            return result;
+        };
+
+        auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+            grpc::CreateChannel(view_server.address(),
+                                grpc::InsecureChannelCredentials()),
+            view_server.address());
+        storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t007b_object_checksum");
+        const auto destination_path = temp_dir.Path("download.bin");
+        const auto temp_output_path = MakeExpectedDownloadTempPath(
+            destination_path,
+            "download-t007b-object-checksum");
+        auto session = transfer.StartDownloadSession(
+            storedemo::DownloadObjectRequest{
+                .request_id = "download-t007b-object-checksum",
+                .cluster_id = cluster_id,
+                .bucket = bucket,
+                .object_key = object_key,
+                .object_id = object_id,
+                .version = version,
+                .destination_path = destination_path,
+                .concurrency = 1});
+        auto checksum_state = storedemo::CreateTransferChecksumState();
+        const auto result = session->Execute(*checksum_state);
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_EQ(result.status, storedemo::ObjectTransferStatusCode::kChecksumMismatch);
+        EXPECT_FALSE(std::filesystem::exists(destination_path));
+        EXPECT_FALSE(std::filesystem::exists(temp_output_path));
+        EXPECT_EQ(storage_client->write_calls, 0U);
+    }
+
+    TEST_F(StorageReadIntegrationTest,
+           ProductionDownloadRetainsRepairReadyDiagnosticsWithoutRepairWrites)
+    {
+        ScopedManifestMetadataServer metadata_server;
+        ScopedManifestViewServer view_server;
+        view_server.service().SetMetadataEndpoint(metadata_server.address());
+
+        const std::string cluster_id = "cluster-t007b-repair-ready";
+        const std::string bucket = "bucket-t007b-repair-ready";
+        const std::string object_key = "objects/repair-ready.bin";
+        const std::string object_id = "obj-t007b-repair-ready";
+        const std::uint64_t version = 15;
+        const std::string payload = storedemo::test::MakeChunkPayload(34, "rr");
+
+        const auto chunk0 = MakeStoreIdentityOrThrow(object_id, version, 0, 0);
+        const std::vector<raftdemo::ChunkRef> manifest{
+            MakeChunkRef(chunk0, payload, {"replica-a", "replica-b"})};
+        metadata_server.service().SetCommittedObject(
+            MakeCommittedObjectRecord(bucket, object_key, object_id, version, payload, manifest));
+
+        view_server.service().SetStorageNodes(
+            {
+                MakeReadStorageSnapshot(cluster_id, "replica-a", "127.0.0.1:8941",
+                                        128ULL * 1024ULL * 1024ULL),
+                MakeReadStorageSnapshot(cluster_id, "replica-b", "127.0.0.1:8942",
+                                        128ULL * 1024ULL * 1024ULL),
+            },
+            1714002000000ULL);
+
+        auto metadata_client =
+            storedemo::CreateGrpcMetadataTransferClient(metadata_server.address());
+        auto storage_client = std::make_shared<RecordingReadStorageTransferClient>();
+        storage_client->read_behavior =
+            [&](const storedemo::StorageTransferReadRequest &request)
+        {
+            storedemo::StorageTransferReadResult result;
+            result.target = request.target;
+            result.metadata.identity = request.identity;
+            result.metadata.node_id = request.target.node_id;
+            result.metadata.size = request.expected_checksum.size_bytes;
+            result.metadata.checksum = request.expected_checksum;
+            if (request.target.node_id == "replica-a")
+            {
+                result.status = storedemo::StorageNodeStatusCode::kNotFound;
+                result.error_detail = "replica-a missing chunk";
+                return result;
+            }
+
+            result.status = storedemo::StorageNodeStatusCode::kCorrupted;
+            result.error_detail = "replica-b corrupted payload";
+            result.metadata.state = storedemo::ChunkState::kCorrupted;
+            return result;
+        };
+
+        auto view_client = std::make_shared<viewdemo::ViewNodeClient>(
+            grpc::CreateChannel(view_server.address(),
+                                grpc::InsecureChannelCredentials()),
+            view_server.address());
+        storedemo::ObjectTransfer transfer(metadata_client, storage_client, view_client);
+
+        storedemo::test::ScopedStoreTestDir temp_dir("storage_read_t007b_repair_ready");
+        const auto destination_path = temp_dir.Path("download.bin");
+        auto session = transfer.StartDownloadSession(
+            storedemo::DownloadObjectRequest{
+                .request_id = "download-t007b-repair-ready",
+                .cluster_id = cluster_id,
+                .bucket = bucket,
+                .object_key = object_key,
+                .object_id = object_id,
+                .version = version,
+                .destination_path = destination_path,
+                .concurrency = 1});
+        auto checksum_state = storedemo::CreateTransferChecksumState();
+        const auto result = session->Execute(*checksum_state);
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "missing", "replica-a"));
+        EXPECT_TRUE(ResultHasDiagnosticContaining(result, "corruption", "replica-b"));
+        EXPECT_EQ(storage_client->write_calls, 0U);
+        EXPECT_FALSE(std::filesystem::exists(destination_path));
     }
 } // namespace

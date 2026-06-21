@@ -1240,20 +1240,15 @@ namespace storedemo
             return std::nullopt;
         }
 
-        [[nodiscard]] std::optional<StorageTransferTarget> ResolveReplicaTarget(
-            const TransferCommittedChunk &chunk,
-            const std::unordered_map<StorageNodeId, StorageTransferTarget> &storage_targets)
+        struct DownloadReplicaAttemptFailure
         {
-            for (const auto &replica_node_id : chunk.replica_nodes)
-            {
-                const auto it = storage_targets.find(replica_node_id);
-                if (it != storage_targets.end() && !it->second.endpoint.empty())
-                {
-                    return it->second;
-                }
-            }
-            return std::nullopt;
-        }
+            ObjectTransferStatusCode status{ObjectTransferStatusCode::kStorageRejected};
+            std::string node_id;
+            std::string endpoint;
+            std::string classification;
+            std::string detail;
+            bool retryable{false};
+        };
 
         [[nodiscard]] std::vector<StorageTransferTarget> ResolveManifestReplicaTargets(
             const TransferCommittedChunk &chunk,
@@ -1270,6 +1265,167 @@ namespace storedemo
                 }
             }
             return targets;
+        }
+
+        [[nodiscard]] DownloadReplicaAttemptFailure MakeDownloadReplicaAttemptFailure(
+            const StorageTransferTarget &target,
+            const ObjectTransferStatusCode status,
+            std::string classification,
+            std::string detail,
+            const bool retryable = false)
+        {
+            DownloadReplicaAttemptFailure failure;
+            failure.status = status;
+            failure.node_id = target.node_id;
+            failure.endpoint = target.endpoint;
+            failure.classification = std::move(classification);
+            failure.detail = std::move(detail);
+            failure.retryable = retryable;
+            return failure;
+        }
+
+        [[nodiscard]] DownloadReplicaAttemptFailure BuildReadResultFailure(
+            const StorageTransferTarget &target,
+            const StorageTransferReadResult &read_result)
+        {
+            std::string classification;
+            switch (read_result.status)
+            {
+            case StorageNodeStatusCode::kNotFound:
+                classification = "missing";
+                break;
+            case StorageNodeStatusCode::kTimeout:
+                classification = "timeout";
+                break;
+            case StorageNodeStatusCode::kChecksumMismatch:
+                classification = "checksum mismatch";
+                break;
+            case StorageNodeStatusCode::kCorrupted:
+                classification = "corruption";
+                break;
+            case StorageNodeStatusCode::kCancelled:
+                classification = "cancelled";
+                break;
+            case StorageNodeStatusCode::kInvalidArgument:
+                classification = "invalid payload";
+                break;
+            default:
+                classification = read_result.retryable
+                                     ? "retryable failure"
+                                     : "transport/storage failure";
+                break;
+            }
+
+            std::string detail = read_result.error_detail;
+            if (detail.empty())
+            {
+                detail = "StorageNode ReadChunk returned status=";
+                detail += ToString(read_result.status);
+            }
+            return MakeDownloadReplicaAttemptFailure(
+                target,
+                MapStorageStatus(read_result.status),
+                std::move(classification),
+                std::move(detail),
+                read_result.retryable);
+        }
+
+        [[nodiscard]] std::string BuildReplicaAttemptDiagnosticMessage(
+            const DownloadReplicaAttemptFailure &failure)
+        {
+            std::string message =
+                "manifest replica read attempt failed (" + failure.classification +
+                "); trying next same-chunk manifest replica when available: " +
+                failure.detail;
+            return message;
+        }
+
+        [[nodiscard]] std::string BuildAggregatedChunkReadFailureDetail(
+            const TransferCommittedChunk &chunk,
+            const std::vector<DownloadReplicaAttemptFailure> &failures)
+        {
+            std::string detail =
+                "chunk " + std::to_string(chunk.identity.chunk_index) +
+                " failed after all same-chunk manifest replicas were attempted; attempted node ids=[";
+            for (std::size_t index = 0; index < failures.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    detail += ", ";
+                }
+                detail += failures[index].node_id.empty() ? "<unknown>"
+                                                          : failures[index].node_id;
+            }
+            detail += "]; replica failures={";
+            for (std::size_t index = 0; index < failures.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    detail += "; ";
+                }
+                const auto &failure = failures[index];
+                detail += failure.node_id.empty() ? "<unknown>" : failure.node_id;
+                detail += ": ";
+                detail += failure.classification;
+                if (failure.retryable)
+                {
+                    detail += " (retryable)";
+                }
+                detail += ": ";
+                detail += failure.detail;
+            }
+            detail += "}";
+            return detail;
+        }
+
+        [[nodiscard]] ObjectTransferStatusCode AggregateChunkReadFailureStatus(
+            const std::vector<DownloadReplicaAttemptFailure> &failures)
+        {
+            if (failures.empty())
+            {
+                return ObjectTransferStatusCode::kStorageRejected;
+            }
+
+            auto contains_status = [&failures](const ObjectTransferStatusCode status)
+            {
+                return std::any_of(
+                    failures.begin(),
+                    failures.end(),
+                    [status](const DownloadReplicaAttemptFailure &failure)
+                    {
+                        return failure.status == status;
+                    });
+            };
+
+            if (contains_status(ObjectTransferStatusCode::kChecksumMismatch))
+            {
+                return ObjectTransferStatusCode::kChecksumMismatch;
+            }
+            if (contains_status(ObjectTransferStatusCode::kConflict))
+            {
+                return ObjectTransferStatusCode::kConflict;
+            }
+            if (contains_status(ObjectTransferStatusCode::kTimeout))
+            {
+                return ObjectTransferStatusCode::kTimeout;
+            }
+            if (contains_status(ObjectTransferStatusCode::kNotFound))
+            {
+                return ObjectTransferStatusCode::kNotFound;
+            }
+            if (contains_status(ObjectTransferStatusCode::kCancelled))
+            {
+                return ObjectTransferStatusCode::kCancelled;
+            }
+            if (contains_status(ObjectTransferStatusCode::kInvalidArgument))
+            {
+                return ObjectTransferStatusCode::kInvalidArgument;
+            }
+            if (contains_status(ObjectTransferStatusCode::kUnsupported))
+            {
+                return ObjectTransferStatusCode::kUnsupported;
+            }
+            return failures.front().status;
         }
 
         [[nodiscard]] std::vector<StorageTransferTarget>
@@ -3675,8 +3831,9 @@ namespace storedemo
                     }
 
                     std::optional<StorageTransferReadResult> successful_read;
-                    std::optional<StorageTransferReadResult> last_failure;
-                    std::optional<StorageTransferTarget> last_attempted_target;
+                    std::optional<StorageTransferTarget> successful_target;
+                    std::vector<DownloadReplicaAttemptFailure> attempt_failures;
+                    attempt_failures.reserve(manifest_targets.size());
                     for (const auto &target : manifest_targets)
                     {
                         const auto read_result = storage_client_->ReadChunk(
@@ -3685,96 +3842,151 @@ namespace storedemo
                              .identity = chunk.identity,
                              .expected_checksum = chunk.checksum,
                              .verify_checksum = true});
-                        if (read_result.ok())
+
+                        if (!read_result.ok())
                         {
-                            successful_read = read_result;
-                            last_attempted_target = target;
-                            break;
+                            auto failure =
+                                BuildReadResultFailure(target, read_result);
+                            result.diagnostics.push_back(
+                                MakeDiagnostic(
+                                    failure.status,
+                                    BuildReplicaAttemptDiagnosticMessage(failure),
+                                    request_.request_id,
+                                    chunk.identity.chunk_index,
+                                    chunk.identity.offset,
+                                    chunk.identity.chunk_id,
+                                    failure.retryable));
+                            result.diagnostics.back().node_id = failure.node_id;
+                            result.diagnostics.back().endpoint = failure.endpoint;
+                            attempt_failures.push_back(std::move(failure));
+                            continue;
                         }
 
-                        last_failure = read_result;
-                        last_attempted_target = target;
-                        result.diagnostics.push_back(
-                            MakeDiagnostic(
-                                MapStorageStatus(read_result.status),
-                                "manifest replica read attempt failed; trying next same-chunk manifest replica when available: " +
-                                    read_result.error_detail,
-                                request_.request_id,
-                                chunk.identity.chunk_index,
-                                chunk.identity.offset,
-                                chunk.identity.chunk_id,
-                                read_result.retryable));
-                        result.diagnostics.back().node_id = target.node_id;
-                        result.diagnostics.back().endpoint = target.endpoint;
+                        if (read_result.metadata.state == ChunkState::kCorrupted)
+                        {
+                            auto failure = MakeDownloadReplicaAttemptFailure(
+                                target,
+                                ObjectTransferStatusCode::kChecksumMismatch,
+                                "corruption",
+                                "StorageNode returned corrupted chunk state for COMMITTED manifest replica");
+                            result.diagnostics.push_back(
+                                MakeDiagnostic(
+                                    failure.status,
+                                    BuildReplicaAttemptDiagnosticMessage(failure),
+                                    request_.request_id,
+                                    chunk.identity.chunk_index,
+                                    chunk.identity.offset,
+                                    chunk.identity.chunk_id,
+                                    failure.retryable));
+                            result.diagnostics.back().node_id = failure.node_id;
+                            result.diagnostics.back().endpoint = failure.endpoint;
+                            attempt_failures.push_back(std::move(failure));
+                            continue;
+                        }
+
+                        if (static_cast<std::uint64_t>(read_result.payload.size()) !=
+                            chunk.size)
+                        {
+                            auto failure = MakeDownloadReplicaAttemptFailure(
+                                target,
+                                ObjectTransferStatusCode::kConflict,
+                                "size mismatch",
+                                "expected_size=" + std::to_string(chunk.size) +
+                                    ", actual_size=" +
+                                    std::to_string(read_result.payload.size()));
+                            result.diagnostics.push_back(
+                                MakeDiagnostic(
+                                    failure.status,
+                                    BuildReplicaAttemptDiagnosticMessage(failure),
+                                    request_.request_id,
+                                    chunk.identity.chunk_index,
+                                    chunk.identity.offset,
+                                    chunk.identity.chunk_id,
+                                    failure.retryable));
+                            result.diagnostics.back().node_id = failure.node_id;
+                            result.diagnostics.back().endpoint = failure.endpoint;
+                            attempt_failures.push_back(std::move(failure));
+                            continue;
+                        }
+
+                        const auto checksum_update = checksum_state.Append(
+                            {.chunk_index = chunk.identity.chunk_index,
+                             .offset = chunk.identity.offset,
+                             .payload = read_result.payload,
+                             .expected_chunk_checksum = chunk.checksum});
+                        if (!checksum_update.ok())
+                        {
+                            if (checksum_update.status !=
+                                ObjectTransferStatusCode::kChecksumMismatch)
+                            {
+                                Fail(&result,
+                                     checksum_update.status,
+                                     checksum_update.error_detail,
+                                     chunk.identity.chunk_index,
+                                     chunk.identity.offset,
+                                     target.node_id,
+                                     target.endpoint,
+                                     chunk.identity.chunk_id,
+                                     false);
+                                close_output();
+                                cleanup_temp();
+                                return result;
+                            }
+
+                            auto failure = MakeDownloadReplicaAttemptFailure(
+                                target,
+                                checksum_update.status,
+                                "checksum mismatch",
+                                checksum_update.error_detail);
+                            result.diagnostics.push_back(
+                                MakeDiagnostic(
+                                    failure.status,
+                                    BuildReplicaAttemptDiagnosticMessage(failure),
+                                    request_.request_id,
+                                    chunk.identity.chunk_index,
+                                    chunk.identity.offset,
+                                    chunk.identity.chunk_id,
+                                    failure.retryable));
+                            result.diagnostics.back().node_id = failure.node_id;
+                            result.diagnostics.back().endpoint = failure.endpoint;
+                            attempt_failures.push_back(std::move(failure));
+                            continue;
+                        }
+
+                        successful_read = read_result;
+                        successful_target = target;
+                        break;
                     }
 
                     if (!successful_read.has_value())
                     {
                         const auto fallback_status =
-                            last_failure.has_value()
-                                ? MapStorageStatus(last_failure->status)
-                                : ObjectTransferStatusCode::kStorageRejected;
+                            AggregateChunkReadFailureStatus(attempt_failures);
+                        const auto aggregated_detail =
+                            BuildAggregatedChunkReadFailureDetail(
+                                chunk,
+                                attempt_failures);
                         Fail(&result,
                              fallback_status,
-                             last_failure.has_value()
-                                 ? "StorageNode ReadChunk failed for all same-chunk manifest replicas: " +
-                                       last_failure->error_detail
-                                 : "StorageNode ReadChunk failed for all same-chunk manifest replicas",
+                             aggregated_detail,
                              chunk.identity.chunk_index,
                              chunk.identity.offset,
-                             last_attempted_target.has_value()
-                                 ? last_attempted_target->node_id
+                             !attempt_failures.empty()
+                                 ? attempt_failures.back().node_id
                                  : std::string(),
-                             last_attempted_target.has_value()
-                                 ? last_attempted_target->endpoint
+                             !attempt_failures.empty()
+                                 ? attempt_failures.back().endpoint
                                  : std::string(),
                              chunk.identity.chunk_id,
-                             last_failure.has_value() && last_failure->retryable);
+                             !attempt_failures.empty() &&
+                                 attempt_failures.back().retryable);
                         close_output();
                         cleanup_temp();
                         return result;
                     }
 
                     const auto &read_result = *successful_read;
-                    const auto &selected_target = *last_attempted_target;
-
-                    if (static_cast<std::uint64_t>(read_result.payload.size()) !=
-                        chunk.size)
-                    {
-                        Fail(&result,
-                             ObjectTransferStatusCode::kConflict,
-                             "StorageNode returned payload size inconsistent with COMMITTED manifest",
-                             chunk.identity.chunk_index,
-                             chunk.identity.offset,
-                             selected_target.node_id,
-                             selected_target.endpoint,
-                             chunk.identity.chunk_id,
-                             false);
-                        close_output();
-                        cleanup_temp();
-                        return result;
-                    }
-
-                    const auto checksum_update = checksum_state.Append(
-                        {.chunk_index = chunk.identity.chunk_index,
-                         .offset = chunk.identity.offset,
-                         .payload = read_result.payload,
-                         .expected_chunk_checksum = chunk.checksum});
-                    if (!checksum_update.ok())
-                    {
-                        Fail(&result,
-                             checksum_update.status,
-                             checksum_update.error_detail,
-                             chunk.identity.chunk_index,
-                             chunk.identity.offset,
-                             selected_target.node_id,
-                             selected_target.endpoint,
-                             chunk.identity.chunk_id,
-                             false);
-                        close_output();
-                        cleanup_temp();
-                        return result;
-                    }
+                    const auto &selected_target = *successful_target;
 
                     output.seekp(static_cast<std::streamoff>(chunk.identity.offset),
                                  std::ios::beg);

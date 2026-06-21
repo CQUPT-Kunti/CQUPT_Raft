@@ -69,7 +69,7 @@
 
 ## Phase 4: User Story 3 - Manifest Read And Repair-Ready Facts (Priority: P2)
 
-- [ ] T007 [P] [US3] Add production manifest replica fallback reads in `modules/store/transfer/object_transfer.cpp` using existing read-replica policy and read integration tests.
+- [X] T007 [P] [US3] Add production manifest replica fallback reads in `modules/store/transfer/object_transfer.cpp` using existing read-replica policy and read integration tests.
 
 修改目标：download 对每个 chunk 按 manifest replica list 和可用健康事实排序，首个副本失败时尝试同 chunk 其他副本并校验 checksum。  
 涉及文件：`modules/store/transfer/object_transfer.cpp`、`modules/store/placement/replica_policy.cpp` 如需 read ordering 补强、`tests/storage_read_integration_test.cpp`、`tests/support/storage_read_test_utils.h`。  
