@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -295,6 +296,7 @@ namespace storedemo
         }
 
         StorageNodeStatusCode SelectTargetNode(const ScrubManifest &manifest,
+                                               const ScrubRepairCandidate &candidate,
                                                const StorageNodeRegistry &registry,
                                                const std::uint64_t now_unix_ms,
                                                StorageNodeId *selected_target,
@@ -324,9 +326,66 @@ namespace storedemo
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = placement.error_detail.empty()
-                                        ? "no healthy repair target is available"
-                                        : placement.error_detail;
+                    auto join_nodes = [](const std::vector<StorageNodeId> &nodes)
+                    {
+                        if (nodes.empty())
+                        {
+                            return std::string("[]");
+                        }
+
+                        std::ostringstream stream;
+                        stream << "[";
+                        for (std::size_t index = 0; index < nodes.size(); ++index)
+                        {
+                            if (index != 0)
+                            {
+                                stream << ",";
+                            }
+                            stream << nodes[index];
+                        }
+                        stream << "]";
+                        return stream.str();
+                    };
+
+                    auto join_exclusions = [](const std::vector<PlacementNodeExclusion> &excluded)
+                    {
+                        if (excluded.empty())
+                        {
+                            return std::string("[]");
+                        }
+
+                        std::ostringstream stream;
+                        stream << "[";
+                        for (std::size_t index = 0; index < excluded.size(); ++index)
+                        {
+                            if (index != 0)
+                            {
+                                stream << ";";
+                            }
+                            stream << excluded[index].node_id << ":"
+                                   << excluded[index].reason;
+                        }
+                        stream << "]";
+                        return stream.str();
+                    };
+
+                    std::ostringstream stream;
+                    stream << "repair replacement placement failed for chunk "
+                           << manifest.identity.chunk_id
+                           << "; retained_healthy_replicas="
+                           << join_nodes(candidate.healthy_source_replicas)
+                           << "; existing_manifest_replicas="
+                           << join_nodes(manifest.replica_nodes)
+                           << "; bad_replicas="
+                           << join_nodes(candidate.bad_replicas)
+                           << "; decision_epoch=" << now_unix_ms
+                           << "; placement_exclusions="
+                           << join_exclusions(placement.decision.excluded_nodes)
+                           << "; placement_error="
+                           << (placement.error_detail.empty()
+                                   ? "no healthy repair target is available"
+                                   : placement.error_detail);
+                    *error_detail = stream.str();
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
@@ -480,6 +539,7 @@ namespace storedemo
             }
 
             const auto target_status = SelectTargetNode(result.request.manifest,
+                                                        result.request.repair_candidate,
                                                         *registry,
                                                         now_unix_ms,
                                                         &result.target_node,
@@ -627,6 +687,7 @@ namespace storedemo
             }
 
             return SelectTargetNode(request->manifest,
+                                    request->repair_candidate,
                                     *registry,
                                     now_unix_ms,
                                     selected_target,

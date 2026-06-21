@@ -13,6 +13,15 @@
 - 本模块应持续保留 `excluded_nodes`、`reasons`、决策纪元等 decision reason，便于测试、排障和后续工业化观测。
 - 本模块保持纯策略计算边界，不把写入执行、metadata commit、Raft 共识或真实 payload 处理混进来。
 
+#### T008-A replacement placement 约束
+
+- repair Decision B 的 replacement target 仍复用 `PlacementManager` 和 `ReplicaPolicySelector` 的纯策略边界，不引入新的公开 placement struct。
+- committed manifest 中已经承载该 chunk 的 `replica_nodes` 必须作为 `excluded_nodes` 传入 replacement placement，避免把 retained healthy replica 或原坏节点重新选成 target。
+- replacement target 只能来自当前 `StorageNodeRegistry` 的 live / writable / capacity-sufficient / non-overloaded / non-high-pressure 节点。
+- 若 manifest 中旧副本节点当前已经 offline、draining、read-only、high-pressure、capacity insufficient 或 write admission overloaded，它们会继续通过 `excluded_nodes` 或 eligibility filter 留下明确排除原因，但不会因为“曾经在 manifest 里”而获得优先级。
+- replacement placement 失败时，需要保留 chunk identity、retained healthy replicas、existing manifest replicas、bad replicas、decision epoch 以及 placement exclusions，供 repair-B 后续决策和诊断复用。
+- 本阶段只产生 replacement decision facts，不执行 `ReadChunk`、`WriteChunk`、repair copy、manifest update 或后台 repair task。
+
 当前只负责：
 
 - `StorageNodePlacementCandidate` 候选节点模型
