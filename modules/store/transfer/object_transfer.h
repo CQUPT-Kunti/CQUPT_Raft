@@ -207,6 +207,9 @@ namespace storedemo
         std::filesystem::path source_path;
         std::uint64_t chunk_size{0};
         std::uint32_t concurrency{1};
+        std::uint64_t max_inflight_bytes{0};
+        std::uint32_t replica_fanout_concurrency{0};
+        std::uint64_t replica_write_timeout_ms{0};
         // 这些副本策略是 CreateWritePlan 的 metadata facts 输入，
         // 不是本地自行决定对象可见性的 authority。
         std::uint32_t desired_replica_count{0};

@@ -30,7 +30,8 @@ namespace storedemo
         constexpr std::array<std::uint32_t, 8> kSha256InitialState = {
             0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
             0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
-        constexpr std::size_t kMaxReplicaFanoutWorkers = 2;
+        constexpr std::size_t kMaxReplicaFanoutWorkers = 3;
+        constexpr std::uint32_t kDefaultReplicaFanoutConcurrency = 2;
         constexpr std::uint64_t kReplicaWriteTimeoutMs = 200;
 
         constexpr std::array<std::uint32_t, 64> kSha256RoundConstants = {
@@ -90,18 +91,28 @@ namespace storedemo
         }
 
         [[nodiscard]] std::size_t ResolveReplicaFanoutWorkerCount(
+            const std::uint32_t max_inflight_chunks,
+            const std::uint32_t effective_replica_fanout_concurrency,
             const std::size_t max_parallel_replica_tasks)
         {
+            const std::size_t bounded_parallelism_goal = std::max<std::size_t>(
+                max_inflight_chunks,
+                effective_replica_fanout_concurrency);
             return std::max<std::size_t>(
                 1,
-                std::min<std::size_t>(max_parallel_replica_tasks,
-                                      kMaxReplicaFanoutWorkers));
+                std::min<std::size_t>(
+                    max_parallel_replica_tasks,
+                    std::min<std::size_t>(bounded_parallelism_goal,
+                                          kMaxReplicaFanoutWorkers)));
         }
 
-        [[nodiscard]] StorageTaskContext ResolveReplicaWriteTaskContext()
+        [[nodiscard]] StorageTaskContext ResolveReplicaWriteTaskContext(
+            const std::uint64_t replica_write_timeout_ms)
         {
             StorageTaskContext context;
-            context.timeout_ms = kReplicaWriteTimeoutMs;
+            context.timeout_ms = replica_write_timeout_ms == 0
+                                     ? kReplicaWriteTimeoutMs
+                                     : replica_write_timeout_ms;
             context.best_effort_cancel = false;
             return context;
         }
@@ -476,6 +487,8 @@ namespace storedemo
         {
             std::uint32_t requested_concurrency{0};
             std::uint32_t effective_concurrency{0};
+            std::uint32_t requested_replica_fanout_concurrency{0};
+            std::uint32_t effective_replica_fanout_concurrency{0};
             std::uint32_t max_inflight_chunks{0};
             std::uint32_t max_buffered_chunks{0};
             std::uint32_t max_task_slots{0};
@@ -556,6 +569,40 @@ namespace storedemo
             return budget;
         }
 
+        [[nodiscard]] SessionConcurrencyBudget ResolveUploadSessionConcurrencyBudget(
+            const std::uint32_t requested_concurrency,
+            const std::uint64_t bounded_chunk_bytes,
+            const std::uint64_t configured_max_inflight_bytes,
+            const std::uint32_t requested_replica_fanout_concurrency,
+            const std::uint32_t desired_replica_count)
+        {
+            SessionConcurrencyBudget budget;
+            budget.requested_concurrency = requested_concurrency;
+            budget.effective_concurrency = requested_concurrency;
+            budget.max_inflight_chunks = budget.effective_concurrency;
+            budget.max_buffered_chunks = budget.effective_concurrency;
+            budget.max_task_slots = budget.effective_concurrency;
+            budget.max_inflight_payload_bytes =
+                configured_max_inflight_bytes == 0
+                    ? SaturatingMultiply(
+                          bounded_chunk_bytes,
+                          std::max<std::uint32_t>(1, requested_concurrency))
+                    : configured_max_inflight_bytes;
+            if (g_test_max_inflight_bytes_override.has_value())
+            {
+                budget.max_inflight_payload_bytes =
+                    *g_test_max_inflight_bytes_override;
+            }
+            budget.requested_replica_fanout_concurrency =
+                requested_replica_fanout_concurrency;
+            budget.effective_replica_fanout_concurrency =
+                requested_replica_fanout_concurrency == 0
+                    ? desired_replica_count
+                    : requested_replica_fanout_concurrency;
+            budget.clamped = false;
+            return budget;
+        }
+
         [[nodiscard]] std::uint64_t MaxManifestChunkSize(
             const std::vector<TransferCommittedChunk> &chunks)
         {
@@ -621,7 +668,19 @@ namespace storedemo
             else
             {
                 message +=
-                    "; object transfer stays on a single bounded chunk-in-flight path";
+                    direction == ObjectTransferDirection::kUpload
+                        ? "; upload session uses configured bounded multi-chunk pipeline"
+                        : "; object transfer stays on a single bounded chunk-in-flight path";
+            }
+            if (direction == ObjectTransferDirection::kUpload)
+            {
+                message +=
+                    ", requested_replica_fanout_concurrency=" +
+                    std::to_string(
+                        budget.requested_replica_fanout_concurrency) +
+                    ", effective_replica_fanout_concurrency=" +
+                    std::to_string(
+                        budget.effective_replica_fanout_concurrency);
             }
             return message;
         }
@@ -1951,13 +2010,37 @@ namespace storedemo
                 std::shared_ptr<viewdemo::ViewNodeClient> view_client)
                 : BasicTransferSession(MakeInitialSnapshot(request)),
                   request_(std::move(request)),
-                  session_budget_(ResolveSessionConcurrencyBudget(
+                  session_budget_(ResolveUploadSessionConcurrencyBudget(
                       request_.concurrency,
-                      request_.chunk_size)),
+                      request_.chunk_size,
+                      request_.max_inflight_bytes == 0
+                          ? SaturatingMultiply(
+                                request_.chunk_size,
+                                std::max<std::uint32_t>(1, request_.concurrency))
+                          : request_.max_inflight_bytes,
+                      request_.replica_fanout_concurrency == 0
+                          ? std::min<std::uint32_t>(
+                                request_.desired_replica_count,
+                                kDefaultReplicaFanoutConcurrency)
+                          : request_.replica_fanout_concurrency,
+                      request_.desired_replica_count)),
                   metadata_client_(std::move(metadata_client)),
                   storage_client_(std::move(storage_client)),
                   view_client_(std::move(view_client))
             {
+                if (request_.max_inflight_bytes == 0)
+                {
+                    request_.max_inflight_bytes = SaturatingMultiply(
+                        request_.chunk_size,
+                        std::max<std::uint32_t>(1, request_.concurrency));
+                }
+                if (request_.replica_fanout_concurrency == 0)
+                {
+                    request_.replica_fanout_concurrency =
+                        std::min<std::uint32_t>(
+                            request_.desired_replica_count,
+                            kDefaultReplicaFanoutConcurrency);
+                }
                 mutable_snapshot().concurrency = session_budget_.effective_concurrency;
             }
 
@@ -2371,6 +2454,8 @@ namespace storedemo
                 BoundedStorageExecutor replica_fanout_executor(
                     StorageExecutorConfig{
                         .worker_count = ResolveReplicaFanoutWorkerCount(
+                            session_budget_.max_inflight_chunks,
+                            session_budget_.effective_replica_fanout_concurrency,
                             max_parallel_replica_tasks),
                         .queue_capacity = fanout_queue_capacity});
 
@@ -2743,7 +2828,8 @@ namespace storedemo
                                                                              .expected_checksum =
                                                                                  expected_checksum,
                                                                              .context =
-                                                                                 ResolveReplicaWriteTaskContext(),
+                                                                                ResolveReplicaWriteTaskContext(
+                                                                                    request_.replica_write_timeout_ms),
                                                                              .payload =
                                                                                  *shared_payload});
                                                                 }
@@ -3320,10 +3406,32 @@ namespace storedemo
                     SetErrorDetail(error_detail, "concurrency must be greater than 0");
                     return ObjectTransferStatusCode::kInvalidArgument;
                 }
+                if (request_.max_inflight_bytes < request_.chunk_size)
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "max_inflight_bytes must be greater than or equal to chunk_size");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.replica_fanout_concurrency == 0)
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "replica_fanout_concurrency must be greater than 0");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
                 if (request_.desired_replica_count == 0)
                 {
                     SetErrorDetail(error_detail,
                                    "desired_replica_count must be greater than 0");
+                    return ObjectTransferStatusCode::kInvalidArgument;
+                }
+                if (request_.replica_fanout_concurrency >
+                    request_.desired_replica_count)
+                {
+                    SetErrorDetail(
+                        error_detail,
+                        "replica_fanout_concurrency must be less than or equal to desired_replica_count");
                     return ObjectTransferStatusCode::kInvalidArgument;
                 }
                 if (request_.minimum_successful_writes == 0 ||

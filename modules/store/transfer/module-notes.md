@@ -169,9 +169,9 @@ T005-B 后该路径的正式 quorum / slow-replica 语义是：
 
 T006-A 后 upload second pass 的 multi-chunk 并发边界是：
 - upload second pass 允许多个 chunk 同时处于 upload in-flight 状态
-- 同时 in-flight 的 chunk 数不得超过 `max_inflight_chunks`（当前实现为 `2`，来自 `kMaxPerSessionInFlightChunks`）
+- 同时 in-flight 的 chunk 数来自 upload request / client config 的 `upload_concurrency`
 - 必须先获得 chunk slot（即 executor worker），再读取该 chunk payload
-- 每个 chunk task 内继续复用 T005 的 bounded replica fan-out（`kMaxReplicaFanoutWorkers = 2`）
+- 每个 chunk task 内继续复用 T005 的 bounded replica fan-out；共享 fan-out executor 当前仍有硬上限，但生产 `storage_client` 会把 `replica_fanout_concurrency=3` 传入 upload request，用于单 chunk fan-out 语义与 diagnostics
 - 不使用 detached thread 或无界 `std::async`
 - 复用现有 `BoundedStorageExecutor` 作为 chunk 级别调度器
 - 每个 chunk payload 由对应 task 以栈上 `std::string` 读入后转为 `shared_ptr<const std::string>` 交给 fan-out tasks 共享
@@ -182,7 +182,7 @@ T006-A 后 upload second pass 的 multi-chunk 并发边界是：
 
 T006-B 后 upload second pass 新增 `max_inflight_bytes` 预算控制：
 
-- `max_inflight_bytes` 来自 `SessionConcurrencyBudget::max_inflight_payload_bytes`，当前实现为 `chunk_size * max_inflight_chunks`
+- `max_inflight_bytes` 来自 upload request / client config，并落到 `SessionConcurrencyBudget::max_inflight_payload_bytes`
 - byte budget 通过 `InflightByteBudget` 结构体共享，在提交循环中使用 `AcquirePayloadByteBudget` 获取
 - 预算必须在 payload 读取前获取（在 chunk task 提交到 executor 之前）：主线程在 `for` 循环中先获取预算，再 `Submit`
 - 如果 `expected_size > max_inflight_bytes`，即刻返回 `kInternalError` 配置错误，不等待、不绕过、不预读 payload

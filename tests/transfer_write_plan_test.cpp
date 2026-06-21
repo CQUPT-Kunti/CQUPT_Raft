@@ -1175,6 +1175,8 @@ TEST(ObjectTransferWritePlanTest,
     request.source_path = source_path;
     request.chunk_size = 64;
     request.concurrency = 1;
+    request.max_inflight_bytes = 64;
+    request.replica_fanout_concurrency = 3;
     request.desired_replica_count = 3;
     request.minimum_successful_writes = 2;
     request.client_time_unix_ms = 1714001002600ULL;
@@ -1190,7 +1192,7 @@ TEST(ObjectTransferWritePlanTest,
     ASSERT_EQ(result.write_plan->chunks.size(), 1U);
     ASSERT_EQ(storage_client->writes.size(), 3U);
     EXPECT_TRUE(payload_valid);
-    EXPECT_EQ(max_active_replica_tasks, 2U);
+    EXPECT_EQ(max_active_replica_tasks, 3U);
     EXPECT_EQ(active_replica_tasks, 0U);
     EXPECT_GT(storage_client->writes.front().context.timeout_ms, 0U);
 
@@ -1208,12 +1210,13 @@ TEST(ObjectTransferWritePlanTest,
         commit_request->chunks(0).replica_nodes().begin(),
         commit_request->chunks(0).replica_nodes().end());
     ASSERT_EQ(committed_nodes.size(), 2U);
-    EXPECT_EQ(committed_nodes[0], selected_nodes[0]);
-    EXPECT_EQ(committed_nodes[1], selected_nodes[1]);
-    EXPECT_EQ(std::find(committed_nodes.begin(),
-                        committed_nodes.end(),
-                        selected_nodes[2]),
-              committed_nodes.end());
+    for (const auto &node_id : committed_nodes)
+    {
+        EXPECT_NE(std::find(selected_nodes.begin(),
+                            selected_nodes.end(),
+                            node_id),
+                  selected_nodes.end());
+    }
     EXPECT_TRUE(HasDiagnosticContaining(result, "commit_eligible=true"));
 }
 
@@ -1746,7 +1749,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-overlap";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 2;
+    request.max_inflight_bytes = 64;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;
@@ -1823,7 +1828,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-peak";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 4;
+    request.max_inflight_bytes = 512;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;
@@ -1834,7 +1841,7 @@ TEST(ObjectTransferWritePlanTest,
     const auto result = session->Execute(*reader, *checksum_state);
 
     EXPECT_TRUE(result.ok()) << result.error_detail;
-    EXPECT_LE(storage_client->PeakInflight(), 2);
+    EXPECT_LE(storage_client->PeakInflight(), 4);
     EXPECT_EQ(storage_client->writes_.size(), 4U);
     const auto commit_request = metadata_server.service().last_commit_request();
     ASSERT_TRUE(commit_request.has_value());
@@ -1891,7 +1898,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-slot";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 2;
+    request.max_inflight_bytes = 64;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;
@@ -1968,7 +1977,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-order";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 4;
+    request.max_inflight_bytes = 128;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;
@@ -2239,7 +2250,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-bytes";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 4;
+    request.max_inflight_bytes = 128;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;
@@ -2314,7 +2327,9 @@ TEST(ObjectTransferWritePlanTest,
     request.object_id = "obj-brel";
     request.source_path = source_path;
     request.chunk_size = 32;
-    request.concurrency = 1;
+    request.concurrency = 2;
+    request.max_inflight_bytes = 64;
+    request.replica_fanout_concurrency = 1;
     request.desired_replica_count = 1;
     request.minimum_successful_writes = 1;
     request.client_time_unix_ms = 1714002000100ULL;

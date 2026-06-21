@@ -37,6 +37,9 @@ namespace
         std::string cluster_id;
         std::string view_endpoint;
         std::uint64_t chunk_size{storedemo::kProductionChunkSizeBytes};
+        std::uint32_t upload_concurrency{1};
+        std::uint64_t max_inflight_bytes{storedemo::kProductionChunkSizeBytes};
+        std::uint32_t replica_fanout_concurrency{1};
         std::uint32_t replica_count{1};
         std::uint32_t minimum_successful_writes{1};
         std::chrono::milliseconds discovery_timeout{3000};
@@ -335,6 +338,25 @@ namespace
                 config.replica_count = static_cast<std::uint32_t>(*value);
             }
             if (const auto value =
+                    ExtractUnsignedConfigValue(content, "upload_concurrency");
+                value.has_value())
+            {
+                config.upload_concurrency = static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
+                    ExtractUnsignedConfigValue(content, "max_inflight_bytes");
+                value.has_value())
+            {
+                config.max_inflight_bytes = *value;
+            }
+            if (const auto value =
+                    ExtractUnsignedConfigValue(content, "replica_fanout_concurrency");
+                value.has_value())
+            {
+                config.replica_fanout_concurrency =
+                    static_cast<std::uint32_t>(*value);
+            }
+            if (const auto value =
                     ExtractUnsignedConfigValue(content, "minimum_successful_writes");
                 value.has_value() && *value > 0)
             {
@@ -389,10 +411,30 @@ namespace
                 config.commit_deadline = std::chrono::milliseconds(*value);
             }
 
+            if (config.upload_concurrency < 1)
+            {
+                throw ClientConfigError(
+                    "config upload_concurrency must be greater than or equal to 1");
+            }
+            if (config.max_inflight_bytes < storedemo::kProductionChunkSizeBytes)
+            {
+                throw ClientConfigError(
+                    "config max_inflight_bytes must be greater than or equal to production chunk size");
+            }
+            if (config.replica_fanout_concurrency < 1)
+            {
+                throw ClientConfigError(
+                    "config replica_fanout_concurrency must be greater than or equal to 1");
+            }
             if (config.minimum_successful_writes > config.replica_count)
             {
                 throw ClientConfigError(
                     "config minimum_successful_writes exceeds replica_count");
+            }
+            if (config.replica_fanout_concurrency > config.replica_count)
+            {
+                throw ClientConfigError(
+                    "config replica_fanout_concurrency exceeds replica_count");
             }
             return config;
         }
@@ -1287,7 +1329,11 @@ namespace
                               : args.object_id,
              .source_path = args.source_path,
              .chunk_size = args.chunk_size.value_or(config.chunk_size),
-             .concurrency = args.concurrency.value_or(1),
+             .concurrency = args.concurrency.value_or(config.upload_concurrency),
+             .max_inflight_bytes = config.max_inflight_bytes,
+             .replica_fanout_concurrency = config.replica_fanout_concurrency,
+             .replica_write_timeout_ms = static_cast<std::uint64_t>(
+                 config.storage_timeout.count()),
              .desired_replica_count =
                  args.replica_count.value_or(config.replica_count),
              .minimum_successful_writes =

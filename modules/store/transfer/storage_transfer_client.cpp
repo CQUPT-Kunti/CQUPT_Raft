@@ -2,8 +2,11 @@
 
 #include "store/node/storage_node_client.h"
 
+#include "store/transfer/object_transfer.h"
+
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <string_view>
@@ -333,6 +336,32 @@ namespace storedemo
                 std::chrono::milliseconds(bounded_backoff_ms));
             return true;
         }
+
+        [[nodiscard]] int ResolveGrpcMessageLimitBytes(
+            const StorageTransferClientConfig &config)
+        {
+            constexpr std::uint64_t kGrpcEnvelopeHeadroomBytes = 1024ULL * 1024ULL;
+            constexpr std::uint64_t kGrpcMinimumMessageBytes = 4ULL * 1024ULL * 1024ULL;
+
+            std::uint64_t message_limit = config.grpc_message_limit_bytes;
+            if (message_limit == 0)
+            {
+                message_limit =
+                    static_cast<std::uint64_t>(kProductionChunkSizeBytes) +
+                    kGrpcEnvelopeHeadroomBytes;
+            }
+            if (message_limit < kGrpcMinimumMessageBytes)
+            {
+                message_limit = kGrpcMinimumMessageBytes;
+            }
+            if (message_limit >
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            {
+                message_limit =
+                    static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+            }
+            return static_cast<int>(message_limit);
+        }
     } // namespace
 
     class GrpcStorageTransferClient final : public StorageTransferClient
@@ -555,8 +584,13 @@ namespace storedemo
                 }
             }
 
-            auto channel = grpc::CreateChannel(std::string(endpoint),
-                                               ResolveCredentials());
+            grpc::ChannelArguments arguments;
+            const int message_limit_bytes = ResolveGrpcMessageLimitBytes(config_);
+            arguments.SetMaxReceiveMessageSize(message_limit_bytes);
+            arguments.SetMaxSendMessageSize(message_limit_bytes);
+            auto channel = grpc::CreateCustomChannel(std::string(endpoint),
+                                                     ResolveCredentials(),
+                                                     arguments);
             std::lock_guard<std::mutex> lock(mutex_);
             auto [it, inserted] =
                 channels_.emplace(std::string(endpoint), std::move(channel));
