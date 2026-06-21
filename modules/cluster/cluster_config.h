@@ -98,6 +98,77 @@ namespace clusterdemo
         std::chrono::milliseconds liveness_dead_timeout{0};
     };
 
+    struct ClusterRuntimeSection
+    {
+        std::optional<std::uint64_t> chunk_size_bytes;
+        std::optional<std::uint32_t> replica_count;
+        std::optional<std::uint32_t> minimum_successful_writes;
+        std::optional<std::uint64_t> reserve_capacity_min_bytes;
+        std::optional<std::uint32_t> reserve_capacity_percent;
+        std::optional<std::uint64_t> placement_refresh_interval_ms;
+        std::optional<std::uint64_t> metadata_rpc_timeout_ms;
+        std::optional<std::uint64_t> storage_rpc_timeout_ms;
+        std::optional<std::uint64_t> discovery_rpc_timeout_ms;
+        std::optional<std::uint64_t> config_load_timeout_ms;
+        std::optional<std::string> identity_durability;
+    };
+
+    struct StoreRuntimeSection
+    {
+        std::optional<std::uint64_t> chunk_size_bytes;
+        std::optional<std::uint32_t> upload_concurrency;
+        std::optional<std::uint32_t> download_concurrency;
+        std::optional<std::uint64_t> chunk_write_timeout_ms;
+        std::optional<std::uint64_t> chunk_read_timeout_ms;
+        std::optional<std::uint64_t> storage_heartbeat_interval_ms;
+        std::optional<std::uint64_t> stale_timeout_ms;
+        std::optional<std::uint64_t> dead_timeout_ms;
+        std::optional<std::uint32_t> max_write_retries;
+        std::optional<std::uint32_t> max_transient_write_retries;
+        std::optional<std::uint32_t> max_transient_read_retries;
+        std::optional<std::uint32_t> initial_backoff_ms;
+        std::optional<std::uint32_t> max_backoff_ms;
+        std::optional<std::uint64_t> create_write_plan_timeout_ms;
+        std::optional<std::uint64_t> commit_object_timeout_ms;
+        std::optional<std::uint64_t> head_object_timeout_ms;
+        std::optional<std::uint64_t> get_manifest_timeout_ms;
+        std::optional<bool> wait_for_ready;
+        std::optional<std::uint32_t> replica_count;
+        std::optional<std::uint32_t> minimum_successful_writes;
+        std::optional<std::uint64_t> reserve_capacity_min_bytes;
+        std::optional<std::uint32_t> reserve_capacity_percent;
+        std::optional<std::uint64_t> max_inflight_bytes;
+        std::optional<std::uint32_t> replica_fanout_concurrency;
+    };
+
+    struct ViewRuntimeSection
+    {
+        std::optional<std::uint64_t> self_refresh_interval_ms;
+        std::optional<std::uint64_t> peer_sync_interval_ms;
+        std::optional<std::uint64_t> stale_timeout_ms;
+        std::optional<std::uint64_t> suspect_timeout_ms;
+        std::optional<std::uint64_t> dead_timeout_ms;
+        std::optional<std::uint64_t> register_timeout_ms;
+        std::optional<std::uint64_t> heartbeat_timeout_ms;
+        std::optional<std::uint64_t> discovery_timeout_ms;
+        std::optional<std::uint64_t> cluster_view_timeout_ms;
+        std::optional<std::uint64_t> peer_sync_timeout_ms;
+        std::optional<bool> wait_for_ready;
+    };
+
+    struct RaftRuntimeSection
+    {
+        std::optional<std::uint64_t> heartbeat_interval_ms;
+        std::optional<std::uint64_t> election_timeout_min_ms;
+        std::optional<std::uint64_t> election_timeout_max_ms;
+        std::optional<std::uint64_t> rpc_deadline_ms;
+        std::optional<std::uint64_t> install_snapshot_timeout_ms;
+        std::optional<std::uint64_t> snapshot_log_threshold;
+        std::optional<std::uint64_t> snapshot_interval_ms;
+        std::optional<std::uint64_t> snapshot_max_snapshot_count;
+        std::optional<std::uint64_t> proposal_max_command_bytes;
+    };
+
     struct ViewNodeConfig
     {
         // 允许为空；后续可由配置生成器或 identity 流程补全稳定 node_id。
@@ -147,6 +218,10 @@ namespace clusterdemo
         InitialRaftMembershipConfig initial_raft_membership;
         ChunkPolicyConfig chunk_policy;
         ClusterTimeoutConfig timeouts;
+        ClusterRuntimeSection cluster_runtime;
+        StoreRuntimeSection store_runtime;
+        ViewRuntimeSection view_runtime;
+        RaftRuntimeSection raft_runtime;
     };
 
     struct ClusterConfigValidationIssue

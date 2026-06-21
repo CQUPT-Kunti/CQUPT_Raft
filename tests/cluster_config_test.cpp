@@ -1070,5 +1070,112 @@ namespace clusterdemo
             EXPECT_TRUE(ContainsIssue(overlapping_result.validation,
                                       ClusterConfigIssueCode::kInvalidInitialMembership));
         }
+
+        TEST(cluster_config_validation_test,
+             preserves_runtime_sections_for_store_view_and_raft_during_roundtrip)
+        {
+            const std::filesystem::path json_path = MakeTempConfigPath(3);
+            const std::string json = R"JSON({
+  "cluster_id": "runtime-section-roundtrip",
+  "base_dir": ".",
+  "view_nodes": [
+    {
+      "node_id": "view-1",
+      "endpoint": "127.0.0.1:3101",
+      "peer_seeds": [],
+      "data_dir": "view-1"
+    }
+  ],
+  "metadata_nodes": [
+    {
+      "node_id": "meta-1",
+      "raft_id": 1,
+      "endpoint": "127.0.0.1:3201",
+      "data_dir": "meta-1",
+      "snapshot_dir": "meta-1-snap",
+      "initial_role": "voter"
+    }
+  ],
+  "storage_nodes": [
+    {
+      "node_id": "store-1",
+      "endpoint": "127.0.0.1:3301",
+      "data_dir": "store-1",
+      "capacity_bytes": 1024,
+      "failure_domain": { "zone": "z1", "rack": "r1" }
+    }
+  ],
+  "initial_raft_membership": {
+    "membership_epoch": 1,
+    "voter_raft_ids": [1],
+    "learner_raft_ids": []
+  },
+  "chunk_policy": {
+    "chunk_size_bytes": 4096,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "checksum_algorithm": "sha256"
+  },
+  "timeouts": {
+    "discovery_rpc_timeout_ms": 500,
+    "metadata_rpc_timeout_ms": 800,
+    "storage_rpc_timeout_ms": 1200,
+    "heartbeat_interval_ms": 1000,
+    "registration_timeout_ms": 3000,
+    "commit_deadline_ms": 5000,
+    "liveness_stale_timeout_ms": 4000,
+    "liveness_dead_timeout_ms": 9000
+  },
+  "store": {
+    "upload_concurrency": 4,
+    "max_inflight_bytes": 536870912,
+    "replica_fanout_concurrency": 3,
+    "wait_for_ready": true
+  },
+  "view": {
+    "self_refresh_interval_ms": 10000,
+    "peer_sync_interval_ms": 5000,
+    "peer_sync_timeout_ms": 3000,
+    "wait_for_ready": false
+  },
+  "raft": {
+    "heartbeat_interval_ms": 100,
+    "election_timeout_min_ms": 1000,
+    "election_timeout_max_ms": 2000,
+    "rpc_deadline_ms": 1000,
+    "snapshot_log_threshold": 10000,
+    "snapshot_interval_ms": 1800000,
+    "snapshot_max_snapshot_count": 5,
+    "proposal_max_command_bytes": 1048576
+  }
+})JSON";
+
+            WriteConfigJson(json_path, json);
+            const auto loaded = LoadClusterConfigFromJsonFile(json_path);
+            ASSERT_TRUE(loaded.ok()) << loaded.error_detail;
+            ASSERT_TRUE(loaded.config.has_value());
+
+            EXPECT_EQ(loaded.config->store_runtime.upload_concurrency, 4U);
+            EXPECT_EQ(loaded.config->store_runtime.max_inflight_bytes, 536870912ULL);
+            EXPECT_EQ(loaded.config->store_runtime.replica_fanout_concurrency, 3U);
+            EXPECT_EQ(loaded.config->store_runtime.wait_for_ready, true);
+            EXPECT_EQ(loaded.config->view_runtime.self_refresh_interval_ms, 10000ULL);
+            EXPECT_EQ(loaded.config->view_runtime.peer_sync_interval_ms, 5000ULL);
+            EXPECT_EQ(loaded.config->view_runtime.peer_sync_timeout_ms, 3000ULL);
+            EXPECT_EQ(loaded.config->view_runtime.wait_for_ready, false);
+            EXPECT_EQ(loaded.config->raft_runtime.heartbeat_interval_ms, 100ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.election_timeout_min_ms, 1000ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.election_timeout_max_ms, 2000ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.rpc_deadline_ms, 1000ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.snapshot_log_threshold, 10000ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.snapshot_interval_ms, 1800000ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.snapshot_max_snapshot_count, 5ULL);
+            EXPECT_EQ(loaded.config->raft_runtime.proposal_max_command_bytes, 1048576ULL);
+
+            const std::string serialized = SerializeClusterConfigToJson(*loaded.config);
+            EXPECT_NE(serialized.find("\"store\""), std::string::npos);
+            EXPECT_NE(serialized.find("\"view\""), std::string::npos);
+            EXPECT_NE(serialized.find("\"raft\""), std::string::npos);
+        }
     } // namespace
 } // namespace clusterdemo

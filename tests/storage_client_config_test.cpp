@@ -39,6 +39,8 @@ namespace
                << "    \"checksum_algorithm\": \"sha256\"\n"
                << "  },\n"
                << "  \"store\": {\n"
+               << "    \"replica_count\": 3,\n"
+               << "    \"minimum_successful_writes\": 2,\n"
                << "    \"upload_concurrency\": 4,\n"
                << "    \"download_concurrency\": 2,\n"
                << "    \"max_inflight_bytes\": 536870912,\n"
@@ -89,7 +91,7 @@ TEST(StorageClientConfigTest,
     EXPECT_EQ(config.initial_backoff_ms, 50U);
     EXPECT_EQ(config.max_backoff_ms, 1000U);
     EXPECT_TRUE(config.transfer_wait_for_ready);
-    EXPECT_TRUE(config.view_wait_for_ready);
+    EXPECT_FALSE(config.view_wait_for_ready);
 }
 
 TEST(StorageClientConfigTest,
@@ -127,6 +129,8 @@ TEST(StorageClientConfigTest,
            << "    \"checksum_algorithm\": \"sha256\"\n"
            << "  },\n"
            << "  \"store\": {\n"
+           << "    \"replica_count\": 3,\n"
+           << "    \"minimum_successful_writes\": 2,\n"
            << "    \"upload_concurrency\": 4,\n"
            << "    \"max_inflight_bytes\": 536870912,\n"
            << "    \"replica_fanout_concurrency\": 4\n"

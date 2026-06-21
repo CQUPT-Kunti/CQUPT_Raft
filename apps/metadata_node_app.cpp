@@ -594,6 +594,32 @@ namespace
         {
             node_config.rpc_deadline = config.timeouts.metadata_rpc_timeout;
         }
+        if (config.raft_runtime.rpc_deadline_ms.has_value())
+        {
+            node_config.rpc_deadline = std::chrono::milliseconds(
+                *config.raft_runtime.rpc_deadline_ms);
+        }
+        if (config.raft_runtime.heartbeat_interval_ms.has_value())
+        {
+            node_config.heartbeat_interval = std::chrono::milliseconds(
+                *config.raft_runtime.heartbeat_interval_ms);
+        }
+        if (config.raft_runtime.election_timeout_min_ms.has_value())
+        {
+            node_config.election_timeout_min = std::chrono::milliseconds(
+                *config.raft_runtime.election_timeout_min_ms);
+        }
+        if (config.raft_runtime.election_timeout_max_ms.has_value())
+        {
+            node_config.election_timeout_max = std::chrono::milliseconds(
+                *config.raft_runtime.election_timeout_max_ms);
+        }
+        if (config.raft_runtime.proposal_max_command_bytes.has_value())
+        {
+            node_config.proposal_limits.max_command_bytes =
+                static_cast<std::size_t>(
+                    *config.raft_runtime.proposal_max_command_bytes);
+        }
 
         // cluster config 里的 heartbeat_interval_ms 用于 ViewNode / StorageNode
         // 的注册与观测心跳，不应直接复用成 Raft heartbeat。
@@ -622,28 +648,45 @@ namespace
     }
 
     [[nodiscard]] raftdemo::snapshotConfig BuildSnapshotConfig(
+        const clusterdemo::ClusterConfig &config,
         const MetadataNodeStartupConfig &startup)
     {
         raftdemo::snapshotConfig snapshot_config;
         snapshot_config.snapshot_dir = startup.snapshot_dir.string();
+        if (config.raft_runtime.snapshot_log_threshold.has_value())
+        {
+            snapshot_config.log_threshold =
+                *config.raft_runtime.snapshot_log_threshold;
+        }
+        if (config.raft_runtime.snapshot_interval_ms.has_value())
+        {
+            snapshot_config.snapshot_interval = std::chrono::milliseconds(
+                *config.raft_runtime.snapshot_interval_ms);
+        }
+        if (config.raft_runtime.snapshot_max_snapshot_count.has_value())
+        {
+            snapshot_config.max_snapshot_count = static_cast<std::size_t>(
+                *config.raft_runtime.snapshot_max_snapshot_count);
+        }
         return snapshot_config;
     }
 
     [[nodiscard]] viewdemo::ViewNodeClientConfig BuildViewNodeClientConfig(
-        const clusterdemo::ClusterTimeoutConfig &timeouts)
+        const clusterdemo::ClusterConfig &cluster_config)
     {
         viewdemo::ViewNodeClientConfig config;
-        if (timeouts.registration_timeout > std::chrono::milliseconds::zero())
+        if (cluster_config.timeouts.registration_timeout > std::chrono::milliseconds::zero())
         {
-            config.register_timeout = timeouts.registration_timeout;
-            config.heartbeat_timeout = timeouts.registration_timeout;
+            config.register_timeout = cluster_config.timeouts.registration_timeout;
+            config.heartbeat_timeout = cluster_config.timeouts.registration_timeout;
         }
-        if (timeouts.discovery_rpc_timeout > std::chrono::milliseconds::zero())
+        if (cluster_config.timeouts.discovery_rpc_timeout > std::chrono::milliseconds::zero())
         {
-            config.cluster_view_timeout = timeouts.discovery_rpc_timeout;
-            config.discovery_timeout = timeouts.discovery_rpc_timeout;
+            config.cluster_view_timeout = cluster_config.timeouts.discovery_rpc_timeout;
+            config.discovery_timeout = cluster_config.timeouts.discovery_rpc_timeout;
         }
-        config.wait_for_ready = false;
+        config.wait_for_ready =
+            cluster_config.view_runtime.wait_for_ready.value_or(false);
         return config;
     }
 
@@ -1182,7 +1225,7 @@ namespace
         std::vector<ViewRegistrationTarget> targets;
         targets.reserve(config.view_nodes.size());
 
-        const auto client_config = BuildViewNodeClientConfig(config.timeouts);
+        const auto client_config = BuildViewNodeClientConfig(config);
         for (const auto &view_node : config.view_nodes)
         {
             auto channel = grpc::CreateChannel(
@@ -1511,7 +1554,7 @@ namespace
         const raftdemo::NodeConfig node_config =
             BuildRaftNodeConfig(*loaded_config.config, startup);
         const raftdemo::snapshotConfig snapshot_config =
-            BuildSnapshotConfig(startup);
+            BuildSnapshotConfig(*loaded_config.config, startup);
         std::vector<ViewRegistrationTarget> view_targets =
             BuildViewTargets(*loaded_config.config);
 

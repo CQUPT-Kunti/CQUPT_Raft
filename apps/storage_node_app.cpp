@@ -195,22 +195,23 @@ namespace
     }
 
     [[nodiscard]] viewdemo::ViewNodeClientConfig BuildViewClientConfig(
-        const clusterdemo::ClusterTimeoutConfig &timeouts)
+        const clusterdemo::ClusterConfig &cluster_config)
     {
         viewdemo::ViewNodeClientConfig config;
-        if (timeouts.registration_timeout > std::chrono::milliseconds::zero())
+        if (cluster_config.timeouts.registration_timeout > std::chrono::milliseconds::zero())
         {
-            config.register_timeout = timeouts.registration_timeout;
-            config.heartbeat_timeout = timeouts.registration_timeout;
+            config.register_timeout = cluster_config.timeouts.registration_timeout;
+            config.heartbeat_timeout = cluster_config.timeouts.registration_timeout;
         }
-        else if (timeouts.discovery_rpc_timeout >
+        else if (cluster_config.timeouts.discovery_rpc_timeout >
                  std::chrono::milliseconds::zero())
         {
-            config.register_timeout = timeouts.discovery_rpc_timeout;
-            config.heartbeat_timeout = timeouts.discovery_rpc_timeout;
+            config.register_timeout = cluster_config.timeouts.discovery_rpc_timeout;
+            config.heartbeat_timeout = cluster_config.timeouts.discovery_rpc_timeout;
         }
 
-        config.wait_for_ready = true;
+        config.wait_for_ready =
+            cluster_config.store_runtime.wait_for_ready.value_or(true);
         return config;
     }
 
@@ -385,10 +386,15 @@ namespace
         StorageNodeStartupConfig startup;
         startup.cluster_id = config.cluster_id;
         startup.registry_config = BuildRegistryConfig(config.timeouts);
-        startup.view_client_config = BuildViewClientConfig(config.timeouts);
+        startup.view_client_config = BuildViewClientConfig(config);
         startup.grpc_message_limit_bytes =
             ComputeGrpcMessageLimitBytes(config.chunk_policy.chunk_size_bytes);
-        if (config.timeouts.heartbeat_interval >
+        if (config.store_runtime.storage_heartbeat_interval_ms.has_value())
+        {
+            startup.heartbeat_interval = std::chrono::milliseconds(
+                *config.store_runtime.storage_heartbeat_interval_ms);
+        }
+        else if (config.timeouts.heartbeat_interval >
             std::chrono::milliseconds::zero())
         {
             startup.heartbeat_interval = config.timeouts.heartbeat_interval;
