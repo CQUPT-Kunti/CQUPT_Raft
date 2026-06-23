@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
+option(BUILD_TESTING "Build test targets" OFF)
+
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(WIN32)
     set(CMAKE_TOOLCHAIN_FILE "D:/Tools/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -409,5 +411,7 @@ raft_add_optional_app_target(storage_bench
   apps/storage_bench.cpp
 )
 
-enable_testing()
-add_subdirectory(tests)
+if(BUILD_TESTING)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
