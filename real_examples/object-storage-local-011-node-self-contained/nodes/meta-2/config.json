@@ -1,0 +1,249 @@
+{
+  "cluster_id": "example-local-011-node-self-contained",
+  "base_dir": ".",
+  "view_nodes": [
+    {
+      "node_id": "view-1",
+      "endpoint": "127.0.0.1:9301",
+      "peer_seeds": [
+        "127.0.0.1:9302"
+      ],
+      "data_dir": "data"
+    },
+    {
+      "node_id": "view-2",
+      "endpoint": "127.0.0.1:9302",
+      "peer_seeds": [
+        "127.0.0.1:9301"
+      ],
+      "data_dir": "data"
+    }
+  ],
+  "metadata_nodes": [
+    {
+      "node_id": "meta-1",
+      "raft_id": 1,
+      "endpoint": "127.0.0.1:9401",
+      "data_dir": "data",
+      "snapshot_dir": "snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-2",
+      "raft_id": 2,
+      "endpoint": "127.0.0.1:9402",
+      "data_dir": "data",
+      "snapshot_dir": "snapshots",
+      "initial_role": "voter"
+    },
+    {
+      "node_id": "meta-3",
+      "raft_id": 3,
+      "endpoint": "127.0.0.1:9403",
+      "data_dir": "data",
+      "snapshot_dir": "snapshots",
+      "initial_role": "voter"
+    }
+  ],
+  "storage_nodes": [
+    {
+      "node_id": "store-1",
+      "endpoint": "127.0.0.1:9501",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-a",
+        "rack": "rack-a1"
+      }
+    },
+    {
+      "node_id": "store-2",
+      "endpoint": "127.0.0.1:9502",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-a",
+        "rack": "rack-a2"
+      }
+    },
+    {
+      "node_id": "store-3",
+      "endpoint": "127.0.0.1:9503",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-b",
+        "rack": "rack-b1"
+      }
+    },
+    {
+      "node_id": "store-4",
+      "endpoint": "127.0.0.1:9504",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-b",
+        "rack": "rack-b2"
+      }
+    },
+    {
+      "node_id": "store-5",
+      "endpoint": "127.0.0.1:9505",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-c",
+        "rack": "rack-c1"
+      }
+    },
+    {
+      "node_id": "store-6",
+      "endpoint": "127.0.0.1:9506",
+      "data_dir": "data",
+      "capacity_bytes": 10737418240,
+      "failure_domain": {
+        "zone": "zone-c",
+        "rack": "rack-c2"
+      }
+    }
+  ],
+  "initial_raft_membership": {
+    "membership_epoch": 1,
+    "voter_raft_ids": [
+      1,
+      2,
+      3
+    ],
+    "learner_raft_ids": []
+  },
+  "chunk_policy": {
+    "chunk_size_bytes": 134217728,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "checksum_algorithm": "sha256"
+  },
+  "timeouts": {
+    "discovery_rpc_timeout_ms": 2000,
+    "metadata_rpc_timeout_ms": 3000,
+    "storage_rpc_timeout_ms": 60000,
+    "heartbeat_interval_ms": 2000,
+    "registration_timeout_ms": 2000,
+    "commit_deadline_ms": 10000,
+    "liveness_stale_timeout_ms": 30000,
+    "liveness_dead_timeout_ms": 90000
+  },
+  "cluster": {
+    "chunk_size_bytes": 134217728,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "reserve_capacity_min_bytes": 21474836480,
+    "reserve_capacity_percent": 5,
+    "placement_refresh_interval_ms": 30000,
+    "metadata_rpc_timeout_ms": 3000,
+    "storage_rpc_timeout_ms": 60000,
+    "discovery_rpc_timeout_ms": 2000,
+    "config_load_timeout_ms": 3000,
+    "identity_durability": "required"
+  },
+  "raft": {
+    "heartbeat_interval_ms": 100,
+    "election_timeout_min_ms": 1000,
+    "election_timeout_max_ms": 2000,
+    "rpc_deadline_ms": 1000,
+    "install_snapshot_timeout_ms": 60000,
+    "snapshot_log_threshold": 10000,
+    "snapshot_interval_ms": 1800000,
+    "snapshot_max_snapshot_count": 5,
+    "snapshot_trailing_logs": 10000,
+    "snapshot_min_snapshot_interval_ms": 300000,
+    "snapshot_io_buffer_bytes": 1048576,
+    "max_entries_per_segment": 8192,
+    "max_command_bytes": 67108864,
+    "snapshot_metadata_guard_bytes": 1048576,
+    "snapshot_checksum_read_buffer_bytes": 65536,
+    "append_entries_per_rpc": 256,
+    "append_entries_bytes": 1048576,
+    "max_inflight_replication_msgs": 256,
+    "replication_initial_backoff_ms": 50,
+    "replication_max_backoff_ms": 1000,
+    "replication_retry_jitter_percent": 20,
+    "metadata_proposal_inflight": 16,
+    "metadata_proposal_cache_limit": 1024,
+    "proposal_max_command_bytes": 1048576
+  },
+  "store": {
+    "chunk_size_bytes": 134217728,
+    "upload_concurrency": 4,
+    "download_concurrency": 2,
+    "chunk_write_timeout_ms": 60000,
+    "chunk_read_timeout_ms": 60000,
+    "transfer_buffer_bytes": {
+      "min": 1048576,
+      "default": 4194304,
+      "max": 4194304
+    },
+    "staging_cleanup_grace_period_ms": 1800000,
+    "storage_heartbeat_interval_ms": 10000,
+    "stale_timeout_ms": 30000,
+    "dead_timeout_ms": 90000,
+    "stale_timeout_zero_policy": "config_error",
+    "dead_timeout_less_than_stale_policy": "config_error",
+    "executor_worker_count": {
+      "min": 4,
+      "max": 8,
+      "cpu_divisor": 2
+    },
+    "executor_queue_capacity": 1024,
+    "executor_worker_count_zero_policy": "config_error",
+    "executor_queue_capacity_zero_policy": "config_error",
+    "chunk_index_shard_count": 64,
+    "chunk_index_lock_stripe_count": 256,
+    "chunk_index_default_page_size": 128,
+    "chunk_index_max_page_size": 4096,
+    "max_write_retries": 2,
+    "max_transient_write_retries": 3,
+    "max_transient_read_retries": 3,
+    "initial_backoff_ms": 50,
+    "max_backoff_ms": 1000,
+    "retry_jitter_percent": 20,
+    "create_write_plan_timeout_ms": 3000,
+    "commit_object_timeout_ms": 10000,
+    "head_object_timeout_ms": 3000,
+    "get_manifest_timeout_ms": 5000,
+    "wait_for_ready": false,
+    "gc_worker_count": 2,
+    "gc_queue_capacity": 256,
+    "gc_default_max_attempts": 3,
+    "scrub_worker_count": 2,
+    "scrub_queue_capacity": 256,
+    "scrub_default_timeout_ms": 300000,
+    "repair_max_active_tasks": 16,
+    "repair_max_tasks": 512,
+    "repair_default_timeout_ms": 900000,
+    "rebalance_max_active_tasks": 8,
+    "rebalance_max_tasks": 512,
+    "rebalance_default_timeout_ms": 900000,
+    "replica_count": 3,
+    "minimum_successful_writes": 2,
+    "reserve_capacity_min_bytes": 21474836480,
+    "reserve_capacity_percent": 5,
+    "max_inflight_bytes": 536870912,
+    "replica_fanout_concurrency": 3
+  },
+  "view": {
+    "self_refresh_interval_ms": 10000,
+    "peer_sync_interval_ms": 5000,
+    "stale_timeout_ms": 30000,
+    "suspect_timeout_ms": 60000,
+    "dead_timeout_ms": 90000,
+    "stale_timeout_zero_policy": "config_error",
+    "suspect_less_than_stale_policy": "config_error",
+    "dead_less_than_suspect_policy": "config_error",
+    "register_timeout_ms": 2000,
+    "heartbeat_timeout_ms": 2000,
+    "discovery_timeout_ms": 2000,
+    "cluster_view_timeout_ms": 2000,
+    "peer_sync_timeout_ms": 3000,
+    "wait_for_ready": false
+  }
+}

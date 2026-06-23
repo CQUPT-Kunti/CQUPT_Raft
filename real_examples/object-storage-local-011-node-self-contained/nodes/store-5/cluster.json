@@ -1,0 +1,13 @@
+{
+  "chunk_size_bytes": 134217728,
+  "replica_count": 3,
+  "minimum_successful_writes": 2,
+  "reserve_capacity_min_bytes": 21474836480,
+  "reserve_capacity_percent": 5,
+  "placement_refresh_interval_ms": 30000,
+  "metadata_rpc_timeout_ms": 3000,
+  "storage_rpc_timeout_ms": 60000,
+  "discovery_rpc_timeout_ms": 2000,
+  "config_load_timeout_ms": 3000,
+  "identity_durability": "required"
+}

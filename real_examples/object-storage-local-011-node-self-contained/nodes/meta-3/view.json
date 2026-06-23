@@ -1,0 +1,16 @@
+{
+  "self_refresh_interval_ms": 10000,
+  "peer_sync_interval_ms": 5000,
+  "stale_timeout_ms": 30000,
+  "suspect_timeout_ms": 60000,
+  "dead_timeout_ms": 90000,
+  "stale_timeout_zero_policy": "config_error",
+  "suspect_less_than_stale_policy": "config_error",
+  "dead_less_than_suspect_policy": "config_error",
+  "register_timeout_ms": 2000,
+  "heartbeat_timeout_ms": 2000,
+  "discovery_timeout_ms": 2000,
+  "cluster_view_timeout_ms": 2000,
+  "peer_sync_timeout_ms": 3000,
+  "wait_for_ready": false
+}
