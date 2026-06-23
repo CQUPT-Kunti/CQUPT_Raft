@@ -1,0 +1,9 @@
+identity_version=2
+cluster_id=example-local-010-config-driven-simulated
+node_id=store-2
+node_type=storage
+raft_id=
+created_at_unix_ms=1782192282138
+membership_state=non_raft
+persistent_generation=1
+source=config_generator

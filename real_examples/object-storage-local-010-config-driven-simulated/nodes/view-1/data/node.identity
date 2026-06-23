@@ -1,0 +1,9 @@
+identity_version=2
+cluster_id=example-local-010-config-driven-simulated
+node_id=view-1
+node_type=view
+raft_id=
+created_at_unix_ms=1782192278508
+membership_state=non_raft
+persistent_generation=1
+source=config_generator
