@@ -715,5 +715,45 @@ cd real_examples/object-storage-local-010-config-driven-simulated
 ./rpc_demo.sh parallel-roundtrip
 ./tingzhi.sh
 ```
-
 这一条路径目前最接近“已经梳理清楚、适合演示、适合讲清系统结构”的版本。
+
+## 客户端和服务端
+
+### 服务器节点运行
+
+- `view_node_app`  
+  部署在 ViewNode，负责服务发现和节点状态观测。
+
+- `metadata_node_app`  
+  部署在 MetadataNode，负责 Raft 元数据服务。
+
+- `storage_node_app`  
+  部署在 StorageNode，负责 Chunk 数据读写。
+
+### 用户电脑、测试机或运维机运行
+
+- `storage_client`  
+  对象存储客户端，用于上传、下载和查询状态。
+
+- `raft_metadata_client`  
+  元数据 RPC 客户端，用于 `create-bucket`、`list-objects`、`commit-object` 等调试、运维和验证操作。
+
+### 其他
+
+- `raft_demo`  
+  用于 Raft 演示或实验，不作为正式对象存储多节点部署的主程序。
+
+### 最简记忆
+
+```text
+服务器节点：
+view_node_app
+metadata_node_app
+storage_node_app
+
+客户端工具：
+storage_client
+raft_metadata_client
+
+演示程序：
+raft_demo
