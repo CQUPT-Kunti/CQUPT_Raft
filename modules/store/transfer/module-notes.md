@@ -91,6 +91,10 @@
    - 记录 `prepared_chunks`
 3. 通过 ViewNode `DiscoverMetadata`
 4. 调用 `MetadataTransferClient::CreateWritePlan(...)`
+   - 当前逻辑边界是：
+     - 先创建 pending object
+     - 再基于 `prepared_chunks` 和当前 `DiscoverStorage` 结果做 per-chunk placement
+     - 再返回完整 `TransferWritePlan`
 5. 通过 ViewNode `DiscoverStorage`
 6. 第二遍重新按 bounded chunk 读取源文件
 7. 对每个 chunk：
@@ -106,6 +110,88 @@
 - `CreateWritePlan` / `CommitObject` 都不传真实 payload
 - 即使 chunk 已经 durable，未成功 `CommitObject` 前对象也不能被普通读路径视为可见
 
+当前 `TransferWritePlan` 的关键字段包括：
+
+- plan 级：
+  - `request_id`
+  - `bucket`
+  - `object_key`
+  - `object_id`
+  - `version`
+  - `chunk_size_bytes`
+  - `total_chunks`
+  - `replica_count`
+  - `minimum_successful_writes`
+  - `placement_epoch`
+  - `created_at_unix_ms`
+  - `expires_at_unix_ms`
+- chunk 级：
+  - `identity`
+  - `offset`
+  - `expected_size`
+  - `expected_checksum`
+  - `selected_replica_nodes`
+  - `candidate_nodes`
+
+其中：
+
+- `selected_replica_nodes` 是 upload 执行 authority
+- `candidate_nodes` 只保留给可选诊断/调试，不参与 upload 执行选点
+- `placement_epoch` 当前来自 ViewNode `DiscoverStorage.observed_at_unix_ms`
+- `expires_at_unix_ms` 当前是基于 discovery / CreateWritePlan timeout 推导出的第一阶段客户端有效期边界，不宣称强一致快照承诺
+
+T004 后 upload 第二遍执行的约束是：
+
+- 每个 chunk 只消费对应 `selected_replica_nodes`
+- discovery 只负责把 selected `node_id -> data-plane endpoint` 解析成 `StorageTransferTarget`
+- `candidate_nodes`、discovery 返回的其他健康节点、以及任何按 `node_id` / endpoint 排序的 fallback，都不能参与补点或重新 placement
+- 若 `selected_replica_nodes` 为空、数量不匹配、重复，或某个 selected `node_id` 无法在当前 discovery 中解析到 endpoint，upload 必须在写入前显式失败
+
+T005-A 后 upload 第二遍对单个 chunk 的 replica fan-out 边界是：
+
+- 同一个 chunk 的 selected replica writes 通过 `BoundedStorageExecutor` 并行执行
+- fan-out worker 上限当前由 `object_transfer.cpp` 内部常量控制，当前实现上限为 `2`
+- 任务队列容量按当前 chunk 的 `desired_replica_count` 建立，避免为每个 replica 创建独立线程
+- upload 会等待当前 chunk 已启动的全部 replica task 完成后，再做 `minimum_successful_writes` 聚合
+- 聚合顺序按 selected replica 的稳定顺序执行，不依赖任务完成先后
+- manifest / `CommitObject` 只记录实际 durable success 的 replica nodes
+- 当前尚未实现 quorum 达成后的提前返回，也不会主动取消已经启动的慢副本 RPC；这是 T005-B 的继续收紧方向
+
+T005-B 后该路径的正式 quorum / slow-replica 语义是：
+
+- chunk commit-eligibility 的唯一条件是 `durable_success_count >= minimum_successful_writes`
+- 每个 replica write 都带显式 `StorageTaskContext.timeout_ms`，当前由 `object_transfer.cpp` 内部常量控制
+- quorum 达成后，upload 不会把后续普通失败回写成 chunk failure；但仍会等待当前 chunk 已启动任务在各自 bounded deadline 内完成收尾
+- timeout / retryable / transport-uncertain 节点不会进入 manifest，只进入 diagnostics 和 cleanup risk facts
+- non-retryable failure 与 uncertain failure 会在 chunk 聚合阶段显式区分；当 quorum 未达成且存在 uncertain 节点时，chunk 失败优先暴露 uncertain/timeout 语义
+- manifest facts 会在 `CommitObject` 前基于 actual durable success nodes 冻结；planned、attempted、failed、uncertain 节点都不会进入 committed manifest
+- chunk 之间仍然串行；multi-chunk concurrency 继续留给 T006
+
+T006-A 后 upload second pass 的 multi-chunk 并发边界是：
+- upload second pass 允许多个 chunk 同时处于 upload in-flight 状态
+- 同时 in-flight 的 chunk 数来自 upload request / client config 的 `upload_concurrency`
+- 必须先获得 chunk slot（即 executor worker），再读取该 chunk payload
+- 每个 chunk task 内继续复用 T005 的 bounded replica fan-out；共享 fan-out executor 当前仍有硬上限，但生产 `storage_client` 会把 `replica_fanout_concurrency=3` 传入 upload request，用于单 chunk fan-out 语义与 diagnostics
+- 不使用 detached thread 或无界 `std::async`
+- 复用现有 `BoundedStorageExecutor` 作为 chunk 级别调度器
+- 每个 chunk payload 由对应 task 以栈上 `std::string` 读入后转为 `shared_ptr<const std::string>` 交给 fan-out tasks 共享
+- chunk 完成后释放 executor worker slot，后续 chunk 可继续调度
+- chunk 结果按 chunk index 写入稳定结果槽位 `MultiChunkUploadState::results[pi]`，不按完成顺序聚合
+- 只有在所有 chunk task 都安全收尾后，才调用 `CommitObject`
+- 任一 chunk 失败时不丢失其他已启动 chunk 的 durable / cleanup facts
+
+T006-B 后 upload second pass 新增 `max_inflight_bytes` 预算控制：
+
+- `max_inflight_bytes` 来自 upload request / client config，并落到 `SessionConcurrencyBudget::max_inflight_payload_bytes`
+- byte budget 通过 `InflightByteBudget` 结构体共享，在提交循环中使用 `AcquirePayloadByteBudget` 获取
+- 预算必须在 payload 读取前获取（在 chunk task 提交到 executor 之前）：主线程在 `for` 循环中先获取预算，再 `Submit`
+- 如果 `expected_size > max_inflight_bytes`，即刻返回 `kInternalError` 配置错误，不等待、不绕过、不预读 payload
+- chunk task 完成（replica fan-out 收尾 + 结果聚合 + `shared_payload` 引用释放）后，通过 `ReleasePayloadByteBudget` 释放预算
+- 释放通知 `byte_budget->cv`，唤醒主线程以继续调度后续 chunk
+- `g_test_max_inflight_bytes_override` 允许测试覆盖字节预算值，用于构造 oversized chunk 场景
+- 预算耗尽时，主线程在 `byte_budget->cv.wait(...)` 阻塞，直到有 chunk 完成并释放预算；期间不会继续读取新 chunk
+- 最后一个小 chunk 使用 `prepared_chunk.size` 获取预算，不使用完整 `chunk_size`
+
 ### download
 
 download 当前是 manifest-driven、逐 chunk、临时文件重建流程：
@@ -118,7 +204,8 @@ download 当前是 manifest-driven、逐 chunk、临时文件重建流程：
 6. 通过 ViewNode `DiscoverStorage`
 7. 创建临时输出文件
 8. 逐 chunk：
-   - 从 manifest 选 replica target
+   - 只从该 chunk 的 manifest `replica_nodes` 解析 replica targets
+   - 首个 replica read 失败后，继续尝试同 chunk 下一个 manifest replica
    - 调用 `StorageTransferClient::ReadChunk(...)`
    - 校验 chunk checksum / size
    - 按 offset 写入临时文件
@@ -131,6 +218,18 @@ download 不接受：
 - ViewNode 推断出来的“看起来可能存在”的对象
 - StorageNode 本地 live chunk 列表作为可见性 authority
 
+T007-A 后 download 的 manifest-scoped fallback 边界是：
+
+- 每个 chunk 的 candidate list 只能来自该 chunk committed manifest 的 `replica_nodes`
+- 不同 chunk 可以拥有不同 replica set；download 必须逐 chunk 独立解析
+- discovery 只负责把 manifest node_id 解析到 data-plane endpoint，不允许扩展候选集合
+- 若 manifest 某个 node_id 缺少当前 observed facts，但 discovery 仍能解析 endpoint，该节点仍可作为中性 fallback 尝试
+- 不允许从 fixed replica group、其他 chunk、或 manifest 外的健康 StorageNode 推断 fallback
+- T007-B 后，replica read 返回 `NotFound` / timeout / retryable failure / corruption / size mismatch / chunk checksum mismatch 时，当前 replica 都会被视为失败并继续尝试同 chunk 下一个 manifest replica
+- 只有某个 replica 完整通过 size + chunk checksum 校验后，chunk payload 才会写入临时输出文件
+- 若同 chunk 所有 manifest replicas 都失败，download 返回 chunk-scoped 聚合错误，detail 至少保留 attempted node ids 与逐节点 failure 分类，便于后续 repair-ready 诊断消费
+- 最终 output 只有在全部 chunk 成功且最终 object checksum 通过后才会 `rename` 发布；object checksum mismatch 或 chunk 失败时会清理 `.part` 临时文件，不留下可误判为成功的输出
+
 ## 当前 adapter 语义
 
 ### Metadata transfer client
@@ -138,8 +237,9 @@ download 不接受：
 `metadata_transfer_client.cpp` 当前采用“现有 MetadataService 最小映射”：
 
 - `CreateWritePlan`
-  - 当前通过现有 `CreateObject` RPC 建立 pending metadata
-  - 由于当前 service 没有显式 chunk layout/placement 返回，`TransferWritePlan.chunks` 不由 adapter 伪造
+  - 当前先通过现有 `CreateObject` RPC 建立 pending metadata
+  - metadata adapter 只负责 object/version/time/policy 等基础 facts
+  - 完整 chunk layout / selected replica nodes 由 transfer upload 编排层基于本地 `prepared_chunks` 和当前 storage 观测结果组装
 - `CommitObject`
   - 通过现有 `CommitObject` RPC 提交 chunk manifest facts
 - `GetObjectManifest`

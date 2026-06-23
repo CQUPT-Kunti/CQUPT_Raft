@@ -199,16 +199,19 @@ namespace
     }
 
     [[nodiscard]] std::chrono::milliseconds ComputeSelfRefreshInterval(
-        const clusterdemo::ClusterTimeoutConfig &timeouts,
+        const clusterdemo::ClusterConfig &config,
         const viewdemo::ViewRegistryConfig &registry_config)
     {
         constexpr auto kDefaultSelfRefreshInterval = std::chrono::milliseconds(1000);
         constexpr auto kMinimumSelfRefreshInterval = std::chrono::milliseconds(1);
 
         auto interval =
-            timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
-                ? timeouts.heartbeat_interval
-                : kDefaultSelfRefreshInterval;
+            config.view_runtime.self_refresh_interval_ms.has_value()
+                ? std::chrono::milliseconds(
+                      *config.view_runtime.self_refresh_interval_ms)
+                : (config.timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
+                       ? config.timeouts.heartbeat_interval
+                       : kDefaultSelfRefreshInterval);
         if (interval <= std::chrono::milliseconds::zero())
         {
             interval = kDefaultSelfRefreshInterval;
@@ -240,15 +243,18 @@ namespace
     }
 
     [[nodiscard]] std::chrono::milliseconds ComputePeerSyncInterval(
-        const clusterdemo::ClusterTimeoutConfig &timeouts)
+        const clusterdemo::ClusterConfig &config)
     {
         constexpr auto kDefaultPeerSyncInterval = std::chrono::milliseconds(1000);
         constexpr auto kMinimumPeerSyncInterval = std::chrono::milliseconds(100);
 
         auto interval =
-            timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
-                ? timeouts.heartbeat_interval
-                : kDefaultPeerSyncInterval;
+            config.view_runtime.peer_sync_interval_ms.has_value()
+                ? std::chrono::milliseconds(
+                      *config.view_runtime.peer_sync_interval_ms)
+                : (config.timeouts.heartbeat_interval > std::chrono::milliseconds::zero()
+                       ? config.timeouts.heartbeat_interval
+                       : kDefaultPeerSyncInterval);
         if (interval < kMinimumPeerSyncInterval)
         {
             interval = kMinimumPeerSyncInterval;
@@ -286,16 +292,21 @@ namespace
     }
 
     [[nodiscard]] viewdemo::ViewNodeClientConfig BuildPeerSyncClientConfig(
-        const clusterdemo::ClusterTimeoutConfig &timeouts)
+        const clusterdemo::ClusterConfig &cluster_config)
     {
         constexpr auto kDefaultPeerSyncTimeout = std::chrono::milliseconds(2000);
 
         viewdemo::ViewNodeClientConfig config;
         config.peer_sync_timeout =
-            timeouts.discovery_rpc_timeout > std::chrono::milliseconds::zero()
-                ? timeouts.discovery_rpc_timeout
-                : kDefaultPeerSyncTimeout;
-        config.wait_for_ready = false;
+            cluster_config.view_runtime.peer_sync_timeout_ms.has_value()
+                ? std::chrono::milliseconds(
+                      *cluster_config.view_runtime.peer_sync_timeout_ms)
+                : (cluster_config.timeouts.discovery_rpc_timeout >
+                       std::chrono::milliseconds::zero()
+                       ? cluster_config.timeouts.discovery_rpc_timeout
+                       : kDefaultPeerSyncTimeout);
+        config.wait_for_ready =
+            cluster_config.view_runtime.wait_for_ready.value_or(false);
         return config;
     }
 
@@ -834,12 +845,12 @@ namespace
         {
             startup = ResolveStartupConfig(*loaded_config.config, args);
             startup.self_refresh_interval = ComputeSelfRefreshInterval(
-                loaded_config.config->timeouts,
+                *loaded_config.config,
                 startup.registry_config);
             startup.peer_client_config = BuildPeerSyncClientConfig(
-                loaded_config.config->timeouts);
+                *loaded_config.config);
             startup.peer_sync_interval = ComputePeerSyncInterval(
-                loaded_config.config->timeouts);
+                *loaded_config.config);
             startup.peer_sync_max_backoff = ComputePeerSyncMaxBackoff(
                 startup.peer_sync_interval);
         }

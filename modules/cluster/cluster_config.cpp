@@ -156,6 +156,60 @@ namespace clusterdemo
                        : 0ULL;
         }
 
+        template <typename T>
+        void AppendOptionalJsonUnsignedField(std::ostringstream *oss,
+                                             const char *name,
+                                             const std::optional<T> &value,
+                                             bool *first)
+        {
+            if (oss == nullptr || first == nullptr || !value.has_value())
+            {
+                return;
+            }
+            if (!*first)
+            {
+                *oss << ",\n";
+            }
+            *oss << "    \"" << name << "\": "
+                 << static_cast<std::uint64_t>(*value);
+            *first = false;
+        }
+
+        void AppendOptionalJsonBoolField(std::ostringstream *oss,
+                                         const char *name,
+                                         const std::optional<bool> &value,
+                                         bool *first)
+        {
+            if (oss == nullptr || first == nullptr || !value.has_value())
+            {
+                return;
+            }
+            if (!*first)
+            {
+                *oss << ",\n";
+            }
+            *oss << "    \"" << name << "\": "
+                 << (*value ? "true" : "false");
+            *first = false;
+        }
+
+        void AppendOptionalJsonStringField(std::ostringstream *oss,
+                                           const char *name,
+                                           const std::optional<std::string> &value,
+                                           bool *first)
+        {
+            if (oss == nullptr || first == nullptr || !value.has_value())
+            {
+                return;
+            }
+            if (!*first)
+            {
+                *oss << ",\n";
+            }
+            *oss << "    \"" << name << "\": " << JsonString(*value);
+            *first = false;
+        }
+
         void AppendIssue(ClusterConfigValidationResult *result,
                          const ClusterConfigIssueCode code,
                          std::string field_path,
@@ -1078,6 +1132,17 @@ namespace clusterdemo
             return *unsigned_value;
         }
 
+        [[nodiscard]] bool ExpectBool(const JsonValue &value,
+                                      const std::string_view context)
+        {
+            const auto *bool_value = std::get_if<bool>(&value.storage);
+            if (bool_value == nullptr)
+            {
+                throw std::runtime_error(std::string(context) + " must be boolean");
+            }
+            return *bool_value;
+        }
+
         [[nodiscard]] const JsonValue *FindObjectField(const JsonValue::Object &object,
                                                        const std::string_view key)
         {
@@ -1140,6 +1205,204 @@ namespace clusterdemo
                                      std::to_string(index) + "]"));
             }
             return strings;
+        }
+
+        [[nodiscard]] std::optional<std::uint64_t> OptionalUnsignedField(
+            const JsonValue::Object &object,
+            const std::string_view key)
+        {
+            const JsonValue *value = FindObjectField(object, key);
+            if (value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(value->storage))
+            {
+                return std::nullopt;
+            }
+            return ExpectUnsigned(*value, key);
+        }
+
+        [[nodiscard]] std::optional<bool> OptionalBoolField(
+            const JsonValue::Object &object,
+            const std::string_view key)
+        {
+            const JsonValue *value = FindObjectField(object, key);
+            if (value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(value->storage))
+            {
+                return std::nullopt;
+            }
+            return ExpectBool(*value, key);
+        }
+
+        [[nodiscard]] std::optional<std::uint32_t> OptionalUint32Field(
+            const JsonValue::Object &object,
+            const std::string_view key)
+        {
+            const auto value = OptionalUnsignedField(object, key);
+            if (!value.has_value())
+            {
+                return std::nullopt;
+            }
+            return static_cast<std::uint32_t>(*value);
+        }
+
+        [[nodiscard]] ClusterRuntimeSection ParseClusterRuntimeSection(
+            const JsonValue::Object &root)
+        {
+            ClusterRuntimeSection runtime;
+            const JsonValue *section_value = FindObjectField(root, "cluster");
+            if (section_value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(section_value->storage))
+            {
+                return runtime;
+            }
+
+            const JsonValue::Object &section = ExpectObject(*section_value, "cluster");
+            runtime.chunk_size_bytes = OptionalUnsignedField(section, "chunk_size_bytes");
+            runtime.replica_count = OptionalUint32Field(section, "replica_count");
+            runtime.minimum_successful_writes =
+                OptionalUint32Field(section, "minimum_successful_writes");
+            runtime.reserve_capacity_min_bytes =
+                OptionalUnsignedField(section, "reserve_capacity_min_bytes");
+            runtime.reserve_capacity_percent =
+                OptionalUint32Field(section, "reserve_capacity_percent");
+            runtime.placement_refresh_interval_ms =
+                OptionalUnsignedField(section, "placement_refresh_interval_ms");
+            runtime.metadata_rpc_timeout_ms =
+                OptionalUnsignedField(section, "metadata_rpc_timeout_ms");
+            runtime.storage_rpc_timeout_ms =
+                OptionalUnsignedField(section, "storage_rpc_timeout_ms");
+            runtime.discovery_rpc_timeout_ms =
+                OptionalUnsignedField(section, "discovery_rpc_timeout_ms");
+            runtime.config_load_timeout_ms =
+                OptionalUnsignedField(section, "config_load_timeout_ms");
+            runtime.identity_durability = OptionalStringField(section, "identity_durability");
+            return runtime;
+        }
+
+        [[nodiscard]] StoreRuntimeSection ParseStoreRuntimeSection(
+            const JsonValue::Object &root)
+        {
+            StoreRuntimeSection runtime;
+            const JsonValue *section_value = FindObjectField(root, "store");
+            if (section_value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(section_value->storage))
+            {
+                return runtime;
+            }
+
+            const JsonValue::Object &section = ExpectObject(*section_value, "store");
+            runtime.chunk_size_bytes = OptionalUnsignedField(section, "chunk_size_bytes");
+            runtime.upload_concurrency =
+                OptionalUint32Field(section, "upload_concurrency");
+            runtime.download_concurrency =
+                OptionalUint32Field(section, "download_concurrency");
+            runtime.chunk_write_timeout_ms =
+                OptionalUnsignedField(section, "chunk_write_timeout_ms");
+            runtime.chunk_read_timeout_ms =
+                OptionalUnsignedField(section, "chunk_read_timeout_ms");
+            runtime.storage_heartbeat_interval_ms =
+                OptionalUnsignedField(section, "storage_heartbeat_interval_ms");
+            runtime.stale_timeout_ms = OptionalUnsignedField(section, "stale_timeout_ms");
+            runtime.dead_timeout_ms = OptionalUnsignedField(section, "dead_timeout_ms");
+            runtime.max_write_retries =
+                OptionalUint32Field(section, "max_write_retries");
+            runtime.max_transient_write_retries =
+                OptionalUint32Field(section, "max_transient_write_retries");
+            runtime.max_transient_read_retries =
+                OptionalUint32Field(section, "max_transient_read_retries");
+            runtime.initial_backoff_ms =
+                OptionalUint32Field(section, "initial_backoff_ms");
+            runtime.max_backoff_ms =
+                OptionalUint32Field(section, "max_backoff_ms");
+            runtime.create_write_plan_timeout_ms =
+                OptionalUnsignedField(section, "create_write_plan_timeout_ms");
+            runtime.commit_object_timeout_ms =
+                OptionalUnsignedField(section, "commit_object_timeout_ms");
+            runtime.head_object_timeout_ms =
+                OptionalUnsignedField(section, "head_object_timeout_ms");
+            runtime.get_manifest_timeout_ms =
+                OptionalUnsignedField(section, "get_manifest_timeout_ms");
+            runtime.wait_for_ready = OptionalBoolField(section, "wait_for_ready");
+            runtime.replica_count =
+                OptionalUint32Field(section, "replica_count");
+            runtime.minimum_successful_writes =
+                OptionalUint32Field(section, "minimum_successful_writes");
+            runtime.reserve_capacity_min_bytes =
+                OptionalUnsignedField(section, "reserve_capacity_min_bytes");
+            runtime.reserve_capacity_percent =
+                OptionalUint32Field(section, "reserve_capacity_percent");
+            runtime.max_inflight_bytes =
+                OptionalUnsignedField(section, "max_inflight_bytes");
+            runtime.replica_fanout_concurrency =
+                OptionalUint32Field(section, "replica_fanout_concurrency");
+            return runtime;
+        }
+
+        [[nodiscard]] ViewRuntimeSection ParseViewRuntimeSection(
+            const JsonValue::Object &root)
+        {
+            ViewRuntimeSection runtime;
+            const JsonValue *section_value = FindObjectField(root, "view");
+            if (section_value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(section_value->storage))
+            {
+                return runtime;
+            }
+
+            const JsonValue::Object &section = ExpectObject(*section_value, "view");
+            runtime.self_refresh_interval_ms =
+                OptionalUnsignedField(section, "self_refresh_interval_ms");
+            runtime.peer_sync_interval_ms =
+                OptionalUnsignedField(section, "peer_sync_interval_ms");
+            runtime.stale_timeout_ms = OptionalUnsignedField(section, "stale_timeout_ms");
+            runtime.suspect_timeout_ms =
+                OptionalUnsignedField(section, "suspect_timeout_ms");
+            runtime.dead_timeout_ms = OptionalUnsignedField(section, "dead_timeout_ms");
+            runtime.register_timeout_ms =
+                OptionalUnsignedField(section, "register_timeout_ms");
+            runtime.heartbeat_timeout_ms =
+                OptionalUnsignedField(section, "heartbeat_timeout_ms");
+            runtime.discovery_timeout_ms =
+                OptionalUnsignedField(section, "discovery_timeout_ms");
+            runtime.cluster_view_timeout_ms =
+                OptionalUnsignedField(section, "cluster_view_timeout_ms");
+            runtime.peer_sync_timeout_ms =
+                OptionalUnsignedField(section, "peer_sync_timeout_ms");
+            runtime.wait_for_ready = OptionalBoolField(section, "wait_for_ready");
+            return runtime;
+        }
+
+        [[nodiscard]] RaftRuntimeSection ParseRaftRuntimeSection(
+            const JsonValue::Object &root)
+        {
+            RaftRuntimeSection runtime;
+            const JsonValue *section_value = FindObjectField(root, "raft");
+            if (section_value == nullptr ||
+                std::holds_alternative<std::nullptr_t>(section_value->storage))
+            {
+                return runtime;
+            }
+
+            const JsonValue::Object &section = ExpectObject(*section_value, "raft");
+            runtime.heartbeat_interval_ms =
+                OptionalUnsignedField(section, "heartbeat_interval_ms");
+            runtime.election_timeout_min_ms =
+                OptionalUnsignedField(section, "election_timeout_min_ms");
+            runtime.election_timeout_max_ms =
+                OptionalUnsignedField(section, "election_timeout_max_ms");
+            runtime.rpc_deadline_ms =
+                OptionalUnsignedField(section, "rpc_deadline_ms");
+            runtime.install_snapshot_timeout_ms =
+                OptionalUnsignedField(section, "install_snapshot_timeout_ms");
+            runtime.snapshot_log_threshold =
+                OptionalUnsignedField(section, "snapshot_log_threshold");
+            runtime.snapshot_interval_ms =
+                OptionalUnsignedField(section, "snapshot_interval_ms");
+            runtime.snapshot_max_snapshot_count =
+                OptionalUnsignedField(section, "snapshot_max_snapshot_count");
+            runtime.proposal_max_command_bytes =
+                OptionalUnsignedField(section, "proposal_max_command_bytes");
+            return runtime;
         }
 
         [[nodiscard]] ClusterChecksumAlgorithm ParseChecksumAlgorithm(
@@ -1352,6 +1615,10 @@ namespace clusterdemo
                                        "timeouts"),
                     "timeouts.liveness_dead_timeout_ms")),
             };
+            config.cluster_runtime = ParseClusterRuntimeSection(root);
+            config.store_runtime = ParseStoreRuntimeSection(root);
+            config.view_runtime = ParseViewRuntimeSection(root);
+            config.raft_runtime = ParseRaftRuntimeSection(root);
             return config;
         }
     } // namespace
@@ -2621,7 +2888,155 @@ namespace clusterdemo
             << ToMillis(config.timeouts.liveness_stale_timeout) << ",\n";
         oss << "    \"liveness_dead_timeout_ms\": "
             << ToMillis(config.timeouts.liveness_dead_timeout) << "\n";
-        oss << "  }\n";
+        oss << "  }";
+
+        {
+            bool first = true;
+            std::ostringstream section;
+            AppendOptionalJsonUnsignedField(&section, "chunk_size_bytes",
+                                            config.cluster_runtime.chunk_size_bytes, &first);
+            AppendOptionalJsonUnsignedField(&section, "replica_count",
+                                            config.cluster_runtime.replica_count, &first);
+            AppendOptionalJsonUnsignedField(&section, "minimum_successful_writes",
+                                            config.cluster_runtime.minimum_successful_writes, &first);
+            AppendOptionalJsonUnsignedField(&section, "reserve_capacity_min_bytes",
+                                            config.cluster_runtime.reserve_capacity_min_bytes, &first);
+            AppendOptionalJsonUnsignedField(&section, "reserve_capacity_percent",
+                                            config.cluster_runtime.reserve_capacity_percent, &first);
+            AppendOptionalJsonUnsignedField(&section, "placement_refresh_interval_ms",
+                                            config.cluster_runtime.placement_refresh_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "metadata_rpc_timeout_ms",
+                                            config.cluster_runtime.metadata_rpc_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "storage_rpc_timeout_ms",
+                                            config.cluster_runtime.storage_rpc_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "discovery_rpc_timeout_ms",
+                                            config.cluster_runtime.discovery_rpc_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "config_load_timeout_ms",
+                                            config.cluster_runtime.config_load_timeout_ms, &first);
+            AppendOptionalJsonStringField(&section, "identity_durability",
+                                          config.cluster_runtime.identity_durability, &first);
+            if (!first)
+            {
+                oss << ",\n  \"cluster\": {\n" << section.str() << "\n  }";
+            }
+        }
+
+        {
+            bool first = true;
+            std::ostringstream section;
+            AppendOptionalJsonUnsignedField(&section, "chunk_size_bytes",
+                                            config.store_runtime.chunk_size_bytes, &first);
+            AppendOptionalJsonUnsignedField(&section, "upload_concurrency",
+                                            config.store_runtime.upload_concurrency, &first);
+            AppendOptionalJsonUnsignedField(&section, "download_concurrency",
+                                            config.store_runtime.download_concurrency, &first);
+            AppendOptionalJsonUnsignedField(&section, "chunk_write_timeout_ms",
+                                            config.store_runtime.chunk_write_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "chunk_read_timeout_ms",
+                                            config.store_runtime.chunk_read_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "storage_heartbeat_interval_ms",
+                                            config.store_runtime.storage_heartbeat_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "stale_timeout_ms",
+                                            config.store_runtime.stale_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "dead_timeout_ms",
+                                            config.store_runtime.dead_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "max_write_retries",
+                                            config.store_runtime.max_write_retries, &first);
+            AppendOptionalJsonUnsignedField(&section, "max_transient_write_retries",
+                                            config.store_runtime.max_transient_write_retries, &first);
+            AppendOptionalJsonUnsignedField(&section, "max_transient_read_retries",
+                                            config.store_runtime.max_transient_read_retries, &first);
+            AppendOptionalJsonUnsignedField(&section, "initial_backoff_ms",
+                                            config.store_runtime.initial_backoff_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "max_backoff_ms",
+                                            config.store_runtime.max_backoff_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "create_write_plan_timeout_ms",
+                                            config.store_runtime.create_write_plan_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "commit_object_timeout_ms",
+                                            config.store_runtime.commit_object_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "head_object_timeout_ms",
+                                            config.store_runtime.head_object_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "get_manifest_timeout_ms",
+                                            config.store_runtime.get_manifest_timeout_ms, &first);
+            AppendOptionalJsonBoolField(&section, "wait_for_ready",
+                                        config.store_runtime.wait_for_ready, &first);
+            AppendOptionalJsonUnsignedField(&section, "replica_count",
+                                            config.store_runtime.replica_count, &first);
+            AppendOptionalJsonUnsignedField(&section, "minimum_successful_writes",
+                                            config.store_runtime.minimum_successful_writes, &first);
+            AppendOptionalJsonUnsignedField(&section, "reserve_capacity_min_bytes",
+                                            config.store_runtime.reserve_capacity_min_bytes, &first);
+            AppendOptionalJsonUnsignedField(&section, "reserve_capacity_percent",
+                                            config.store_runtime.reserve_capacity_percent, &first);
+            AppendOptionalJsonUnsignedField(&section, "max_inflight_bytes",
+                                            config.store_runtime.max_inflight_bytes, &first);
+            AppendOptionalJsonUnsignedField(&section, "replica_fanout_concurrency",
+                                            config.store_runtime.replica_fanout_concurrency, &first);
+            if (!first)
+            {
+                oss << ",\n  \"store\": {\n" << section.str() << "\n  }";
+            }
+        }
+
+        {
+            bool first = true;
+            std::ostringstream section;
+            AppendOptionalJsonUnsignedField(&section, "self_refresh_interval_ms",
+                                            config.view_runtime.self_refresh_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "peer_sync_interval_ms",
+                                            config.view_runtime.peer_sync_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "stale_timeout_ms",
+                                            config.view_runtime.stale_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "suspect_timeout_ms",
+                                            config.view_runtime.suspect_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "dead_timeout_ms",
+                                            config.view_runtime.dead_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "register_timeout_ms",
+                                            config.view_runtime.register_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "heartbeat_timeout_ms",
+                                            config.view_runtime.heartbeat_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "discovery_timeout_ms",
+                                            config.view_runtime.discovery_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "cluster_view_timeout_ms",
+                                            config.view_runtime.cluster_view_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "peer_sync_timeout_ms",
+                                            config.view_runtime.peer_sync_timeout_ms, &first);
+            AppendOptionalJsonBoolField(&section, "wait_for_ready",
+                                        config.view_runtime.wait_for_ready, &first);
+            if (!first)
+            {
+                oss << ",\n  \"view\": {\n" << section.str() << "\n  }";
+            }
+        }
+
+        {
+            bool first = true;
+            std::ostringstream section;
+            AppendOptionalJsonUnsignedField(&section, "heartbeat_interval_ms",
+                                            config.raft_runtime.heartbeat_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "election_timeout_min_ms",
+                                            config.raft_runtime.election_timeout_min_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "election_timeout_max_ms",
+                                            config.raft_runtime.election_timeout_max_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "rpc_deadline_ms",
+                                            config.raft_runtime.rpc_deadline_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "install_snapshot_timeout_ms",
+                                            config.raft_runtime.install_snapshot_timeout_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "snapshot_log_threshold",
+                                            config.raft_runtime.snapshot_log_threshold, &first);
+            AppendOptionalJsonUnsignedField(&section, "snapshot_interval_ms",
+                                            config.raft_runtime.snapshot_interval_ms, &first);
+            AppendOptionalJsonUnsignedField(&section, "snapshot_max_snapshot_count",
+                                            config.raft_runtime.snapshot_max_snapshot_count, &first);
+            AppendOptionalJsonUnsignedField(&section, "proposal_max_command_bytes",
+                                            config.raft_runtime.proposal_max_command_bytes, &first);
+            if (!first)
+            {
+                oss << ",\n  \"raft\": {\n" << section.str() << "\n  }";
+            }
+        }
+
+        oss << "\n";
         oss << "}\n";
         return oss.str();
     }

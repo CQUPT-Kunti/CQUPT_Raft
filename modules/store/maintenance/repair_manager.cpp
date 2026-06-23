@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -259,9 +260,12 @@ namespace storedemo
 
         StorageNodeStatusCode SelectSourceNode(
             const std::vector<StorageNodeId> &candidate_sources,
+            const std::unordered_set<StorageNodeId> &manifest_replicas,
             const std::map<StorageNodeId, StorageNodeRegistryNodeSnapshot, std::less<>> &snapshots,
             StorageNodeId *selected_source,
-            std::string *error_detail)
+            std::string *error_detail,
+            std::vector<PlacementNodeExclusion> *excluded_nodes,
+            std::vector<StorageNodeId> *retained_healthy_sources)
         {
             if (selected_source == nullptr)
             {
@@ -274,31 +278,110 @@ namespace storedemo
 
             for (const auto &node_id : candidate_sources)
             {
+                if (!manifest_replicas.contains(node_id))
+                {
+                    if (excluded_nodes != nullptr)
+                    {
+                        excluded_nodes->push_back(
+                            PlacementNodeExclusion{
+                                .node_id = node_id,
+                                .reason =
+                                    "healthy repair source is not in committed manifest replicas"});
+                    }
+                    continue;
+                }
+
                 const auto snapshot_it = snapshots.find(node_id);
                 if (snapshot_it == snapshots.end())
                 {
+                    if (excluded_nodes != nullptr)
+                    {
+                        excluded_nodes->push_back(
+                            PlacementNodeExclusion{
+                                .node_id = node_id,
+                                .reason = "repair source registry snapshot is missing"});
+                    }
                     continue;
                 }
                 if (!IsHealthyRepairSource(snapshot_it->second))
                 {
+                    if (excluded_nodes != nullptr)
+                    {
+                        std::string reason = "repair source is not currently healthy";
+                        if (snapshot_it->second.liveness !=
+                            StorageNodeRegistryLiveness::kLive)
+                        {
+                            reason = "repair source registry facts are not live";
+                        }
+                        else if (snapshot_it->second.facts.health.health !=
+                                 StorageNodeHealth::kHealthy)
+                        {
+                            reason = std::string("repair source health is not healthy: ") +
+                                     ToString(snapshot_it->second.facts.health.health);
+                        }
+                        else if (snapshot_it->second.facts.health.disk_pressure ==
+                                     StorageNodeDiskPressure::kHigh ||
+                                 snapshot_it->second.facts.health.disk_pressure ==
+                                     StorageNodeDiskPressure::kFull)
+                        {
+                            reason = std::string("repair source disk pressure is too high: ") +
+                                     ToString(snapshot_it->second.facts.health.disk_pressure);
+                        }
+                        excluded_nodes->push_back(
+                            PlacementNodeExclusion{.node_id = node_id,
+                                                   .reason = std::move(reason)});
+                    }
                     continue;
                 }
-                *selected_source = node_id;
+                if (retained_healthy_sources != nullptr)
+                {
+                    retained_healthy_sources->push_back(node_id);
+                }
+                if (selected_source->empty())
+                {
+                    *selected_source = node_id;
+                }
+            }
+
+            if (!selected_source->empty())
+            {
                 return StorageNodeStatusCode::kOk;
             }
 
             if (error_detail != nullptr)
             {
-                *error_detail = "no healthy repair source is available";
+                if (excluded_nodes != nullptr && !excluded_nodes->empty())
+                {
+                    std::ostringstream stream;
+                    stream << "no healthy repair source is available; excluded_sources=[";
+                    for (std::size_t index = 0; index < excluded_nodes->size(); ++index)
+                    {
+                        if (index != 0)
+                        {
+                            stream << ";";
+                        }
+                        stream << (*excluded_nodes)[index].node_id << ":"
+                               << (*excluded_nodes)[index].reason;
+                    }
+                    stream << "]";
+                    *error_detail = stream.str();
+                }
+                else
+                {
+                    *error_detail = "no healthy repair source is available";
+                }
             }
             return StorageNodeStatusCode::kInvalidArgument;
         }
 
         StorageNodeStatusCode SelectTargetNode(const ScrubManifest &manifest,
+                                               const std::vector<StorageNodeId> &retained_healthy_sources,
+                                               const std::vector<StorageNodeId> &bad_replicas,
                                                const StorageNodeRegistry &registry,
                                                const std::uint64_t now_unix_ms,
                                                StorageNodeId *selected_target,
-                                               std::string *error_detail)
+                                               std::string *error_detail,
+                                               PlacementDecision *placement_decision)
         {
             if (selected_target == nullptr)
             {
@@ -320,13 +403,74 @@ namespace storedemo
 
             const auto placement = placement_manager.SelectPlacement(
                 placement_request, registry, now_unix_ms);
+            if (placement_decision != nullptr)
+            {
+                *placement_decision = placement.decision;
+            }
             if (!placement.ok() || placement.decision.replica_nodes.empty())
             {
                 if (error_detail != nullptr)
                 {
-                    *error_detail = placement.error_detail.empty()
-                                        ? "no healthy repair target is available"
-                                        : placement.error_detail;
+                    auto join_nodes = [](const std::vector<StorageNodeId> &nodes)
+                    {
+                        if (nodes.empty())
+                        {
+                            return std::string("[]");
+                        }
+
+                        std::ostringstream stream;
+                        stream << "[";
+                        for (std::size_t index = 0; index < nodes.size(); ++index)
+                        {
+                            if (index != 0)
+                            {
+                                stream << ",";
+                            }
+                            stream << nodes[index];
+                        }
+                        stream << "]";
+                        return stream.str();
+                    };
+
+                    auto join_exclusions = [](const std::vector<PlacementNodeExclusion> &excluded)
+                    {
+                        if (excluded.empty())
+                        {
+                            return std::string("[]");
+                        }
+
+                        std::ostringstream stream;
+                        stream << "[";
+                        for (std::size_t index = 0; index < excluded.size(); ++index)
+                        {
+                            if (index != 0)
+                            {
+                                stream << ";";
+                            }
+                            stream << excluded[index].node_id << ":"
+                                   << excluded[index].reason;
+                        }
+                        stream << "]";
+                        return stream.str();
+                    };
+
+                    std::ostringstream stream;
+                    stream << "repair replacement placement failed for chunk "
+                           << manifest.identity.chunk_id
+                           << "; retained_healthy_replicas="
+                           << join_nodes(retained_healthy_sources)
+                           << "; existing_manifest_replicas="
+                           << join_nodes(manifest.replica_nodes)
+                           << "; bad_replicas="
+                           << join_nodes(bad_replicas)
+                           << "; decision_epoch=" << now_unix_ms
+                           << "; placement_exclusions="
+                           << join_exclusions(placement.decision.excluded_nodes)
+                           << "; placement_error="
+                           << (placement.error_detail.empty()
+                                   ? "no healthy repair target is available"
+                                   : placement.error_detail);
+                    *error_detail = stream.str();
                 }
                 return StorageNodeStatusCode::kInvalidArgument;
             }
@@ -350,6 +494,9 @@ namespace storedemo
             RepairTaskRequest request;
             StorageNodeId source_node;
             StorageNodeId target_node;
+            std::vector<StorageNodeId> retained_healthy_sources;
+            std::vector<PlacementNodeExclusion> source_exclusions;
+            PlacementDecision replacement_decision;
             std::string error_detail;
 
             [[nodiscard]] bool ok() const
@@ -467,11 +614,18 @@ namespace storedemo
                 snapshots.emplace(node.node_id, node);
             }
 
+            const std::unordered_set<StorageNodeId> manifest_replicas(
+                result.request.manifest.replica_nodes.begin(),
+                result.request.manifest.replica_nodes.end());
+
             const auto source_status = SelectSourceNode(
                 result.request.repair_candidate.healthy_source_replicas,
+                manifest_replicas,
                 snapshots,
                 &result.source_node,
-                &result.error_detail);
+                &result.error_detail,
+                &result.source_exclusions,
+                &result.retained_healthy_sources);
             if (source_status != StorageNodeStatusCode::kOk)
             {
                 result.code = RepairTaskPlanningCode::kNoHealthySource;
@@ -480,10 +634,13 @@ namespace storedemo
             }
 
             const auto target_status = SelectTargetNode(result.request.manifest,
+                                                        result.retained_healthy_sources,
+                                                        result.request.repair_candidate.bad_replicas,
                                                         *registry,
                                                         now_unix_ms,
                                                         &result.target_node,
-                                                        &result.error_detail);
+                                                        &result.error_detail,
+                                                        &result.replacement_decision);
             if (target_status != StorageNodeStatusCode::kOk)
             {
                 result.code = RepairTaskPlanningCode::kNoHealthyTarget;
@@ -616,21 +773,31 @@ namespace storedemo
                 snapshots.emplace(node.node_id, node);
             }
 
+            const std::unordered_set<StorageNodeId> manifest_replicas(
+                request->manifest.replica_nodes.begin(),
+                request->manifest.replica_nodes.end());
+
             const auto source_status = SelectSourceNode(
                 request->repair_candidate.healthy_source_replicas,
+                manifest_replicas,
                 snapshots,
                 selected_source,
-                error_detail);
+                error_detail,
+                nullptr,
+                nullptr);
             if (source_status != StorageNodeStatusCode::kOk)
             {
                 return source_status;
             }
 
             return SelectTargetNode(request->manifest,
+                                    request->repair_candidate.healthy_source_replicas,
+                                    request->repair_candidate.bad_replicas,
                                     *registry,
                                     now_unix_ms,
                                     selected_target,
-                                    error_detail);
+                                    error_detail,
+                                    nullptr);
         }
 
         RepairManagerSubmitResult EnqueuePlannedTask(
@@ -698,6 +865,9 @@ namespace storedemo
         }
 
         RepairTask MakeRepairTask(const RepairTaskRequest &request,
+                                  const std::vector<StorageNodeId> &retained_healthy_sources,
+                                  const std::vector<PlacementNodeExclusion> &source_exclusions,
+                                  const PlacementDecision &replacement_decision,
                                   const StorageNodeId &source_node,
                                   const StorageNodeId &target_node,
                                   const std::uint64_t now_unix_ms)
@@ -710,7 +880,13 @@ namespace storedemo
             task.expected_checksum = request.repair_candidate.expected_checksum;
             task.expected_size = request.repair_candidate.expected_size;
             task.existing_replica_nodes = request.manifest.replica_nodes;
+            task.healthy_source_replicas = retained_healthy_sources;
             task.bad_replicas = request.repair_candidate.bad_replicas;
+            task.excluded_nodes = source_exclusions;
+            task.excluded_nodes.insert(task.excluded_nodes.end(),
+                                       replacement_decision.excluded_nodes.begin(),
+                                       replacement_decision.excluded_nodes.end());
+            task.replacement_decision = replacement_decision;
             task.context = request.context;
             task.task_id = BuildRepairTaskId(task.chunk_id,
                                              task.expected_checksum,
@@ -905,6 +1081,9 @@ namespace storedemo
         }
 
         const auto planned_task = MakeRepairTask(plan.request,
+                                                 plan.retained_healthy_sources,
+                                                 plan.source_exclusions,
+                                                 plan.replacement_decision,
                                                  plan.source_node,
                                                  plan.target_node,
                                                  now_unix_ms);
@@ -983,6 +1162,9 @@ namespace storedemo
         }
 
         const auto planned_task = MakeRepairTask(plan.request,
+                                                 plan.retained_healthy_sources,
+                                                 plan.source_exclusions,
+                                                 plan.replacement_decision,
                                                  plan.source_node,
                                                  plan.target_node,
                                                  now_unix_ms);

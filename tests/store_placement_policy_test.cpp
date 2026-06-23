@@ -102,6 +102,40 @@ namespace
         return &(*it);
     }
 
+    std::vector<std::string> SelectedNodeIds(
+        const storedemo::PlacementDecisionResult &result)
+    {
+        std::vector<std::string> node_ids;
+        node_ids.reserve(result.decision.replica_nodes.size());
+        for (const auto &candidate : result.decision.replica_nodes)
+        {
+            node_ids.push_back(candidate.node_id);
+        }
+        return node_ids;
+    }
+
+    std::unordered_set<std::string> SelectedNodeIdSet(
+        const storedemo::PlacementDecisionResult &result)
+    {
+        const auto node_ids = SelectedNodeIds(result);
+        return std::unordered_set<std::string>(node_ids.begin(), node_ids.end());
+    }
+
+    std::string SerializeSortedNodeSet(
+        const std::unordered_set<std::string> &node_ids)
+    {
+        std::vector<std::string> ordered(node_ids.begin(), node_ids.end());
+        std::sort(ordered.begin(), ordered.end());
+
+        std::string encoded;
+        for (const auto &node_id : ordered)
+        {
+            encoded.append(node_id);
+            encoded.push_back(',');
+        }
+        return encoded;
+    }
+
     TEST(StorePlacementPolicyTest, ReplicaCountOneSelectsHealthyNode)
     {
         storedemo::ReplicaPolicySelector selector;
@@ -373,7 +407,7 @@ namespace
     }
 
     TEST(StorePlacementPolicyTest,
-         HealthAwarePlacementKeepsStableOrderingForHealthyLowLoadNodes)
+         HealthAwarePlacementKeepsResourcePriorityAndUsesDeterministicTieBreakWithinTier)
     {
         storedemo::ReplicaPolicySelector selector;
         auto request = MakeRequest(3, 2, 256);
@@ -417,8 +451,103 @@ namespace
         EXPECT_EQ(result.decision.replica_nodes[0].node_id,
                   medium_pressure_low_load.node_id);
         EXPECT_EQ(result.decision.replica_nodes[1].node_id, low_load.node_id);
-        EXPECT_EQ(result.decision.replica_nodes[2].node_id,
-                  tie_node_id_first.node_id);
+        EXPECT_TRUE(result.decision.replica_nodes[2].node_id == tie_node_id_first.node_id ||
+                    result.decision.replica_nodes[2].node_id == tie_node_id_second.node_id);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         EquivalentCandidatesProduceStableSelectionIndependentOfCandidateInputOrder)
+    {
+        storedemo::ReplicaPolicySelector selector;
+        auto request = MakeRequest(3, 2, 256);
+        request.identity.object_id = "obj-t002-order";
+        request.identity.version = 7;
+        request.identity.chunk_index = 4;
+        request.decision_epoch = 2002;
+
+        std::vector<storedemo::StorageNodePlacementCandidate> candidates;
+        for (std::size_t index = 1; index <= 9; ++index)
+        {
+            candidates.push_back(MakeCandidate(index, 4096));
+        }
+
+        auto rotated_candidates = candidates;
+        std::rotate(rotated_candidates.begin(),
+                    rotated_candidates.begin() + 4,
+                    rotated_candidates.end());
+
+        const auto first_result = selector.SelectReplicas(request, candidates);
+        const auto repeated_result = selector.SelectReplicas(request, candidates);
+        const auto rotated_result = selector.SelectReplicas(request, rotated_candidates);
+
+        ASSERT_EQ(first_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << first_result.error_detail;
+        ASSERT_EQ(repeated_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << repeated_result.error_detail;
+        ASSERT_EQ(rotated_result.status, storedemo::StorageNodeStatusCode::kOk)
+            << rotated_result.error_detail;
+
+        EXPECT_EQ(SelectedNodeIds(first_result), SelectedNodeIds(repeated_result));
+        EXPECT_EQ(SelectedNodeIds(first_result), SelectedNodeIds(rotated_result));
+        EXPECT_EQ(SelectedNodeIdSet(first_result).size(), 3U);
+    }
+
+    TEST(StorePlacementPolicyTest,
+         EquivalentNineNodePoolDistributesChunksBeyondLexicalFrontThree)
+    {
+        storedemo::ReplicaPolicySelector selector;
+
+        std::vector<storedemo::StorageNodePlacementCandidate> candidates;
+        for (std::size_t index = 1; index <= 9; ++index)
+        {
+            candidates.push_back(MakeCandidate(index, 4096));
+        }
+
+        std::vector<std::string> lexical_node_ids;
+        lexical_node_ids.reserve(candidates.size());
+        for (const auto &candidate : candidates)
+        {
+            lexical_node_ids.push_back(candidate.node_id);
+        }
+        std::sort(lexical_node_ids.begin(), lexical_node_ids.end());
+        const std::unordered_set<std::string> lexical_front_three = {
+            lexical_node_ids[0], lexical_node_ids[1], lexical_node_ids[2]};
+
+        std::unordered_set<std::string> covered_nodes;
+        std::unordered_set<std::string> unique_replica_sets;
+        bool observed_non_lexical_selection = false;
+
+        for (std::uint32_t chunk_index = 0; chunk_index < 8; ++chunk_index)
+        {
+            auto request = MakeRequest(3, 2, 256);
+            request.identity.object_id = "obj-t002-distribution";
+            request.identity.version = 9;
+            request.identity.chunk_index = chunk_index;
+            request.decision_epoch = 4200;
+
+            const auto result = selector.SelectReplicas(request, candidates);
+
+            ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+                << result.error_detail;
+            ASSERT_EQ(result.decision.replica_nodes.size(), 3U);
+
+            const auto selected_set = SelectedNodeIdSet(result);
+            EXPECT_EQ(selected_set.size(), 3U);
+            if (selected_set != lexical_front_three)
+            {
+                observed_non_lexical_selection = true;
+            }
+
+            for (const auto &node_id : selected_set)
+            {
+                covered_nodes.insert(node_id);
+            }
+            unique_replica_sets.insert(SerializeSortedNodeSet(selected_set));
+        }
+
+        EXPECT_TRUE(observed_non_lexical_selection);
+        EXPECT_GE(covered_nodes.size(), 6U);
+        EXPECT_GE(unique_replica_sets.size(), 2U);
     }
 
     TEST(StorePlacementPolicyTest, ReadReplicaSelectionPreservesManifestOrderWhenFactsAreNeutral)

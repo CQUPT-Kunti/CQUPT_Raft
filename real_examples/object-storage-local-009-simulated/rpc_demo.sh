@@ -8,6 +8,7 @@ CLIENT_BIN="$BIN_DIR/storage_client"
 METADATA_CLIENT_BIN="$BIN_DIR/raft_metadata_client"
 STORAGE_NODE_BIN="$BIN_DIR/storage_node_app"
 METADATA_NODE_BIN="$BIN_DIR/metadata_node_app"
+CONFIG_GENERATOR="$SCRIPT_DIR/generate_cluster_config.sh"
 CONFIG_PATH="$SCRIPT_DIR/cluster.json"
 JOIN_CONFIG_PATH="$SCRIPT_DIR/storage-join-store-7.json"
 METADATA_LEARNER_CONFIG_PATH="$SCRIPT_DIR/metadata-learner-4.json"
@@ -38,8 +39,21 @@ FAILOVER_STOP_VIEW_ENDPOINT="${FAILOVER_STOP_VIEW_ENDPOINT:-127.0.0.1:9301}"
 FAILOVER_SURVIVOR_VIEW_NODE_ID="${FAILOVER_SURVIVOR_VIEW_NODE_ID:-view-2}"
 FAILOVER_SURVIVOR_VIEW_ENDPOINT="${FAILOVER_SURVIVOR_VIEW_ENDPOINT:-127.0.0.1:9302}"
 FAILOVER_SURVIVOR_CONFIG_PATH="$SCRIPT_DIR/logs/failover-view-2-client.json"
+PARALLEL_STATUS_LOG="$SCRIPT_DIR/logs/status.log"
+PARALLEL_CREATE_BUCKET_LOG="$SCRIPT_DIR/logs/create-bucket.log"
+PARALLEL_UPLOAD_LOG="$SCRIPT_DIR/logs/upload.log"
+PARALLEL_DOWNLOAD_LOG="$SCRIPT_DIR/logs/download.log"
+PARALLEL_UPLOAD_CONCURRENCY=""
+PARALLEL_MAX_INFLIGHT_BYTES=""
+PARALLEL_REPLICA_FANOUT_CONCURRENCY=""
+PARALLEL_PREFERRED_MIN_BYTES=$((1024 * 1024 * 1024))
+PARALLEL_PREFERRED_MAX_BYTES=$((10 * 1024 * 1024 * 1024))
+PARALLEL_REQUIRED_STABLE_LIVE_POLLS="${PARALLEL_REQUIRED_STABLE_LIVE_POLLS:-3}"
 
 declare -a TEST_FILES=()
+
+PARALLEL_SOURCE_FILE=""
+PARALLEL_SOURCE_FILE_SIZE_BYTES=0
 
 require_client() {
   if [[ ! -x "$CLIENT_BIN" ]]; then
@@ -76,12 +90,57 @@ require_test_files_dir() {
   fi
 }
 
+ensure_generated_cluster_config() {
+  "$CONFIG_GENERATOR" >/dev/null
+}
+
+read_config_number() {
+  local query="$1"
+  jq -r "$query" "$CONFIG_PATH"
+}
+
+load_parallel_runtime_config() {
+  PARALLEL_UPLOAD_CONCURRENCY="$(read_config_number '.store.upload_concurrency')"
+  PARALLEL_MAX_INFLIGHT_BYTES="$(read_config_number '.store.max_inflight_bytes')"
+  PARALLEL_REPLICA_FANOUT_CONCURRENCY="$(read_config_number '.store.replica_fanout_concurrency')"
+}
+
 collect_test_files() {
   mapfile -t TEST_FILES < <(find "$TEST_FILES_DIR" -type f | sort)
   if [[ "${#TEST_FILES[@]}" -eq 0 ]]; then
     echo "no files found under $TEST_FILES_DIR" >&2
     exit 1
   fi
+}
+
+select_parallel_test_file() {
+  local -a candidates=()
+  mapfile -t candidates < <(find "$TEST_FILES_DIR" -type f -printf '%s\t%p\n' | sort -nr)
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    echo "no files found under $TEST_FILES_DIR" >&2
+    exit 1
+  fi
+
+  local entry
+  local size
+  local path
+  for entry in "${candidates[@]}"; do
+    size="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    if (( size >= PARALLEL_PREFERRED_MIN_BYTES && size <= PARALLEL_PREFERRED_MAX_BYTES )); then
+      PARALLEL_SOURCE_FILE="$path"
+      PARALLEL_SOURCE_FILE_SIZE_BYTES="$size"
+      TEST_FILES=("$path")
+      return 0
+    fi
+  done
+
+  entry="${candidates[0]}"
+  size="${entry%%$'\t'*}"
+  path="${entry#*$'\t'}"
+  PARALLEL_SOURCE_FILE="$path"
+  PARALLEL_SOURCE_FILE_SIZE_BYTES="$size"
+  TEST_FILES=("$path")
 }
 
 relative_path_from_test_dir() {
@@ -132,6 +191,23 @@ run_status_capture() {
     "$CLIENT_BIN" status --config "$client_config"
   ) | tee "$output_file"
   emit_dynamic_metadata_diagnostics
+}
+
+format_bytes() {
+  local size="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$size"
+    return 0
+  fi
+  printf '%sB\n' "$size"
+}
+
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+file_size_bytes() {
+  stat -c '%s' "$1"
 }
 
 view_pid_file() {
@@ -254,6 +330,37 @@ status_reports_live_cluster() {
   fi
 
   grep -E '^metadata_node ' "$output_file" | grep -E 'raft_role=leader|membership_observation=voter' >/dev/null 2>&1
+}
+
+wait_for_live_cluster() {
+  local required_stable_polls="$1"
+  local stable_polls=0
+  local started_at
+  local deadline
+  local output_file
+  started_at="$(date +%s)"
+  deadline=$((started_at + JOIN_WAIT_SECONDS))
+  output_file="$(mktemp)"
+  trap 'rm -f "$output_file"' RETURN
+
+  while (( $(date +%s) <= deadline )); do
+    run_status_capture "$output_file" >/dev/null
+    if status_reports_live_cluster "$output_file"; then
+      stable_polls=$((stable_polls + 1))
+      if (( stable_polls >= required_stable_polls )); then
+        cp "$output_file" "$PARALLEL_STATUS_LOG"
+        echo "[parallel-roundtrip] cluster live and stable polls=$stable_polls"
+        return 0
+      fi
+    else
+      stable_polls=0
+    fi
+    sleep "$STATUS_POLL_INTERVAL_SECONDS"
+  done
+
+  echo "[parallel-roundtrip] FAILED reason=cluster_not_stable wait_seconds=$JOIN_WAIT_SECONDS required_stable_polls=$required_stable_polls" >&2
+  tail -n 50 "$output_file" >&2 || true
+  return 1
 }
 
 status_reports_surviving_view_ready() {
@@ -395,7 +502,7 @@ ensure_bucket_exists() {
     "$METADATA_CLIENT_BIN" "$leader_endpoint" create-bucket \
       --request-id "$request_id" \
       --bucket "$BUCKET"
-  )
+  ) | tee "$PARALLEL_CREATE_BUCKET_LOG"
   rm -f "$status_output"
 }
 
@@ -1274,13 +1381,112 @@ verify_local_copy_one() {
   local object_prefix="$1"
   local source_file="$2"
   local download_file
+  local source_size
+  local download_size
   download_file="$(download_path_for_file "$object_prefix" "$source_file")"
-  if cmp -s "$source_file" "$download_file"; then
-    echo "[verify] OK source=$source_file downloaded=$download_file"
+  source_size="$(file_size_bytes "$source_file")"
+  download_size="$(file_size_bytes "$download_file")"
+  if [[ "$source_size" == "$download_size" ]]; then
+    echo "[verify] OK source=$source_file downloaded=$download_file size_bytes=$download_size"
     return 0
   fi
-  echo "[verify] FAILED source=$source_file downloaded=$download_file" >&2
+  echo "[verify] FAILED source=$source_file downloaded=$download_file source_size=$source_size download_size=$download_size" >&2
   return 1
+}
+
+assert_parallel_upload_config_observed() {
+  local expected_requested="requested_concurrency=$PARALLEL_UPLOAD_CONCURRENCY"
+  local expected_effective="effective_concurrency=$PARALLEL_UPLOAD_CONCURRENCY"
+  local expected_bytes="max_inflight_payload_bytes=$PARALLEL_MAX_INFLIGHT_BYTES"
+  local expected_fanout="effective_replica_fanout_concurrency=$PARALLEL_REPLICA_FANOUT_CONCURRENCY"
+
+  grep -F "$expected_requested" "$PARALLEL_UPLOAD_LOG" >/dev/null
+  grep -F "$expected_effective" "$PARALLEL_UPLOAD_LOG" >/dev/null
+  grep -F "$expected_bytes" "$PARALLEL_UPLOAD_LOG" >/dev/null
+  grep -F "$expected_fanout" "$PARALLEL_UPLOAD_LOG" >/dev/null
+}
+
+run_parallel_roundtrip() {
+  load_parallel_runtime_config
+  mkdir -p "$LOG_DIR" "$DOWNLOAD_DIR"
+  : > "$PARALLEL_CREATE_BUCKET_LOG"
+  : > "$PARALLEL_STATUS_LOG"
+  : > "$PARALLEL_UPLOAD_LOG"
+  : > "$PARALLEL_DOWNLOAD_LOG"
+
+  wait_for_live_cluster "$PARALLEL_REQUIRED_STABLE_LIVE_POLLS"
+  ensure_bucket_exists
+  select_parallel_test_file
+
+  local object_prefix
+  local source_file
+  local object_key
+  local download_file
+  local client_config
+  local upload_started_at
+  local upload_finished_at
+  local download_started_at
+  local download_finished_at
+  local upload_elapsed
+  local download_elapsed
+  local download_size
+
+  object_prefix="$(roundtrip_object_prefix)"
+  source_file="$PARALLEL_SOURCE_FILE"
+  object_key="$(object_key_for_file "$object_prefix" "$source_file")"
+  download_file="$(download_path_for_file "$object_prefix" "$source_file")"
+  client_config="$(active_client_config_path)"
+
+  echo "[parallel-roundtrip] source_file=$source_file size_bytes=$PARALLEL_SOURCE_FILE_SIZE_BYTES size_human=$(format_bytes "$PARALLEL_SOURCE_FILE_SIZE_BYTES")"
+
+  mkdir -p "$(dirname "$download_file")"
+  rm -f "$download_file"
+
+  upload_started_at="$(date +%s)"
+  (
+    cd "$SCRIPT_DIR"
+    "$CLIENT_BIN" upload \
+      --config "$client_config" \
+      --bucket "$BUCKET" \
+      --object "$object_key" \
+      --file "$source_file"
+  ) 2>&1 | tee "$PARALLEL_UPLOAD_LOG"
+  upload_finished_at="$(date +%s)"
+  upload_elapsed=$((upload_finished_at - upload_started_at))
+
+  assert_parallel_upload_config_observed
+  wait_for_live_cluster "$PARALLEL_REQUIRED_STABLE_LIVE_POLLS"
+
+  download_started_at="$(date +%s)"
+  (
+    cd "$SCRIPT_DIR"
+    "$CLIENT_BIN" download \
+      --config "$client_config" \
+      --bucket "$BUCKET" \
+      --object "$object_key" \
+      --out "$download_file" \
+      --concurrency "$PARALLEL_UPLOAD_CONCURRENCY"
+  ) 2>&1 | tee "$PARALLEL_DOWNLOAD_LOG"
+  download_finished_at="$(date +%s)"
+  download_elapsed=$((download_finished_at - download_started_at))
+
+  download_size="$(file_size_bytes "$download_file")"
+  if [[ "$download_size" != "$PARALLEL_SOURCE_FILE_SIZE_BYTES" ]]; then
+    echo "[parallel-roundtrip] FAILED size mismatch source_size=$PARALLEL_SOURCE_FILE_SIZE_BYTES download_size=$download_size" >&2
+    return 1
+  fi
+
+  echo "[parallel-roundtrip] PASS"
+  echo "[parallel-roundtrip] upload_concurrency=$PARALLEL_UPLOAD_CONCURRENCY"
+  echo "[parallel-roundtrip] max_inflight_bytes=$PARALLEL_MAX_INFLIGHT_BYTES"
+  echo "[parallel-roundtrip] replica_fanout_concurrency=$PARALLEL_REPLICA_FANOUT_CONCURRENCY"
+  echo "[parallel-roundtrip] source_file=$source_file"
+  echo "[parallel-roundtrip] source_size_bytes=$PARALLEL_SOURCE_FILE_SIZE_BYTES"
+  echo "[parallel-roundtrip] source_size_human=$(format_bytes "$PARALLEL_SOURCE_FILE_SIZE_BYTES")"
+  echo "[parallel-roundtrip] upload_seconds=$upload_elapsed"
+  echo "[parallel-roundtrip] download_seconds=$download_elapsed"
+  echo "[parallel-roundtrip] downloaded_size_bytes=$download_size"
+  echo "[parallel-roundtrip] download_file=$download_file"
 }
 
 run_roundtrip() {
@@ -1401,6 +1607,7 @@ run_promote_metadata_learners() {
 main() {
   require_client
   require_test_files_dir
+  ensure_generated_cluster_config
   case "$ACTION" in
     status)
       run_status
@@ -1438,10 +1645,12 @@ main() {
             --config "$client_config" \
             --bucket "$BUCKET" \
             --object "$(object_key_for_file "$object_prefix" "$source_file")" \
-            --file "$source_file" \
-            --concurrency 3
+            --file "$source_file"
         )
       done
+      ;;
+    parallel-roundtrip)
+      run_parallel_roundtrip
       ;;
     download)
       echo "download action is not supported standalone in sibling 009 script; use roundtrip" >&2
@@ -1451,7 +1660,7 @@ main() {
       run_roundtrip
       ;;
     *)
-      echo "unsupported action: $ACTION (expected: status|join-storage|join-metadata-learner|join-metadata-learner-2|promote-metadata-learner|promote-metadata-learners|failover-view|upload|roundtrip)" >&2
+      echo "unsupported action: $ACTION (expected: status|join-storage|join-metadata-learner|join-metadata-learner-2|promote-metadata-learner|promote-metadata-learners|failover-view|upload|parallel-roundtrip|roundtrip)" >&2
       exit 1
       ;;
   esac

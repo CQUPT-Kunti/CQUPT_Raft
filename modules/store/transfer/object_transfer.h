@@ -82,8 +82,10 @@ namespace storedemo
     struct TransferChunkPlan
     {
         ChunkIdentity identity;
+        std::uint64_t offset{0};
         std::uint64_t expected_size{0};
         ChunkChecksum expected_checksum;
+        std::vector<StorageNodeId> selected_replica_nodes;
         std::vector<StorageNodeId> candidate_nodes;
         std::uint32_t required_replica_count{0};
         std::uint32_t minimum_successful_writes{0};
@@ -116,6 +118,11 @@ namespace storedemo
         std::string object_key;
         std::string object_id;
         std::uint64_t version{0};
+        std::uint64_t chunk_size_bytes{0};
+        std::uint32_t total_chunks{0};
+        std::uint32_t replica_count{0};
+        std::uint32_t minimum_successful_writes{0};
+        std::uint64_t placement_epoch{0};
         TransferObjectChecksumFacts object_checksum;
         std::vector<TransferChunkPlan> chunks;
         std::uint64_t created_at_unix_ms{0};
@@ -200,6 +207,9 @@ namespace storedemo
         std::filesystem::path source_path;
         std::uint64_t chunk_size{0};
         std::uint32_t concurrency{1};
+        std::uint64_t max_inflight_bytes{0};
+        std::uint32_t replica_fanout_concurrency{0};
+        std::uint64_t replica_write_timeout_ms{0};
         // 这些副本策略是 CreateWritePlan 的 metadata facts 输入，
         // 不是本地自行决定对象可见性的 authority。
         std::uint32_t desired_replica_count{0};
@@ -385,6 +395,9 @@ namespace storedemo
     {
     public:
         ~UploadTransferSession() override;
+
+        static void SetMaxInflightPayloadBytesOverrideForTesting(
+            std::uint64_t max_bytes);
 
         [[nodiscard]] virtual const UploadObjectRequest &request() const = 0;
         virtual UploadObjectResult Execute(

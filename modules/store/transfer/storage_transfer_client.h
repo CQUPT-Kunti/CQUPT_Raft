@@ -86,6 +86,8 @@ namespace storedemo
         std::uint32_t initial_backoff_ms{10};
         // 有界退避上限，避免因单个 chunk 传输放大阻塞。
         std::uint32_t max_backoff_ms{50};
+        // 大 chunk 下载需要同步放宽 gRPC 收发消息上限；0 表示使用内部默认值。
+        std::uint64_t grpc_message_limit_bytes{0};
         // 为空时默认使用 insecure channel credentials。
         std::shared_ptr<grpc::ChannelCredentials> channel_credentials;
     };

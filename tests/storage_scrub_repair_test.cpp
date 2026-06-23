@@ -2741,6 +2741,25 @@ namespace
             no_target_manager.SubmitUnderReplicatedTask(*no_target_scrub);
         EXPECT_EQ(no_target_submit.code,
                   storedemo::UnderReplicatedTaskSubmitCode::kNoHealthyTarget);
+        EXPECT_NE(no_target_submit.error_detail.find(no_target_identity.chunk_id),
+                  std::string::npos);
+        EXPECT_NE(no_target_submit.error_detail.find(source_store.config().node_id),
+                  std::string::npos);
+        EXPECT_NE(no_target_submit.error_detail.find(
+                      storedemo::test::MakeStorageNodeIdFixture(7)),
+                  std::string::npos);
+        EXPECT_NE(no_target_submit.error_detail.find(
+                      storedemo::test::MakeStorageNodeIdFixture(8) +
+                      ":node write admission is overloaded"),
+                  std::string::npos);
+        EXPECT_NE(no_target_submit.error_detail.find(
+                      storedemo::test::MakeStorageNodeIdFixture(9) +
+                      ":node disk pressure is too high: High"),
+                  std::string::npos);
+        EXPECT_NE(no_target_submit.error_detail.find(
+                      storedemo::test::MakeStorageNodeIdFixture(10) +
+                      ":node health is not writable: Unavailable"),
+                  std::string::npos);
     }
 
     TEST_F(StorageScrubRepairTest,
@@ -2917,6 +2936,25 @@ namespace
         EXPECT_EQ(task->attempts, 0U);
         EXPECT_EQ(task->last_error, storedemo::StorageNodeStatusCode::kOk);
         EXPECT_TRUE(task->last_error_detail.empty());
+        EXPECT_EQ(task->existing_replica_nodes, manifest.replica_nodes);
+        EXPECT_EQ(task->healthy_source_replicas,
+                  std::vector<storedemo::StorageNodeId>(
+                      {storedemo::test::MakeStorageNodeIdFixture(1),
+                       storedemo::test::MakeStorageNodeIdFixture(2)}));
+        EXPECT_EQ(task->bad_replicas,
+                  std::vector<storedemo::StorageNodeId>(
+                      {storedemo::test::MakeStorageNodeIdFixture(4)}));
+        EXPECT_NE(task->target_node, task->source_node);
+        EXPECT_EQ(std::find(task->existing_replica_nodes.begin(),
+                            task->existing_replica_nodes.end(),
+                            task->target_node),
+                  task->existing_replica_nodes.end());
+        EXPECT_EQ(task->replacement_decision.chunk_id, identity.chunk_id);
+        EXPECT_EQ(task->replacement_decision.decision_epoch, 110U);
+        ASSERT_EQ(task->replacement_decision.replica_nodes.size(), 1U);
+        EXPECT_EQ(task->replacement_decision.replica_nodes.front().node_id,
+                  task->target_node);
+        EXPECT_FALSE(task->excluded_nodes.empty());
 
         EXPECT_EQ(target_store.StatChunk(
                       MakeStatRequest(identity.chunk_id, "repair-manager-create-target"))
@@ -2925,6 +2963,175 @@ namespace
 
         (void)source_store;
         (void)peer_store;
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerPlanningDoesNotExecuteRepairIoDuringSubmit)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-plan-only", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(40, "repair-manager-plan-only");
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto candidate = MakeManagerRepairCandidate(
+            manifest,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            {storedemo::test::MakeStorageNodeIdFixture(4)},
+            true,
+            false);
+
+        std::size_t source_reads = 0;
+        std::size_t target_writes = 0;
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                },
+                .source_reader =
+                    [&source_reads](const storedemo::RepairTask &,
+                                    const storedemo::StorageTaskContext &)
+                {
+                    ++source_reads;
+                    return storedemo::RepairSourceReadResult{};
+                },
+                .target_writer =
+                    [&target_writes](const storedemo::RepairTask &,
+                                     const std::string_view,
+                                     const storedemo::StorageTaskContext &)
+                {
+                    ++target_writes;
+                    return storedemo::RepairTargetWriteResult{};
+                }});
+
+        const auto submit_result =
+            manager.SubmitTask(MakeRepairTaskRequest(manifest, candidate, 10));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+        ASSERT_TRUE(submit_result.task.has_value());
+        EXPECT_EQ(source_reads, 0U);
+        EXPECT_EQ(target_writes, 0U);
+        EXPECT_EQ(submit_result.task->state, storedemo::RepairTaskState::kQueued);
+        EXPECT_EQ(submit_result.task->healthy_source_replicas,
+                  std::vector<storedemo::StorageNodeId>(
+                      {storedemo::test::MakeStorageNodeIdFixture(1),
+                       storedemo::test::MakeStorageNodeIdFixture(2)}));
+        ASSERT_EQ(submit_result.task->replacement_decision.replica_nodes.size(), 1U);
+        EXPECT_EQ(submit_result.task->replacement_decision.replica_nodes.front().node_id,
+                  storedemo::test::MakeStorageNodeIdFixture(3));
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerReplacementPlanningDoesNotForceOriginalReplicaBack)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+        RegisterNode(4,
+                     100,
+                     storedemo::StorageNodeHealth::kHealthy,
+                     storedemo::StorageNodeDiskPressure::kHigh);
+
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-no-force-back", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(40, "repair-manager-no-force-back");
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2),
+             storedemo::test::MakeStorageNodeIdFixture(4)},
+            3);
+        const auto candidate = MakeManagerRepairCandidate(
+            manifest,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            {storedemo::test::MakeStorageNodeIdFixture(4)},
+            true,
+            false);
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        const auto submit_result =
+            manager.SubmitTask(MakeRepairTaskRequest(manifest, candidate, 10));
+        ASSERT_TRUE(submit_result.accepted()) << submit_result.error_detail;
+        ASSERT_TRUE(submit_result.task.has_value());
+        EXPECT_EQ(submit_result.task->target_node,
+                  storedemo::test::MakeStorageNodeIdFixture(3));
+        EXPECT_NE(submit_result.task->target_node,
+                  storedemo::test::MakeStorageNodeIdFixture(4));
+        EXPECT_EQ(submit_result.task->healthy_source_replicas,
+                  std::vector<storedemo::StorageNodeId>(
+                      {storedemo::test::MakeStorageNodeIdFixture(1),
+                       storedemo::test::MakeStorageNodeIdFixture(2)}));
+        EXPECT_EQ(std::find(submit_result.task->existing_replica_nodes.begin(),
+                            submit_result.task->existing_replica_nodes.end(),
+                            submit_result.task->target_node),
+                  submit_result.task->existing_replica_nodes.end());
+    }
+
+    TEST_F(StorageScrubRepairTest,
+           ProductionRepairManagerRejectsManifestExternalHealthySourceAuthorityLeak)
+    {
+        RegisterNode(1, 100);
+        RegisterNode(2, 100);
+        RegisterNode(3, 100);
+
+        const auto identity =
+            MakeIdentityOrThrow("repair-manager-source-authority", 1, 0, 0);
+        const auto payload =
+            storedemo::test::MakeChunkPayload(40, "repair-manager-source-authority");
+        const auto manifest = MakeManifest(
+            identity,
+            payload,
+            {storedemo::test::MakeStorageNodeIdFixture(1),
+             storedemo::test::MakeStorageNodeIdFixture(2)},
+            3);
+        const auto candidate = MakeManagerRepairCandidate(
+            manifest,
+            {storedemo::test::MakeStorageNodeIdFixture(3)},
+            {storedemo::test::MakeStorageNodeIdFixture(2)},
+            true,
+            false);
+
+        storedemo::RepairManager manager(
+            &registry_,
+            storedemo::RepairManagerConfig{
+                .max_active_tasks = 4,
+                .max_tasks = 8,
+                .now_unix_ms = []()
+                {
+                    return 110;
+                }});
+
+        const auto submit_result =
+            manager.SubmitTask(MakeRepairTaskRequest(manifest, candidate, 10));
+        EXPECT_EQ(submit_result.code,
+                  storedemo::RepairManagerSubmitCode::kInvalidArgument);
+        EXPECT_NE(submit_result.error_detail.find(
+                      "healthy repair source is not in committed manifest replicas"),
+                  std::string::npos);
     }
 
     TEST_F(StorageScrubRepairTest,

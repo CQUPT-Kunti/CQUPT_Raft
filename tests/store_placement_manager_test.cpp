@@ -211,6 +211,80 @@ namespace
                                    "placement_manager caller excluded 1 nodes"));
     }
 
+    TEST(StorePlacementManagerTest,
+         ReplacementPlacementExcludesExistingReplicasAndSelectsBestRemainingTarget)
+    {
+        storedemo::PlacementManager manager;
+        auto request = MakeRequest(1, 1, 512);
+
+        auto retained_healthy_a = MakeCandidate(1, 24'576);
+        retained_healthy_a.load.active_reads = 0;
+        retained_healthy_a.load.active_writes = 0;
+        retained_healthy_a.load.queued_ops = 0;
+
+        auto weaker_eligible = MakeCandidate(2, 12'288);
+        weaker_eligible.load.active_reads = 1;
+        weaker_eligible.load.active_writes = 2;
+        weaker_eligible.load.queued_ops = 1;
+
+        auto original_bad_replica = MakeCandidate(3, 32'768);
+        auto replacement_target = MakeCandidate(4, 16'384);
+        replacement_target.load.active_reads = 0;
+        replacement_target.load.active_writes = 1;
+        replacement_target.load.queued_ops = 0;
+
+        auto readonly = MakeCandidate(5,
+                                      20'480,
+                                      0,
+                                      storedemo::StorageNodeHealth::kReadOnly);
+        auto overloaded = MakeCandidate(6, 20'480);
+        overloaded.write_admission_overloaded = true;
+
+        request.excluded_nodes = {retained_healthy_a.node_id,
+                                  original_bad_replica.node_id};
+
+        std::vector<storedemo::StorageNodePlacementCandidate> candidates = {
+            weaker_eligible,
+            readonly,
+            original_bad_replica,
+            overloaded,
+            retained_healthy_a,
+            replacement_target};
+
+        const auto result = manager.SelectPlacement(request, candidates);
+
+        ASSERT_EQ(result.status, storedemo::StorageNodeStatusCode::kOk)
+            << result.error_detail;
+        ASSERT_EQ(result.decision.replica_nodes.size(), 1U);
+        EXPECT_EQ(result.decision.replica_nodes.front().node_id,
+                  replacement_target.node_id);
+
+        const auto *retained_exclusion =
+            FindExclusion(result.decision.excluded_nodes, retained_healthy_a.node_id);
+        ASSERT_NE(retained_exclusion, nullptr);
+        EXPECT_EQ(retained_exclusion->reason, "node is explicitly excluded");
+
+        const auto *bad_replica_exclusion =
+            FindExclusion(result.decision.excluded_nodes, original_bad_replica.node_id);
+        ASSERT_NE(bad_replica_exclusion, nullptr);
+        EXPECT_EQ(bad_replica_exclusion->reason, "node is explicitly excluded");
+
+        const auto *readonly_exclusion =
+            FindExclusion(result.decision.excluded_nodes, readonly.node_id);
+        ASSERT_NE(readonly_exclusion, nullptr);
+        EXPECT_EQ(readonly_exclusion->reason,
+                  "node health is not writable: ReadOnly");
+
+        const auto *overloaded_exclusion =
+            FindExclusion(result.decision.excluded_nodes, overloaded.node_id);
+        ASSERT_NE(overloaded_exclusion, nullptr);
+        EXPECT_EQ(overloaded_exclusion->reason,
+                  "node write admission is overloaded");
+
+        EXPECT_TRUE(ContainsReason(result.decision.reasons,
+                                   "placement_manager caller excluded 2 nodes"));
+    }
+
     TEST(StorePlacementManagerTest, EligibilityFailuresRemainObservableThroughManager)
     {
         storedemo::PlacementManager manager;

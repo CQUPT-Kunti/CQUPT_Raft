@@ -58,6 +58,8 @@ namespace storedemo
     inline constexpr char kChunkIdSeparator = '~';
     inline constexpr std::size_t kMaxChunkIdLength = 255;
     inline constexpr std::size_t kMaxChunkObjectIdLength = 223;
+    inline constexpr std::uint64_t kProductionChunkSizeBytes =
+        128ULL * 1024ULL * 1024ULL;
 
     StorageNodeStatusCode ValidateChunkObjectId(std::string_view object_id,
                                                 std::string *error_detail = nullptr);

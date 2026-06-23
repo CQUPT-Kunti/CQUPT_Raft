@@ -13,6 +13,15 @@
 - 本模块应持续保留 `excluded_nodes`、`reasons`、决策纪元等 decision reason，便于测试、排障和后续工业化观测。
 - 本模块保持纯策略计算边界，不把写入执行、metadata commit、Raft 共识或真实 payload 处理混进来。
 
+#### T008-A replacement placement 约束
+
+- repair Decision B 的 replacement target 仍复用 `PlacementManager` 和 `ReplicaPolicySelector` 的纯策略边界，不引入新的公开 placement struct。
+- committed manifest 中已经承载该 chunk 的 `replica_nodes` 必须作为 `excluded_nodes` 传入 replacement placement，避免把 retained healthy replica 或原坏节点重新选成 target。
+- replacement target 只能来自当前 `StorageNodeRegistry` 的 live / writable / capacity-sufficient / non-overloaded / non-high-pressure 节点。
+- 若 manifest 中旧副本节点当前已经 offline、draining、read-only、high-pressure、capacity insufficient 或 write admission overloaded，它们会继续通过 `excluded_nodes` 或 eligibility filter 留下明确排除原因，但不会因为“曾经在 manifest 里”而获得优先级。
+- replacement placement 失败时，需要保留 chunk identity、retained healthy replicas、existing manifest replicas、bad replicas、decision epoch 以及 placement exclusions，供 repair-B 后续决策和诊断复用。
+- 本阶段只产生 replacement decision facts，不执行 `ReadChunk`、`WriteChunk`、repair copy、manifest update 或后台 repair task。
+
 当前只负责：
 
 - `StorageNodePlacementCandidate` 候选节点模型
@@ -543,14 +552,18 @@
 ### 5. 对合格候选做稳定排序
 
 - 排序优先级是：
-  - `available_capacity_bytes` 更大优先
-  - `load.TotalInflight()` 更低优先
-  - `load.active_writes` 更低优先
-  - `load.active_reads` 更低优先
-  - `node_id` 字典序更小优先
-  - `original_index` 更小优先
-- 最后一层 `original_index` 兜底的作用是：
-  - 当所有可观测指标都完全相同时，输出仍然稳定可预测
+  - 先按 resource tier 排序：
+    - `available_capacity_bytes` 对应的 post-write headroom tier 更大优先
+    - `load.TotalInflight()` tier 更低优先
+    - `load.active_writes` tier 更低优先
+    - `load.active_reads` tier 更低优先
+  - 对处于同一资源 tier 的候选，使用 chunk-scoped deterministic jitter 做稳定分散
+  - 仅在极少数 hash 冲突或完全等价条目场景下，才用内部稳定兜底维持严格弱序
+- jitter 输入使用：
+  - `chunk_id`
+  - `decision_epoch`
+  - `node_id`
+- 这里的 `node_id` 只作为 hash identity input，不是 lexical priority，也不是生产权重
 
 ### 6. 两阶段选点
 
@@ -587,7 +600,7 @@
 - 如果成功选满：
   - 返回 `kOk`
   - 向 `decision.reasons` 追加一条排序依据说明：
-    - `replicas are ordered by available capacity, lower inflight load, then node_id`
+    - `replicas are ordered by resource tiers first, then chunk-scoped deterministic jitter`
 
 ## 当前选择语义
 
@@ -599,11 +612,8 @@
   - 可用容量不足以容纳 `chunk_size_bytes + reserve_capacity_bytes`
   - 调用方显式排除的节点
 - 节点排序固定为：
-  - `available_capacity_bytes` 更大优先
-  - `load.TotalInflight()` 更低优先
-  - `load.active_writes` 更低优先
-  - `load.active_reads` 更低优先
-  - `node_id` 字典序兜底
+  - 先按容量和负载 tier 保持 resource-aware 优先级
+  - tier 内使用 chunk-scoped deterministic jitter 分散热点
 - 输出副本节点不会重复 `node_id`
 - `prefer_distinct_zones = true` 时，会先尽量跨 zone 选点，再按常规排序补齐剩余副本
 - `PlacementManager` 不改变 `ReplicaPolicySelector` 的排序和筛选结果，只在输出里补决策摘要
