@@ -431,16 +431,146 @@ cd real_examples/object-storage-local-010-config-driven-simulated
 
 ### 多机实战建议操作顺序
 
-1. 先在所有机器分发统一配置
-2. 先启动两个 `ViewNode`
-3. 再启动三个 `MetadataNode`
-4. 确认 Raft leader 稳定
-5. 再启动多个 `StorageNode`
-6. 用客户端跑 `status`
-7. 再做 upload / download 压测或业务流量验证
-8. 如需扩容，再加入新的：
-   - `StorageNode`
-   - `MetadataNode learner`
+推荐优先使用：
+
+- `real_examples/object-storage-local-011-node-self-contained`
+
+这套目录适合先在单机上模拟“多机分角色部署”，因为每个节点都有自己独立的：
+
+- `start.sh`
+- `stop.sh`
+- `status.sh`
+- `config.json`
+
+建议按下面顺序操作：
+
+1. 先停止旧节点，避免上一次残留进程、端口占用或脏状态影响本次验证。
+2. 先启动两个 `ViewNode`：
+   - `nodes/view-1/start.sh`
+   - `nodes/view-2/start.sh`
+3. 再启动三个 `MetadataNode`：
+   - `nodes/meta-1/start.sh`
+   - `nodes/meta-2/start.sh`
+   - `nodes/meta-3/start.sh`
+4. 等待 `Raft` leader 稳定后，再启动多个 `StorageNode`：
+   - `nodes/store-1/start.sh`
+   - `nodes/store-2/start.sh`
+   - `nodes/store-3/start.sh`
+   - `nodes/store-4/start.sh`
+   - `nodes/store-5/start.sh`
+   - `nodes/store-6/start.sh`
+5. 对所有节点执行一次 `status.sh`，确认 `view / metadata / storage` 都已经运行。
+6. 用 `storage_client status --config real_examples/object-storage-local-011-node-self-contained/cluster.json` 检查当前 view 视角下的 leader hint 和节点存活状态。
+7. 先创建 bucket，再做上传下载。建桶时如果命中了非 leader `MetadataNode`，要根据 `leader hint` 切到真正 leader 重新执行。
+8. 上传下载验证建议直接使用：
+   - `tests/test_files/HKU-IS.rar`
+   - `tests/test_files/总结.zip`
+9. 上传完成后立刻做下载回读，并校验：
+   - 文件大小是否一致
+   - `sha256` 是否一致
+10. 测试完成后，按相反顺序停止所有节点：
+    - 先停 `StorageNode`
+    - 再停 `MetadataNode`
+    - 最后停 `ViewNode`
+11. 如需扩容，再加入新的：
+    - `StorageNode`
+    - `MetadataNode learner`
+
+一套可直接复用的本地模拟顺序如下：
+
+```bash
+cd real_examples/object-storage-local-011-node-self-contained
+
+# 1. 停止旧节点
+./nodes/store-6/stop.sh || true
+./nodes/store-5/stop.sh || true
+./nodes/store-4/stop.sh || true
+./nodes/store-3/stop.sh || true
+./nodes/store-2/stop.sh || true
+./nodes/store-1/stop.sh || true
+./nodes/meta-3/stop.sh || true
+./nodes/meta-2/stop.sh || true
+./nodes/meta-1/stop.sh || true
+./nodes/view-2/stop.sh || true
+./nodes/view-1/stop.sh || true
+
+# 2. 启动 view
+./nodes/view-1/start.sh
+./nodes/view-2/start.sh
+
+# 3. 启动 metadata
+./nodes/meta-1/start.sh
+./nodes/meta-2/start.sh
+./nodes/meta-3/start.sh
+
+# 4. 启动 storage
+./nodes/store-1/start.sh
+./nodes/store-2/start.sh
+./nodes/store-3/start.sh
+./nodes/store-4/start.sh
+./nodes/store-5/start.sh
+./nodes/store-6/start.sh
+
+# 5. 查看状态
+./nodes/view-1/status.sh
+./nodes/view-2/status.sh
+./nodes/meta-1/status.sh
+./nodes/meta-2/status.sh
+./nodes/meta-3/status.sh
+./nodes/store-1/status.sh
+./nodes/store-2/status.sh
+./nodes/store-3/status.sh
+./nodes/store-4/status.sh
+./nodes/store-5/status.sh
+./nodes/store-6/status.sh
+```
+
+推荐的上传下载验证命令如下：
+
+```bash
+build/linux/storage_client status \
+  --config real_examples/object-storage-local-011-node-self-contained/cluster.json
+
+build/linux/raft_metadata_client 127.0.0.1:9401 create-bucket \
+  --request-id create-bucket-demo \
+  --bucket example-bucket
+
+build/linux/storage_client upload \
+  --config real_examples/object-storage-local-011-node-self-contained/cluster.json \
+  --bucket example-bucket \
+  --object test-files-roundtrip/HKU-IS.rar \
+  --file tests/test_files/HKU-IS.rar \
+  --request-id upload-hku-is
+
+build/linux/storage_client download \
+  --config real_examples/object-storage-local-011-node-self-contained/cluster.json \
+  --bucket example-bucket \
+  --object test-files-roundtrip/HKU-IS.rar \
+  --out real_examples/object-storage-local-011-node-self-contained/downloads/test-files-roundtrip/HKU-IS.rar \
+  --request-id download-hku-is
+
+build/linux/storage_client upload \
+  --config real_examples/object-storage-local-011-node-self-contained/cluster.json \
+  --bucket example-bucket \
+  --object test-files-roundtrip/总结.zip \
+  --file tests/test_files/总结.zip \
+  --request-id upload-summary-zip
+
+build/linux/storage_client download \
+  --config real_examples/object-storage-local-011-node-self-contained/cluster.json \
+  --bucket example-bucket \
+  --object test-files-roundtrip/总结.zip \
+  --out real_examples/object-storage-local-011-node-self-contained/downloads/test-files-roundtrip/总结.zip \
+  --request-id download-summary-zip
+```
+
+如果 `create-bucket` 返回 `NOT_LEADER`，不要直接判定失败。应当根据返回的 `leader_hint_address`，改连当前 leader，例如：
+
+```bash
+build/linux/raft_metadata_client 127.0.0.1:9402 create-bucket \
+  --request-id create-bucket-demo \
+  --bucket example-bucket
+```
 
 ### 多机实战要特别注意的几点
 

@@ -8,7 +8,7 @@
       "peer_seeds": [
         "127.0.0.1:9302"
       ],
-      "data_dir": "data"
+      "data_dir": "../view-1/data"
     },
     {
       "node_id": "view-2",
@@ -16,7 +16,7 @@
       "peer_seeds": [
         "127.0.0.1:9301"
       ],
-      "data_dir": "data"
+      "data_dir": "../view-2/data"
     }
   ],
   "metadata_nodes": [
@@ -24,40 +24,40 @@
       "node_id": "meta-1",
       "raft_id": 1,
       "endpoint": "127.0.0.1:9401",
-      "data_dir": "data",
-      "snapshot_dir": "snapshots",
+      "data_dir": "../meta-1/data",
+      "snapshot_dir": "../meta-1/snapshots",
       "initial_role": "voter"
     },
     {
       "node_id": "meta-2",
       "raft_id": 2,
       "endpoint": "127.0.0.1:9402",
-      "data_dir": "data",
-      "snapshot_dir": "snapshots",
+      "data_dir": "../meta-2/data",
+      "snapshot_dir": "../meta-2/snapshots",
       "initial_role": "voter"
     },
     {
       "node_id": "meta-3",
       "raft_id": 3,
       "endpoint": "127.0.0.1:9403",
-      "data_dir": "data",
-      "snapshot_dir": "snapshots",
+      "data_dir": "../meta-3/data",
+      "snapshot_dir": "../meta-3/snapshots",
       "initial_role": "voter"
     },
     {
       "node_id": "meta-4",
       "raft_id": 4,
       "endpoint": "127.0.0.1:9404",
-      "data_dir": "data",
-      "snapshot_dir": "snapshots",
+      "data_dir": "../meta-4/data",
+      "snapshot_dir": "../meta-4/snapshots",
       "initial_role": "candidate"
     },
     {
       "node_id": "meta-5",
       "raft_id": 5,
       "endpoint": "127.0.0.1:9405",
-      "data_dir": "data",
-      "snapshot_dir": "snapshots",
+      "data_dir": "/home/yangjilei/Code/C++/CQUPT_Raft/real_examples/object-storage-local-011-node-self-contained/nodes/meta-5/data",
+      "snapshot_dir": "/home/yangjilei/Code/C++/CQUPT_Raft/real_examples/object-storage-local-011-node-self-contained/nodes/meta-5/snapshots",
       "initial_role": "candidate"
     }
   ],
@@ -65,7 +65,7 @@
     {
       "node_id": "store-1",
       "endpoint": "127.0.0.1:9501",
-      "data_dir": "data",
+      "data_dir": "../store-1/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-a",
@@ -75,7 +75,7 @@
     {
       "node_id": "store-2",
       "endpoint": "127.0.0.1:9502",
-      "data_dir": "data",
+      "data_dir": "../store-2/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-a",
@@ -85,7 +85,7 @@
     {
       "node_id": "store-3",
       "endpoint": "127.0.0.1:9503",
-      "data_dir": "data",
+      "data_dir": "../store-3/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-b",
@@ -95,7 +95,7 @@
     {
       "node_id": "store-4",
       "endpoint": "127.0.0.1:9504",
-      "data_dir": "data",
+      "data_dir": "../store-4/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-b",
@@ -105,7 +105,7 @@
     {
       "node_id": "store-5",
       "endpoint": "127.0.0.1:9505",
-      "data_dir": "data",
+      "data_dir": "../store-5/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-c",
@@ -115,7 +115,7 @@
     {
       "node_id": "store-6",
       "endpoint": "127.0.0.1:9506",
-      "data_dir": "data",
+      "data_dir": "../store-6/data",
       "capacity_bytes": 10737418240,
       "failure_domain": {
         "zone": "zone-c",

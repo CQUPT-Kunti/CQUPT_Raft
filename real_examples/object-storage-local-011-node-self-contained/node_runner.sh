@@ -30,6 +30,22 @@ REPO_ROOT="$(cd "$EXAMPLE_DIR/../.." && pwd)"
 BIN_DIR="${BIN_DIR:-$REPO_ROOT/build/linux}"
 CONFIG_PATH="${CONFIG_PATH:-$EXAMPLE_DIR/cluster.json}"
 
+resolve_node_path() {
+  local path_value="$1"
+  if [[ "$path_value" = /* ]]; then
+    printf '%s\n' "$path_value"
+  else
+    printf '%s\n' "$NODE_CONF_DIR/$path_value"
+  fi
+}
+
+DATA_DIR_PATH="$(resolve_node_path "$DATA_DIR")"
+LOG_FILE_PATH="$(resolve_node_path "$LOG_FILE")"
+PID_FILE_PATH="$(resolve_node_path "$PID_FILE")"
+if [[ -n "${SNAPSHOT_DIR:-}" ]]; then
+  SNAPSHOT_DIR_PATH="$(resolve_node_path "$SNAPSHOT_DIR")"
+fi
+
 require_binary() {
   if [[ ! -x "$BIN_DIR/$APP_TARGET" ]]; then
     echo "missing binary: $BIN_DIR/$APP_TARGET" >&2
@@ -80,17 +96,17 @@ start_node() {
   require_binary
 
   mkdir -p \
-    "$(dirname "$EXAMPLE_DIR/$DATA_DIR")" \
-    "$(dirname "$EXAMPLE_DIR/$LOG_FILE")" \
-    "$(dirname "$EXAMPLE_DIR/$PID_FILE")"
+    "$(dirname "$DATA_DIR_PATH")" \
+    "$(dirname "$LOG_FILE_PATH")" \
+    "$(dirname "$PID_FILE_PATH")"
 
   if [[ -n "${SNAPSHOT_DIR:-}" ]]; then
-    mkdir -p "$EXAMPLE_DIR/$SNAPSHOT_DIR"
+    mkdir -p "$SNAPSHOT_DIR_PATH"
   fi
 
-  if [[ -f "$EXAMPLE_DIR/$PID_FILE" ]]; then
+  if [[ -f "$PID_FILE_PATH" ]]; then
     local old_pid
-    old_pid="$(cat "$EXAMPLE_DIR/$PID_FILE")"
+    old_pid="$(cat "$PID_FILE_PATH")"
     if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
       if process_matches_node "$old_pid"; then
         echo "$NODE_ID already running pid=$old_pid"
@@ -99,7 +115,7 @@ start_node() {
       echo "$NODE_ID pid file points to unrelated process pid=$old_pid" >&2
       return 1
     fi
-    rm -f "$EXAMPLE_DIR/$PID_FILE"
+    rm -f "$PID_FILE_PATH"
   fi
 
   (
@@ -107,40 +123,40 @@ start_node() {
     setsid "$BIN_DIR/$APP_TARGET" \
       --config "$CONFIG_PATH" \
       --node_id "$NODE_ID" \
-      --data_dir "$DATA_DIR" \
+      --data_dir "$DATA_DIR_PATH" \
       --listen "$LISTEN" \
-      >"$LOG_FILE" 2>&1 < /dev/null &
-    echo "$!" > "$PID_FILE"
+      >"$LOG_FILE_PATH" 2>&1 < /dev/null &
+    echo "$!" > "$PID_FILE_PATH"
   )
 
   local pid
-  pid="$(cat "$EXAMPLE_DIR/$PID_FILE")"
+  pid="$(cat "$PID_FILE_PATH")"
   sleep 0.3
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "failed to start $NODE_ID, see $EXAMPLE_DIR/$LOG_FILE" >&2
+    echo "failed to start $NODE_ID, see $LOG_FILE_PATH" >&2
     return 1
   fi
 
-  echo "started node_id=$NODE_ID target=$APP_TARGET pid=$pid listen=$LISTEN log=$EXAMPLE_DIR/$LOG_FILE"
+  echo "started node_id=$NODE_ID target=$APP_TARGET pid=$pid listen=$LISTEN log=$LOG_FILE_PATH"
 }
 
 stop_node() {
-  if [[ ! -f "$EXAMPLE_DIR/$PID_FILE" ]]; then
+  if [[ ! -f "$PID_FILE_PATH" ]]; then
     echo "skip node_id=$NODE_ID reason=missing_pid_file"
     return 0
   fi
 
   local pid
-  pid="$(cat "$EXAMPLE_DIR/$PID_FILE")"
+  pid="$(cat "$PID_FILE_PATH")"
   if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
     echo "remove stale pid file node_id=$NODE_ID reason=invalid_pid pid_value=$pid"
-    rm -f "$EXAMPLE_DIR/$PID_FILE"
+    rm -f "$PID_FILE_PATH"
     return 0
   fi
 
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "remove stale pid file node_id=$NODE_ID pid=$pid reason=process_not_running"
-    rm -f "$EXAMPLE_DIR/$PID_FILE"
+    rm -f "$PID_FILE_PATH"
     return 0
   fi
 
@@ -154,18 +170,18 @@ stop_node() {
     return 1
   fi
 
-  rm -f "$EXAMPLE_DIR/$PID_FILE"
+  rm -f "$PID_FILE_PATH"
   echo "stopped node_id=$NODE_ID pid=$pid"
 }
 
 status_node() {
-  if [[ ! -f "$EXAMPLE_DIR/$PID_FILE" ]]; then
+  if [[ ! -f "$PID_FILE_PATH" ]]; then
     echo "node_id=$NODE_ID status=stopped reason=missing_pid_file"
     return 1
   fi
 
   local pid
-  pid="$(cat "$EXAMPLE_DIR/$PID_FILE")"
+  pid="$(cat "$PID_FILE_PATH")"
   if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
     echo "node_id=$NODE_ID status=stopped reason=invalid_pid pid_value=$pid"
     return 1
@@ -181,7 +197,7 @@ status_node() {
     return 1
   fi
 
-  echo "node_id=$NODE_ID status=running pid=$pid listen=$LISTEN log=$EXAMPLE_DIR/$LOG_FILE"
+  echo "node_id=$NODE_ID status=running pid=$pid listen=$LISTEN log=$LOG_FILE_PATH"
 }
 
 case "$ACTION" in

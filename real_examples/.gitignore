@@ -3,3 +3,4 @@
 *.zip
 /object-storage-local-009-simulated/downloads/*
 /object-storage-local-010-config-driven-simulated/downloads/*
+/object-storage-local-011-node-self-contained/downloads/*
