@@ -8,14 +8,6 @@
 
 系统当前重点已经从“能跑起来”推进到“工业化对象存储主路径”：
 
-- 对象按 `128 MiB` 固定 chunk 切分
-- upload 支持 `4` 个 chunk 并发进入 pipeline
-- in-flight payload 预算为 `512 MiB`
-- 每个 chunk 对 `3` 个 selected replicas 并发 fan-out 写入
-- quorum 阈值为 `2 / 3`
-- committed manifest 保存每个 chunk 的实际 durable replica facts
-- download 严格依据 committed manifest 做同 chunk 副本 fallback
-
 ---
 
 ## 项目概览
